@@ -1,0 +1,458 @@
+<section id="ch-practice-01-app-architecture" class="chapter" data-chapter="practice-01-app-architecture">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>LLM 应用分层架构</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-app-architecture" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>32 分钟</strong> · 阶段：<strong>应用架构与能力拼图</strong> · 能力：拆解 CorpAssist 接入/编排/数据三层，选型同步异步与双栈边界</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>在 <a href="#ch-basics-05-api-contracts">API 契约与集成方式</a> 中你已画出 BFF → LLM 网关 → 厂商的<strong>物理拓扑</strong>。本章把它上升为<strong>逻辑分层</strong>：哪些组件只做接入、谁负责 <span class="term" data-term-id="rag" tabindex="0">RAG</span> 与 <span class="term" data-term-id="agent" tabindex="0">Agent</span> 编排、数据与索引落在哪。没有分层，团队会在 BFF 里堆 Prompt、在业务服务里直连模型，最终无法治理 <span class="term" data-term-id="token" tabindex="0">Token</span> 成本与合规。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用接入层 / 编排层 / 数据层三张「职责卡」标注 CorpAssist 的 gateway、BFF、orchestrator、RAG 索引</li>
+          <li>为客服对话、夜间批摘要、<span class="term" data-term-id="agent" tabindex="0">Agent</span> 工单三类场景选择同步 HTTP 或异步消息</li>
+          <li>说明 Python AI 服务与 Spring 治理栈各自负责什么、如何通过 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 网关衔接</li>
+          <li>列举至少 5 条 LLM 应用常见反模式，并对照 CorpAssist 的推荐做法</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>接入不智能</strong>：BFF + <code>llm-gateway</code> 管鉴权、限流、流式透传，不写 RAG 核心逻辑。</li>
+          <li><strong>编排在中间</strong>：<code>dialog-orchestrator</code> 组装 messages、调工具、控制步数预算。</li>
+          <li><strong>数据可演进</strong>：向量索引、文档版本、审计日志独立成数据层，与模型厂商解耦。</li>
+          <li><strong>双栈有边界</strong>：Python 擅检索/评测/Notebook 实验；Spring 擅租户、审计、与企业 IAM/配置中心集成。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>接入层 / 编排层 / 数据层</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度问答 S1</span>
+        员工在 Web 端提问「产假天数」。请求经 <strong>corpassist-bff</strong> 鉴权后，不应在 BFF 内拼 20 条制度片段，而应由<strong>编排层</strong>调用 <strong>rag-service</strong> 检索，再经 <strong>llm-gateway</strong> 以 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 协议补全。
+      </aside>
+
+      <p>企业 LLM 应用可抽象为三层（与经典「表现 / 业务 / 数据」对应，但中间层专指<strong>模型侧编排</strong>）：</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>层</th><th>CorpAssist 组件</th><th>核心职责</th><th>不应做</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>接入层</strong></td>
+            <td><code>corpassist-bff</code>、<code>llm-gateway</code></td>
+            <td>JWT/租户、SSE 透传、模型路由、密钥托管、<span class="term" data-term-id="token" tabindex="0">Token</span> usage 落库</td>
+            <td>文档分块策略、向量重建、复杂 Agent 规划</td>
+          </tr>
+          <tr>
+            <td><strong>编排层</strong></td>
+            <td><code>dialog-orchestrator</code>、<code>agent-runtime</code>（可选）</td>
+            <td>多轮状态、<span class="term" data-term-id="rag" tabindex="0">RAG</span> 调用链、工具调用、<span class="term" data-term-id="prompt-engineering" tabindex="0">提示词</span> 模板版本、降级文案</td>
+            <td>持有厂商 API Key、直接暴露给公网</td>
+          </tr>
+          <tr>
+            <td><strong>数据层</strong></td>
+            <td><code>rag-index</code>、对象存储、元数据库、审计仓</td>
+            <td>文档入库、<span class="term" data-term-id="embedding" tabindex="0">Embedding</span> 索引、引用片段 ID、评测集与反馈</td>
+            <td>同步调用大模型生成最终用户可见答案（生成在编排层触发）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · 三层逻辑架构（含 RAG 索引）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph access [接入层 Access]
+    Web[Web / 钉钉 / API 客户端]
+    BFF[corpassist-bff]
+    GW[llm-gateway OpenAI 兼容]
+  end
+  subgraph orchestration [编排层 Orchestration]
+    ORCH[dialog-orchestrator]
+    AGT[agent-runtime]
+    RAGS[rag-service 检索 API]
+  end
+  subgraph data [数据层 Data]
+    IDX[(rag-index 向量+元数据)]
+    OBJ[(对象存储 原始 PDF)]
+    AUD[(审计与 usage 仓)]
+  end
+  subgraph models [模型提供方]
+    LLM[对话模型 API]
+    EMB[Embedding API]
+  end
+  subgraph biz [业务域 非 LLM 核心]
+    HR[hr-service]
+    ERP[erp-service]
+  end
+  Web -->|HTTPS JWT| BFF
+  BFF -->|REST SSE| ORCH
+  BFF -->|流式透传| GW
+  ORCH --> RAGS
+  ORCH --> AGT
+  ORCH --> GW
+  AGT --> GW
+  RAGS --> IDX
+  RAGS --> EMB
+  GW --> LLM
+  GW --> AUD
+  ORCH -->|工具回调| HR
+  AGT -->|工具回调| ERP
+  IDX --> OBJ</pre>
+        <p class="diagram-caption">与 <a href="#ch-basics-05-api-contracts">API 契约</a> 中 BFF→网关→厂商图互补：本图强调编排与数据层边界。生成始终经 gateway；索引更新走数据层异步流水线。</p>
+      </div>
+
+      <h4>一次 RAG 问答的调用序（概念）</h4>
+      <ol>
+        <li>BFF 校验租户，附带 <code>session_id</code> 转发至 orchestrator。</li>
+        <li>Orchestrator 调 rag-service：混合检索 → 得到 top-k 片段与 <code>chunk_id</code>。</li>
+        <li>拼装 <code>messages</code>（system + 引用块 + user），经 gateway <code>POST /v1/chat/completions</code>。</li>
+        <li>流式 chunk 经 BFF 写 SSE；末包 <code>usage</code> 写入审计仓，按部门归因 <span class="term" data-term-id="token" tabindex="0">Token</span>。</li>
+      </ol>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># CorpAssist 分层职责配置片段（application-corpassist.yml）
+corpassist:
+  layers:
+    access:
+      bff: corpassist-bff          # 鉴权、聚合、SSE 透传
+      gateway: llm-gateway         # OpenAI 兼容、路由、密钥、usage
+    orchestration:
+      dialog: dialog-orchestrator  # RAG 拼装、多轮、降级
+      agent: agent-runtime         # 工具调用、步数预算 max_steps: 8
+    data:
+      rag_index: rag-index         # 向量集合 corpassist-hr-v3
+      object_store: minio://docs
+  rag:
+    retrieval:
+      top_k: 6
+      rerank: true
+    # 索引重建在数据层异步任务，不阻塞在线问答
+    ingest:
+      queue: corpassist-doc-ingest
+      embedding_model: text-embedding-v3</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>同步 vs 异步</h3>
+      <p>「同步」指用户或调用方<strong>阻塞等待</strong>一次 HTTP/SSE 往返内得到结果；「异步」指提交任务后立即返回 <code>job_id</code>，由消息队列或调度器在后台完成，结果通过轮询、Webhook 或站内信送达。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>推荐模式</th><th>CorpAssist 实现要点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Web 客服 / 制度问答</td>
+            <td><strong>同步 + <span class="term" data-term-id="streaming" tabindex="0">流式</span></strong></td>
+            <td>BFF 保持 SSE；编排层超时 60～120s；网关禁止缓冲</td>
+          </tr>
+          <tr>
+            <td>1000 页 PDF 全库重索引</td>
+            <td><strong>异步</strong></td>
+            <td>数据层 <code>doc-ingest</code> 队列；进度 API；失败可重试分片</td>
+          </tr>
+          <tr>
+            <td>夜间批量摘要、评测跑批</td>
+            <td><strong>异步</strong></td>
+            <td>非流式 <code>chat/completions</code>；Worker 消费；结果写对象存储</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="agent" tabindex="0">Agent</span> 多步工具（查 ERP→发邮件）</td>
+            <td><strong>同步长连接或异步任务</strong></td>
+            <td>步数 &gt; 3 或总 <span class="term" data-term-id="token" tabindex="0">Token</span> 高时改异步，前端轮询 <code>/jobs/{id}</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">误用同步</span>
+          <ul>
+            <li>HTTP 请求内同步遍历万篇文档做 Embedding</li>
+            <li>Agent 10+ 步工具调用堵在 BFF 线程池</li>
+            <li>批处理走流式 SSE，占用网关长连接</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>在线问答：同步编排 + 流式生成</li>
+            <li>索引/评测：异步队列 + 可观测 job 状态</li>
+            <li>超时后返回 job_id，而非无限挂起 HTTP</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：rag-service 检索 200ms，模型首 token 2s，整答 15s——应在哪一层设超时？</summary>
+        <p><strong>分层超时</strong>：BFF 对前端总超时略大于编排；编排对 RAG 单独 3～5s，对 gateway 读超时覆盖生成；网关对厂商再套一层。避免只用 BFF 一个 30s 掩盖 RAG 变慢。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈分工预览</h3>
+      <p>CorpAssist 采用 <strong>Python AI 服务</strong> + <strong>Spring 治理栈</strong> 并行：不是「二选一」，而是<strong>按层分工</strong>，经统一 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 网关与内部 REST 契约协作。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>能力域</th><th>Python AI 栈</th><th>Spring 治理栈</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>典型服务</td>
+            <td><code>rag-service</code>、评测脚本、Notebook 实验</td>
+            <td><code>corpassist-bff</code>、<code>llm-gateway</code>、<code>dialog-orchestrator</code></td>
+          </tr>
+          <tr>
+            <td>擅长</td>
+            <td>LangChain/LlamaIndex 原型、向量流水线、离线 <span class="term" data-term-id="embedding" tabindex="0">Embedding</span> 批处理</td>
+            <td>多租户、OAuth2、配置中心、与 hr/erp 现有 Feign 集成</td>
+          </tr>
+          <tr>
+            <td>模型调用</td>
+            <td>httpx / openai SDK → 同一 <code>base_url</code></td>
+            <td>Spring AI ChatClient → 同一 gateway</td>
+          </tr>
+          <tr>
+            <td>治理</td>
+            <td>容器化 + 资源限额；敏感逻辑仍走 Spring 审计入口</td>
+            <td>全链路 trace_id、操作审计、密钥不落 Python 配置仓库</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// Spring 编排层：调用 Python rag-service，再调统一网关
+@Service
+public class CorpAssistDialogService {
+  private final RagClient ragClient;       // REST → rag-service (Python)
+  private final ChatClient chatClient;   // Spring AI → llm-gateway
+
+  public Flux&lt;String&gt; answerWithRag(String tenantId, String question) {
+    List&lt;RagChunk&gt; chunks = ragClient.retrieve(tenantId, question, 6);
+    String context = RagPromptBuilder.formatCitations(chunks);
+    return chatClient.prompt()
+        .system("仅依据引用回答；无依据则拒答。")
+        .user(context + "\n\n问：" + question)
+        .stream()
+        .content();
+  }
+}</code></pre>
+      </div>
+
+      <p>Python 侧 <code>rag-service</code> 暴露 <code>POST /v1/retrieve</code>，返回 <code>chunk_id</code>、文本与分数；不在 Python 进程内缓存厂商 API Key 给前端。后续 <a href="#ch-practice-05-handson-first-call">首次打通模型调用</a> 将对照 httpx 与 Spring AI 配置项。</p>
+
+      <div class="notice">
+        <strong>衔接 basics</strong>
+        <p>双栈都依赖 <a href="#ch-basics-05-api-contracts">BFF 与 OpenAI 兼容网关</a> 的契约；分层架构决定<strong>哪一段用哪门语言</strong>，而不是两套互不相关的模型接入。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>反模式列举</h3>
+      <p>以下反模式在 Java 微服务团队接手 LLM 项目时高频出现。每条给出 CorpAssist 推荐替代。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>#</th><th>反模式</th><th>后果</th><th>推荐</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td><strong>智能堆在 BFF</strong>：BFF 内写 RAG、调 ERP 工具</td>
+            <td>无法独立扩缩容；前端协议变更牵动智能逻辑</td>
+            <td>下沉 <code>dialog-orchestrator</code></td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td><strong>业务服务直连模型</strong>：各服务自带 API Key</td>
+            <td>密钥泄露、<span class="term" data-term-id="token" tabindex="0">Token</span> 不可归因</td>
+            <td>仅 <code>llm-gateway</code> 持钥</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><strong>无数据层版本</strong>：向量索引与 PDF 不同步</td>
+            <td>引用过期制度，合规风险</td>
+            <td>文档 <code>version</code> + 索引别名切换</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td><strong>先 <span class="term" data-term-id="fine-tuning" tabindex="0">微调</span> 再建 RAG</strong></td>
+            <td>知识更新慢、成本高</td>
+            <td>企业知识库优先 <span class="term" data-term-id="rag" tabindex="0">RAG</span>；微调仅用于风格/格式</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td><strong>Agent 无步数与工具白名单</strong></td>
+            <td>循环调用、费用爆炸</td>
+            <td><code>max_steps</code>、工具审计、人工确认写操作</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td><strong>全链路同步</strong>：索引/Agent 长任务占 HTTP 线程</td>
+            <td>雪崩、网关连接耗尽</td>
+            <td>异步队列 + job 状态 API</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-tabs" role="tablist" aria-label="反模式自检">
+        <input type="radio" name="prac01-antipattern-tab" id="prac01-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac01-antipattern-tab" id="prac01-tab-b" class="learn-tab-input" />
+        <label for="prac01-tab-a">接入层红灯</label>
+        <label for="prac01-tab-b">编排/数据红灯</label>
+        <div class="learn-tab-panel" id="prac01-panel-a" role="tabpanel">
+          <ul>
+            <li>BFF 解析 PDF 或跑 Embedding</li>
+            <li>网关内嵌业务规则引擎替代 orchestrator</li>
+            <li>对流式响应做全量缓冲再返回</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac01-panel-b" role="tabpanel">
+          <ul>
+            <li>检索结果不记录 <code>chunk_id</code>，无法溯源</li>
+            <li>把历史对话无限塞进 prompt 不用 <span class="term" data-term-id="context-window" tabindex="0">上下文窗口</span> 预算</li>
+            <li>评测集与生产索引混用同一集合名</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">四条对应四个 section，作为 practice 阶段架构共同语言。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>三层</strong>：接入（BFF+gateway）/ 编排（orchestrator+agent）/ 数据（rag-index+存储）；生成经 gateway，检索在数据与 rag-service。</li>
+        <li><strong>同步异步</strong>：用户可见用同步+流式；索引与批处理用异步；Agent 长链可转 job。</li>
+        <li><strong>双栈</strong>：Python 做 AI 流水线实验与检索；Spring 做 BFF、网关、编排与企业集成。</li>
+        <li><strong>反模式</strong>：忌 BFF 堆智能、业务直连模型、无索引版本、无 Agent 预算。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-fundamentals_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 6 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="three-layers" /> 能说出接入/编排/数据各 2 个 CorpAssist 组件名</label></li>
+          <li><label><input type="checkbox" data-id="rag-flow" /> 能口述一次 RAG 问答的 4 步调用序</label></li>
+          <li><label><input type="checkbox" data-id="sync-async" /> 能为客服、全库索引、夜间批处理各选同步或异步</label></li>
+          <li><label><input type="checkbox" data-id="dual-stack" /> 能说明 Python 与 Spring 各负责哪类服务</label></li>
+          <li><label><input type="checkbox" data-id="antipatterns" /> 能列举 5 条反模式及推荐替代</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验（若已发布）</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>接入层</td><td>BFF + gateway，不堆 RAG</td></tr>
+                <tr><td>编排层</td><td>orchestrator 拼 prompt、调工具</td></tr>
+                <tr><td>数据层</td><td>rag-index、文档版本、审计</td></tr>
+                <tr><td>在线</td><td>同步 + SSE</td></tr>
+                <tr><td>离线</td><td>异步队列 + job</td></tr>
+                <tr><td>双栈</td><td>Python 检索/实验，Spring 治理</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>画 CorpAssist 三层架构，说明一次制度问答请求经过哪些服务。</li>
+              <li>为什么 RAG 索引重建应异步，而客服回答宜同步流式？</li>
+              <li>Python rag-service 与 Spring orchestrator 如何划分边界？若只允许一个服务直连 llm-gateway，选谁？</li>
+              <li>列举 3 条「BFF 堆智能」带来的线上事故风险。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成 Demo 分层标注与过关清单；进入 <a href="#ch-practice-02-interview-scenarios">面试 TOP5 应用场景与 CorpAssist 模块</a>，把 S1～S5 场景映射到本架构各层。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/concepts.html" target="_blank" rel="noopener">Spring AI — Concepts</a></li>
+      <li><a href="https://python.langchain.com/docs/concepts/rag/" target="_blank" rel="noopener">LangChain — RAG 概念</a></li>
+      <li><a href="https://platform.openai.com/docs/guides/production-best-practices" target="_blank" rel="noopener">OpenAI — Production best practices</a></li>
+      <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic — Building effective agents</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 CorpAssist 三层图上标注你负责的服务，并对照 YAML/Java 片段填写团队的分层职责表。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打印或导出本章 Mermaid「三层逻辑架构」图，用三种颜色标出接入/编排/数据组件；对照 <a href="#ch-basics-05-api-contracts">API 契约章</a> 的 BFF→网关图，标出两图差异（物理 vs 逻辑）。</li>
+      <li>打开 <code>demos/practice-01-architecture-lab/</code>，复制 <code>layer-mapping-template.md</code>，为 S1 制度问答填写每层负责的仓库/服务名（可填 hypothetical）。</li>
+      <li>在「同步 vs 异步」表中新增一行：你们公司的「周报 AI 摘要」场景，写清同步/异步及理由。</li>
+      <li>从「反模式列举」选 2 条，对照你当前项目代码或设计文档，写「是否存在 + 改造建议」各 1 句。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">产品要求在 corpassist-bff 内直接调用通义 API 并拼接检索结果，以「加快上线」。是否接受？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不接受为长期方案</strong>。短期 PoC 可容忍，但违背接入/编排分层：密钥与 <span class="term" data-term-id="token" tabindex="0">Token</span> 治理失控，RAG 无法复用。应拆出 orchestrator + rag-service，BFF 只透传。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Agent 办公自动化需连续调用 8 次工具，每次 3～5s，用户仍在浏览器等待。应如何调整架构？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>改为<strong>异步 job</strong>：提交返回 <code>job_id</code>，agent-runtime 在后台执行并推送进度；或限制 <span class="term" data-term-id="agent" tabindex="0">Agent</span> <code>max_steps</code> 并合并工具调用。避免 BFF HTTP 线程阻塞 40s+。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：分层架构标注实验</h4>
+      <p>目录：<code>demos/practice-01-architecture-lab/</code>（<code>corpassist-layers.yaml</code>、<code>layer-mapping-template.md</code>、同步/异步场景卡）。<strong>验收</strong>：职责表三层各至少 1 个服务名；场景卡 4 行已填同步/异步及理由。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-05-api-contracts">API 契约与集成方式</a>：BFF、网关、流式透传物理视图</li>
+      <li><a href="#ch-practice-02-interview-scenarios">面试 TOP5 应用场景与 CorpAssist 模块</a>：S1～S5 映射到本架构</li>
+      <li><a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a>：双栈配置对照</li>
+      <li><a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>：编排层 Token 预算</li>
+      <li><a href="https://martinfowler.com/articles/microservices.html" target="_blank" rel="noopener">Martin Fowler — Microservices（分层思想对照）</a></li>
+    </ul>
+  </div>
+</section>

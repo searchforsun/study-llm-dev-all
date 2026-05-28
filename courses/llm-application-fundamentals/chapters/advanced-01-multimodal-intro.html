@@ -1,0 +1,387 @@
+<section id="ch-advanced-01-multimodal-intro" class="chapter" data-chapter="advanced-01-multimodal-intro">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多模态应用入门</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-multimodal-intro" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>28 分钟</strong> · 阶段：<strong>进阶场景与面试映射</strong> · 能力：区分图文/PDF 处理路径，定位 OCR 在 <span class="term" data-term-id="rag" tabindex="0">RAG</span> 中的位置，设计 CorpAssist 附件问答边界</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 在 <a href="#ch-practice-02-interview-scenarios">面试场景与能力拼图</a> 的 <strong>S1 制度问答</strong> 跑通纯文本 <span class="term" data-term-id="rag" tabindex="0">RAG</span> 后，业务很快会提需求：「上传扫描版 PDF / 报销单截图，能不能直接问？」多模态不是「把图片塞进 chat」，而是要在<strong>入库</strong>与<strong>在线问答</strong>两条链路上做选型——OCR 再索引 vs 视觉模型直读，直接影响 <span class="term" data-term-id="token" tabindex="0">Token</span> 成本、延迟与合规。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 CorpAssist 区分「可搜索 PDF / 扫描件 / 单页截图」三类图文输入的处理策略</li>
+          <li>说明 OCR 在 <span class="term" data-term-id="rag" tabindex="0">RAG</span> 流水线中的位置：何时 OCR→切块→<span class="term" data-term-id="embedding" tabindex="0">Embedding</span>，何时保留版面结构</li>
+          <li>列举视觉大模型的能力边界（表格、手写、印章、超长附件）与降级方案</li>
+          <li>设计附件问答 API：与 <a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a> 中编排层、数据层的职责对齐</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>能 OCR 就别整页 vision</strong>：扫描件入库走 OCR + 文本 <span class="term" data-term-id="rag" tabindex="0">RAG</span>，比每问把 PDF 页当图片喂模型更省 <span class="term" data-term-id="token" tabindex="0">Token</span>。</li>
+          <li><strong>附件问答分两条路</strong>：已索引文档走检索；临时上传走「解析 → 摘要/切块 → 单次问答」。</li>
+          <li><strong>多模态计费不同于文本</strong>：图文页常按 patch/页计费，见 <a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>。</li>
+          <li><strong>合规优先</strong>：附件可能含身份证、合同金额；解析与日志策略与隐私章一致。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>图文 PDF 场景</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S1 制度库扩容</span>
+        HR 批量导入 120 份制度 PDF：其中 40% 为扫描件、30% 为 Word 导出可搜索 PDF、30% 含复杂表格与流程图。若统一按「纯文本抽取」处理，扫描件几乎空白；若全部走视觉模型，索引成本与延迟不可接受。
+      </aside>
+      <p>企业知识库中的「图文 PDF」通常指三类混合输入：<strong> born-digital 可搜索 PDF</strong>（内嵌文字层）、<strong>扫描件</strong>（页即图片）、<strong>混合型</strong>（部分页可搜索、部分为截图或图表）。应用侧首先要做<strong>文档分类与路由</strong>，而不是假设所有 PDF 都能 <code>pdftotext</code> 一把梭。</p>
+
+      <h4>三类 PDF 的处理策略（CorpAssist 文档中心）</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>类型</th><th>识别信号</th><th>入库路径</th><th>问答路径</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>可搜索 PDF</strong></td>
+            <td>每页可选中文字；<code>extract_text</code> 字符数 &gt; 阈值</td>
+            <td>直接抽取 → 切块 → <span class="term" data-term-id="embedding" tabindex="0">Embedding</span> 入向量库</td>
+            <td>标准 S1 <span class="term" data-term-id="rag" tabindex="0">RAG</span>：检索片段 + 文本模型生成</td>
+          </tr>
+          <tr>
+            <td><strong>扫描件 PDF</strong></td>
+            <td>抽取文本极少；页渲染为 bitmap</td>
+            <td>OCR（Tesseract / 云 OCR / 版面模型）→ 文本 + 可选坐标 → 切块 → Embedding</td>
+            <td>同上；引用时可带页码与 OCR 置信度</td>
+          </tr>
+          <tr>
+            <td><strong>图表 / 流程图为主</strong></td>
+            <td>OCR 文本少但视觉结构重要</td>
+            <td>页级 caption 模型生成描述 + 缩略图存对象存储；文本描述入索引</td>
+            <td>复杂页可触发「视觉问答」分支（见能力边界节）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>扫描件跳过 OCR，直接把 PDF 二进制当「附件」每次进 prompt</li>
+            <li>不区分入库与在线：用户问一次就全量 vision 读 80 页</li>
+            <li>忽略表格结构，OCR 后表格变乱码行</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>入库流水线：<code>classify → ocr|extract → chunk → embed</code></li>
+            <li>在线附件：单文件页数 / 大小上限 + 异步解析任务</li>
+            <li>表格页走专用版面解析或 HTML 中间表示</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>与 <a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a> 对照：<strong>文档解析与 OCR</strong> 属于数据层（<code>doc-ingestion-worker</code>）；<strong>不入 BFF</strong>。编排层只消费「已结构化 chunk + metadata」，保持与纯文本 S1 相同的检索接口。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>OCR 在 RAG 中的位置</h3>
+      <p>OCR（光学字符识别）在 CorpAssist 中不是「给用户看的功能」，而是<strong>RAG 入库链路的预处理环节</strong>：把非结构化像素变成可检索、可计费的文本。位置错误（例如只在问答时 OCR）会导致重复计算、无法增量更新索引、且难以做离线评测。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · 扫描件 PDF 入库与 S1 RAG 问答（示意）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph ingest ["数据层 · 入库（离线/异步）"]
+    A[上传 PDF] --> B{classify 页类型}
+    B -->|可搜索| C[text extract]
+    B -->|扫描| D[OCR + 版面]
+    C --> E[chunk + metadata]
+    D --> E
+    E --> F[Embedding]
+    F --> G[(向量库 hr-handbook)]
+  end
+  subgraph online ["编排层 · 在线 S1 问答"]
+    Q[用户: 产假附件第几页?] --> R[rag.retrieve]
+    R --> G
+    R --> H[top-k 文本片段]
+    H --> I[llm.chat 文本模型]
+    I --> J[回答 + 页码引用]
+  end
+  G -.->|已索引| R</pre>
+        <p class="diagram-caption">OCR 发生在<strong>入库</strong>，在线问答仍走文本 <span class="term" data-term-id="rag" tabindex="0">RAG</span>。仅当问题明确指向「这一页长什么样」且索引无足够描述时，才走视觉分支。</p>
+      </div>
+
+      <h4>OCR 输出应携带的 metadata</h4>
+      <ul>
+        <li><code>page_no</code>、<code>source_file_id</code>：支持 S1 引用溯源</li>
+        <li><code>ocr_confidence</code>：低置信块可降权或人工复核队列</li>
+        <li><code>bbox</code>（可选）：前端高亮原文位置</li>
+        <li><code>parser_version</code>：与 <a href="#ch-practice-04-observability-intro">效果、延迟与可观测入门</a> 中的 <code>index_version</code> 对齐，便于评测回归</li>
+      </ul>
+
+      <p>切块策略与纯文本一致：按标题/段落/表格单元切分，但扫描件需控制<strong>块大小</strong>——OCR 噪声会污染 <span class="term" data-term-id="embedding" tabindex="0">Embedding</span> 相似度。CorpAssist 实践：OCR 后先跑一遍「去 hyphen / 合并断行」再 chunk；表格单独成块并打 <code>content_type=table</code> 标签。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：用户上传临时报销单截图问「金额是多少」，应走已入库向量库还是临时解析？</summary>
+        <p>走<strong>临时附件解析</strong>：文件未进 S1 制度库，不应污染长期索引。流程为「上传 → OCR/版面 → 短上下文单次问答」，答毕按 retention 策略删除或脱敏存档；若企业政策要求留档，再异步决定是否入库。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>能力边界</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 附件问答预期管理</span>
+        员工上传 60 页扫描合同问「违约金条款原文」。产品期望 10 秒内精确引用；若走 vision 全页读取，<span class="term" data-term-id="token" tabindex="0">Token</span> 与延迟爆炸，且模型可能漏读脚注。需要明确：什么必须 OCR 入库，什么可 vision 单页，什么应拒答并引导人工。
+      </aside>
+      <p>视觉语言模型（VLM）与 OCR+<span class="term" data-term-id="rag" tabindex="0">RAG</span> 各有边界。面试与方案评审中，应能说明「为什么不把所有 PDF 都交给 GPT-4V / Qwen-VL 一次读完」。</p>
+
+      <h4>能力对照表</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>任务</th><th>OCR + 文本 RAG</th><th>视觉模型直读</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>长文档（&gt;20 页）事实问答</td>
+            <td>强（检索定位）</td>
+            <td>弱（窗口与成本）</td>
+            <td>必须入库 RAG</td>
+          </tr>
+          <tr>
+            <td>单页表格 / 票据字段</td>
+            <td>中（依赖版面 OCR）</td>
+            <td>强（小图）</td>
+            <td>临时附件可 vision；入库仍 OCR</td>
+          </tr>
+          <tr>
+            <td>流程图「步骤顺序」</td>
+            <td>弱（纯 OCR 丢结构）</td>
+            <td>中～强</td>
+            <td>页级 caption 入索引 + 必要时 vision</td>
+          </tr>
+          <tr>
+            <td>手写批注 / 印章</td>
+            <td>弱</td>
+            <td>中（不可靠）</td>
+            <td>低置信拒答 + 人工通道</td>
+          </tr>
+          <tr>
+            <td>实时相机拍照</td>
+            <td>不适用</td>
+            <td>强</td>
+            <td>单独场景（非 S1 主路径）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>多模态 API 请求示例（在线单页 vision 分支）</h4>
+      <p>当用户临时上传<strong>单张</strong> PNG 且问题为「提取图中金额」时，编排层可调用网关上的 vision 模型。注意：<code>image_url</code> 应使用<strong>短时 signed URL</strong>，勿把 base64 巨图长期写日志。</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "model": "corpassist-vision-fast",
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是 CorpAssist 附件助手。仅根据图片中的可见文字回答；看不清则明确拒答。不要编造金额或条款。"
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "请读出报销单上的合计金额（数字即可）。"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://object-store.internal/corpassist/attachments/tmp-a8f3.png?X-Amz-Expires=300",
+            "detail": "high"
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 256,
+  "temperature": 0
+}</code></pre>
+      </div>
+      <p>响应中的 <code>usage.prompt_tokens</code> 对 vision 往往包含「图像 patch」折算，显著高于同等字数纯文本——预算估算见 <a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>。网关应打标签 <code>modality=vision</code> 便于 SLI 拆分。</p>
+
+      <div class="notice">
+        <strong>拒答与降级</strong>
+        <ul>
+          <li>页数 &gt; 上限 → 提示「请先入库或选择单页」</li>
+          <li>OCR 置信度 &lt; 阈值 → 不进入 RAG，进入人工审核</li>
+          <li>含 PII 敏感类 → 走 <a href="#ch-practice-03-data-privacy">数据、隐私与合规入门</a> 中的脱敏流水线</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 附件问答</h3>
+      <p>「附件问答」是产品能力名：用户在对话中挂文件并提问。技术上它横跨<strong>接入层</strong>（上传、病毒扫描、大小限制）、<strong>编排层</strong>（路由：已索引 vs 临时 vision/OCR）、<strong>数据层</strong>（解析任务队列与对象存储）。与 S1 制度库共用 <code>llm-gateway</code>，但 model 可能是 <code>corpassist-fast</code>（文本）或 <code>corpassist-vision-fast</code>（视觉）。</p>
+
+      <h4>附件问答路由决策</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>条件</th><th>路由</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>file_id</code> 已关联 S1 索引</td>
+            <td>文本 RAG</td>
+            <td>与制度问答相同，检索范围可 filter 该文档</td>
+          </tr>
+          <tr>
+            <td>临时 PDF ≤ 10 页，未入库</td>
+            <td>异步 OCR → 内存 chunk → 文本 LLM</td>
+            <td>会话级上下文，不写向量库</td>
+          </tr>
+          <tr>
+            <td>临时图片 1～2 张，字段抽取类</td>
+            <td>Vision API</td>
+            <td>见上一节 JSON 示例</td>
+          </tr>
+          <tr>
+            <td>扫描件 &gt; 10 页或含合同密级</td>
+            <td>拒答 / 转人工</td>
+            <td>引导走正式入库审批流</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>与 <a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a> 衔接：文本与 vision 可共用同一 OpenAI 兼容端点，仅 <code>model</code> 与 <code>messages[].content</code> 结构不同。BFF 对前端统一「附件 + 问题」表单，编排层内部拆分。</p>
+
+      <div class="notice notice-outcome">
+        <strong>与 S1 面试场景对齐</strong>
+        <p>系统设计题「企业知识库支持 PDF」标准答法：<strong>入库流水线（含 OCR）+ 文本 RAG + 引用溯源</strong>；多模态 vision 仅作<strong>补充分支</strong>（单页票据、图表描述）。详见 <a href="#ch-practice-02-interview-scenarios">面试场景与能力拼图 · S1 企业 RAG 知识库</a>。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，advanced 阶段建立多模态与 RAG 分工的共同语言。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>图文 PDF 场景</strong>：分类可搜索 / 扫描 / 图表三类，入库路由不同；解析在数据层不在 BFF。</li>
+        <li><strong>OCR 在 RAG 中的位置</strong>：OCR 在离线入库；在线 S1 仍走文本检索 + 文本生成，metadata 支撑溯源。</li>
+        <li><strong>能力边界</strong>：长文档靠 <span class="term" data-term-id="rag" tabindex="0">RAG</span>；vision 适合小图字段抽取；手写/印章要拒答与人工。</li>
+        <li><strong>CorpAssist 附件问答</strong>：编排层按「已索引 / 临时 OCR / vision / 拒答」路由，与网关多 model 及 <span class="term" data-term-id="token" tabindex="0">Token</span> 标签对齐。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-fundamentals_advanced01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pdf-three-types" /> 能说出三类 PDF 及各自入库路径</label></li>
+          <li><label><input type="checkbox" data-id="ocr-ingest" /> 能解释 OCR 为何放在入库而非每次问答</label></li>
+          <li><label><input type="checkbox" data-id="vision-vs-rag" /> 能对比 vision 直读与 OCR+RAG 的适用任务</label></li>
+          <li><label><input type="checkbox" data-id="attachment-route" /> 能画出附件问答的四条路由条件</label></li>
+          <li><label><input type="checkbox" data-id="demo-lab" /> 已完成 demo 目录中的 OCR/vision 对比实验（可选）</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>扫描件 PDF</td><td>页即图，必须 OCR 再 Embedding</td></tr>
+                <tr><td>OCR 在 RAG</td><td>入库预处理，在线仍文本检索</td></tr>
+                <tr><td>vision 分支</td><td>小图、临时、字段类；长文档不用</td></tr>
+                <tr><td>image_url</td><td>短时 signed URL；detail 影响 Token</td></tr>
+                <tr><td>附件问答</td><td>编排层路由，非 BFF 内解析</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>企业知识库 PDF 很多是扫描件，你会如何设计入库流水线？</li>
+              <li>为什么不让 vision 模型每次读取用户上传的 50 页合同？</li>
+              <li>附件问答与 S1 制度 RAG 在架构上如何复用、如何隔离？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成 demo 实验与过关清单；继续 <a href="#ch-advanced-02-domestic-stack">国产化与信创选型</a>，或回到 <a href="#ch-practice-02-interview-scenarios">S1 企业 RAG 知识库</a> 对照场景答法。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/guides/images-vision" target="_blank" rel="noopener">OpenAI — Images and vision</a></li>
+      <li><a href="https://platform.openai.com/docs/api-reference/chat/create" target="_blank" rel="noopener">OpenAI API — Chat Completions（多模态 content 数组）</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/qwen-vl-plus" target="_blank" rel="noopener">阿里云 Model Studio — 通义千问 VL 视觉理解</a></li>
+      <li><a href="https://unstructured.io/blog/ocr-vs-vision-models-for-document-parsing" target="_blank" rel="noopener">Unstructured — OCR vs Vision models for document parsing</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 CorpAssist 假数据为「扫描制度 PDF + 临时报销截图」各写一条处理路径，并对照 vision JSON 请求估算 Token 差异。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在「三类 PDF 策略表」中为<strong>混合型 PDF（含 5 页流程图）</strong>补一行入库与问答建议。</li>
+      <li>复制「多模态 API 请求示例」：将 <code>detail</code> 改为 <code>low</code>，说明对费用与识别精度的 trade-off。</li>
+      <li>在「OCR 在 RAG 中位置」Mermaid 上增加节点：低置信 OCR 块进入 <code>human_review_queue</code>。</li>
+      <li>为附件问答路由表增加一列「预计 prompt_tokens 数量级（示意）」：文本 RAG vs vision 单图。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">产品要求「上传 200 页扫描 PDF 立刻问答」，是否应同步调用 vision 模型读全文件？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不应。</strong> 超出窗口与预算，且无法复用索引。应走异步 OCR + 切块 + <span class="term" data-term-id="embedding" tabindex="0">Embedding</span> 入库，或拒答并引导分批入库；在线仅对已索引部分做 <span class="term" data-term-id="rag" tabindex="0">RAG</span>。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">OCR 与 vision 都能「读图」，是否可以用 vision 替代 OCR 做入库？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>大批量入库不推荐。</strong> Vision 按页/patch 计费高、难做确定性切块与版本管理；OCR+文本管道更易评测、增量更新与对齐 S1 引用。Vision 适合临时小图或 caption 补充。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist 多模态 OCR 与 Vision 对比实验</h4>
+      <p>目录：<code>demos/advanced-01-multimodal-lab/</code>（<code>sample-scan-page.png</code>、<code>ocr-vs-vision-routing.md</code>、示例 curl 与 Token 对比表）。<strong>验收</strong>：完成一张「文档类型 → 处理路径」决策表；能口述 OCR 入库与 vision 单次调用的成本差异。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-02-interview-scenarios">面试场景与能力拼图</a>：<strong>S1 企业 RAG 知识库</strong> 与 PDF 系统设计答法</li>
+      <li><a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a>：文档解析在数据层、编排在中间</li>
+      <li><a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>：多模态 PDF / patch 计费</li>
+      <li><a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a>：同一网关切换 text / vision model</li>
+      <li><a href="#ch-practice-04-observability-intro">效果、延迟与可观测入门</a>：按 <code>modality</code> 拆分 Token SLI</li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-02-domestic-stack">国产化与信创选型</a>：通义 VL 与本地 OCR 栈</li>
+    </ul>
+  </div>
+</section>

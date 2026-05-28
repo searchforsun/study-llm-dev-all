@@ -1,0 +1,466 @@
+<section id="ch-practice-05-handson-first-call" class="chapter" data-chapter="practice-05-handson-first-call">
+  <header class="chapter-header">
+    <h2>实战：首次打通模型调用</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-handson-first-call" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>工程实践与分层</strong> · 能力：用 curl / Python / Spring AI 完成首次 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 调用并读懂响应</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-05-api-contracts">API 契约与集成方式</a> 讲了契约与拓扑；本章在<strong>你的机器上跑通第一条请求</strong>。CorpAssist 后续 Python 编排与 Spring AI 微服务共用同一网关地址，先会用 curl 验通，再复制到双栈客户端，能少走半天联调弯路。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 curl 完成非流式与 <span class="term" data-term-id="streaming" tabindex="0">流式</span> 调用，并从 JSON / SSE 中取出回复与 <code>usage</code></li>
+          <li>用 Python（httpx 或 OpenAI SDK）编写可运行的最小客户端</li>
+          <li>配置 Spring AI <code>ChatClient</code> Bean，指向公司 LLM 网关</li>
+          <li>对照双栈在超时、流式、<span class="term" data-term-id="token" tabindex="0">Token</span> 计费上的共同配置项</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>动手前准备</strong>
+        <ul>
+          <li>一个 <strong>OpenAI 兼容</strong> 端点：通义 compatible-mode、DeepSeek、或 CorpAssist <code>llm-gateway</code>（见 Demo 目录 <code>.env.example</code>）</li>
+          <li>环境变量：<code>CORPASSIST_LLM_BASE_URL</code>、<code>CORPASSIST_LLM_KEY</code>、<code>CORPASSIST_LLM_MODEL</code></li>
+          <li>Python 3.10+（可选 <code>pip install httpx openai</code>）；Java 17+ 与 Spring Boot 3.x（Spring AI 章节预览）</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>curl 调用</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 联调第一步</span>
+        网关刚部署到测试环境，运维给你 Key 与 <code>base_url</code>。在改任何业务代码前，用 <strong>curl 证明链路可达</strong>，并确认 <code>model</code> 路由与 <code>usage</code> 字段符合采购合同。
+      </aside>
+      <p>所有后续客户端最终都变成同一条 HTTP：<code>POST {base_url}/chat/completions</code>。curl 无依赖、可脚本化，适合写进 CI 冒烟或 on-call 手册。</p>
+
+      <h4>非流式：一次拿完整 JSON</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># Linux / macOS / Git Bash
+export CORPASSIST_LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export CORPASSIST_LLM_KEY="sk-your-key"
+export CORPASSIST_LLM_MODEL="qwen-plus"
+
+curl -s "${CORPASSIST_LLM_BASE_URL%/}/chat/completions" \
+  -H "Authorization: Bearer ${CORPASSIST_LLM_KEY}" \
+  -H "Content-Type: application/json" \
+  -H "X-Request-Id: $(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)" \
+  -d '{
+    "model": "'"${CORPASSIST_LLM_MODEL}"'",
+    "stream": false,
+    "temperature": 0.2,
+    "max_tokens": 256,
+    "messages": [
+      {"role": "system", "content": "你是 CorpAssist 企业助手，回答须简洁。"},
+      {"role": "user", "content": "年假最多可休几天？"}
+    ]
+  }' | jq -r '.choices[0].message.content, .usage'</code></pre>
+      </div>
+      <p>成功时关注三处：<code>choices[0].message.content</code>（正文）、<code>usage.prompt_tokens</code> / <code>completion_tokens</code>（<span class="term" data-term-id="token" tabindex="0">Token</span> 计费依据）、<code>id</code>（排障时提供给网关日志）。</p>
+
+      <h4>流式：SSE 逐块输出</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">curl -N "${CORPASSIST_LLM_BASE_URL%/}/chat/completions" \
+  -H "Authorization: Bearer ${CORPASSIST_LLM_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "'"${CORPASSIST_LLM_MODEL}"'",
+    "stream": true,
+    "messages": [{"role": "user", "content": "用三句话介绍 RAG"}]
+  }'</code></pre>
+      </div>
+      <p>加 <code>-N</code> 禁用 curl 缓冲，才能实时看到 <code>data: {...}</code> 行与结尾 <code>data: [DONE]</code>。流式场景下 <span class="term" data-term-id="streaming" tabindex="0">streaming</span> 的 <code>delta.content</code> 需客户端拼接；最后一包常带 <code>usage</code>（依厂商略有差异，见 <a href="#ch-basics-05-api-contracts">API 契约与集成方式</a>）。</p>
+
+      <div class="notice">
+        <strong>Windows PowerShell</strong>
+        <p>Demo 目录提供 <code>chat-non-stream.ps1</code> / <code>chat-stream.ps1</code>，逻辑与上述 bash 等价；加载 <code>.env</code> 后执行即可。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Python 最小客户端</h3>
+      <p>CorpAssist 的 Python 编排服务（评测脚本、离线摘要、RAG 流水线）推荐两种写法：<strong>httpx</strong>（显式 HTTP，与 curl 一一对应）或 <strong>官方 OpenAI SDK</strong>（改 <code>base_url</code> 即可连 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 网关）。</p>
+
+      <h4>方式 A：httpx 异步客户端</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">#!/usr/bin/env python3
+"""CorpAssist 最小调用 — httpx（与 curl 同形）。"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+
+import httpx
+
+BASE_URL = os.environ.get("CORPASSIST_LLM_BASE_URL", "").rstrip("/")
+API_KEY = os.environ.get("CORPASSIST_LLM_KEY", "")
+MODEL = os.environ.get("CORPASSIST_LLM_MODEL", "qwen-plus")
+
+
+async def chat_once(user_text: str, *, stream: bool = False) -> str | None:
+    if not BASE_URL or not API_KEY:
+        raise RuntimeError("请设置 CORPASSIST_LLM_BASE_URL 与 CORPASSIST_LLM_KEY")
+
+    timeout = httpx.Timeout(60.0, connect=5.0)
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+
+    async with httpx.AsyncClient(base_url=BASE_URL, headers=headers, timeout=timeout) as client:
+        if not stream:
+            r = await client.post(
+                "/chat/completions",
+                json={
+                    "model": MODEL,
+                    "stream": False,
+                    "messages": [
+                        {"role": "system", "content": "你是 CorpAssist 企业助手。"},
+                        {"role": "user", "content": user_text},
+                    ],
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            usage = data.get("usage", {})
+            print(
+                f"usage: prompt={usage.get('prompt_tokens')} "
+                f"completion={usage.get('completion_tokens')}",
+                file=sys.stderr,
+            )
+            return data["choices"][0]["message"]["content"]
+
+        async with client.stream(
+            "POST",
+            "/chat/completions",
+            json={
+                "model": MODEL,
+                "stream": True,
+                "messages": [{"role": "user", "content": user_text}],
+            },
+        ) as r:
+            r.raise_for_status()
+            parts: list[str] = []
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    break
+                import json
+
+                chunk = json.loads(payload)
+                delta = chunk["choices"][0].get("delta", {})
+                if text := delta.get("content"):
+                    parts.append(text)
+                    print(text, end="", flush=True)
+            print()
+            return "".join(parts)
+
+
+if __name__ == "__main__":
+    q = sys.argv[1] if len(sys.argv) > 1 else "用一句话解释 OpenAI 兼容 API"
+    print(asyncio.run(chat_once(q, stream="--stream" in sys.argv)))</code></pre>
+      </div>
+
+      <h4>方式 B：OpenAI SDK</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">#!/usr/bin/env python3
+"""CorpAssist 最小调用 — openai 包（base_url 指向网关）。"""
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["CORPASSIST_LLM_KEY"],
+    base_url=os.environ["CORPASSIST_LLM_BASE_URL"].rstrip("/"),
+)
+
+resp = client.chat.completions.create(
+    model=os.environ.get("CORPASSIST_LLM_MODEL", "qwen-plus"),
+    messages=[{"role": "user", "content": "CorpAssist 制度问答和客服各适合流式还是非流式？"}],
+    stream=False,
+    max_tokens=256,
+)
+print(resp.choices[0].message.content)
+print(resp.usage)</code></pre>
+      </div>
+      <p>运行：<code>python demos/practice-05-first-call-lab/ask_httpx.py "你的问题"</code>；流式加 <code>--stream</code>。SDK 版见同目录 <code>ask_openai_sdk.py</code>。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring AI ChatClient 预览</h3>
+      <p>Java 侧 CorpAssist 微服务通过 <strong>Spring AI 1.x</strong> 的 <code>ChatClient</code> 访问同一网关。配置 <code>spring.ai.openai.base-url</code> 与 API Key 后，业务代码只写 prompt，不绑死某一国内厂商 SDK。</p>
+
+      <h4>application.yml（网关 + 模型）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    openai:
+      api-key: ${CORPASSIST_LLM_KEY}
+      base-url: ${CORPASSIST_LLM_BASE_URL:https://llm-gateway.corpassist.internal/v1}
+      chat:
+        options:
+          model: ${CORPASSIST_LLM_MODEL:corpassist-fast}
+          temperature: 0.2
+          max-tokens: 512</code></pre>
+      </div>
+
+      <h4>ChatClient Bean 与调用</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">package com.corpassist.llm;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Flux;
+
+@Configuration
+class CorpAssistLlmConfig {
+
+  @Bean
+  ChatClient corpAssistChatClient(ChatClient.Builder builder) {
+    return builder
+        .defaultSystem("你是 CorpAssist 企业助手，回答须简洁并提示信息来源类型。")
+        .build();
+  }
+}
+
+@RestController
+class CorpAssistChatSmokeController {
+
+  private final ChatClient chatClient;
+
+  CorpAssistChatSmokeController(ChatClient corpAssistChatClient) {
+    this.chatClient = corpAssistChatClient;
+  }
+
+  /** 非流式 — 对齐 curl stream:false */
+  @GetMapping("/internal/llm/smoke")
+  String smoke(@RequestParam(defaultValue = "ping") String q) {
+    return chatClient.prompt().user(q).call().content();
+  }
+
+  /** 流式 — 对齐 curl stream:true + SSE */
+  @GetMapping(value = "/internal/llm/smoke-stream", produces = "text/event-stream")
+  Flux&lt;String&gt; smokeStream(@RequestParam String q) {
+    return chatClient.prompt().user(q).stream().content();
+  }
+}</code></pre>
+      </div>
+      <p>本地验证：启动 Spring Boot 后访问 <code>/internal/llm/smoke?q=年假几天</code>；流式端点用浏览器或 <code>curl -N</code> 观察逐段输出。生产环境此类接口应加内网鉴权，勿对公网暴露。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈对照</h3>
+      <p>Python 编排与 Spring AI 微服务在 CorpAssist 中长期并存。首次打通后，用下表统一<strong>环境变量 / 配置项</strong>，避免「curl 能通、Java 报 401」类问题。</p>
+
+      <div class="mermaid-wrap">
+        <h5>首次调用 · 请求路径（非流式）</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant Dev as 开发者脚本/curl
+  participant Py as Python httpx 或 OpenAI SDK
+  participant Java as Spring AI ChatClient
+  participant GW as llm-gateway OpenAI 兼容
+  participant LLM as 模型厂商或私有化集群
+
+  Dev->>GW: POST /v1/chat/completions JSON
+  Py->>GW: POST /chat/completions 同契约
+  Java->>GW: Spring AI 转 chat/completions
+  GW->>LLM: 路由 model + 鉴权
+  LLM-->>GW: choices + usage
+  GW-->>Dev: JSON 完整响应
+  GW-->>Py: JSON 完整响应
+  GW-->>Java: 映射为 ChatResponse</pre>
+        <p class="diagram-caption">三端共享 <code>base_url</code>、<code>api-key</code>、<code>model</code>；差异在客户端如何解析 <span class="term" data-term-id="streaming" tabindex="0">流式</span> chunk 与记录 <span class="term" data-term-id="token" tabindex="0">Token</span> <code>usage</code>。</p>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>维度</th><th>curl</th><th>Python</th><th>Spring AI</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>端点</strong></td>
+            <td><code>$BASE/chat/completions</code></td>
+            <td><code>base_url</code> + <code>/chat/completions</code></td>
+            <td><code>spring.ai.openai.base-url</code></td>
+          </tr>
+          <tr>
+            <td><strong>鉴权</strong></td>
+            <td><code>Authorization: Bearer</code></td>
+            <td>同上 / SDK <code>api_key</code></td>
+            <td><code>spring.ai.openai.api-key</code></td>
+          </tr>
+          <tr>
+            <td><strong>非流式</strong></td>
+            <td><code>"stream": false</code></td>
+            <td><code>stream=False</code> / <code>.create(...)</code></td>
+            <td><code>.call().content()</code></td>
+          </tr>
+          <tr>
+            <td><strong>流式</strong></td>
+            <td><code>curl -N</code> + SSE 行</td>
+            <td><code>client.stream</code> 解析 <code>data:</code></td>
+            <td><code>.stream().content()</code> → Flux</td>
+          </tr>
+          <tr>
+            <td><strong>Token 用量</strong></td>
+            <td><code>jq .usage</code></td>
+            <td><code>resp.usage</code> / JSON <code>usage</code></td>
+            <td><code>ChatResponse.getMetadata().getUsage()</code></td>
+          </tr>
+          <tr>
+            <td><strong>典型用途</strong></td>
+            <td>冒烟、on-call</td>
+            <td>RAG 流水线、评测、脚本</td>
+            <td>BFF 邻域服务、同步 API</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">联调反模式</span>
+          <ul>
+            <li>curl 用公网 DashScope URL，Java 仍指向旧内网网关</li>
+            <li>Python 未设读超时，流式长回答挂死线程池</li>
+            <li>只看 content 不看 <code>usage</code>，无法核对 <span class="term" data-term-id="token" tabindex="0">Token</span> 账单</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>三端共用 Demo <code>.env</code> 或 K8s Secret 同一套变量名</li>
+            <li>先非流式打通，再开 <span class="term" data-term-id="streaming" tabindex="0">streaming</span> 验证 SSE</li>
+            <li>请求带 <code>X-Request-Id</code>，与网关日志关联</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="notice notice-outcome">
+        <strong>与进阶章节衔接</strong>
+        <p>文本对话跑通后，CorpAssist 附件问答会引入<strong>图文 / PDF</strong> 等多模态输入，仍可能走同一网关的不同 <code>model</code> 或专用端点。预习见 <a href="#ch-advanced-01-multimodal-intro">多模态应用入门</a>；费用与窗口仍回到 <a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">首次打通 = 同一 OpenAI 兼容契约，三种客户端各跑通一次。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>curl</strong>：最快验证 Key、model、<code>usage</code>；流式务必 <code>-N</code>。</li>
+        <li><strong>Python</strong>：httpx 与 curl 同构；OpenAI SDK 改 <code>base_url</code> 即可换厂商。</li>
+        <li><strong>Spring AI</strong>：<code>ChatClient</code> + <code>spring.ai.openai.*</code> 指向网关，<code>call</code> / <code>stream</code> 对应非流式与 SSE。</li>
+        <li><strong>双栈</strong>：统一环境变量与请求 ID；先非流式再流式；多模态见进阶章。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-fundamentals_practice05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="curl-ok" /> curl 非流式返回 content 与 usage</label></li>
+          <li><label><input type="checkbox" data-id="curl-stream" /> curl 流式见过 <code>[DONE]</code></label></li>
+          <li><label><input type="checkbox" data-id="python-ok" /> Python 脚本在本机跑通</label></li>
+          <li><label><input type="checkbox" data-id="java-config" /> 能写出 Spring AI 的 base-url 与 ChatClient Bean</label></li>
+          <li><label><input type="checkbox" data-id="dual-stack" /> 完成双栈对照表（Demo 模板）</label></li>
+        </ul>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何建议先 curl 再写 Java，而不是直接起 Spring Boot？</summary>
+        <p>curl 排除框架配置干扰，最快定位是 Key、URL、model 还是网络问题；Issue 可原样附在工单里。框架通了仍应用 curl 对拍同一请求体。</p>
+      </details>
+
+      <p class="chapter-review-next">下一步：完成 Demo 验收与章节测验；继续 <a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a>，或预习 <a href="#ch-advanced-01-multimodal-intro">多模态应用入门</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener">OpenAI API — Chat Completions</a></li>
+      <li><a href="https://www.python-httpx.org/" target="_blank" rel="noopener">HTTPX 文档</a></li>
+      <li><a href="https://github.com/openai/openai-python" target="_blank" rel="noopener">OpenAI Python SDK</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI — ChatClient</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">按顺序完成：curl 冒烟 → Python 脚本 → 填写双栈对照表；有 Java 环境可本地起 Spring AI 冒烟接口。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>进入 <code>demos/practice-05-first-call-lab/</code>，复制 <code>.env.example</code> 为 <code>.env</code> 并填入真实 Key 与 <code>BASE_URL</code>。</li>
+      <li>执行 <code>chat-non-stream.sh</code>（或 PowerShell 版），确认响应含 <code>choices</code> 与 <code>usage</code>。</li>
+      <li>执行 <code>chat-stream.sh</code>，肉眼看至少 3 个 SSE <code>data:</code> 与 <code>[DONE]</code>。</li>
+      <li>运行 <code>ask_httpx.py</code> 与 <code>ask_openai_sdk.py</code>，对比 stderr 中的 usage 是否接近。</li>
+      <li>填写 <code>dual-stack-compare.md</code> 中你负责栈的一列；Java 同学补充 <code>application.example.yml</code> 与 Controller 片段。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">curl 非流式已成功，但 Spring Boot 报 401。最应先核对哪两项？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong><code>spring.ai.openai.api-key</code></strong> 是否与 curl 的 Bearer 一致；<strong><code>base-url</code></strong> 是否多了/少了 <code>/v1</code> 或与 curl 的 <code>CORPASSIST_LLM_BASE_URL</code> 完全一致（勿一个走公网一个走内网）。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Python 流式脚本已打印半段回答后进程被 kill，厂商是否一定未计费？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不一定</strong>。已生成的输出 <span class="term" data-term-id="token" tabindex="0">Token</span> 通常仍计费；勿盲目重试同一轮。应新开会话或显式续写策略，见 <a href="#ch-basics-05-api-contracts">API 契约</a> 流式中断说明。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：首次打通实验包</h4>
+      <p>目录：<code>demos/practice-05-first-call-lab/</code>（<code>.env.example</code>、curl/PowerShell、<code>ask_httpx.py</code>、<code>ask_openai_sdk.py</code>、<code>application.example.yml</code>、<code>dual-stack-compare.md</code>）。<strong>验收</strong>：非流式 curl 或 Python 任一成功；流式见过 <code>[DONE]</code>；对照表三行已填。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-05-api-contracts">API 契约与集成方式</a>：SSE、重试、BFF 拓扑</li>
+      <li><a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>：读懂 <code>usage</code> 字段</li>
+      <li><a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a>：接入层 / 编排层 / 数据层</li>
+      <li><a href="#ch-advanced-01-multimodal-intro">多模态应用入门</a>：图文 PDF 与附件问答</li>
+    </ul>
+  </div>
+</section>

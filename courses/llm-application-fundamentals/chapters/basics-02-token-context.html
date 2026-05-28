@@ -1,0 +1,474 @@
+<section id="ch-basics-02-token-context" class="chapter" data-chapter="basics-02-token-context">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Token、上下文窗口与费用</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-token-context" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25 分钟</strong> · 阶段：<strong>应用问题域与模型认知</strong> · 能力：估算单次调用成本并设计上下文截断</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-01-llm-app-landscape">从大模型到应用工程</a> 建立了 CorpAssist 全景；在写第一行 API 之前，必须理解<strong>按 <span class="term" data-term-id="token" tabindex="0">Token</span> 计费</strong>与<strong><span class="term" data-term-id="context-window" tabindex="0">上下文窗口</span> 上限</strong>——它们直接决定多轮客服能否「记住」历史、长文档问答是否买得起。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用输入/输出单价粗算 CorpAssist 一次制度问答或客服回合的费用</li>
+          <li>为多轮对话选择截断策略（保留 system、滑动窗口、摘要压缩）</li>
+          <li>说明长 PDF 全量塞进提示词 vs <span class="term" data-term-id="rag" tabindex="0">RAG</span> 检索片段的代价差异</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>计费单位</strong>：商用 API 通常按 <span class="term" data-term-id="token" tabindex="0">Token</span>（词元）计输入与输出，中英文切分方式不同，不能按「字数」心算。</li>
+          <li><strong>硬上限</strong>：<span class="term" data-term-id="context-window" tabindex="0">上下文窗口</span> 限制单次请求可携带的 Token 总量（系统提示 + 历史 + 用户本轮 + 预留输出）。</li>
+          <li><strong>截断是工程默认</strong>：超过窗口或预算时，必须主动丢弃/摘要旧消息，而不是假设模型「自动忘记」。</li>
+          <li><strong>长文档别硬塞</strong>：入库用 <span class="term" data-term-id="embedding" tabindex="0">Embedding</span> + 检索（RAG）通常比整份 PDF 进提示词更省、更稳。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Token 计费模型</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 财务与容量评审</span>
+        产品要在 Q2 为「制度问答」开通 500 名活跃用户。运维问：若每人每天 20 轮、每轮平均 3k 输入 Token + 500 输出 Token，月费大概多少？本章先建立<strong>单价 × Token 数</strong>的心算框架。
+      </aside>
+      <p>对应用开发者而言，<span class="term" data-term-id="token" tabindex="0">Token</span> 不是语言学概念，而是<strong>计费与上下文配额的最小单位</strong>。同一句话在中英文、不同模型下的 Token 数可能差 30% 以上，预算应留余量。</p>
+      <ul>
+        <li><strong>输入 Token（prompt）</strong>：发给模型的全部内容——<span class="term" data-term-id="prompt-engineering" tabindex="0">系统提示</span>、历史消息、检索到的制度片段、用户问题。</li>
+        <li><strong>输出 Token（completion）</strong>：模型生成部分；<span class="term" data-term-id="streaming" tabindex="0">流式输出</span> 仍按最终生成量计费。</li>
+        <li><strong>常见计价</strong>：输入/输出分开标价（如「￥x / 百万输入 Token」「￥y / 百万输出 Token」）；部分厂商对缓存命中输入有折扣（实现细节见厂商文档）。</li>
+      </ul>
+
+      <h4>对照：按 Token 计费 vs 传统 SaaS 席位</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>维度</th><th>按席位（传统 SaaS）</th><th>按 Token（LLM API）</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>成本驱动</td>
+              <td>账号数、功能包</td>
+              <td>调用次数 × 上下文长度 × 生成长度</td>
+            </tr>
+            <tr>
+              <td>CorpAssist 风险</td>
+              <td>用户少但调用少 → 固定成本</td>
+              <td>少数用户上传 200 页 PDF 并反复追问 → 费用尖刺</td>
+            </tr>
+            <tr>
+              <td>工程对策</td>
+              <td>License 控制</td>
+              <td>配额、限流、<span class="term" data-term-id="rag" tabindex="0">RAG</span> 限片段、输出 <code>max_tokens</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>代码：单次请求成本粗算（伪代码）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># CorpAssist 制度问答 — 单次调用费用估算（数值仅为示意）
+PRICE_IN_PER_M = 2.0    # 元 / 百万输入 token
+PRICE_OUT_PER_M = 8.0   # 元 / 百万输出 token
+
+prompt_tokens = 3200    # system + 检索片段 + 用户问题
+completion_tokens = 450
+
+cost_yuan = (
+    prompt_tokens * PRICE_IN_PER_M / 1_000_000
+    + completion_tokens * PRICE_OUT_PER_M / 1_000_000
+)
+# cost_yuan ≈ 0.01 量级；日活 500 × 20 轮需再乘调用量</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li>用「汉字个数」代替 Token — 中文往往 1～2 字一个 Token，且含标点与 JSON 结构。</li>
+          <li>只估输出、忽略输入 — 长文档场景输入常占 80% 以上费用。</li>
+          <li>忘记工具/函数调用的额外 Token — Agent 场景下 schema 与中间结果也计入上下文。</li>
+        </ul>
+      </div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：同一回答，把 temperature 从 0.2 调到 0.9，Token 费用一定变多吗？</summary>
+        <p>不一定。费用主要由<strong>实际上下文长度与生成 Token 数</strong>决定；<span class="term" data-term-id="temperature" tabindex="0">temperature</span> 影响采样随机性，可能改变措辞长度，但不是计费主因。应通过 <code>max_tokens</code> 与提示词约束控制输出上限。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文截断策略</h3>
+      <p><span class="term" data-term-id="context-window" tabindex="0">上下文窗口</span> 是单次请求可处理的 Token 上限（如 32k、128k、200k，随模型而变）。CorpAssist <strong>多轮智能客服</strong> 若把全部历史原样拼接，几轮后就会触顶，必须在校验层实现<strong>截断策略</strong>。</p>
+
+      <h4>流程：消息列表在窗口内的组装与截断</h4>
+      <div class="mermaid-wrap">
+        <h5>上下文窗口 · 多轮消息截断（CorpAssist 客服）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph build [编排层组装 messages]
+    SYS[system 制度话术\n始终保留]
+    RAG[可选 RAG 检索片段\n按预算裁剪]
+    HIST[历史 user/assistant\n从新到旧累加]
+    CUR[user 本轮问题]
+  end
+  subgraph measure [Token 计数]
+    TIK["tiktoken / 厂商 tokenizer\n累计 prompt_tokens"]
+  end
+  subgraph limit [超过 context_window 或费用预算]
+    DROP[丢弃最旧 assistant/user 对]
+    SUM[或摘要压缩旧对话为一条 system 摘要]
+    TRIM[或截断单条过长 tool 结果]
+  end
+  SYS --> TIK
+  RAG --> TIK
+  HIST --> TIK
+  CUR --> TIK
+  TIK -->|未超限| API["Chat Completions API"]
+  TIK -->|超限| limit
+  DROP --> TIK
+  SUM --> TIK
+  TRIM --> TIK
+  limit --> TIK</pre>
+        <p class="diagram-caption">原则：<strong>system 与合规指令优先保留</strong>；历史从新到旧填充；超限后先丢最旧轮次，再考虑摘要。勿静默截断导致用户刚说过的话被模型「遗忘」。</p>
+      </div>
+
+      <h4>策略对照表</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>策略</th><th>做法</th><th>CorpAssist 适用</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>滑动窗口</strong></td>
+            <td>只保留最近 N 轮或最近 M 个 Token</td>
+            <td>标准客服；实现简单，可预测</td>
+          </tr>
+          <tr>
+            <td><strong>摘要压缩</strong></td>
+            <td>周期性用小模型把旧对话压成一条摘要消息</td>
+            <td>长会话需保留「用户已提供工号」等事实</td>
+          </tr>
+          <tr>
+            <td><strong>分层存储</strong></td>
+            <td>会话事实写入 DB，提示词只注入结构化记忆</td>
+            <td>与 Java 侧用户画像服务对接时常用</td>
+          </tr>
+          <tr>
+            <td><strong>检索替代堆历史</strong></td>
+            <td>用 <span class="term" data-term-id="rag" tabindex="0">RAG</span> 拉相关制度片段，而非重复粘贴全文</td>
+            <td>制度问答主路径；降低重复 Token</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>代码：OpenAI 兼容 messages 数组（截断前）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "model": "qwen-plus",
+  "max_tokens": 512,
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是 CorpAssist 客服。仅依据检索到的制度作答；无依据时说明无法确认。"
+    },
+    {
+      "role": "user",
+      "content": "我想申请异地办公，需要哪些材料？"
+    },
+    {
+      "role": "assistant",
+      "content": "根据《远程办公管理办法》第 3 条，需提交……"
+    },
+    {
+      "role": "user",
+      "content": "审批一般要几天？"
+    }
+  ]
+}</code></pre>
+      </div>
+      <p>编排层在 POST 之前应对 <code>messages</code> 做 Token 预算：为输出预留 <code>max_tokens</code>，剩余额度才分配给历史与 RAG 片段。网关若支持 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容协议</span>，计数逻辑可在 BFF 统一实现，Python 与 Spring AI 客户端复用同一策略。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐 · 无界堆历史</span>
+          <ul>
+            <li>每轮把 30 轮完整对话发给模型</li>
+            <li>触顶后 API 报错或厂商静默截断头部</li>
+            <li>用户刚提供的订单号可能被挤掉</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐 · 预算内组装</span>
+          <ul>
+            <li>固定保留 system + 本轮 RAG top-k</li>
+            <li>历史按 Token 从新到旧填充至预算 70%</li>
+            <li>关键槽位（工号、工单号）写入会话表再注入</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>长文档场景代价</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 200 页员工手册 PDF</span>
+        业务方希望「上传即可问」。若将全文一次性放入提示词：单次输入可能 15 万 Token 以上，费用与延迟都不可接受，且仍受<strong>上下文窗口</strong>硬限制。正确路径是切块、<span class="term" data-term-id="embedding" tabindex="0">向量化</span>、检索 top-k 片段再生成。
+      </aside>
+      <p>长文档场景的核心矛盾：<strong>模型一次能「看见」的文本有限，而企业知识库体积无限</strong>。应用层应默认走索引管线，而非「超大提示词」。</p>
+
+      <h4>序列图：全量提示词 vs RAG 片段</h4>
+      <div class="mermaid-wrap">
+        <h5>长文档问答 · Token 消耗对比（概念）</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 用户
+  participant BFF as CorpAssist BFF
+  participant V as 向量库
+  participant LLM as 大模型 API
+  Note over U,LLM: 方案 A 全量 PDF（不推荐）
+  U->>BFF: 问「产假有多少天？」
+  BFF->>LLM: prompt 含整份 PDF (~150k tokens)
+  LLM-->>BFF: 回答 + 高额账单
+  Note over U,LLM: 方案 B RAG（推荐）
+  U->>BFF: 同上
+  BFF->>V: 查询 embedding 相似片段
+  V-->>BFF: top-5 段落 (~2k tokens)
+  BFF->>LLM: system + 片段 + 问题
+  LLM-->>BFF: 回答 + 可控费用</pre>
+        <p class="diagram-caption">Embedding 索引阶段另计 Embedding API 费用；单次问答的生成调用仍以检索后的片段 Token 为主。</p>
+      </div>
+
+      <h4>代价维度表</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>方案</th><th>单次问答输入 Token</th><th>延迟</th><th>幻觉风险</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>整份 PDF 进 prompt</td>
+              <td>极高，易触顶</td>
+              <td>高</td>
+              <td>中（信息过载仍可能漏读）</td>
+            </tr>
+            <tr>
+              <td><span class="term" data-term-id="rag" tabindex="0">RAG</span> top-5 片段</td>
+              <td>低且稳定</td>
+              <td>中（多一次检索）</td>
+              <td>中，需引用溯源（后续章节展开）</td>
+            </tr>
+            <tr>
+              <td>预摘要 + 分层目录</td>
+              <td>中</td>
+              <td>中</td>
+              <td>摘要错误会传导，需人工抽检</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>入库时选择 <span class="term" data-term-id="embedding" tabindex="0">Embedding</span> 模型需兼顾维度、中文效果与单价；这与「对话模型」计费分开。CorpAssist 文档中心应监控：<strong>平均每问检索片段 Token 数</strong>、<strong>命中率</strong>，避免为追求召回把 top-k 开得过大。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>窗口已经 128k，是否还需要 RAG？</summary>
+          <div class="learn-faq-body">需要。窗口变大不消除<strong>费用与延迟</strong>线性增长；多文档并发时仍会触顶。RAG 还改善可更新性（改制度只重索引片段）。</div>
+        </details>
+        <details>
+          <summary>多模态 PDF（扫描件）Token 怎么算？</summary>
+          <div class="learn-faq-body">图文页常按 patch/页计费，往往高于纯文本。CorpAssist 附件问答应优先 OCR 再入向量库（见进阶多模态章）。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>成本估算练习</h3>
+      <p>将前文公式落到 CorpAssist 两个具体场景，形成可复用的<strong>容量粗算表</strong>（评审会与 <a href="#ch-basics-04-model-selection">模型选型：商用 API vs 开源</a> 衔接）。</p>
+
+      <h4>练习数据（示意单价，请以厂商官网为准）</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>场景</th><th>假设</th><th>单次 Token</th><th>心算要点</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>S1 制度问答</strong></td>
+              <td>system 800 + RAG 2500 + 用户 200；输出 600</td>
+              <td>in 3500 / out 600</td>
+              <td>输入为主；优化 RAG top-k 直接降费</td>
+            </tr>
+            <tr>
+              <td><strong>S2 多轮客服</strong></td>
+              <td>保留最近 6 轮，共 in 4200；输出 350</td>
+              <td>in 4200 / out 350</td>
+              <td>轮次越多越贵；截断策略是成本控制阀</td>
+            </tr>
+            <tr>
+              <td><strong>S3 尖刺风险</strong></td>
+              <td>用户粘贴 3 万字会议纪要</td>
+              <td>in 可能 &gt; 50k</td>
+              <td>需在网关做上传大小与 Token 预检拒绝</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>月费粗算模板</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># CorpAssist Q2 容量粗算 — 客服通道（示意）
+users = 500
+rounds_per_user_per_day = 20
+days = 30
+avg_in = 4200
+avg_out = 350
+price_in_m = 2.0
+price_out_m = 8.0
+
+total_in = users * rounds_per_user_per_day * days * avg_in
+total_out = users * rounds_per_user_per_day * days * avg_out
+
+monthly_yuan = (
+    total_in * price_in_m / 1_000_000
+    + total_out * price_out_m / 1_000_000
+)
+# 代入后得到月费数量级；评审时再加 30% 余量应对尖刺与重试</code></pre>
+      </div>
+
+      <p>工程上还应预留：<strong>失败重试</strong>（同 prompt 可能计费多次）、<strong>评测流水线</strong>批量调用、以及未来 <span class="term" data-term-id="agent" tabindex="0">Agent</span> 多步推理的链式放大。下一章从应用视角理解生成机制，便于解释「为何输出越长越慢、越贵」。</p>
+      <p>继续学习：<a href="#ch-basics-03-transformer-apps">Transformer 应用层理解</a>（Attention 直觉、温度与幻觉）。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">本章建立 LLM 应用的「计量单位」。验收时能用 CorpAssist 场景各举一例费用与截断决策。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Token 计费模型</strong>：费用 ≈ 输入 Token × 输入单价 + 输出 Token × 输出单价；勿用字数代替 Token，输入在长文档场景常占大头。</li>
+        <li><strong>上下文截断策略</strong>：在 <span class="term" data-term-id="context-window" tabindex="0">上下文窗口</span> 与预算内组装 messages；system 与合规指令优先，历史从新到旧填充，超限丢最旧或摘要。</li>
+        <li><strong>长文档场景代价</strong>：整份 PDF 进 prompt 费用与延迟不可控；<span class="term" data-term-id="embedding" tabindex="0">Embedding</span> + RAG 片段是默认工程路径。</li>
+        <li><strong>成本估算练习</strong>：用日活 × 轮次 × 平均 Token × 单价粗算月费，并为尖刺上传与重试留余量。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-fundamentals_basics02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="token-billing" /> 能区分输入/输出 Token 并写出费用公式</label></li>
+          <li><label><input type="checkbox" data-id="truncation" /> 能描述 CorpAssist 客服的截断顺序（system 优先等）</label></li>
+          <li><label><input type="checkbox" data-id="rag-vs-full" /> 能说明长 PDF 全量 prompt 与 RAG 的代价差异</label></li>
+          <li><label><input type="checkbox" data-id="monthly-estimate" /> 完成一次月费数量级粗算</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>Token</td><td>计费与配额最小单位</td></tr>
+                <tr><td>上下文窗口</td><td>单次请求 Token 硬上限</td></tr>
+                <tr><td>截断</td><td>超限主动丢旧历史或摘要</td></tr>
+                <tr><td>RAG</td><td>用片段替代全文进 prompt</td></tr>
+                <tr><td>Embedding</td><td>检索索引；费用与对话分开</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>多轮客服「模型忘了用户刚说的工号」，可能是截断策略哪一步出了问题？如何改？</li>
+              <li>业务坚持「把整库 PDF 都给模型」时，你如何从技术成本与风险两方面说服改用 RAG？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-basics-03-transformer-apps">Transformer 应用层理解</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/guides/text-generation" target="_blank" rel="noopener">OpenAI — Text generation &amp; tokens</a></li>
+      <li><a href="https://platform.openai.com/tokenizer" target="_blank" rel="noopener">OpenAI Tokenizer（估算工具）</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/billing" target="_blank" rel="noopener">阿里云百炼 — 模型计费说明</a></li>
+      <li><a href="https://api-docs.deepseek.com/quick_start/pricing" target="_blank" rel="noopener">DeepSeek API — Pricing</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 填写<strong>单次费用粗算</strong>与<strong>多轮截断标注</strong>，并对照本章 Mermaid 流程图说明客服历史被丢弃的顺序（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>用正文「单次请求成本粗算」伪代码，代入 S1 制度问答（in 3500 / out 600），写出单次费用（元）数量级（单价可用表内示意值）。</li>
+      <li>对照 Mermaid「多轮消息截断」流程图，在纸上标注：触顶后先执行 <code>DROP</code> 还是 <code>SUM</code> 取决于你们选的策略；并写明 system 消息是否会被丢弃。</li>
+      <li>用「月费粗算模板」计算 S2 客服通道：500 人 × 20 轮/天 × 30 天，avg_in=4200、avg_out=350，写出月费数量级并加 30% 余量一句理由。</li>
+      <li>可选：用 OpenAI Tokenizer 或厂商 SDK 对一段 200 字中文制度条文计数，对比「字数 × 2」估算误差。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">CorpAssist 客服为「记住更多历史」，将 context_window 从 32k 换到 128k 模型且不做截断。费用与稳定性会如何？是否推荐？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>单次输入 Token 可随历史线性增长，<strong>费用与延迟显著上升</strong>；尖刺用户仍可能触顶或拖垮 P99。不推荐仅靠换大窗口；应保留<strong>滑动窗口/摘要 + 会话表存关键槽位</strong>，大窗口作为缓冲而非无界堆叠。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">用户上传 200 页 PDF 并要求「每次问答都附带全文」。下列哪项最能同时降费用与触顶风险？A 换更大窗口 B RAG 检索 top-k 片段 C 提高 temperature</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>选 <strong>B</strong>。RAG 将单次 prompt 控制在 top-k 片段 Token；A 只缓解触顶不解决费用线性增长；C 与上下文长度无关。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Token 预算与截断策略表</h4>
+      <p>目录：<code>demos/basics-02-token-budget/</code>（<code>estimate_cost.py</code> + 预算表模板）。<strong>验收</strong>：运行脚本得到 S1/S2 费用数量级；预算表列含 max_context、保留轮次、截断策略。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-transformer-apps">Transformer 应用层理解</a>：生成过程、温度与幻觉边界</li>
+      <li><a href="https://github.com/openai/tiktoken" target="_blank" rel="noopener">tiktoken — 开源 Token 计数库</a></li>
+      <li><a href="https://platform.openai.com/docs/guides/prompt-caching" target="_blank" rel="noopener">OpenAI — Prompt caching（降低重复 system 成本）</a></li>
+      <li><a href="https://www.anthropic.com/news/prompt-caching" target="_blank" rel="noopener">Anthropic — Prompt caching 说明</a></li>
+    </ul>
+  </div>
+</section>

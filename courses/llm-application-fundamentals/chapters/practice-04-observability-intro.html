@@ -1,0 +1,398 @@
+<section id="ch-practice-04-observability-intro" class="chapter" data-chapter="practice-04-observability-intro">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>效果、延迟与可观测入门</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-observability-intro" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>26 分钟</strong> · 阶段：<strong>应用架构与能力拼图</strong> · 能力：定义 CorpAssist 核心 SLI、读懂 Trace 与评测闭环，并与 SRE 对齐告警</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>LLM 应用上线后，「能跑」不够——产品会问<strong>回答准不准</strong>，SRE 会问<strong>为什么 P95 突然 8 秒</strong>，财务会问<strong><span class="term" data-term-id="token" tabindex="0">Token</span> 为何翻倍</strong>。可观测性把这三类问题放进同一套指标、日志与 Trace 语言里，避免应用团队与运维各说各话。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 CorpAssist 列出三条核心 SLI：延迟 P95、Token 用量、评测通过率</li>
+          <li>用 Trace / Span 描述一次 <span class="term" data-term-id="rag" tabindex="0">RAG</span> 问答的跨服务耗时分布</li>
+          <li>说明「离线评测 → 上线 → 监控回归」的 eval loop 预览，与 Prompt/检索改动的关系</li>
+          <li>与 SRE 约定告警分级、仪表盘归属与 on-call 交接信息</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>SLI 要可行动</strong>：不只「成功率」，还要区分首字延迟、端到端 P95、检索空结果率。</li>
+          <li><strong>Trace 串起黑盒</strong>：一次用户提问可能穿越 BFF、编排、<span class="term" data-term-id="rag" tabindex="0">RAG</span>、网关；没有 Span 只能猜。</li>
+          <li><strong>效果要评测闭环</strong>：线上指标反映体验，离线 golden set 反映「该不该发版」。</li>
+          <li><strong>与 SRE 分工</strong>：应用定义 SLO 与业务标签；平台提供采集、存储与告警路由。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>核心 SLI</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度问答 S1</span>
+        知识库问答在促销期流量翻倍。领导要求：<strong>用户感知延迟</strong>不能劣化 30%；<strong>月度 Token 预算</strong>不能超支；<strong>抽检答案合格率</strong>不能低于 85%。本章用三条 SLI 把诉求翻译成可监控、可告警的数字。
+      </aside>
+      <p><strong>SLI（Service Level Indicator）</strong>是「对用户或业务真正重要」的可测量指标。LLM 应用除传统 HTTP 可用性外，必须显式纳入<strong>生成质量</strong>与<strong>Token 成本</strong>，否则会出现「监控全绿、产品全红」。</p>
+
+      <h4>CorpAssist 三条核心 SLI</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>SLI</th><th>定义（示例）</th><th>为何重要</th><th>常见分解维度</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>延迟 P95</strong></td>
+            <td>从用户提交问题到<strong>首字可见</strong>（TTFT）或<strong>完整回复结束</strong>的 95 分位耗时</td>
+            <td>流式场景下用户先感知 TTFT；批处理更关心端到端</td>
+            <td><code>scene=rag_qa</code>、<code>model=corpassist-fast</code>、是否命中缓存</td>
+          </tr>
+          <tr>
+            <td><strong>Token 用量</strong></td>
+            <td>每请求 <code>prompt_tokens + completion_tokens</code>；可按租户/部门聚合</td>
+            <td>直接关联账单与 <a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a> 中的预算</td>
+            <td>输入 vs 输出、<span class="term" data-term-id="rag" tabindex="0">RAG</span> 检索片段长度、是否重复重试</td>
+          </tr>
+          <tr>
+            <td><strong>评测通过率</strong></td>
+            <td>离线 golden set 上「引用正确 + 拒答得当 + 无编造条款」的比例；线上可采样人工或 LLM-as-judge</td>
+            <td>延迟低但<strong>幻觉</strong>升高时，传统可用性指标发现不了</td>
+            <td>场景 S1～S5、Prompt 版本、检索模型版本</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>从 SLI 到 SLO（与 SRE 对齐用）</h4>
+      <p>SLO 是 SLI 的目标区间，例如「制度问答端到端 P95 &lt; 4s（28 天滚动）」「评测通过率 ≥ 85%」。错误预算（error budget）耗尽时，应冻结 Prompt/索引大改，优先稳定性——详见下一节与 SRE 的协作接口。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>只监控 <code>HTTP 200</code>，不记录 <code>usage</code> 与 TTFT</li>
+            <li>把「用户点赞」当唯一质量指标，无离线 golden set</li>
+            <li>P95 用全站混合流量，掩盖 RAG 检索变慢</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>网关统一落库 <code>usage</code>，编排层打 <code>trace_id</code></li>
+            <li>发版门禁：评测通过率不低于基线 −2%</li>
+            <li>按场景分 SLI 仪表盘（S1 知识库 vs S2 客服）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Prometheus 指标示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">prometheus</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># CorpAssist dialog-orchestrator 暴露的指标（示意）
+# HELP corpassist_chat_e2e_seconds 端到端耗时（含 RAG + LLM）
+# TYPE corpassist_chat_e2e_seconds histogram
+corpassist_chat_e2e_seconds_bucket{scene="rag_qa",le="2"} 120
+corpassist_chat_e2e_seconds_bucket{scene="rag_qa",le="5"} 480
+corpassist_chat_e2e_seconds_bucket{scene="rag_qa",le="10"} 500
+corpassist_chat_e2e_seconds_sum{scene="rag_qa"} 980.5
+corpassist_chat_e2e_seconds_count{scene="rag_qa"} 500
+
+# HELP corpassist_llm_tokens_total 累计 Token（与厂商 usage 对齐）
+# TYPE corpassist_llm_tokens_total counter
+corpassist_llm_tokens_total{direction="prompt",tenant="hr"} 1.24e6
+corpassist_llm_tokens_total{direction="completion",tenant="hr"} 3.1e5
+
+# HELP corpassist_eval_pass_rate 最近一次离线评测通过率（0-1）
+# TYPE corpassist_eval_pass_rate gauge
+corpassist_eval_pass_rate{suite="policy-qa-golden-v3"} 0.87</code></pre>
+      </div>
+      <p>告警示例（Recording rule 思路）：<code>histogram_quantile(0.95, rate(corpassist_chat_e2e_seconds_bucket[5m])) &gt; 4</code> 持续 15 分钟 → P2；<code>corpassist_eval_pass_rate &lt; 0.85</code> 且为新发版标签 → P1 并阻断后续发布。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Trace 概念</h3>
+      <p><strong>Trace</strong> 表示一次用户请求的全链路；其中的<strong>Span</strong> 是子步骤（如「向量检索」「调用 chat/completions」）。OpenTelemetry 等标准让 Java 编排服务与 Python RAG  worker 共用 <code>trace_id</code>，在 Jaeger / Tempo 中拼成火焰图。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · 一次 RAG 问答的 Trace Span（示意）</h5>
+        <pre class="mermaid">flowchart LR
+  subgraph trace ["trace_id=7f3a… 用户: 年假最多几天?"]
+    S0["Span: bff.chat\nhttp.server\n28ms"]
+    S1["Span: orchestrator.handle\ninternal\n2.1s"]
+    S2["Span: rag.retrieve\ninternal\n380ms"]
+    S3["Span: llm.chat_completions\nclient\n1.6s"]
+    S4["Span: post.check_citations\ninternal\n45ms"]
+  end
+  S0 --> S1
+  S1 --> S2
+  S1 --> S3
+  S1 --> S4
+  S2 -.->|parent| S1
+  S3 -.->|parent| S1
+  S4 -.->|parent| S1</pre>
+        <p class="diagram-caption">同一 <code>trace_id</code> 贯穿 BFF → 编排 → RAG → 网关 LLM 调用。分析 P95 劣化时，先看 S2（检索）还是 S3（模型）变长，避免盲目加机器。</p>
+      </div>
+
+      <h4>结构化日志（JSON）与 Span 关联</h4>
+      <p>指标适合聚合告警；日志适合排障单条请求。务必在每条业务日志携带 <code>trace_id</code>、<code>span_id</code>、<code>tenant_id</code>，并与 <a href="#ch-practice-03-data-privacy">数据、隐私与合规入门</a> 中的脱敏规则一致（勿记录完整用户问题中的身份证、手机号）。</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "ts": "2026-05-28T10:15:03.412Z",
+  "level": "INFO",
+  "service": "dialog-orchestrator",
+  "trace_id": "7f3a9c2e1b004d5a8f0c3e2d1a0b9c8",
+  "span_id": "a1b2c3d4e5f60718",
+  "parent_span_id": "bff991122334455",
+  "event": "llm.completion_finished",
+  "scene": "rag_qa",
+  "model": "corpassist-fast",
+  "latency_ms": 1620,
+  "usage": {
+    "prompt_tokens": 3180,
+    "completion_tokens": 412,
+    "total_tokens": 3592
+  },
+  "rag": {
+    "hit_count": 4,
+    "top_score": 0.82,
+    "retrieve_ms": 376
+  },
+  "eval_tags": {
+    "prompt_version": "policy-qa-v12",
+    "index_version": "hr-handbook-2026q1"
+  },
+  "user_question_redacted": "年假最多可休***？"
+}</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>与网关 <code>usage</code> 对齐</strong>
+        <p><a href="#ch-basics-05-api-contracts">API 契约与集成方式</a> 中响应体的 <code>usage</code> 应在 <code>llm-gateway</code> 落库，并由编排 Span 引用同一 <code>request_id</code>。否则 Token SLI 与财务对账会出现「网关一套、业务日志一套」。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：P95 从 3s 升到 7s，但 LLM Span 耗时不变，最该先看哪个 Span？</summary>
+        <p>优先看 <strong><span class="term" data-term-id="rag" tabindex="0">RAG</span> 检索 Span</strong>（S2）或编排层串行步骤是否新增（如额外 rerank、未并行化的工具调用）。若检索正常，再查 BFF 流式缓冲、数据库或下游业务 API。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>评测闭环预览</h3>
+      <p>可观测性中的「效果」不能只靠线上点赞。<strong>Eval loop（评测闭环）</strong> 把 golden 问题集、自动/人工评判与发版门禁连起来，形成「改 Prompt / 改索引 → 跑评测 → 对比 SLI → 灰度上线 → 监控回归」的循环。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · Eval loop 预览</h5>
+        <pre class="mermaid">flowchart LR
+  A[变更: Prompt / 分块 / Embedding] --> B[离线评测集]
+  B --> C{通过率 ≥ SLO?}
+  C -->|否| A
+  C -->|是| D[灰度 5% 流量]
+  D --> E[观察 P95 / Token / 抽检]
+  E --> F{回归?}
+  F -->|是| G[全量发布]
+  F -->|否| A
+  G --> H[持续采样 + 周度复评]</pre>
+        <p class="diagram-caption">评测通过率是发版门禁；上线后仍用 P95 与 Token SLI 监控体验与成本。完整评测流水线在后续 RAG/Agent 课程展开，本章建立共同语言即可。</p>
+      </div>
+
+      <h4>评测通过率 vs 线上 SLI</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>离线评测（golden set）</th><th>线上 SLI / 采样</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>目的</strong></td>
+            <td>发版前拦截明显退化</td>
+            <td>发现真实流量分布下的长尾问题</td>
+          </tr>
+          <tr>
+            <td><strong>CorpAssist 示例</strong></td>
+            <td>200 条制度问答，检查引用条文 ID 是否匹配</td>
+            <td>每周抽检 50 条 + 用户点踩率</td>
+          </tr>
+          <tr>
+            <td><strong>与 Token 关系</strong></td>
+            <td>固定集可预算单次评测成本</td>
+            <td>异常飙升可能意味检索片段过长或重试风暴</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>应用团队应维护<strong>版本标签</strong>（<code>prompt_version</code>、<code>index_version</code>），使线上日志与离线评测结果可对比。当评测通过率下降 2 个百分点时，即使 P95 未变，也应视为 incident 调查项。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>与 SRE 协作接口</h3>
+      <p>有 Java 微服务经验的读者熟悉与 SRE 的「错误预算 + 告警分级」。LLM 应用需在接口中<strong>多两类信息</strong>：效果退化（评测/抽检）与成本异常（Token）。</p>
+
+      <h4>分工 RACI（简化）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>事项</th><th>应用团队</th><th>SRE / 平台</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>定义 SLI / SLO 与业务标签</td>
+            <td><strong>R/A</strong></td>
+            <td>C</td>
+          </tr>
+          <tr>
+            <td>Prometheus / OTel 采集、存储、告警路由</td>
+            <td>C</td>
+            <td><strong>R/A</strong></td>
+          </tr>
+          <tr>
+            <td>golden set 与评测流水线</td>
+            <td><strong>R/A</strong></td>
+            <td>I（提供 CI 算力可选）</td>
+          </tr>
+          <tr>
+            <td>on-call runbook：429 退避 vs RAG 索引损坏</td>
+            <td><strong>R</strong> 业务章节</td>
+            <td><strong>A</strong> 告警模板</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>告警分级示例（与 SRE 共识）</h4>
+      <ul>
+        <li><strong>P1</strong>：评测通过率跌破 SLO 且与 24h 内发版相关；或核心场景可用性 &lt; 99%。</li>
+        <li><strong>P2</strong>：P95 超 SLO 15 分钟；单租户 Token 小时环比 &gt; 200%（可能泄漏或滥用）。</li>
+        <li><strong>P3</strong>：检索空结果率升高、非核心场景延迟波动。</li>
+      </ul>
+
+      <div class="notice notice-outcome">
+        <strong>与动手章衔接</strong>
+        <p>下一章 <a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a> 将在真实 curl / 客户端中拿到 <code>usage</code>；本章要求你在调用链上预留 <code>trace_id</code> 与指标埋点位置。分层拓扑见 <a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a>。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，practice 阶段建立可观测与效果共同语言。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>核心 SLI</strong>：CorpAssist 至少盯延迟 P95、<span class="term" data-term-id="token" tabindex="0">Token</span> 用量、评测通过率，并按场景拆分。</li>
+        <li><strong>Trace 概念</strong>：用 Span 定位 RAG vs LLM 瓶颈；日志 JSON 携带 <code>trace_id</code> 与 <code>usage</code>。</li>
+        <li><strong>评测闭环预览</strong>：离线 golden set 门禁 + 线上 SLI 回归，版本标签贯穿。</li>
+        <li><strong>与 SRE 协作</strong>：应用定 SLO 与 runbook 业务章节，平台管采集与告警路由。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-fundamentals_practice04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="sli-three" /> 能说出 CorpAssist 三条 SLI 及各自告警含义</label></li>
+          <li><label><input type="checkbox" data-id="trace-span" /> 能在 Trace 图上指出 RAG 与 LLM 两个 Span</label></li>
+          <li><label><input type="checkbox" data-id="eval-loop" /> 能画出 eval loop 中「评测不通过则回滚变更」分支</label></li>
+          <li><label><input type="checkbox" data-id="sre-raci" /> 能说明应用与 SRE 在 Prometheus 与 golden set 上的分工</label></li>
+          <li><label><input type="checkbox" data-id="demo-lab" /> 已完成 demo 目录中的 SLI 表填写（可选）</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>SLI</td><td>对用户重要的可测量指标</td></tr>
+                <tr><td>P95 延迟</td><td>95% 请求快于此值；看 TTFT 或端到端</td></tr>
+                <tr><td>Token SLI</td><td>usage 聚合 = 成本与滥用信号</td></tr>
+                <tr><td>Trace / Span</td><td>一次请求 / 其中一个子步骤</td></tr>
+                <tr><td>eval pass rate</td><td>golden set 发版门禁</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为何 LLM 应用不能只看 HTTP 200 和平均延迟？</li>
+              <li>P95 变差但 LLM 调用耗时不变，你会如何排查？</li>
+              <li>评测通过率与线上 P95 同时恶化，优先回滚哪类变更？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成 demo 实验与过关清单；进入 <a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a>，在真实响应中核对 <code>usage</code> 与请求 ID。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://opentelemetry.io/docs/concepts/signals/traces/" target="_blank" rel="noopener">OpenTelemetry — Traces</a></li>
+      <li><a href="https://prometheus.io/docs/practices/histograms/" target="_blank" rel="noopener">Prometheus — Histograms 与分位数</a></li>
+      <li><a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener">Google SRE — Service Level Objectives</a></li>
+      <li><a href="https://platform.openai.com/docs/api-reference/chat/object" target="_blank" rel="noopener">OpenAI API — usage 字段说明</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用示例指标与日志 JSON 为 CorpAssist 制度问答填一张 SLI 表，并在 Trace 图上标出你负责的服务 Span。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制「Prometheus 指标示例」：为 <code>scene=rag_qa</code> 写一条 P95 告警 PromQL 思路（可用 <code>histogram_quantile</code>）。</li>
+      <li>修改「结构化日志」：增加字段 <code>citation_ids: ["HR-12-3"]</code>，说明它如何帮助评测团队对齐 golden set。</li>
+      <li>在「Trace Span」Mermaid 上标出：若将 rerank 从 S2 内拆成独立 Span，对排障有何帮助。</li>
+      <li>与搭档角色扮演：应用工程师 vs SRE，用 3 分钟对齐 P1/P2 告警各一例。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">评测通过率 90% → 84%，但 HTTP 成功率 99.9%、P95 正常。是否应触发 P1？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>应视为 P1 或 P1 候选</strong>（若 SLO 为 85% 且刚发版）。效果 SLO 与可用性解耦；需比对 <code>prompt_version</code> / <code>index_version</code>，暂停灰度并回滚检索或 Prompt 变更，而非只看网关健康。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">为降 P95，团队决定把所有历史对话全量塞进 prompt，不用 <span class="term" data-term-id="rag" tabindex="0">RAG</span>。可能同时恶化哪条 SLI？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>Token 用量</strong>与<strong>延迟</strong>往往同时恶化（上下文变长，首字与生成更慢）；长上下文还可能增加幻觉，间接拉低<strong>评测通过率</strong>。应优化检索与截断，而非堆历史。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist 可观测 SLI 与 Trace 实验</h4>
+      <p>目录：<code>demos/practice-04-observability-lab/</code>（<code>sli-dashboard-template.md</code>、示例 <code>sample-request.log.json</code>、PromQL 片段）。<strong>验收</strong>：SLI 表三行已填（P95 / Token / eval）；日志 JSON 能对应 Trace 图上的至少 3 个 Span。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a>：在真实响应中读取 <code>usage</code> 与请求 ID</li>
+      <li><a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a>：接入层 / 编排层 / 数据层与埋点位置</li>
+      <li><a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>：Token SLI 与预算</li>
+      <li><a href="#ch-practice-03-data-privacy">数据、隐私与合规入门</a>：日志脱敏与 <code>user_question_redacted</code></li>
+      <li><a href="#ch-basics-05-api-contracts">API 契约与集成方式</a>：网关 <code>usage</code> 落库</li>
+    </ul>
+  </div>
+</section>

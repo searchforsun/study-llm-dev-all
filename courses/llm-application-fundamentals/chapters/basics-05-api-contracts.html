@@ -1,0 +1,459 @@
+<section id="ch-basics-05-api-contracts" class="chapter" data-chapter="basics-05-api-contracts">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>API 契约与集成方式</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05-api-contracts" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>28 分钟</strong> · 阶段：<strong>应用问题域与模型认知</strong> · 能力：读懂 OpenAI 兼容契约、选型流式/非流式并在 BFF 中安全接入</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 不会直接让业务微服务各自持有厂商 API Key。你需要理解<strong>统一的 HTTP 契约</strong>：请求体长什么样、<span class="term" data-term-id="streaming" tabindex="0">流式</span>如何推给前端、失败时如何重试。这与 Java 团队熟悉的 REST/OpenAPI 同源，只是资源从「订单」变成了「对话补全」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>说明 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容协议</span> 为何让通义、DeepSeek、私有化网关共用同一套客户端</li>
+          <li>对比流式（SSE）与非流式在 CorpAssist 客服场景下的体验与实现差异</li>
+          <li>根据 HTTP 状态与错误体设计重试、退避与熔断，避免重复扣 <span class="term" data-term-id="token" tabindex="0">Token</span> 费</li>
+          <li>画出 BFF → LLM 网关 → 模型厂商的集成拓扑，并对接下一阶段应用分层</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>契约统一</strong>：<code>POST /v1/chat/completions</code> + JSON 消息数组是事实标准；改 <code>base_url</code> 即可换厂商。</li>
+          <li><strong>流式优先体验</strong>：客服/写作类前端用 <code>stream: true</code> + SSE；批处理、评测流水线可用非流式。</li>
+          <li><strong>错误要分层</strong>：4xx 多为参数/鉴权勿盲重试；429/5xx 配合指数退避与幂等请求 ID。</li>
+          <li><strong>BFF 不堆智能</strong>：编排、RAG、工具调用放在后端服务；BFF 负责鉴权、聚合与流式透传。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OpenAI 兼容协议</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 多模型路由</span>
+        采购了通义、DeepSeek 与内网私有化 Qwen，运维希望<strong>一套 Spring AI / Python 客户端</strong>，通过配置 <code>spring.ai.openai.base-url</code> 指向公司 LLM 网关，而不是每个业务服务写三套 SDK。
+      </aside>
+      <p><strong><span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容（OpenAI-compatible）</span></strong>指请求/响应 JSON 形状、路径与 Header 约定与 OpenAI Chat Completions API 对齐。国内主流商用 API 与多数私有化推理框架（vLLM、TGI 等）均提供兼容端点，应用层只需替换 <code>base_url</code>、<code>api-key</code> 与 <code>model</code> 名称。</p>
+
+      <h4>核心端点与消息结构</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>字段/路径</th><th>含义</th><th>CorpAssist 注意点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>POST /v1/chat/completions</code></td>
+            <td>多轮对话补全</td>
+            <td>BFF 或 <code>llm-gateway</code> 对外暴露；业务服务不直连公网</td>
+          </tr>
+          <tr>
+            <td><code>messages[]</code></td>
+            <td><code>role</code>：system / user / assistant</td>
+            <td>制度问答的 system 提示放在网关或编排层统一注入</td>
+          </tr>
+          <tr>
+            <td><code>model</code></td>
+            <td>逻辑模型名</td>
+            <td>网关内映射到真实厂商型号（如 <code>corpassist-fast</code> → <code>qwen-turbo</code>）</td>
+          </tr>
+          <tr>
+            <td><code>max_tokens</code> / <span class="term" data-term-id="temperature" tabindex="0">temperature</span></td>
+            <td>生成长度与随机性</td>
+            <td>与 <a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a> 中的 <span class="term" data-term-id="context-window" tabindex="0">上下文窗口</span>、计费直接相关</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>非流式调用（curl）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">curl -s https://llm-gateway.corpassist.internal/v1/chat/completions \
+  -H "Authorization: Bearer $CORPASSIST_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Request-Id: $(uuidgen)" \
+  -d '{
+    "model": "corpassist-fast",
+    "messages": [
+      {"role": "system", "content": "你是 CorpAssist 企业助手，回答须简洁并标注信息来源类型。"},
+      {"role": "user", "content": "年假最多可休几天？"}
+    ],
+    "temperature": 0.2,
+    "max_tokens": 512
+  }'</code></pre>
+      </div>
+      <p>响应体中 <code>choices[0].message.content</code> 为完整回复；<code>usage.prompt_tokens</code> / <code>completion_tokens</code> 用于成本归因（按部门、应用 ID 打标签可在网关侧记录）。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>每个微服务内置不同厂商 SDK，密钥散落配置中心</li>
+            <li>在业务库表硬编码 prompt 模板且无版本管理</li>
+            <li>忽略 <code>usage</code>，无法做 Token 预算告警</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>统一 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 网关 + 路由策略</li>
+            <li>Spring AI / httpx 仅配置 <code>base_url</code> 与超时</li>
+            <li>请求 ID、租户 ID 贯穿日志与计费</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>流式与非流式</h3>
+      <p>非流式一次返回完整 JSON；<strong><span class="term" data-term-id="streaming" tabindex="0">流式（streaming）</span></strong>在请求体设 <code>"stream": true</code>，服务端以 <strong>SSE（Server-Sent Events）</strong> 推送多个 <code>data:</code> 行，每块含增量 <code>delta.content</code>，最终以 <code>data: [DONE]</code> 结束。</p>
+
+      <h4>选型对照</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>非流式</th><th>流式 SSE</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>用户体验</strong></td>
+            <td>等待数秒后出现整段文字</td>
+            <td>逐字/逐句出现，降低「卡住」感</td>
+          </tr>
+          <tr>
+            <td><strong>CorpAssist 场景</strong></td>
+            <td>夜间批处理摘要、评测脚本、Webhook 回调</td>
+            <td>Web 客服、制度问答、写作助手</td>
+          </tr>
+          <tr>
+            <td><strong>实现</strong></td>
+            <td>普通 HTTP 客户端即可</td>
+            <td>需保持长连接；BFF/网关勿缓冲整段 body</td>
+          </tr>
+          <tr>
+            <td><strong>计费</strong></td>
+            <td>响应末 <code>usage</code> 一次给出</td>
+            <td>常在最后一个 chunk 带 <code>usage</code>（依厂商略有差异）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>流式请求与 SSE 片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">curl -N https://llm-gateway.corpassist.internal/v1/chat/completions \
+  -H "Authorization: Bearer $CORPASSIST_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"corpassist-fast","stream":true,"messages":[{"role":"user","content":"用三句话介绍 RAG"}]}'</code></pre>
+      </div>
+
+      <h4>SSE 响应示例（节选）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">http</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"RAG"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" 是检索增强生成"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":18,"total_tokens":60}}
+
+data: [DONE]</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>网关透传要点</strong>
+        <p>Spring Cloud Gateway 或 Nginx 对流式路由须关闭响应缓冲（如 <code>proxy_buffering off</code>），并设置足够长的读超时。BFF 用 <code>text/event-stream</code> 原样写给浏览器，避免在内存中拼接完整回复再下发——否则失去 <span class="term" data-term-id="streaming" tabindex="0">流式</span> 意义。</p>
+      </div>
+
+      <h4>双栈客户端预览</h4>
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">java</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-java">// Spring AI 1.x — 指向 CorpAssist LLM 网关（OpenAI 兼容）
+@Bean
+ChatClient corpAssistChatClient(ChatClient.Builder builder) {
+  return builder
+      .defaultSystem("你是 CorpAssist 企业助手。")
+      .build();
+}
+
+// 流式：return chatClient.prompt().user(question).stream().content();
+// 非流式：return chatClient.prompt().user(question).call().content();</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python">import httpx
+
+async def ask_corpassist(user_text: str) -> str:
+    async with httpx.AsyncClient(
+        base_url="https://llm-gateway.corpassist.internal/v1",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        timeout=httpx.Timeout(60.0, connect=5.0),
+    ) as client:
+        r = await client.post(
+            "/chat/completions",
+            json={
+                "model": "corpassist-fast",
+                "messages": [{"role": "user", "content": user_text}],
+                "stream": False,
+            },
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]</code></pre>
+        </div>
+      </div>
+      <p>完整动手见 <a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a>；本章聚焦契约本身。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>错误码与重试</h3>
+      <p>LLM 调用跨公网或专有云，失败是常态。工程上须区分<strong>不可重试</strong>（修正参数）与<strong>可重试</strong>（瞬时过载），并控制 <span class="term" data-term-id="token" tabindex="0">Token</span> 重复消耗风险。</p>
+
+      <h4>常见 HTTP 与处理策略</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>状态</th><th>典型原因</th><th>CorpAssist 策略</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>401 / 403</strong></td>
+            <td>Key 无效、租户无权限</td>
+            <td>告警运维，<strong>不重试</strong>；检查网关到厂商的密钥轮换</td>
+          </tr>
+          <tr>
+            <td><strong>400</strong></td>
+            <td>消息超出 <span class="term" data-term-id="context-window" tabindex="0">上下文窗口</span>、非法 model</td>
+            <td>截断历史或降级模型；记录 <code>X-Request-Id</code> 给支持</td>
+          </tr>
+          <tr>
+            <td><strong>429</strong></td>
+            <td>限流、配额耗尽</td>
+            <td>指数退避 + 抖动；队列化非实时任务；切换备用模型路由</td>
+          </tr>
+          <tr>
+            <td><strong>502 / 503 / 504</strong></td>
+            <td>网关/厂商瞬时故障</td>
+            <td>有限次重试（如 2～3 次）；熔断后走降级文案</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>错误体通常含 <code>error.message</code>、<code>error.type</code>（如 <code>rate_limit_exceeded</code>）。<strong>幂等</strong>：对「已提交但响应丢失」的非流式请求，可用固定 <code>X-Request-Id</code> 在网关去重（若厂商支持）；流式中断则只能重新发起新对话轮次，并在产品层提示用户「生成已中断」。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="重试决策">
+        <input type="radio" name="bas05-retry-tab" id="bas05-retry-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="bas05-retry-tab" id="bas05-retry-tab-b" class="learn-tab-input" />
+        <label for="bas05-retry-tab-a">宜重试</label>
+        <label for="bas05-retry-tab-b">不宜重试</label>
+        <div class="learn-tab-panel" id="bas05-retry-panel-a" role="tabpanel">
+          <ul>
+            <li>429 / 503，且未超过单用户 QPS 预算</li>
+            <li>连接超时、读超时（确认请求体未损坏）</li>
+            <li>网关到厂商链路抖动，备用路由可用</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="bas05-retry-panel-b" role="tabpanel">
+          <ul>
+            <li>400 参数错误、401 鉴权失败</li>
+            <li>流式已输出部分 token 后中断（避免双倍计费与语义重复）</li>
+            <li>业务侧已判定敏感内容拦截（policy violation）</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：非流式调用超时，客户端不知道厂商是否已生成完毕，该不该立刻原样重试？</summary>
+        <p>不应无界重试。优先用<strong>同一 <code>X-Request-Id</code></strong> 查询网关是否已有结果；若无查询能力，最多 1 次幂等重试并限制 <code>max_tokens</code>，同时在前端提示可能重复。更好的做法是在网关记录 in-flight 状态。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>与微服务 BFF 关系</h3>
+      <p>有 Java 微服务经验的读者可把 CorpAssist 看成：<strong>前端只认识 BFF</strong>，BFF 聚合身份、会话与业务 API；<strong>LLM 能力集中在网关与编排服务</strong>，而不是在每个 <code>hr-service</code>、<code>finance-service</code> 里各写一套 ChatClient。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · BFF → LLM 网关 → 模型厂商</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph clients [客户端]
+    Web[Web / 移动端]
+  end
+  subgraph edge [接入层]
+    BFF[corpassist-bff]
+  end
+  subgraph platform [平台层]
+    GW[llm-gateway OpenAI 兼容]
+    ORCH[dialog-orchestrator]
+    RAG[rag-service]
+  end
+  subgraph providers [模型提供方]
+    P1[通义 / DeepSeek 等商用 API]
+    P2[私有化 Qwen 集群]
+  end
+  subgraph biz [业务微服务]
+    HR[hr-service]
+    FIN[finance-service]
+  end
+  Web -->|HTTPS + JWT| BFF
+  BFF -->|REST 聚合| HR
+  BFF -->|REST 聚合| FIN
+  BFF -->|SSE 透传 / REST| GW
+  ORCH --> GW
+  RAG --> ORCH
+  BFF --> ORCH
+  GW --> P1
+  GW --> P2</pre>
+        <p class="diagram-caption">BFF 负责鉴权、会话 ID、限流与流式透传；编排服务组合 RAG/工具；网关统一密钥、路由与 usage 落库。业务微服务仍用传统 REST，仅在需要时由编排层回调。</p>
+      </div>
+
+      <h4>职责划分</h4>
+      <ul>
+        <li><strong>BFF</strong>：用户身份、多租户、将前端 <code>/api/chat/stream</code> 转为对网关的 <code>chat/completions</code>；不写 Prompt 工程核心逻辑。</li>
+        <li><strong>llm-gateway</strong>：<span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 入口、模型路由、密钥托管、全链路 <code>usage</code> 与审计。</li>
+        <li><strong>dialog-orchestrator / rag-service</strong>：<span class="term" data-term-id="rag" tabindex="0">RAG</span> 检索、引用拼接、工具调用；产出最终 <code>messages</code> 再调网关。</li>
+        <li><strong>业务微服务</strong>：提供权威业务数据（制度条文、审批状态），不直接持有大模型 API Key。</li>
+      </ul>
+
+      <div class="notice notice-outcome">
+        <strong>与下一阶段衔接</strong>
+        <p>接入层 / 编排层 / 数据层的完整分层、同步异步选型与反模式，将在 <a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a> 展开。本章的 BFF–网关–厂商拓扑是该章的「物理视图」前置。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，basics 阶段收官前复述 API 集成要点。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>OpenAI 兼容协议</strong>：<code>/v1/chat/completions</code> + <code>messages</code> 是跨厂商统一契约；CorpAssist 通过网关换模型而非换 SDK。</li>
+        <li><strong>流式与非流式</strong>：面向用户用 SSE 流式；批处理与评测用非流式；网关与 BFF 须禁止缓冲流式响应。</li>
+        <li><strong>错误码与重试</strong>：4xx 修正参数，429/5xx 有限退避；用请求 ID 与 usage 控制重复 <span class="term" data-term-id="token" tabindex="0">Token</span> 成本。</li>
+        <li><strong>BFF 与微服务</strong>：BFF 聚合与透传，智能编排下沉；业务服务不直连厂商，详见 <a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a>。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-fundamentals_basics05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="openai-compat" /> 能写出 chat/completions 请求中最关键的 4 个字段</label></li>
+          <li><label><input type="checkbox" data-id="stream-sse" /> 能解释 SSE 中 <code>delta</code> 与 <code>[DONE]</code> 的作用</label></li>
+          <li><label><input type="checkbox" data-id="retry-policy" /> 能区分 400 与 429 的重试策略</label></li>
+          <li><label><input type="checkbox" data-id="bff-topology" /> 能口述 BFF、网关、编排、业务服务四条边界</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>OpenAI 兼容</td><td>换 base_url，不换应用代码形状</td></tr>
+                <tr><td>流式</td><td>stream:true → SSE chunk</td></tr>
+                <tr><td>usage</td><td>prompt/completion tokens 计费依据</td></tr>
+                <tr><td>429</td><td>退避 + 路由/队列</td></tr>
+                <tr><td>BFF</td><td>鉴权聚合，不堆 RAG 逻辑</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为何公司要自建 LLM 网关，而不是让每个服务直连通义？</li>
+              <li>流式响应在 Gateway 层需要哪些特殊配置？</li>
+              <li>非流式超时后如何尽量避免重复扣费？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成测验；进入 practice 阶段，从 <a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a> 拆解 CorpAssist 接入层、编排层与数据层。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener">OpenAI API — Chat Completions</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/compatibility-of-openai-with-dashscope" target="_blank" rel="noopener">阿里云百炼 — OpenAI 兼容说明</a></li>
+      <li><a href="https://api-docs.deepseek.com/" target="_blank" rel="noopener">DeepSeek API 文档</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI — ChatClient</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 curl 与对照表摸清 CorpAssist 网关契约，并在 BFF–网关拓扑图上标注你负责的服务边界。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>将「非流式 curl」中的 <code>model</code> 改为 <code>stream: true</code>，用 <code>curl -N</code> 观察至少 3 行 <code>data:</code> 与 <code>[DONE]</code>（可用公司网关或兼容沙箱）。</li>
+      <li>对照「常见 HTTP 与处理策略」表：为 429 与 400 各写一句 CorpAssist 运维/runbook 动作（是否重试、谁接手）。</li>
+      <li>在「BFF → LLM 网关 → 模型厂商」Mermaid 上，用不同颜色标出你当前 Java 项目属于 BFF、编排还是业务微服务（纸笔或导出图均可）。</li>
+      <li>阅读 Spring AI 与 httpx 代码块：列出两者共同依赖的环境变量或配置项（<code>base_url</code>、<code>api-key</code>、超时）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">finance-service 为省事先在进程内配置 DeepSeek API Key 并直接调用 <code>api.deepseek.com</code>，与「BFF → 网关」架构相比，最大风险是什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>密钥与审计失控</strong>：Key 散落多服务难以轮换；无法统一 <code>usage</code> 计费、限流与内容安全策略；合规上财务数据出网路径不可管。应改为经 <code>llm-gateway</code> 的 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 调用。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">客服流式回答已输出一半，用户刷新页面。BFF 应对同一 <code>chat/completions</code> 请求自动重试以「续写」吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不应原请求重试</strong>。流式中断后厂商可能已计费；重试会产生重复内容。应开启<strong>新请求</strong>（新 assistant 轮次或新会话），前端提示「已中断，请重新提问」；若需续写，由产品层显式携带已生成片段走编排逻辑，而非 HTTP 层盲重试。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：网关契约速查表</h4>
+      <p>目录：<code>demos/basics-05-api-contracts-lab/</code>（<code>.env.example</code>、curl/PowerShell 脚本、契约表模板）。<strong>验收</strong>：契约表三行已填；流式脚本或 <code>chat-stream.ps1</code> 能收到 SSE chunk。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一阶段</strong>：<a href="#ch-practice-01-app-architecture">LLM 应用分层架构</a>：接入层 / 编排层 / 数据层与反模式</li>
+      <li><a href="#ch-practice-05-handson-first-call">实战：首次打通模型调用</a>：curl、Python、Spring AI 对照实验</li>
+      <li><a href="#ch-basics-02-token-context">Token、上下文窗口与费用</a>：<code>max_tokens</code> 与成本估算</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events" target="_blank" rel="noopener">MDN — Using server-sent events</a></li>
+    </ul>
+  </div>
+</section>
