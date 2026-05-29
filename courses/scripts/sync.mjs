@@ -209,8 +209,9 @@ const prerequisites = {
   'observability-reliability-ops': ['阶段三汇合课进行中'],
   'security-compliance-engineering': ['《生产级 Prompt》', '可与可观测课并行'],
   'enterprise-llm-solution-delivery': [
-    '五大场景落地课全部完成',
-    '阶段一至四核心课',
+    '完成 layer-1：至少 1 门场景课（必修 S1 + 选修 ≥1）',
+    '完成 layer-2：llm-composite-integration-workshop',
+    'security-compliance-engineering basics（场景课前）',
   ],
   'scenario-enterprise-rag-kb': [
     '《RAG 双栈主课》practice',
@@ -220,6 +221,7 @@ const prerequisites = {
     '《上下文记忆》practice',
     '《Agent 编排》basics',
     '《生产级 Prompt》',
+    'security-compliance-engineering basics',
   ],
   'scenario-enterprise-agent-automation': [
     '《Agent 编排》practice',
@@ -232,8 +234,62 @@ const prerequisites = {
   'scenario-enterprise-content-studio': [
     '《生产级 Prompt》practice',
     '《多模型与多模态》basics',
+    'security-compliance-engineering basics',
   ],
 };
+
+/** @type {import('../outline-specs.json').learningPath} */
+const defaultLearningPath = {
+  mode: 'dual-track',
+  goal: '掌握 Python 与 Spring AI 两套工程体系，能在同一业务场景下实现、联调与交付。',
+  trackLegend: [
+    { id: 'shared', label: '共用轨' },
+    { id: 'python', label: 'Python 轨' },
+    { id: 'java', label: 'Spring AI 轨' },
+    { id: 'bridge', label: '汇合轨' },
+    { id: 'scenario', label: '场景落地轨' },
+  ],
+  stages: [],
+  completionRule: {
+    requiredTracks: ['python', 'java'],
+    requiredShared: 'all',
+    requiredBridge: 'all',
+    requiredScenario: 'all',
+  },
+};
+
+function buildLearningPath(spec) {
+  const lp = spec.learningPath ?? defaultLearningPath;
+  const stages = (lp.stages ?? []).map((s) => {
+    const out = { id: s.id, title: s.title };
+    if (s.shared) out.shared = s.shared;
+    if (s.parallel) out.parallel = s.parallel;
+    if (s.bridge) out.bridge = s.bridge;
+    if (s.scenarioMandatory || s.scenarioElective) {
+      out.scenario = [
+        ...(s.scenarioMandatory ?? []),
+        ...(s.scenarioElective ?? []),
+      ];
+      out.scenarioMandatory = s.scenarioMandatory;
+      out.scenarioElective = s.scenarioElective;
+    } else if (s.scenario) {
+      out.scenario = s.scenario;
+    }
+    if (s.notes) out.notes = s.notes;
+    if (s.prerequisiteFor) out.prerequisiteFor = s.prerequisiteFor;
+    if (s.capstoneLayers) out.capstoneLayers = s.capstoneLayers;
+    return out;
+  });
+  return {
+    mode: lp.mode ?? 'dual-track',
+    goal: lp.goal,
+    trackLegend: lp.trackLegend ?? defaultLearningPath.trackLegend,
+    stages,
+    completionRule: lp.completionRule ?? defaultLearningPath.completionRule,
+    northStarCapabilities: spec.northStarCapabilities ?? [],
+    capstoneModel: spec.capstoneModel ?? null,
+  };
+}
 
 const trackOrder = {
   'llm-application-fundamentals': 1,
@@ -266,34 +322,82 @@ function chapters(c) {
   return c.outline.reduce((n, ph) => n + ph.chapters.length, 0);
 }
 
+const TRACK_LABELS = {
+  shared: '共用轨',
+  python: 'Python 轨',
+  java: 'Spring AI 轨',
+  bridge: '汇合轨',
+  scenario: '场景落地',
+};
+
+function buildScenarioMeta(spec) {
+  const bySlug = {};
+  for (const s of spec.interviewScenarios?.scenarios ?? []) {
+    const meta = {
+      id: s.id,
+      title: s.title,
+      scenarioRole: s.scenarioRole ?? null,
+      northStarFocus: s.northStarFocus ?? [],
+      productionPitfalls: s.productionPitfalls ?? [],
+      subTracks: s.subTracks ?? null,
+    };
+    if (s.landingCourse) bySlug[s.landingCourse] = meta;
+    for (const slug of s.courses ?? []) {
+      if (!bySlug[slug]) bySlug[slug] = { ...meta, scenarioRole: bySlug[slug]?.scenarioRole ?? null };
+    }
+  }
+  return bySlug;
+}
+
+function enrichCourse(slug, c, spec, scenarioMetaBySlug) {
+  const rule = spec.learningPath?.completionRule?.requiredScenario;
+  let scenarioRole = scenarioMetaBySlug[slug]?.scenarioRole ?? null;
+  if (!scenarioRole && rule?.mandatory?.includes(slug)) scenarioRole = 'mandatory';
+  if (!scenarioRole && rule?.electiveFrom?.includes(slug)) scenarioRole = 'elective';
+
+  const northStarIds = new Set();
+  for (const ns of spec.northStarCapabilities ?? []) {
+    if (ns.primaryCourses?.includes(slug)) northStarIds.add(ns.id);
+  }
+  for (const id of scenarioMetaBySlug[slug]?.northStarFocus ?? []) {
+    northStarIds.add(id);
+  }
+
+  const track = c.track ?? 'shared';
+  return {
+    slug,
+    track,
+    trackLabel: TRACK_LABELS[track] ?? track,
+    trackOrder: trackOrder[slug] ?? 99,
+    title: c.title,
+    summary: summaries[slug] ?? c.title,
+    path: `${slug}/index.html`,
+    themePreset: slug,
+    accent: accents[slug] ?? { light: '#1565c0', dark: '#64b5f6' },
+    stats: {
+      phases: 3,
+      chapters: chapters(c),
+      publishedChapters: published[slug] ?? 0,
+    },
+    capabilityIds: c.capabilityIds ?? [],
+    prerequisites: prerequisites[slug] ?? [],
+    interviewScenarios: [
+      ...new Set([
+        ...(c.interviewScenarios ?? []),
+        ...[...(interviewByCourse[slug] ?? [])],
+      ]),
+    ].sort(),
+    scenarioRole,
+    northStarIds: [...northStarIds].sort(),
+    scenarioMeta: scenarioMetaBySlug[slug] ?? null,
+  };
+}
+
+const scenarioMetaBySlug = buildScenarioMeta(specFinal);
+
 const courses = Object.keys(specFinal.courses)
   .sort((a, b) => (trackOrder[a] ?? 99) - (trackOrder[b] ?? 99))
-  .map((slug) => {
-    const c = specFinal.courses[slug];
-    return {
-      slug,
-      track: c.track,
-      trackOrder: trackOrder[slug] ?? 99,
-      title: c.title,
-      summary: summaries[slug] ?? c.title,
-      path: `${slug}/index.html`,
-      themePreset: slug,
-      accent: accents[slug] ?? { light: '#1565c0', dark: '#64b5f6' },
-      stats: {
-        phases: 3,
-        chapters: chapters(c),
-        publishedChapters: published[slug] ?? 0,
-      },
-      capabilityIds: c.capabilityIds ?? [],
-      prerequisites: prerequisites[slug] ?? [],
-      interviewScenarios: [
-        ...new Set([
-          ...(c.interviewScenarios ?? []),
-          ...[...(interviewByCourse[slug] ?? [])],
-        ]),
-      ].sort(),
-    };
-  });
+  .map((slug) => enrichCourse(slug, specFinal.courses[slug], specFinal, scenarioMetaBySlug));
 
 const catalog = {
   title: '大模型应用开发 · 课程中心',
@@ -301,82 +405,23 @@ const catalog = {
   globalThemeKey: 'study-self_theme',
   outlineSpecFile: 'outline-specs.json',
   outlineSpecVersion: specFinal.schemaVersion ?? '1',
-  learningPath: {
-    mode: 'dual-track',
-    goal: '掌握 Python 与 Spring AI 两套工程体系，能在同一业务场景下实现、联调与交付。',
-    trackLegend: [
-      { id: 'shared', label: '共用轨' },
-      { id: 'python', label: 'Python 轨' },
-      { id: 'java', label: 'Spring AI 轨' },
-      { id: 'bridge', label: '汇合轨' },
-      { id: 'scenario', label: '场景落地轨' },
-    ],
-    stages: [
+  courseTitleCatalog: Object.fromEntries(
+    courses.map((c) => [c.slug, c.title])
+  ),
+  learningPath: buildLearningPath(specFinal),
+  interviewScenarioIndex: Object.fromEntries(
+    (specFinal.interviewScenarios?.scenarios ?? []).map((s) => [
+      s.id,
       {
-        id: 'stage-1',
-        title: '阶段一 · 认知与双栈基座',
-        shared: ['llm-application-fundamentals'],
-        parallel: {
-          python: ['python-engineering-for-llm'],
-          java: ['spring-ai-engineering'],
-        },
+        title: s.title,
+        landingCourse: s.landingCourse,
+        scenarioRole: s.scenarioRole,
+        northStarFocus: s.northStarFocus ?? [],
+        productionPitfalls: s.productionPitfalls ?? [],
+        subTracks: s.subTracks ?? null,
       },
-      {
-        id: 'stage-2',
-        title: '阶段二 · 交互与 RAG',
-        shared: [
-          'production-prompt-engineering',
-          'context-memory-engineering',
-          'llm-evaluation-quality',
-          'rag-system-engineering',
-          'knowledge-lifecycle-governance',
-        ],
-        parallel: {
-          python: ['retrieval-vector-platform'],
-          java: ['spring-ai-alibaba-engineering'],
-        },
-      },
-      {
-        id: 'stage-3',
-        title: '阶段三 · Agent 与汇合',
-        shared: ['multimodel-routing-multimodal'],
-        parallel: { python: ['agent-orchestration-engineering'] },
-        bridge: ['llm-composite-integration-workshop', 'llm-application-backend'],
-      },
-      {
-        id: 'stage-3b',
-        title: '阶段三B · 五大场景企业落地',
-        scenario: [
-          'scenario-enterprise-rag-kb',
-          'scenario-enterprise-customer-service',
-          'scenario-enterprise-agent-automation',
-          'scenario-enterprise-code-assistant',
-          'scenario-enterprise-content-studio',
-        ],
-      },
-      {
-        id: 'stage-4',
-        title: '阶段四 · 生产化',
-        shared: [
-          'domain-model-adaptation',
-          'llm-serving-for-applications',
-          'observability-reliability-ops',
-          'security-compliance-engineering',
-        ],
-      },
-      {
-        id: 'stage-5',
-        title: '阶段五 · 交付收官',
-        bridge: ['enterprise-llm-solution-delivery'],
-      },
-    ],
-    completionRule: {
-      requiredTracks: ['python', 'java'],
-      requiredShared: 'all',
-      requiredBridge: 'all',
-      requiredScenario: 'all',
-    },
-  },
+    ])
+  ),
   courses,
 };
 

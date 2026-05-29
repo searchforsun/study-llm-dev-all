@@ -23,14 +23,21 @@ npx --yes serve .
 
 ## 学习路径
 
+真源：`outline-specs.json` → `learningPath`（`schemaVersion: 2`）。`node scripts/sync.mjs` 同步到 `courses.json`。
+
 | 阶段 | 内容 |
 |------|------|
 | 一 | `llm-application-fundamentals` → `python-engineering-for-llm` ‖ `spring-ai-engineering` |
-| 二 | Prompt → 上下文记忆 → 评测 → RAG → KB 治理；并行：检索 ‖ SAA |
-| 三 | Agent；多模态；汇合：集成实战 → 应用后端 |
-| 三B | 五大场景落地 `scenario-enterprise-*`（S1–S5） |
-| 四 | 微调 → 推理部署 → 可观测 ‖ 安全合规 |
-| 五 | `enterprise-llm-solution-delivery` |
+| 二 | Prompt → 上下文记忆 → **评测飞轮** → RAG → KB 治理；并行：检索 ‖ SAA |
+| **二B** | **`security-compliance-engineering` basics**（场景课前必读） |
+| 三 | Agent（**确定性桥梁**）；多模态（**成本路由**）；汇合：集成实战 → 应用后端 |
+| 三B | 场景落地：**必修 S1** + **选修 ≥1**（S2/S3/S4/S5）；每门含 `practice-06-production-pitfalls` |
+| 四 | 微调（**偏好飞轮**）→ 推理部署 → 可观测 |
+| 五 | **三层毕业**：场景 Layer1 → 集成 Layer2 → `enterprise-llm-solution-delivery` Layer3 |
+
+**毕业规则**：不必五场景全修；详见 `REFERENCE.md` 与 `courses.json` → `learningPath.completionRule`。
+
+**北极星能力**：NS1 飞轮 / NS2 确定性桥梁 / NS3 成本延迟 — 见 `REFERENCE.md`。
 
 ## 维护
 
@@ -39,6 +46,14 @@ npx --yes serve .
 ```powershell
 node scripts/sync.mjs
 ```
+
+单课正文中将课程 slug 补充为「中文名 + 链接」：
+
+```powershell
+node scripts/enrich-course-refs.mjs --dir llm-application-fundamentals
+```
+
+（读取 `courses.json` 的 `courseTitleCatalog`，更新 `chapters/*.html` 与 `welcome.partial.html`，并写入 `course.json` → `courseCatalog`。）
 
 ## 生成单课（programming-html-tutorial）
 

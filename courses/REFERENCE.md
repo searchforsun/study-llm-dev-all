@@ -2,6 +2,36 @@
 
 面向 **3–5 年大模型应用开发**（纯应用侧，不含算法/Infra）。业务案例统一为 **CorpAssist**。
 
+## 三座北极星能力（项目成败）
+
+| ID | 能力 | 主课程 | 场景中的典型「坑」 |
+|----|------|--------|-------------------|
+| **NS1** | 模型与数据飞轮 | `llm-evaluation-quality`、`domain-model-adaptation`、`knowledge-lifecycle-governance` | 只上线不回归；坏例不进 golden set；换 Embedding 未 re-embed |
+| **NS2** | 概率→确定性桥梁 | `agent-orchestration-engineering`、`scenario-enterprise-customer-service`、`llm-composite-integration-workshop` | 模型改订单；工具假执行；>3 步 Agent 无观察-反思 |
+| **NS3** | 成本与延迟权衡 | `multimodel-routing-multimodal`、`observability-reliability-ops`、`llm-serving-for-applications` | 全站顶配模型；RAG 无缓存；截图直调贵视觉模型 |
+
+真源：`outline-specs.json` → `northStarCapabilities`。
+
+## 三层毕业模型（Capstone）
+
+| 层 | 课程 | 交付 |
+|----|------|------|
+| **Layer 1** | 默认 `scenario-enterprise-rag-kb`（必修）+ 选修 ≥1 门场景 | 双栈 MVP + eval / 引用率 / P95 门禁 |
+| **Layer 2** | `llm-composite-integration-workshop` | 契约 + Trace + 灰度联调 |
+| **Layer 3** | `enterprise-llm-solution-delivery` | TOP5 答辩 + `advanced-07-badcase-flywheel` |
+
+真源：`outline-specs.json` → `capstoneModel`。
+
+## 场景完成策略
+
+| 类型 | 场景 | 说明 |
+|------|------|------|
+| **必修** | S1 企业 RAG 知识库 | 所有应用岗默认深度交付 |
+| **选修 ≥1** | S2 客服 / S3 Agent / S4 代码 / S5 内容 | 按 JD 选 1 门做深；M2 未达标不开第二门 |
+| **S5 子轨** | S5-A 企业营销（默认）/ S5-B 互动娱乐（选修） | 见 `interviewScenarios.scenarios[4].subTracks` |
+
+每门场景课含 **`practice-06-production-pitfalls`**，对应 `productionPitfalls[]` 机读字段。
+
 ## 37 项能力 → 课程
 
 | ID | 能力 | 主课程 | JD |
@@ -55,20 +85,20 @@
 | 评测 / 成本 / 安全 | `llm-evaluation-quality`, `observability-reliability-ops`, `security-compliance-engineering` |
 | 双栈交付 | `llm-composite-integration-workshop`, `enterprise-llm-solution-delivery` |
 
-**不包含**：预训练/RLHF 算法、CUDA/算子、千卡训练（应用岗边界）。
+**不包含**：预训练/RLHF 算法推导、CUDA/算子、千卡训练（应用岗边界）。**包含**：应用侧偏好对齐飞轮（DPO/RLAIF 概念，见 `domain-model-adaptation`）。
 
 ## 面试 TOP5 场景
 
-| 场景 | 主题 | 企业落地课 | 机读详情 |
-|------|------|------------|----------|
-| S1 | RAG 知识库 | `scenario-enterprise-rag-kb` | `outline-specs.json` → `interviewScenarios.scenarios[0]` |
-| S2 | 智能客服 | `scenario-enterprise-customer-service` | 同上 S2 |
-| S3 | Agent 自动化 | `scenario-enterprise-agent-automation` | 同上 S3 |
-| S4 | 代码助手 | `scenario-enterprise-code-assistant` | 同上 S4 |
-| S5 | 内容生成 | `scenario-enterprise-content-studio` | 同上 S5 |
+| 场景 | 主题 | 企业落地课 | 角色 | 生产坑（摘要） |
+|------|------|------------|------|----------------|
+| S1 | RAG 知识库 | `scenario-enterprise-rag-kb` | 必修 | ACL、脏 PDF、Graph、re-embed |
+| S2 | 智能客服 | `scenario-enterprise-customer-service` | 选修 | DST 双校验、API 执行、截图路由 |
+| S3 | Agent 自动化 | `scenario-enterprise-agent-automation` | 选修 | 反思循环、工具假执行、记忆溢出 |
+| S4 | 代码辅助 | `scenario-enterprise-code-assistant` | 选修 | AST RAG、FIM、LSP 闭环 |
+| S5 | 内容生成 | `scenario-enterprise-content-studio` | 选修 | 真查库存、审核、S5-B 角色 OOC |
 
-每门落地课三阶段：**业务架构 → 双栈实战 → 生产化/面试答辩**。横切：`llm-application-fundamentals`、`llm-composite-integration-workshop`、`enterprise-llm-solution-delivery`（`advanced-06-top5-defense`）。
+机读详情：`outline-specs.json` → `interviewScenarios.scenarios[]`（含 `productionPitfalls`、`northStarFocus`、`subTracks`）。
 
-场景字段含：`coreTopics`、`interviewQuestions`、`techStack`、`portfolioHints`、`capstoneChapters`、`landingCourse`。
+每门落地课三阶段：**业务架构 → 双栈实战（含 production-pitfalls）→ 生产化/面试答辩**。横切：`llm-application-fundamentals`、`llm-composite-integration-workshop`、`enterprise-llm-solution-delivery`。
 
-维护：改 `outline-specs.json` 内 `interviewScenarios` → `node scripts/sync.mjs`。
+维护：改 `outline-specs.json` → `node scripts/sync.mjs`。

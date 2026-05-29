@@ -47,7 +47,7 @@ npx --yes serve .
 | **已发布（15/15 章）** | [`llm-application-fundamentals`](courses/llm-application-fundamentals/) — 大模型应用基础：Token、架构拼图、双栈首次调用、多模态/国产化、系统设计、毕业路线图 |
 | **大纲就绪，正文生成中** | 其余 23 门课（门户可见，章节陆续开放） |
 
-建议路径：**先修完共用轨第一课** → 并行进入 `python-engineering-for-llm` 与 `spring-ai-engineering`。
+建议路径：**先修完共用轨第一课** → 并行双栈 → **阶段二B 安全 basics** → 场景 **必修 S1 + 选修 1 门** → 三层毕业（见 [`courses/REFERENCE.md`](courses/REFERENCE.md)）。
 
 ---
 
