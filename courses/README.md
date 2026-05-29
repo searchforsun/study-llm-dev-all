@@ -51,7 +51,10 @@ node scripts/sync.mjs
 
 ```powershell
 node scripts/enrich-course-refs.mjs --dir llm-application-fundamentals
+node scripts/enrich-curriculum-terms.mjs --dir llm-application-fundamentals
 ```
+
+`enrich-curriculum-terms` 将正文中的 S1～S5、NS1～NS3 转为带**行业说法 hover**的术语 span；术语真源在 `outline-specs.json` → `sync.mjs` → `courses.json` 的 `curriculumGlossary`。
 
 （读取 `courses.json` 的 `courseTitleCatalog`，更新 `chapters/*.html` 与 `welcome.partial.html`，并写入 `course.json` → `courseCatalog`。）
 

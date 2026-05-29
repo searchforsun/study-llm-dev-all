@@ -330,6 +330,48 @@ const TRACK_LABELS = {
   scenario: '场景落地',
 };
 
+function buildCurriculumGlossary(spec) {
+  const glossary = {};
+  for (const ns of spec.northStarCapabilities ?? []) {
+    glossary[ns.id] = {
+      id: ns.id,
+      kind: 'northStar',
+      label: ns.readerLabel ?? ns.title,
+      title: ns.title,
+      popularTerms: ns.popularTerms ?? [],
+      oneLiner: ns.oneLiner ?? ns.summary ?? '',
+      summary: ns.summary ?? '',
+    };
+  }
+  for (const s of spec.interviewScenarios?.scenarios ?? []) {
+    glossary[s.id] = {
+      id: s.id,
+      kind: 'scenario',
+      label: s.readerLabel ?? s.title,
+      title: s.title,
+      popularTerms: s.popularTerms ?? [],
+      oneLiner: s.oneLiner ?? '',
+    };
+  }
+  return glossary;
+}
+
+function buildNorthStarIndex(spec) {
+  return Object.fromEntries(
+    (spec.northStarCapabilities ?? []).map((ns) => [
+      ns.id,
+      {
+        title: ns.title,
+        readerLabel: ns.readerLabel ?? ns.title,
+        popularTerms: ns.popularTerms ?? [],
+        oneLiner: ns.oneLiner ?? ns.summary ?? '',
+        summary: ns.summary ?? '',
+        primaryCourses: ns.primaryCourses ?? [],
+      },
+    ])
+  );
+}
+
 function buildScenarioMeta(spec) {
   const bySlug = {};
   for (const s of spec.interviewScenarios?.scenarios ?? []) {
@@ -414,6 +456,9 @@ const catalog = {
       s.id,
       {
         title: s.title,
+        readerLabel: s.readerLabel ?? s.title,
+        popularTerms: s.popularTerms ?? [],
+        oneLiner: s.oneLiner ?? '',
         landingCourse: s.landingCourse,
         scenarioRole: s.scenarioRole,
         northStarFocus: s.northStarFocus ?? [],
@@ -422,6 +467,8 @@ const catalog = {
       },
     ])
   ),
+  northStarIndex: buildNorthStarIndex(specFinal),
+  curriculumGlossary: buildCurriculumGlossary(specFinal),
   courses,
 };
 
