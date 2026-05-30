@@ -124,18 +124,27 @@ const accents = {
   'knowledge-lifecycle-governance': { light: '#6d4c41', dark: '#bcaaa4' },
   'agent-orchestration-engineering': { light: '#c62828', dark: '#ef9a9a' },
   'multimodel-routing-multimodal': { light: '#0277bd', dark: '#4fc3f7' },
-  'llm-composite-integration-workshop': { light: '#512da8', dark: '#b39ddb' },
   'llm-application-backend': { light: '#00695c', dark: '#80cbc4' },
   'domain-model-adaptation': { light: '#5d4037', dark: '#bcaaa4' },
   'llm-serving-for-applications': { light: '#455a64', dark: '#90a4ae' },
   'observability-reliability-ops': { light: '#37474f', dark: '#b0bec5' },
   'security-compliance-engineering': { light: '#c62828', dark: '#ef9a9a' },
+  'llamaindex-rag-engineering': { light: '#0d47a1', dark: '#42a5f5' },
+  'rag-system-py': { light: '#1565c0', dark: '#64b5f6' },
+  'rag-system-java': { light: '#1b5e20', dark: '#81c784' },
+  'agent-orchestration-java': { light: '#2e7d32', dark: '#a5d6a7' },
+  'ai-dev-toolchain': { light: '#00838f', dark: '#4dd0e1' },
   'enterprise-llm-solution-delivery': { light: '#1a237e', dark: '#7986cb' },
-  'scenario-enterprise-rag-kb': { light: '#e65100', dark: '#ffb74d' },
-  'scenario-enterprise-customer-service': { light: '#ad1457', dark: '#f48fb1' },
-  'scenario-enterprise-agent-automation': { light: '#c62828', dark: '#ef9a9a' },
-  'scenario-enterprise-code-assistant': { light: '#00695c', dark: '#80cbc4' },
-  'scenario-enterprise-content-studio': { light: '#6a1b9a', dark: '#ce93d8' },
+  'scenario-py-rag-kb': { light: '#e65100', dark: '#ffb74d' },
+  'scenario-java-rag-kb': { light: '#bf360c', dark: '#ff8a65' },
+  'scenario-py-customer-service': { light: '#ad1457', dark: '#f48fb1' },
+  'scenario-java-customer-service': { light: '#880e4f', dark: '#f06292' },
+  'scenario-py-agent-automation': { light: '#c62828', dark: '#ef9a9a' },
+  'scenario-java-agent-automation': { light: '#b71c1c', dark: '#e57373' },
+  'scenario-py-code-assistant': { light: '#00695c', dark: '#80cbc4' },
+  'scenario-java-code-assistant': { light: '#004d40', dark: '#4db6ac' },
+  'scenario-py-content-studio': { light: '#6a1b9a', dark: '#ce93d8' },
+  'scenario-java-content-studio': { light: '#4a148c', dark: '#ba68c8' },
 };
 
 const summaries = {
@@ -152,7 +161,7 @@ const summaries = {
   'llm-evaluation-quality':
     'RAGAS、人工评测、A/B、坏例归因、用户反馈闭环。',
   'rag-system-engineering':
-    'RAG 全链路双栈实现；含 S1 知识库与 S4 代码库 RAG 面试场景。',
+    'RAG 全链路双栈概念；含 S1 知识库与 S4 代码库 RAG',
   'retrieval-vector-platform':
     'Milvus/ES 混合检索、Rerank、索引调优。',
   'spring-ai-alibaba-engineering':
@@ -163,10 +172,8 @@ const summaries = {
     'LangGraph、多 Agent、工具调用与生产级 Agent。',
   'multimodel-routing-multimodal':
     '多模型路由、Fallback、图文多模态 RAG。',
-  'llm-composite-integration-workshop':
-    'CorpAssist 双栈联调：Spring 治理面 + Python AI 能力面。',
   'llm-application-backend':
-    '网关、SSE、限流、多租户、MQ；Spring Cloud + FastAPI。',
+    'Spring Cloud 网关、SSE、限流、多租户、MQ。',
   'domain-model-adaptation':
     'SFT/LoRA 数据与流水线；DashScope 定制接入。',
   'llm-serving-for-applications':
@@ -175,18 +182,38 @@ const summaries = {
     'OTel/Micrometer、告警、灰度、Token 成本、故障演练。',
   'security-compliance-engineering':
     '内容安全、注入防护、脱敏、工具权限、审计合规。',
+  'llamaindex-rag-engineering':
+    '掌握 LlamaIndex 核心抽象、索引类型与高级 RAG 管线，在生产环境中部署多模态索引',
+  'rag-system-py':
+    '使用 LangChain 与 LlamaIndex 双框架实现 RAG 系统，含 GraphRAG 实操与 Grounding 工程',
+  'rag-system-java':
+    '使用 Spring AI 实现 RAG Pipeline，VectorStore 实战，多知识库路由与企业级部署',
+  'agent-orchestration-java':
+    '基于 Spring AI Alibaba 实现 ReAct Agent、Graph 工作流、多 Agent 编排与 MCP 集成',
+  'ai-dev-toolchain':
+    '掌握 Cursor/Copilot/Claude Code 等 AI 编码工具，构建 Prompt 驱动的开发工作流',
   'enterprise-llm-solution-delivery':
     '双栈方案、PoC、验收与 ToB 交付收官。',
-  'scenario-enterprise-rag-kb':
-    'CorpAssist 知识库端到端落地（S1）；双栈 + 评测 + 面试答辩。',
-  'scenario-enterprise-customer-service':
-    'CorpAssist 智能客服端到端落地（S2）；意图/工具/转人工。',
-  'scenario-enterprise-agent-automation':
-    'CorpAssist 办公 Agent 端到端落地（S3）；LangGraph + SAA。',
-  'scenario-enterprise-code-assistant':
-    'CorpAssist 代码助手端到端落地（S4）；代码 RAG + 延迟优化。',
-  'scenario-enterprise-content-studio':
-    'CorpAssist 内容工坊端到端落地（S5）；模板/审核/个性化。',
+  'scenario-py-rag-kb':
+    '[Python] 企业 RAG 知识库问答系统设计与实现，含文档管线、混合检索与生产化交付',
+  'scenario-java-rag-kb':
+    '[Java] 企业 RAG 知识库问答系统设计与实现，基于 Spring AI 的全链路实现',
+  'scenario-py-customer-service':
+    '[Python] 智能客服系统设计，含意图路由、多轮对话、工具调用与人工转接',
+  'scenario-java-customer-service':
+    '[Java] 智能客服系统设计，基于 Spring AI 的对话引擎与降级策略',
+  'scenario-py-agent-automation':
+    '[Python] Agent 任务自动化系统，LangGraph 工作流 + 多工具协作 + 生产可靠性',
+  'scenario-java-agent-automation':
+    '[Java] Agent 任务自动化系统，SAA Graph + 分布式 Agent + 容灾降级',
+  'scenario-py-code-assistant':
+    '[Python] 代码助手系统，代码库 RAG + FIM + 延迟优化 + IDE 集成',
+  'scenario-java-code-assistant':
+    '[Java] 代码助手系统，Spring AI 代码检索 + 安全检测 + 效能度量',
+  'scenario-py-content-studio':
+    '[Python] 内容生成工坊，风格控制 + 模板引擎 + 审核流水线 + 个性化',
+  'scenario-java-content-studio':
+    '[Java] 内容生成工坊，Spring 编排 + 批量生成 + 合规审核 + A/B 实验',
 };
 
 const prerequisites = {
@@ -194,44 +221,71 @@ const prerequisites = {
   'python-engineering-for-llm': ['《大模型应用基础》'],
   'spring-ai-engineering': ['《大模型应用基础》', 'Spring Boot 3 + 微服务经验'],
   'production-prompt-engineering': ['《大模型应用基础》', '双栈基座课进行中'],
+  'security-compliance-engineering': ['《生产级 Prompt》', '可与可观测课并行'],
   'context-memory-engineering': ['《生产级 Prompt 与对话工程》', '双栈基座课进行中'],
-  'llm-evaluation-quality': ['《生产级 Prompt 与对话工程》'],
   'rag-system-engineering': ['《生产级 Prompt》', '双栈基座 basics 完成'],
+  'knowledge-lifecycle-governance': ['《RAG 双栈主课》basics'],
+  'llm-evaluation-quality': ['《生产级 Prompt 与对话工程》'],
+  'multimodel-routing-multimodal': ['《RAG 双栈主课》practice', '《Spring AI 工程化》advanced'],
   'retrieval-vector-platform': ['《RAG 双栈主课》basics'],
   'spring-ai-alibaba-engineering': ['《Spring AI 工程化》practice'],
-  'knowledge-lifecycle-governance': ['《RAG 双栈主课》basics'],
   'agent-orchestration-engineering': ['《RAG 双栈主课》', '《Spring AI Alibaba》basics'],
-  'multimodel-routing-multimodal': ['《RAG 双栈主课》practice', '《Spring AI 工程化》advanced'],
-  'llm-composite-integration-workshop': ['《RAG》practice', '《SAA》与《Agent》basics'],
-  'llm-application-backend': ['《双栈集成实战》basics'],
-  'domain-model-adaptation': ['《双栈集成实战》'],
-  'llm-serving-for-applications': ['《应用后端治理》'],
-  'observability-reliability-ops': ['阶段三汇合课进行中'],
-  'security-compliance-engineering': ['《生产级 Prompt》', '可与可观测课并行'],
+  'llamaindex-rag-engineering': ['《Python 工程化》basics', '《RAG 双栈主课》basics'],
+  'rag-system-py': ['《RAG 双栈主课》basics', '《Python 工程化》practice'],
+  'rag-system-java': ['《RAG 双栈主课》basics', '《Spring AI 工程化》practice'],
+  'agent-orchestration-java': ['《Spring AI Alibaba》practice', '《RAG 双栈主课》basics'],
+  'ai-dev-toolchain': ['《Python 工程化》basics'],
+  'llm-application-backend': ['《Spring AI 工程化》practice'],
+  'domain-model-adaptation': ['阶段四课程进行中'],
+  'llm-serving-for-applications': ['阶段四课程进行中'],
+  'observability-reliability-ops': ['阶段四课程进行中'],
   'enterprise-llm-solution-delivery': [
-    '完成 layer-1：至少 1 门场景课（必修 S1 + 选修 ≥1）',
-    '完成 layer-2：llm-composite-integration-workshop',
-    'security-compliance-engineering basics（场景课前）',
+    '至少完成 1 门场景课',
+    '完成 stage-4 与 stage-5 核心课',
+    'security-compliance-engineering basics',
   ],
-  'scenario-enterprise-rag-kb': [
+  'scenario-py-rag-kb': [
     '《RAG 双栈主课》practice',
     '《向量检索平台》basics',
   ],
-  'scenario-enterprise-customer-service': [
+  'scenario-java-rag-kb': [
+    '《RAG 双栈主课》practice',
+    '《Spring AI 工程化》practice',
+  ],
+  'scenario-py-customer-service': [
     '《上下文记忆》practice',
     '《Agent 编排》basics',
     '《生产级 Prompt》',
     'security-compliance-engineering basics',
   ],
-  'scenario-enterprise-agent-automation': [
+  'scenario-java-customer-service': [
+    '《上下文记忆》practice',
+    '《Agent 编排》basics',
+    '《生产级 Prompt》',
+    'security-compliance-engineering basics',
+  ],
+  'scenario-py-agent-automation': [
     '《Agent 编排》practice',
     '《Spring AI Alibaba》practice',
   ],
-  'scenario-enterprise-code-assistant': [
+  'scenario-java-agent-automation': [
+    '《Agent 编排》practice',
+    '《Spring AI Alibaba》practice',
+  ],
+  'scenario-py-code-assistant': [
     '《RAG 双栈主课》practice',
     '《上下文记忆》basics',
   ],
-  'scenario-enterprise-content-studio': [
+  'scenario-java-code-assistant': [
+    '《RAG 双栈主课》practice',
+    '《上下文记忆》basics',
+  ],
+  'scenario-py-content-studio': [
+    '《生产级 Prompt》practice',
+    '《多模型与多模态》basics',
+    'security-compliance-engineering basics',
+  ],
+  'scenario-java-content-studio': [
     '《生产级 Prompt》practice',
     '《多模型与多模态》basics',
     'security-compliance-engineering basics',
@@ -243,18 +297,22 @@ const defaultLearningPath = {
   mode: 'dual-track',
   goal: '掌握 Python 与 Spring AI 两套工程体系，能在同一业务场景下实现、联调与交付。',
   trackLegend: [
-    { id: 'shared', label: '共用轨' },
+    { id: 'shared', label: '共享能力课' },
     { id: 'python', label: 'Python 轨' },
-    { id: 'java', label: 'Spring AI 轨' },
-    { id: 'bridge', label: '汇合轨' },
-    { id: 'scenario', label: '场景落地轨' },
+    { id: 'java', label: 'Java 轨' },
+    { id: 'scenario', label: '场景落地课' },
   ],
   stages: [],
   completionRule: {
-    requiredTracks: ['python', 'java'],
+    requiredTracks: 'one',
     requiredShared: 'all',
-    requiredBridge: 'all',
-    requiredScenario: 'all',
+    requiredScenario: {
+      mandatory: [],
+      electiveMin: 1,
+      electiveFrom: [],
+    },
+    securityBasicsBeforeScenario: true,
+    capstoneLayersRequired: ['layer-1', 'layer-2', 'layer-3'],
   },
 };
 
@@ -291,31 +349,47 @@ function buildLearningPath(spec) {
   };
 }
 
+const TRACK_ORDER = {
+  shared: 0,
+  python: 1,
+  java: 2,
+  scenario: 3,
+};
+
 const trackOrder = {
   'llm-application-fundamentals': 1,
   'python-engineering-for-llm': 2,
+  'ai-dev-toolchain': 2,
   'spring-ai-engineering': 2,
+  'spring-ai-alibaba-engineering': 2,
   'production-prompt-engineering': 3,
-  'context-memory-engineering': 4,
+  'security-compliance-engineering': 3,
+  'context-memory-engineering': 3,
+  'rag-system-engineering': 4,
+  'knowledge-lifecycle-governance': 4,
+  'rag-system-py': 4,
+  'llamaindex-rag-engineering': 4,
+  'retrieval-vector-platform': 4,
+  'rag-system-java': 4,
+  'llm-application-backend': 4,
   'llm-evaluation-quality': 5,
-  'rag-system-engineering': 6,
-  'retrieval-vector-platform': 7,
-  'spring-ai-alibaba-engineering': 7,
-  'knowledge-lifecycle-governance': 8,
-  'agent-orchestration-engineering': 9,
-  'multimodel-routing-multimodal': 10,
-  'llm-composite-integration-workshop': 11,
-  'llm-application-backend': 12,
-  'domain-model-adaptation': 13,
-  'llm-serving-for-applications': 14,
-  'observability-reliability-ops': 15,
-  'security-compliance-engineering': 15,
-  'scenario-enterprise-rag-kb': 15,
-  'scenario-enterprise-customer-service': 15,
-  'scenario-enterprise-agent-automation': 15,
-  'scenario-enterprise-code-assistant': 15,
-  'scenario-enterprise-content-studio': 15,
-  'enterprise-llm-solution-delivery': 16,
+  'multimodel-routing-multimodal': 5,
+  'agent-orchestration-engineering': 5,
+  'agent-orchestration-java': 5,
+  'domain-model-adaptation': 6,
+  'llm-serving-for-applications': 6,
+  'observability-reliability-ops': 6,
+  'scenario-py-rag-kb': 7,
+  'scenario-java-rag-kb': 7,
+  'scenario-py-customer-service': 7,
+  'scenario-java-customer-service': 7,
+  'scenario-py-agent-automation': 7,
+  'scenario-java-agent-automation': 7,
+  'scenario-py-code-assistant': 7,
+  'scenario-java-code-assistant': 7,
+  'scenario-py-content-studio': 7,
+  'scenario-java-content-studio': 7,
+  'enterprise-llm-solution-delivery': 8,
 };
 
 function chapters(c) {
@@ -323,11 +397,10 @@ function chapters(c) {
 }
 
 const TRACK_LABELS = {
-  shared: '共用轨',
+  shared: '共享能力课',
   python: 'Python 轨',
-  java: 'Spring AI 轨',
-  bridge: '汇合轨',
-  scenario: '场景落地',
+  java: 'Java 轨',
+  scenario: '场景落地课',
 };
 
 function buildCurriculumGlossary(spec) {
@@ -438,7 +511,13 @@ function enrichCourse(slug, c, spec, scenarioMetaBySlug) {
 const scenarioMetaBySlug = buildScenarioMeta(specFinal);
 
 const courses = Object.keys(specFinal.courses)
-  .sort((a, b) => (trackOrder[a] ?? 99) - (trackOrder[b] ?? 99))
+  .sort((a, b) => {
+    const trackA = specFinal.courses[a]?.track ?? 'shared';
+    const trackB = specFinal.courses[b]?.track ?? 'shared';
+    const trackDiff = (TRACK_ORDER[trackA] ?? 99) - (TRACK_ORDER[trackB] ?? 99);
+    if (trackDiff !== 0) return trackDiff;
+    return (trackOrder[a] ?? 99) - (trackOrder[b] ?? 99);
+  })
   .map((slug) => enrichCourse(slug, specFinal.courses[slug], specFinal, scenarioMetaBySlug));
 
 const catalog = {
