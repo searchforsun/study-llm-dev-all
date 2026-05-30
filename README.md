@@ -23,12 +23,12 @@ npx --yes serve .
 
 | 亮点 | 说明 |
 |------|------|
-| **24 门课 · 337 章** | 共用轨 + Python 轨 + Spring AI 轨 + 汇合轨 + 场景落地轨，大纲见 [`courses/outline-specs.json`](courses/outline-specs.json) |
+| **33 门课 · ~450 章** | 共用轨 + Python 轨 + Spring AI 轨 + 汇合轨 + 场景落地轨（每场景 Py+Java 双版本），大纲见 [`courses/outline-specs.json`](courses/outline-specs.json) |
 | **一条业务线讲到底** | 全系列围绕企业智能助手 **CorpAssist**（制度问答、客服、Agent 自动化、代码辅助、内容工坊） |
-| **面试 TOP5 直达** | S1～S5 各对应一门 `scenario-enterprise-*` 场景课，与能力课路线图对齐 |
+| **面试 TOP5 直达** | S1～S5 各对应 `scenario-py-*` / `scenario-java-*` 双版本场景课，与能力课路线图对齐 |
 | **双栈可交付** | Python 快速验证 RAG / 评测；Spring AI 承接 BFF、网关、治理与企业集成 |
 | **应用工程视角** | 聚焦编排、数据、评测、合规与可观测——**不**讲预训练、CUDA 内核、千卡训练 |
-| **37 项能力对标 JD** | 能力矩阵与招聘关键词见 [`courses/REFERENCE.md`](courses/REFERENCE.md) |
+| **40 项能力对标 JD** | 能力矩阵与招聘关键词见 [`courses/REFERENCE.md`](courses/REFERENCE.md) |
 
 ### 课程站内置能力
 
@@ -45,7 +45,7 @@ npx --yes serve .
 | 状态 | 课程 |
 |------|------|
 | **已发布（15/15 章）** | [`llm-application-fundamentals`](courses/llm-application-fundamentals/) — 大模型应用基础：Token、架构拼图、双栈首次调用、多模态/国产化、系统设计、毕业路线图 |
-| **大纲就绪，正文生成中** | 其余 23 门课（门户可见，章节陆续开放） |
+| **大纲就绪，正文生成中** | 其余 32 门课（门户可见，章节陆续开放） — 包括新增课程：`llamaindex-rag-engineering`、`agent-orchestration-java`、`ai-dev-toolchain`、`rag-system-py`、`rag-system-java`、`scenario-py-*` 场景 5 门、`scenario-java-*` 场景 5 门 |
 
 建议路径：**先修完共用轨第一课** → 并行双栈 → **阶段二B 安全 basics** → 场景 **必修 S1 + 选修 1 门** → 三层毕业（见 [`courses/REFERENCE.md`](courses/REFERENCE.md)）。
 
@@ -54,35 +54,45 @@ npx --yes serve .
 ## 学习路径一览
 
 ```mermaid
-flowchart LR
-  subgraph s1["阶段一 · 认知与双栈基座"]
-    FUND[llm-application-fundamentals]
-    PY[python-engineering-for-llm]
-    SA[spring-ai-engineering]
+flowchart TB
+  subgraph s1["阶段一 · 认知基座"]
+    FUND[大模型应用基础<br/>10章·共享]
   end
-  subgraph s2["阶段二 · 交互与 RAG"]
-    PE[production-prompt-engineering]
-    RAG[rag-system-engineering]
-    EVAL[llm-evaluation-quality]
+  subgraph s2["阶段二 · 工程基座"]
+    PY[Python 工程化<br/>+ AI 工具链]
+    SA[Spring AI 工程化<br/>+ SAA 工程体系]
   end
-  subgraph s3b["阶段三B · 五大场景落地"]
-    S1[scenario-enterprise-rag-kb]
-    S2[scenario-enterprise-customer-service]
-    S3[scenario-enterprise-agent-automation]
+  subgraph s3["阶段三 · 核心能力"]
+    PE[Prompt 工程]
+    SEC[安全合规]
+    CTX[上下文记忆]
   end
-  subgraph s45["阶段四～五 · 生产化与交付"]
-    OPS[observability-reliability-ops]
-    DEL[enterprise-llm-solution-delivery]
+  subgraph s4["阶段四 · RAG 工程"]
+    RAGPY[Python: RAG+LlamaIndex+向量]
+    RAGJV[Java: RAG+后端治理]
   end
-  FUND --> PY
-  FUND --> SA
-  FUND --> PE
-  PE --> RAG
-  RAG --> S1
-  SA --> S2
-  PY --> S3
-  S1 --> OPS
-  S2 --> DEL
+  subgraph s5["阶段五 · 评测与 Agent"]
+    EVAL[评测质量]
+    ROUTE[多模型路由]
+    AGPY[Python: Agent编排]
+    AGJV[Java: Agent编排]
+  end
+  subgraph s6["阶段六 · 生产化"]
+    PROD[领域适配+推理服务+可观测]
+  end
+  subgraph s7["阶段七 · 场景落地"]
+    SCENES[必修S1 + 选修≥1<br/>各5门Py版+Java版]
+  end
+  subgraph s8["阶段八 · 毕业交付"]
+    DEL[企业解决方案交付]
+  end
+  FUND --> PY & SA
+  PY & SA --> PE & SEC & CTX
+  PE & SEC & CTX --> RAGPY & RAGJV
+  RAGPY & RAGJV --> EVAL & ROUTE & AGPY & AGJV
+  EVAL & ROUTE & AGPY & AGJV --> PROD
+  PROD --> SCENES
+  SCENES --> DEL
 ```
 
 更完整的阶段表与并行关系见 [**课程中心说明**](courses/README.md)。
@@ -104,12 +114,15 @@ study-profile-0/
 ├── README.md                 # 本文件
 └── courses/
     ├── index.html            # 课程中心（入口页）
-    ├── courses.json          # 门户目录（24 门课元数据）
+    ├── courses.json          # 门户目录（33 门课元数据）
     ├── outline-specs.json    # 大纲与场景规划真源
-    ├── REFERENCE.md          # 37 能力 + 面试 TOP5 速查
+    ├── REFERENCE.md          # 40 项能力 + 面试 TOP5 速查
     ├── README.md             # 启动方式与维护约定
     ├── scripts/sync.mjs      # 大纲 → 门户目录同步
-    └── <slug>/               # 单门课（chapters、测验、demos）
+    ├── <shared-slug>/        # 共享能力课（12 门）
+    ├── <python-slug>/        # Python 轨（6 门）
+    ├── <java-slug>/          # Java 轨（5 门）
+    └── scenario-{py,java}-*/ # 场景落地课（10 门：5 场景 × 2 轨）
 ```
 
 ---
