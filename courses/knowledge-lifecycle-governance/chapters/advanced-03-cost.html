@@ -1,0 +1,273 @@
+<section id="ch-advanced-03-cost" class="chapter" data-chapter="advanced-03-cost">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>存储与索引成本</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-cost" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>企业级治理</strong> · 能力：热冷分层、冷归档与 NS3 成本模型下的索引预算</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>KB 体量上来后，账单大头往往在<strong>向量存储、对象存储、embed API、检索 QPS</strong>。CorpAssist 用 Milvus + S3 双栈，若把所有历史 PDF 都保持热索引，<span class="term" data-term-id="index-cost" tabindex="0">index cost</span> 会线性爆炸。本章用 <span class="term" data-term-id="cost-ns3" tabindex="0">cost ns3</span>（Node-Storage-Service 三分法）帮你和 FinOps 对齐语言：哪些该热、哪些该冷、归档后如何按需召回。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 <span class="term" data-term-id="hot-cold-tier" tabindex="0">hot cold tier</span>：热库在线检索、温库降配、冷库仅对象存储</li>
+          <li>估算向量维数 × chunk 数 × 副本数的 <span class="term" data-term-id="storage-budget" tabindex="0">storage budget</span></li>
+          <li>制定 <span class="term" data-term-id="cold-archive" tabindex="0">cold archive</span> 与按需 re-index 流程</li>
+          <li>用 <span class="term" data-term-id="embed-cache" tabindex="0">embed cache</span> 与 <span class="term" data-term-id="compress-archive" tabindex="0">compress archive</span> 降低重复 embed 成本</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>NS3 分开看</strong>：Node（Milvus 计算/内存）、Storage（磁盘/S3）、Service（embed API、网关）各占一块预算。</li>
+          <li><strong>分层是治理动作</strong>：<span class="term" data-term-id="tier-storage" tabindex="0">tier storage</span> 要与留存 policy、访问频率联动，不是一次性搬家。</li>
+          <li><strong>归档 ≠ 删除</strong>：冷库 doc 可脱离向量索引，但 metadata 与恢复路径要保留（合规见 <a href="#ch-advanced-02-compliance">合规保留与删除</a>）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>分层</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 年度 FinOps 复盘（60 秒）</span>
+        Milvus 集群内存占用 78%，S3 向量快照 + 原文 420TB。过去 12 个月检索日志显示：<strong>80% query 命中近 90 天文档</strong>，2019 年制度 PDF 几乎零命中却占 35% 存储。CTO 要求在不降召回的前提下，把 <span class="term" data-term-id="index-cost" tabindex="0">index cost</span> 降 30%。
+      </aside>
+
+      <p><span class="term" data-term-id="tier-storage" tabindex="0">tier storage</span> 把 KB 资产按访问频率与业务关键度拆层：</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>数据范围</th><th>索引形态</th><th>检索 SLA</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Hot</strong></td>
+            <td>近 90 天 + 高频制度</td>
+            <td>Milvus 全量向量 + 内存友好索引（HNSW/IVF）</td>
+            <td>&lt; 200ms p95</td>
+          </tr>
+          <tr>
+            <td><strong>Warm</strong></td>
+            <td>90 天～2 年</td>
+            <td>向量在 Milvus 磁盘型 collection；原文 S3 Standard</td>
+            <td>&lt; 500ms p95</td>
+          </tr>
+          <tr>
+            <td><strong>Cold</strong></td>
+            <td>低命中历史 / 已 supersede</td>
+            <td>仅 S3 + metadata；无在线向量</td>
+            <td>按需 re-index，分钟级</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>NS3 成本分解（示意）</h4>
+      <p><span class="term" data-term-id="cost-ns3" tabindex="0">cost ns3</span> 把账单拆成三块，便于和云厂商账单对照：</p>
+      <ul>
+        <li><strong>Node</strong> — Milvus query node / data node  vCPU、RAM（HNSW 内存随向量数线性涨）。</li>
+        <li><strong>Storage</strong> — 向量段文件、S3 原文、快照；<span class="term" data-term-id="compress-archive" tabindex="0">compress archive</span> 对原文 gzip/zstd。</li>
+        <li><strong>Service</strong> — Embedding API 按 token 计费、跨 AZ 流量、Spring 检索网关实例。</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># NS3 粗算：向量存储 GB ≈ chunks * dim * 4 bytes * replica
+def vector_storage_gb(chunks: int, dim: int = 1024, replica: int = 2) -> float:
+    return chunks * dim * 4 * replica / (1024 ** 3)
+
+# 例：5000 万 chunk → 约 390 GB（不含 HNSW 图额外开销 ~1.5x）
+budget = {
+    "node_ram_gb": vector_storage_gb(50_000_000) * 1.5,
+    "storage_s3_tb": 420,
+    "service_embed_usd_month": 12_000,
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>热温冷分层与访问路径</h5>
+        <pre class="mermaid">flowchart TB
+  Q[用户 Query] --> R[Router]
+  R --> H[Hot Milvus]
+  R --> W[Warm Milvus]
+  R --> C{Cold 命中?}
+  C -->|metadata 匹配| RI[按需 Re-index Job]
+  RI --> H
+  C -->|无| Empty[空答 + 运营告警]
+  H --> Merge[合并结果]
+  W --> Merge</pre>
+        <p class="diagram-caption">Cold 层不在线检索；命中 metadata 触发异步 re-index 后再查 Hot（详见 <a href="#ch-practice-01-incremental">增量更新与重建</a>）。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：把 Warm 全降到 Cold 会怎样影响 empty-answer？</summary>
+        <p>历史制度类 query 会 zero-hit 上升；应结合 <a href="#ch-practice-04-obs-kb">知识库可观测</a> 的 top_query 与 recall_gap，只对低命中 doc 降温，而非一刀切。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>归档</h3>
+      <p><span class="term" data-term-id="cold-archive" tabindex="0">cold archive</span> 是把文档从在线向量索引「退场」到低成本存储，同时保留<strong>可恢复性</strong>与<strong>合规留存</strong>。</p>
+
+      <h4>归档触发条件</h4>
+      <ul>
+        <li>检索命中次数 &lt; 阈值 且 doc_age &gt; N 天</li>
+        <li>新版本 <code>superseded_by</code> 已发布 30 天</li>
+        <li>FinOps 预算告警触发人工归档批次</li>
+      </ul>
+
+      <h4>归档作业步骤</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 1. 标记 tier=cold，停止增量 embed
+# 2. Milvus 删除向量（保留 collection schema）
+# 3. S3 转 Glacier / Intelligent-Tiering + compress
+# 4. metadata 保留 restore_uri、content_hash、retention_expires_at</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>归档时删掉 metadata，无法按需 re-index</li>
+            <li>每次 query 冷数据都同步 re-embed（成本爆炸）</li>
+            <li>无 <span class="term" data-term-id="embed-cache" tabindex="0">embed cache</span>，重建索引重复调用 API</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>归档前导出 chunk 快照 + embedding 至 S3（可选，换模型时仍要 re-embed）</li>
+            <li>restore 走审批 + 异步 job，完成后 alias 切回（蓝绿）</li>
+            <li>embed cache key = hash(model_version, chunk_text)</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>成本优化决策表</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>痛点</th><th>NS3 项</th><th>治理手段</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Milvus 内存打满</td>
+            <td>Node</td>
+            <td>降温 doc、降 replica、IVF 替代 HNSW（温层）</td>
+          </tr>
+          <tr>
+            <td>S3 账单高</td>
+            <td>Storage</td>
+            <td>Intelligent-Tiering、<span class="term" data-term-id="compress-archive" tabindex="0">compress archive</span></td>
+          </tr>
+          <tr>
+            <td>重建索引 API 贵</td>
+            <td>Service</td>
+            <td>embed cache、增量 <span class="term" data-term-id="re-embed" tabindex="0">re embed</span> 仅脏 chunk</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只砍 Storage 不砍 Node</strong> — 向量仍在 Milvus 时 Node 内存不会降。</li>
+          <li><strong>归档违反 legal hold</strong> — hold 中的 doc 禁止转 Cold 删除向量。</li>
+          <li><strong>无 storage budget 仪表盘</strong> — 应每月 review chunks × dim × tier 分布。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>分层</strong>：Hot/Warm/Cold 与检索 SLA 绑定；NS3 三分法对齐 FinOps 语言。</li>
+        <li><strong>归档</strong>：向量退场 + metadata 保留 + 按需 re-index；embed cache 与合规留存并行考虑。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="klg_advanced03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="ns3" /> 能解释 NS3 各对应哪些云账单项</label></li>
+          <li><label><input type="checkbox" data-id="tier" /> 能填 Hot/Warm/Cold 三层差异表</label></li>
+          <li><label><input type="checkbox" data-id="archive" /> 能口述归档四步 bash 注释流程</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>5000 万 chunk、1024 维、双副本，向量纯存储大约多少 GB？HNSW 还要乘多少系数？</li>
+              <li>业务要求历史制度可查，但 FinOps 要降本，你如何设计 Warm→Cold 策略？</li>
+              <li>归档后用户 query 命中 cold metadata，同步 re-index 还是异步？权衡是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-advanced-04-interview">面试：KB 治理案例</a> 串讲 ACL 泄露、re-embed 与 stale 排障。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://milvus.io/docs/storage_overview.md" target="_blank" rel="noopener">Milvus Storage — 段文件与内存</a></li>
+      <li><a href="https://aws.amazon.com/s3/storage-classes/" target="_blank" rel="noopener">Amazon S3 Storage Classes — 分层定价</a></li>
+      <li><a href="https://milvus.io/docs/index.md" target="_blank" rel="noopener">Milvus Index — HNSW vs IVF 资源 trade-off</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 NS3 模型完成<strong>向量存储粗算</strong>、<strong>三层分层表</strong>与<strong>归档 SOP 四步</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>用正文 Python 公式计算 2000 万 chunk、768 维、replica=2 的 vector_storage_gb（手算或脚本）。</li>
+      <li>复制 Hot/Warm/Cold 表，为「已 supersede 的制度 PDF」指定应处层级与检索 SLA。</li>
+      <li>对照归档 bash 注释，写出 restore 时需要的 3 个 metadata 字段。</li>
+      <li>（可选）完成 <code>demos/advanced-03-cost-lab/tier-plan.md</code> 填空。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（权衡）FinOps 建议把所有 &gt;1 年 doc 立即删向量转 Glacier，运营担心 empty-answer 上升。你会如何折中？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>先迁 Warm（磁盘型索引）观察 recall_gap；仅对 zero-hit &gt;90 天且已 supersede 的 doc 转 Cold。配合 top_query 报表验证；legal hold 与留存 policy 优先于降温。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：存储与索引成本</h4>
+      <p><code>demos/advanced-03-cost-lab/</code> — 填写 tier-plan.md 的 NS3 预算行与归档触发条件；验收：Node/Storage/Service 各至少一条可量化指标。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-advanced-02-compliance">合规保留与删除</a>：归档与 purge 边界</li>
+      <li><a href="#ch-practice-04-obs-kb">知识库可观测</a>：用 zero-hit 验证降温策略</li>
+    </ul>
+  </div>
+</section>

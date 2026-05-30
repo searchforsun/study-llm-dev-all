@@ -1,0 +1,435 @@
+<section id="ch-basics-03-session" class="chapter" data-chapter="basics-03-session">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>会话与状态</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-session" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>LLM 网关与流式</strong> · 能力：用 Redis 管理多轮对话状态、粘性与 TTL</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>S2 智能客服的多轮上下文不能全靠 LLM「猜」。<span class="term" data-term-id="dialog-state" tabindex="0">dialog state</span>（意图、槽位、订单号）须存 <span class="term" data-term-id="redis-session" tabindex="0">redis session</span>，并与 <span class="term" data-term-id="conversation-id" tabindex="0">conversation id</span> 绑定——纯 LLM 管状态是 NS2 明确反对的生产坑；SSE 断线重连（<a href="#ch-basics-02-sse">SSE 流式端到端</a>）也依赖稳定的 sessionId。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 <span class="term" data-term-id="session-key" tabindex="0">session key</span> 命名：<code>tenant:user:conversation</code>，避免跨租户泄漏</li>
+          <li>在水平扩展下选择 <span class="term" data-term-id="session-stickiness" tabindex="0">session stickiness</span> 或无状态 + 集中存储</li>
+          <li>配置 <span class="term" data-term-id="ttl-policy" tabindex="0">ttl policy</span>：idle 滑动续期与 <span class="term" data-term-id="session-expire" tabindex="0">session expire</span> 绝对上限</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>会话状态 ≠ 模型上下文</strong>：Redis 存结构化 DST；Prompt 只注入必要摘要，raw history 走 <span class="term" data-term-id="thread-store" tabindex="0">thread store</span> 分层。</li>
+          <li><strong>优先无状态服务 + Redis</strong>：比强粘性更易 HPA；粘性仅在有不可外置的本地 SSE 状态时考虑。</li>
+          <li><strong>TTL 要分场景</strong>：客服 idle 30min 滑动；合规归档用 max TTL；结束会话须归档而非仅 DEL。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Redis</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · 多轮查订单（30 秒）</span>
+        用户：「查订单」→ 助手：「请提供订单号」→ 用户：「SO-1024」。BFF 在 Redis 更新 intent=<code>query_order</code>、slots.orderId=<code>SO-1024</code>，再触发 NS2 工具 <code>lookup_order</code>。下一轮用户改问「改地址」时，intent 切换，槽位重置规则由 DST 状态机定义——不靠模型记忆。
+      </aside>
+
+      <p>CorpAssist 用 Redis Hash 存会话：<strong>结构化</strong> <span class="term" data-term-id="dialog-state" tabindex="0">dialog state</span>，而非整段聊天记录。Key 示例：<code>ca:sess:{tenantId}:{conversationId}</code>；用户维度索引可选 <code>ca:user:sess:{tenantId}:{userId}</code> 存活跃 conversationId 列表。</p>
+
+      <h4>会话 Hash 字段</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>conversationId</code></td><td>string</td><td>对外 <span class="term" data-term-id="conversation-id" tabindex="0">conversation id</span>，SSE/REST 共用</td></tr>
+          <tr><td><code>intent</code></td><td>string</td><td>当前意图：<code>query_order</code> / <code>change_address</code></td></tr>
+          <tr><td><code>slots</code></td><td>JSON</td><td>槽位：orderId、addressId 等</td></tr>
+          <tr><td><code>turnCount</code></td><td>int</td><td>轮次，用于异常检测与限流</td></tr>
+          <tr><td><code>lastActiveAt</code></td><td>ISO8601</td><td>滑动 TTL 依据</td></tr>
+          <tr><td><code>summary</code></td><td>string</td><td>注入 Prompt 的短摘要（非全量 history）</td></tr>
+        </tbody>
+      </table>
+
+      <h4>会话 JSON 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "conversationId": "c-8f2a",
+  "tenantId": "t-acme",
+  "userId": "u-991",
+  "intent": "query_order",
+  "slots": { "orderId": "SO-1024" },
+  "turnCount": 5,
+  "lastActiveAt": "2026-05-30T10:00:00Z",
+  "summary": "用户查询订单 SO-1024 物流状态"
+}</code></pre>
+      </div>
+
+      <h4>BFF 读写 Repository（Java 示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public DialogState load(String tenantId, String conversationId) {
+  String key = "ca:sess:" + tenantId + ":" + conversationId;
+  Map&lt;Object, Object&gt; hash = redis.opsForHash().entries(key);
+  if (hash.isEmpty()) return DialogState.newSession(tenantId, conversationId);
+  return DialogState.fromRedis(hash);
+}
+
+public void save(DialogState state) {
+  String key = "ca:sess:" + state.tenantId() + ":" + state.conversationId();
+  redis.opsForHash().putAll(key, state.toMap());
+  redis.expire(key, idleTimeout);  // 滑动 TTL，见「过期」节
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>会话读写路径</h5>
+        <pre class="mermaid">flowchart LR
+  GW[Gateway]
+  BFF[BFF 实例 N]
+  Redis[(Redis Cluster)]
+  Py[Python AI]
+  GW --> BFF
+  BFF -->|HGETALL session| Redis
+  BFF -->|摘要 + slots| Py
+  Py -->|NLU 补槽建议| BFF
+  BFF -->|HSET 更新 DST| Redis</pre>
+        <p class="diagram-caption">任意 BFF 实例均可读写同一 <span class="term" data-term-id="session-key" tabindex="0">session key</span>；Python 不直接持有会话主权，由 BFF 合并后注入。</p>
+      </div>
+
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Redis List 存全量 raw messages，每轮全量注入 Prompt</li>
+            <li>session key 不含 tenantId，仅靠 conversationId</li>
+            <li>会话只存 JVM 内存，扩缩容丢失</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Hash 存 DST + summary；长 history 进 <span class="term" data-term-id="thread-store" tabindex="0">thread store</span> / 向量检索</li>
+            <li>key 必含 tenantId，Gateway 注入头与 key 交叉校验</li>
+            <li>无状态 BFF + Redis 集中会话</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么 conversationId 不能由客户端随意指定新 UUID 而不校验归属？</summary>
+        <p>否则用户 A 可猜测用户 B 的 conversationId 读取会话。创建会话须绑定 JWT 的 userId/tenantId；读取时校验 key 前缀与 Header 一致。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>粘性</h3>
+      <p>SSE 长连接有时被误认为需要 <span class="term" data-term-id="session-stickiness" tabindex="0">session stickiness</span>（同一连接落在同一 BFF Pod）。CorpAssist 推荐：<strong>会话与 SSE 缓冲外置 Redis</strong>，Gateway 轮询即可，滚动发布时配合 <a href="#ch-basics-02-sse">Last-Event-ID</a> 续传。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>方案</th><th>优点</th><th>缺点</th><th>CorpAssist S2</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Gateway 一致性 Hash / Cookie 粘性</td>
+            <td>Pod 内本地 SSE 状态简单</td>
+            <td>扩缩容连接迁移；热点 Pod</td>
+            <td>不推荐作主方案</td>
+          </tr>
+          <tr>
+            <td>Redis 集中会话 + SSE 缓冲（推荐）</td>
+            <td>实例无状态，HPA 友好</td>
+            <td>Redis 延迟与容量规划</td>
+            <td>默认</td>
+          </tr>
+          <tr>
+            <td>Sticky + Redis 双写</td>
+            <td>过渡兼容遗留本地缓存</td>
+            <td>复杂度最高</td>
+            <td>仅迁移期</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>K8s 滚动发布 vs 无状态 BFF</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant GW as Gateway
+  participant P1 as BFF Pod-1
+  participant P2 as BFF Pod-2
+  participant R as Redis
+  C->>GW: SSE on Pod-1
+  Note over P1: Pod-1 终止
+  C->>GW: 重连 Last-Event-ID
+  GW->>P2: 新 Pod
+  P2->>R: 加载 session + replay buffer
+  P2-->>C: 续传 SSE</pre>
+        <p class="diagram-caption">强粘性在 Pod 终止时必断；外置 Redis + 续传才是 S2 可扩缩路径。</p>
+      </div>
+
+      <h4>Gateway 粘性配置（了解即可，非默认）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># 仅作对比：一致性 Hash 示例，CorpAssist 默认不用
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: stream-sticky
+          uri: lb://corpassist-bff
+          predicates:
+            - Path=/v1/stream/**
+          filters:
+            - name: RequestHash
+              args:
+                hashFunction: ipHash</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="状态存放位置">
+        <input type="radio" name="basics03store" id="basics03-tab-redis" class="learn-tab-input" checked />
+        <input type="radio" name="basics03store" id="basics03-tab-local" class="learn-tab-input" />
+        <label for="basics03-tab-redis">Redis 集中</label>
+        <label for="basics03-tab-local">Pod 本地</label>
+        <div class="learn-tab-panel" id="basics03-panel-redis" role="tabpanel">
+          <p><strong>适用</strong>：多轮 DST、SSE 缓冲、HPA、跨 AZ。</p>
+          <p><strong>代价</strong>：Redis 高可用、key 设计、TTL 策略。</p>
+        </div>
+        <div class="learn-tab-panel" id="basics03-panel-local" role="tabpanel">
+          <p><strong>适用</strong>：单实例 PoC、无 Redis 的本地开发。</p>
+          <p><strong>代价</strong>：无法水平扩展；生产禁用。</p>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：K8s 滚动发布时纯粘性会话会有什么问题？</summary>
+        <p>旧 Pod 终止导致 SSE 断开且本地状态丢失。必须依赖 Last-Event-ID + Redis 会话恢复；否则用户需重新开始对话，体验与 NS2 工具链中断。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>过期</h3>
+      <p><span class="term" data-term-id="session-expire" tabindex="0">session expire</span> 与 <span class="term" data-term-id="ttl-policy" tabindex="0">ttl policy</span> 要在「用户体验」「内存成本」「合规留存」之间折中。S2 客服典型：idle 30min 滑动；max 24h 绝对上限；转人工或结案后归档冷存储再 DEL。</p>
+
+      <h4>TTL 策略对照</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>策略</th><th>行为</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>滑动 idle TTL</strong></td><td>每次用户消息 <code>EXPIRE key 1800</code></td><td>30min 无发言则会话过期</td></tr>
+          <tr><td><strong>绝对 max TTL</strong></td><td>创建时记录 <code>expiresAt</code>，到期强制结束</td><td>24h 后须重新建会话（合规）</td></tr>
+          <tr><td><strong>主动关闭</strong></td><td>转人工 / 问题解决 → 归档 + DEL</td><td>写入 OSS/DB 审计，Redis 删除</td></tr>
+          <tr><td><strong>SSE 缓冲 TTL</strong></td><td>短于会话 TTL</td><td>5–10min（见 SSE 章）</td></tr>
+        </tbody>
+      </table>
+
+      <h4>application 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">corpassist:
+  session:
+    redis-prefix: "ca:sess:"
+    idle-timeout: 30m
+    max-ttl: 24h
+    refresh-on-each-request: true
+    archive-on-close: true
+    archive-bucket: "s3://corpassist-session-archive"</code></pre>
+      </div>
+
+      <h4>滑动续期 vs 仅创建时 TTL：代码对比</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">不推荐 · 仅 SET 一次 TTL</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">redis.opsForHash().putAll(key, state);
+redis.expire(key, Duration.ofMinutes(30)); // 只在创建时</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">推荐 · 每次交互续期</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">redis.opsForHash().putAll(key, state);
+redis.expire(key, idleTimeout);
+if (state.exceedsMaxTtl()) {
+  archiveAndClose(state);
+}</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>会话生命周期</h5>
+        <pre class="mermaid">stateDiagram-v2
+  [*] --> Active: 用户发消息
+  Active --> Active: 滑动 EXPIRE
+  Active --> Idle: 无消息 &gt; idle TTL
+  Idle --> [*]: key 过期
+  Active --> Closed: 转人工/结案
+  Closed --> Archived: 写冷存储
+  Archived --> [*]: DEL Redis</pre>
+      </div>
+
+      <h4>常见问题（FAQ）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>会话过期后用户继续用旧 conversationId 发消息怎么办？</summary>
+          <div class="learn-faq-body">
+            <p>返回 410 Gone 或友好提示「会话已过期」，引导新建 conversation；可选携带脱敏 summary 到新会话。写操作须新 <a href="#ch-basics-04-idempotency">Idempotency-Key</a>。</p>
+          </div>
+        </details>
+        <details>
+          <summary>Redis 会话与 Spring Session 是什么关系？</summary>
+          <div class="learn-faq-body">
+            <p>Spring Session 可复用 Redis 存 HTTP Session；CorpAssist 更常用<strong>自定义 DialogState Repository</strong>，字段贴合 NLU/工具槽位，不必强行塞进 Servlet Session。</p>
+          </div>
+        </details>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>无限 TTL</strong> — Redis 内存膨胀；合规也无法解释数据留存。</li>
+          <li><strong>过期只 DEL 不归档</strong> — 客诉与审计无法回溯。</li>
+          <li><strong>把 LLM 输出当唯一状态</strong> — 工具参数须结构化存储，模型幻觉不能作为订单号来源。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">放在正文与复习之间，便于串起全章再做题。每条对应上文一个小节标题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Redis</strong>：Hash 存结构化 dialog state；key 含 tenantId + conversationId；summary 注入 Prompt，非全量 history。</li>
+        <li><strong>粘性</strong>：优先无状态 BFF + Redis；避免强依赖 Gateway 粘性阻碍 HPA 与滚动发布。</li>
+        <li><strong>过期</strong>：idle 滑动 TTL + max 绝对上限；结案归档后 DEL；与 SSE 缓冲 TTL 分层。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_basics03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="key" /> 能写出 session key 含 tenantId 的原因</label></li>
+          <li><label><input type="checkbox" data-id="dst" /> 能区分 dialog state 与注入 Prompt 的 summary</label></li>
+          <li><label><input type="checkbox" data-id="stick" /> 能对比 Gateway 粘性 vs Redis 集中存储</label></li>
+          <li><label><input type="checkbox" data-id="ttl" /> 能区分 idle 滑动 TTL 与 max 绝对 TTL</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>session key</td><td><code>ca:sess:{tenant}:{conv}</code>，防跨租户</td></tr>
+                <tr><td>dialog state</td><td>intent + slots，不靠 LLM 猜</td></tr>
+                <tr><td>session stickiness</td><td>能不用就不用；Redis 外置优先</td></tr>
+                <tr><td>ttl policy</td><td>idle 滑动 + max 绝对 + 归档</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 CorpAssist 不把完整聊天 List 塞进 Redis 每轮全量注入？</li>
+              <li>滚动发布导致 SSE 断开，会话层要配合哪些机制？</li>
+              <li>多租户场景下 session key 设计错误会导致什么安全事故？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-basics-04-idempotency">幂等与重试</a> 处理弱网重复请求与 MQ 去重。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://redis.io/docs/latest/develop/use/patterns/session-store/" target="_blank" rel="noopener">Redis Session Store Pattern</a></li>
+      <li><a href="https://docs.spring.io/spring-session/reference/" target="_blank" rel="noopener">Spring Session Reference</a></li>
+      <li><a href="https://redis.io/docs/latest/develop/use/patterns/distributed-locks/" target="_blank" rel="noopener">Redis Distributed Locks（并发更新会话时参考）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">编辑 <code>demos/basics-03-session-lab/session-config.yaml</code>，为 S2 客服设定 idle/max TTL 并说明理由（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>为 <code>ca:sess:{tenant}:{conv}</code> 设计 Hash 字段列表（至少 intent、slots、turnCount、summary、lastActiveAt）。</li>
+      <li>在 session-config.yaml 填写 idle-timeout（分钟）与 max-ttl（小时），对照正文说明各适用场景。</li>
+      <li>在「粘性 vs Redis」决策表上标注 CorpAssist 推荐方案并写一句 HPA 理由。</li>
+      <li>写一段「会话过期」时 API 应返回的 HTTP 状态与用户提示文案（410 vs 404 取舍）。</li>
+      <li>（可选）画出 Active → Closed → Archived 状态机与 Redis key 变化。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">找错：「把完整多轮聊天记录都塞进 Redis List，每次全量注入 Prompt；session key 仅用 conversationId」。指出<strong>两条</strong>违反原则的做法。</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>① 违反「会话状态 ≠ 模型上下文」：应 DST + summary/thread store，而非无限 raw history（成本与干扰）。② key 缺 tenantId 可能导致跨租户访问若 conversationId 可猜测或泄漏。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">大促：① 会话 idle TTL 改为 7 天 ② 关闭归档直接 DEL ③ 启用 Gateway IP 粘性替代 Redis ④ 保持 Redis 集中 + 30min idle。哪项<strong>最危险</strong>？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>最危险：②</strong>，审计与客诉无法回溯。<strong>③</strong> 阻碍 HPA 且滚动发布断连。① 浪费 Redis 内存且可能违反留存策略。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：会话与状态</h4>
+      <p>目录：<code>demos/basics-03-session-lab/</code>。<strong>验收</strong>：session-config.yaml 含 idle/max TTL 注释；能口头说明为何不推荐纯 Gateway 粘性。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-idempotency">幂等与重试</a>：写操作幂等与会话过期后的请求</li>
+      <li><a href="#ch-basics-02-sse">SSE 流式端到端</a>：sessionId 与 SSE 缓冲绑定</li>
+      <li><a href="../context-memory-engineering/index.html">上下文与混合记忆工程</a>：长期记忆与 thread store 分层</li>
+    </ul>
+  </div>
+</section>

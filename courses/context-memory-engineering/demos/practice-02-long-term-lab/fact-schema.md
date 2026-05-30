@@ -1,0 +1,3 @@
+- user_id
+- fact_text
+- expires_at

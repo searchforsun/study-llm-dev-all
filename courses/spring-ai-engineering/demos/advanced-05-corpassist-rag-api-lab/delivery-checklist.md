@@ -1,0 +1,5 @@
+- [ ] OpenAPI 已发布
+- [ ] /health 与 /v1/rag/query 200
+- [ ] 响应含 sources 数组
+- [ ] request_id 响应头
+- [ ] 评测集 20 条通过率 ≥ 阈值

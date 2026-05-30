@@ -1,0 +1,374 @@
+<section id="ch-basics-02-ingestion" class="chapter" data-chapter="basics-02-ingestion">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>文档接入与解析</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-ingestion" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>RAG 架构与数据管线</strong> · 能力：处理 PDF/Word/HTML，制定 OCR 与清洗策略，对齐双栈 Reader</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>RAG 效果上限往往卡在「第一公里」：<span class="term" data-term-id="ingestion" tabindex="0">ingestion</span> 把扫描件当纯文本、HTML 把导航栏一起入库，后面分块与检索再强也是垃圾进垃圾出。CorpAssist S1 的制度库混有 PDF、Word 与内网 Wiki HTML，本章建立<strong>格式分流 + 清洗 + meta 抽取</strong>的统一规范。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 PDF/Word/HTML 选择合适 <span class="term" data-term-id="document-reader" tabindex="0">document reader</span> 与 <span class="term" data-term-id="pdf-parser" tabindex="0">pdf parser</span> 路径</li>
+          <li>制定 <span class="term" data-term-id="ocr-strategy" tabindex="0">ocr strategy</span>：何时 OCR、如何评估 <span class="term" data-term-id="scan-quality" tabindex="0">scan quality</span></li>
+          <li>设计 <span class="term" data-term-id="dual-reader" tabindex="0">dual reader</span>：Python 索引 Reader 与 Spring 侧元数据契约一致</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>格式分流</strong>：数字 PDF 走文本层；扫描 PDF 走 OCR；Word 保留标题结构；HTML 先去模板噪声。</li>
+          <li><strong>OCR 是成本开关</strong>：只在文本层为空或质量低于阈值时触发，并记录置信度供人工复核。</li>
+          <li><strong>清洗目标</strong>：去掉页眉页脚、重复水印、乱码字符，保留可检索正文与表格语义。</li>
+          <li><strong>双栈 Reader</strong>：解析在 Python 索引任务完成；Spring 只消费已入库文本与 meta，不在线解析原件。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>PDF/Word/HTML</h3>
+
+      <p>企业知识库常见三类源。接入阶段要回答：<strong>能否直接抽文本？结构信息在哪？ACL 从哪来？</strong></p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>格式</th><th>典型来源</th><th>解析要点</th><th>CorpAssist S1 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>PDF</strong></td>
+            <td>盖章制度、扫描归档</td>
+            <td>区分数字 PDF vs 扫描件；表格页单独处理</td>
+            <td>《员工手册》2024 版 80 页</td>
+          </tr>
+          <tr>
+            <td><strong>Word</strong></td>
+            <td>法务/HR 维护的可编辑稿</td>
+            <td>保留 Heading 1/2 供后续结构分块</td>
+            <td>《差旅报销细则》docx</td>
+          </tr>
+          <tr>
+            <td><strong>HTML</strong></td>
+            <td>Confluence / 内网 Wiki</td>
+            <td><span class="term" data-term-id="html-clean" tabindex="0">html clean</span>：去 nav、script、侧边栏</td>
+            <td>IT 运维知识页</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 批量入库（1 分钟）</span>
+        周一 HR 上传 12 份 PDF（3 份为扫描）、2 份 Word、运维同步 40 篇 Wiki HTML。索引任务需按扩展名路由 Reader，输出统一 schema：<code>{ text, meta }</code>，再进入 <a href="#ch-basics-03-chunking">分块策略</a>。
+      </aside>
+
+      <h4>格式路由：推荐 vs 反例</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>所有 PDF 统一 <code>pdftotext</code>，扫描件得到空串仍入库</li>
+            <li>HTML 用正则粗暴 strip，正文与导航粘连</li>
+            <li>Word 只取 plain text，丢弃标题层级</li>
+            <li>不记录 <code>source</code> / <code>page</code>，引用无法落地</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>PDF 先探测文本层；不足则标记 <code>needs_ocr=true</code></li>
+            <li>HTML 用结构化解析（如 readability / trafilatura 思路）</li>
+            <li>Word 导出段落 + style=Heading*</li>
+            <li>每段文本带 <span class="term" data-term-id="metadata-extract" tabindex="0">metadata extract</span>：source、page、dept</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Reader 输出 schema（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "doc_id": "hr-handbook-2024",
+  "format": "pdf",
+  "pages": [
+    {
+      "page": 3,
+      "text": "第三章 试用期管理…",
+      "meta": { "source": "hr.pdf", "dept": "HR", "heading": "试用期管理" }
+    }
+  ]
+}</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Wiki HTML 页面里「面包屑导航」该不该进向量库？</summary>
+        <p>不该。导航在每页重复出现，会污染 embedding、挤占 TopK。应在 <span class="term" data-term-id="html-clean" tabindex="0">html clean</span> 阶段剔除，只保留 main content 区域正文。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>OCR 策略</h3>
+
+      <p>扫描 PDF、拍照归档、部分盖章件没有可靠文本层，需要 <span class="term" data-term-id="ocr-strategy" tabindex="0">ocr strategy</span>。策略核心：<strong>何时 OCR、用什么引擎、如何验收质量、失败怎么办</strong>。</p>
+
+      <h4>触发条件（决策表）</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>信号</th><th>动作</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>文本层字符数 &lt; 阈值 / 页</td>
+            <td>走 OCR</td>
+            <td>避免空块入库</td>
+          </tr>
+          <tr>
+            <td>OCR 平均置信度 &lt; 0.85</td>
+            <td>标记 <code>review_required</code></td>
+            <td>进入人工或二次引擎</td>
+          </tr>
+          <tr>
+            <td>表格页、双栏排版</td>
+            <td>专用版面分析</td>
+            <td>plain OCR 易乱序</td>
+          </tr>
+          <tr>
+            <td>数字 PDF 文本完整</td>
+            <td>跳过 OCR</td>
+            <td>节省成本与延迟</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>PDF 接入 · 文本层 vs OCR 分支</h5>
+        <pre class="mermaid">flowchart TD
+  PDF[PDF 入库] --> DET{文本层可用?}
+  DET -->|是| TXT[直接抽取文本]
+  DET -->|否| OCR[OCR 引擎]
+  OCR --> QA{scan quality OK?}
+  QA -->|是| TXT
+  QA -->|否| FLAG[标记人工复核]
+  TXT --> CLEAN[清洗管道]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="scan-quality" tabindex="0">scan quality</span> 应写入 meta，便于评测「检索不到」是否源于 OCR 噪声。</p>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>全量 OCR</strong> — 成本与耗时暴涨；数字 PDF 完全没必要。</li>
+          <li><strong>OCR 后不清洗</strong> — 断字、竖线、页码会进入分块，检索命中页眉。</li>
+          <li><strong>在线 OCR</strong> — 用户提问时才 OCR，违背离线索引原则；应回退索引任务。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>清洗</h3>
+
+      <p>清洗发生在 Reader 之后、分块之前。目标：让下游 embedding 看见<strong>语义连续的正文</strong>，而不是版式垃圾。</p>
+
+      <h4>典型清洗规则</h4>
+      <ul>
+        <li><strong>重复噪声</strong> — 页眉「内部资料」、页脚页码、水印文字（正则 + 频次检测）。</li>
+        <li><strong>空白与断行</strong> — 合并错误换行；保留段落空行供结构分块。</li>
+        <li><strong>乱码</strong> — 剔除不可见字符与错误编码产生的替换符（U+FFFD）。</li>
+        <li><strong>表格</strong> — 转为 Markdown 表格或「列:值」行，避免列错位（制度里常见报销标准表）。</li>
+      </ul>
+
+      <h4>清洗前后对比（代码示意）</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">清洗前 · PDF 抽取</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">text</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code>内部资料 · 第 3 页
+第三章 试用期管理
+内部资料 · 第 3 页
+试 用 期 考 核 不 合 格 …</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">清洗后 · 可分块文本</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">text</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code>## 第三章 试用期管理
+
+试用期考核不合格，依法无需支付经济补偿。具体流程见 HR 系统…</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <h4>清洗检查清单</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>检查项</th><th>通过标准</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>页眉页脚重复率</td><td>同页重复短语已移除</td></tr>
+          <tr><td>平均行长度</td><td>无大量单字断行</td></tr>
+          <tr><td>空文档</td><td>清洗后 char_count &gt; 0，否则 fail 任务</td></tr>
+          <tr><td>meta 完整</td><td>source、page、dept 非空</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈 Reader</h3>
+
+      <p><span class="term" data-term-id="dual-reader" tabindex="0">Dual reader</span> 指：<strong>解析只发生在 Python 索引栈</strong>；Spring 查询栈读取的是已解析文本与 meta，而不是重复实现一套 Reader。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="Python Reader vs Spring 消费">
+        <input type="radio" name="rag02reader" id="rag02-tab-index" class="learn-tab-input" checked />
+        <input type="radio" name="rag02reader" id="rag02-tab-query" class="learn-tab-input" />
+        <label for="rag02-tab-index">Python · 索引 Reader</label>
+        <label for="rag02-tab-query">Spring · 查询消费</label>
+        <div class="learn-tab-panel" id="rag02-panel-index" role="tabpanel">
+          <p><strong>实现</strong>：LangChain DocumentLoader / Unstructured；按 MIME 路由。</p>
+          <p><strong>输出</strong>：Document 列表 + metadata；失败任务进 dead-letter 队列。</p>
+          <p><strong>版本</strong>：记录 <code>parser_version</code>，便于回归对比。</p>
+        </div>
+        <div class="learn-tab-panel" id="rag02-panel-query" role="tabpanel">
+          <p><strong>实现</strong>：VectorStore 检索返回 text + meta；可选返回 source 链接给前端引用。</p>
+          <p><strong>禁止</strong>：在 Advisor 里打开 MinIO 原 PDF 现解析（延迟与一致性风险）。</p>
+          <p><strong>契约</strong>：filter 字段名与 Python 写入完全一致。</p>
+        </div>
+      </div>
+
+      <h4>与 Demo sample-doc-meta.json 对齐</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "text": "制度节选",
+  "meta": {
+    "source": "hr.pdf",
+    "page": 3,
+    "dept": "HR"
+  }
+}</code></pre>
+      </div>
+      <p>练习时应扩展为生产字段：<code>doc_version</code>、<code>acl</code>、<code>ocr_confidence</code>（OCR 页必填）。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Word 与 PDF 内容重复（同一制度两个格式）怎么处理？</summary>
+          <div class="learn-faq-body">
+            在 meta 中标记 <code>canonical_doc_id</code> 与 <code>format_rank</code>（如 Word 优先于扫描 PDF），检索时可 dedupe 或优先新版本。治理细节在 knowledge-lifecycle 课展开；接入阶段至少要<strong>识别重复</strong>而非双份入库。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>PDF/Word/HTML</strong>：按格式路由 Reader，保留结构与 meta；HTML 必须做内容区提取。</li>
+        <li><strong>OCR 策略</strong>：按需触发，记录置信度与复核标记；数字 PDF 禁止无意义 OCR。</li>
+        <li><strong>清洗</strong>：去页眉页脚与乱码，表格语义化；空文档应 fail 索引任务。</li>
+        <li><strong>双栈 Reader</strong>：Python 解析入库，Spring 只检索；meta 契约是双栈对齐的接口。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_basics02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="format-route" /> 能说明 PDF 数字版与扫描版的不同接入路径</label></li>
+          <li><label><input type="checkbox" data-id="ocr-when" /> 能列出 2 条 OCR 触发条件与 1 条质量门槛</label></li>
+          <li><label><input type="checkbox" data-id="clean-rules" /> 能举例 3 类应清洗的噪声</label></li>
+          <li><label><input type="checkbox" data-id="dual-reader" /> 能解释为何 Spring 不应在线 OCR</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>用户反馈「检索到的都是页眉」，你会从接入链路的哪几步排查？</li>
+              <li>扫描 PDF 入库后 recall 很低，如何区分 OCR 问题还是分块问题？</li>
+              <li>双栈架构下，Reader 升级/parser 变更应如何发布与回归？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-basics-03-chunking">分块策略</a> 在清洗后的文本上讨论固定/语义/结构分块与重叠。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://unstructured-io.github.io/unstructured/" target="_blank" rel="noopener">Unstructured — 多格式文档解析</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/document_loader_pdf/" target="_blank" rel="noopener">LangChain — PDF Document Loader</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI — VectorStore 与 Document metadata</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">围绕 CorpAssist 制度库样本，完成<strong>格式分流</strong>、<strong>OCR 决策</strong>与<strong>meta 字段</strong>设计（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>假设入库清单含 1 份数字 PDF、1 份扫描 PDF、1 篇 Wiki HTML，为每种格式写一条 Reader 路由规则（扩展名/MIME → 处理器）。</li>
+      <li>阅读 <code>demos/basics-02-ingestion-lab/sample-doc-meta.json</code>，补充至少 3 个生产应保留的 meta 字段并说明用途（引用、ACL、版本）。</li>
+      <li>选取一段含重复页眉的假想抽取文本，写出 2 条清洗正则或规则描述（不必真跑代码）。</li>
+      <li>画一张「Python Reader → 清洗 → 向量 meta」三步框图，标出 Spring 侧<strong>不</strong>参与的步骤。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">扫描 PDF 文本层为空，同事选择「仍用 pdftotext 入库空字符串，靠用户提问时再 OCR」。请判断<strong>最核心错误</strong>。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>错误在于<strong>把 OCR 推迟到在线路径且允许空文档入库</strong>。索引阶段就应 OCR 或 fail；空串入库会导致检索噪声与「有文档无内容」的 silent failure。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：HTML 接入哪条<strong>不推荐</strong>？① 提取 main 正文 ② 保留 title 作 heading meta ③ 全文 innerText 含侧边栏链接</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>答：③</strong>。侧边栏在每页重复，污染向量；①② 是推荐做法。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：文档接入与解析实验室</h4>
+      <p>目录：<code>demos/basics-02-ingestion-lab/</code>。<strong>验收</strong>：阅读 sample-doc-meta.json，列出 3 个应保留 meta 字段并说明在 ACL/引用中的作用。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-chunking">分块策略</a> — 清洗后文本如何切 chunk</li>
+      <li><strong>上一章</strong>：<a href="#ch-basics-01-rag-pattern">RAG 模式与架构</a> — 接入在管线中的位置</li>
+      <li><a href="https://www.adobe.com/content/dam/acom/en/devnet/pdf/pdfs/PDF32000_2008.pdf" target="_blank" rel="noopener">PDF 规范参考 — 理解文本层与扫描页</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,208 @@
+<section id="ch-advanced-01-query-transform" class="chapter" data-chapter="advanced-01-query-transform">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>查询改写与 HyDE</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-query-transform" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>进阶 RAG</strong> · 能力：Multi-query / HyDE 改写与 A/B 效果对比</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>用户口语「年假咋请」与制度原文「年假申请流程」embedding 空间距离远，<a href="#ch-practice-03-hybrid">混合检索</a> 仍可能 miss。查询侧 <span class="term" data-term-id="query-rewrite" tabindex="0">query rewrite</span> 在检索前扩展或改写问句，提升 <span class="term" data-term-id="recall-boost" tabindex="0">recall boost</span>；但每多一次 LLM 调用都有 <span class="term" data-term-id="transform-cost" tabindex="0">transform cost</span>，必须量化对比。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>实现 <span class="term" data-term-id="multi-query" tabindex="0">multi query</span> 与结果融合</li>
+          <li>配置 HyDE（假设性文档嵌入）链路</li>
+          <li>用 <a href="#ch-practice-05-eval-loop">评测闭环</a> 对比改写前后 context_recall</li>
+          <li>在 CorpAssist 双栈中选择 Python 改写或 Spring 网关改写</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>改写为检索服务</strong>：生成答案不是 HyDE 的目标，假文档只为 embedding。</li>
+          <li><strong>Multi-query 要融合</strong>：多路检索后 RRF 去重，避免 Prompt 爆炸。</li>
+          <li><strong>成本与收益同测</strong>：latency 与 token 成本写入 eval report。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Multi-query</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 口语问法</span>
+        Demo 样例：原问「年假咋请」→ 改写「年假申请流程 制度」。一条用户问句生成 3～5 条 <span class="term" data-term-id="sub-query" tabindex="0">sub query</span>，分别检索再融合。
+      </aside>
+
+      <h4>改写 Prompt（LangChain）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from langchain.retrievers.multi_query import MultiQueryRetriever
+
+retriever = MultiQueryRetriever.from_llm(
+    retriever=base_vector_retriever,
+    llm=small_llm,
+    prompt=REWRITE_PROMPT,  # 见 demos/advanced-01-query-transform-lab/
+)</code></pre>
+      </div>
+
+      <h4>Spring AI：查询扩展链</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 伪代码：先 ChatClient 生成 sub-queries，再并行 RetrievalAugmentation
+List&lt;String&gt; variants = queryExpander.expand(userQuestion);
+List&lt;Document&gt; merged = fusionService.reciprocalRankFusion(
+    variants.stream().map(vectorStore::similaritySearch).toList());</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>Multi-query 检索</h5>
+        <pre class="mermaid">flowchart LR
+  Q[用户问句] --> R[LLM 改写 N 条]
+  R --> V1[检索 1]
+  R --> V2[检索 2]
+  R --> V3[检索 3]
+  V1 --> F[RRF 融合]
+  V2 --> F
+  V3 --> F
+  F --> C[context pack]</pre>
+      </div>
+
+      <p><span class="term" data-term-id="query-expansion" tabindex="0">query expansion</span> 适合<strong>短问、口语、多义词</strong>；专有编号问法（「制度 HR-2024-03 第 2 条」）通常不必改写，以免漂移。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>HyDE</h3>
+      <p><span class="term" data-term-id="hyde" tabindex="0">hyde</span>（Hypothetical Document Embeddings）：让 LLM 先写一段<strong>假设性答案/段落</strong>，用该段落的 embedding 去向量库检索，而非用原始短问句。</p>
+
+      <h4>HyDE 链路</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def hyde_retrieve(question: str) -> list[Document]:
+    hypothetical = llm.invoke(HYDE_PROMPT.format(q=question))
+    query_vector = embedder.embed_query(hypothetical)
+    return vector_store.similarity_search_by_vector(query_vector, k=8)</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">HyDE 误用</span>
+          <ul>
+            <li>把假设文档直接当最终答案</li>
+            <li>不做 ACL filter</li>
+            <li>合规场景未标注「非引用」</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">HyDE 正用</span>
+          <ul>
+            <li>假文档仅用于 embedding</li>
+            <li>检索后仍走 citation + faithfulness</li>
+            <li>与 multi-query 二选一或分层</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：HyDE 在「条款编号精确查询」上通常有效还是有害？</summary>
+        <p>通常<strong>有害或无益</strong>。编号问法应走 BM25 / keyword boost（见混合检索章）；HyDE 可能编造不存在的条款表述，embedding 反而偏离真实文档。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>效果对比</h3>
+      <p>是否启用改写，必须用同一黄金集对比（见 <span class="term" data-term-id="rag-benchmark" tabindex="0">rag benchmark</span>）。记录指标 + 成本：</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>策略</th><th>context_recall</th><th>P95 延迟</th><th>额外 token</th><th>建议</th></tr></thead>
+          <tbody>
+            <tr><td>baseline（无改写）</td><td>0.80</td><td>1.2s</td><td>0</td><td>默认</td></tr>
+            <tr><td>multi-query ×3</td><td>0.87</td><td>2.1s</td><td>~400</td><td>口语 FAQ 开启</td></tr>
+            <tr><td>HyDE</td><td>0.85</td><td>1.8s</td><td>~250</td><td>抽象问法试用</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>决策：何时启用改写</h4>
+      <ul>
+        <li>context_recall 提升 ≥ 5% 且 P95 可接受 → 生产开启</li>
+        <li>仅个别类目提升 → 按 <span class="term" data-term-id="intent-router" tabindex="0">intent router</span> 路由到改写链</li>
+        <li>改写后 faithfulness 下降 → 检查假文档是否污染生成 Prompt</li>
+      </ul>
+
+      <p><span class="term" data-term-id="rewrite-prompt" tabindex="0">rewrite prompt</span> 应约束：不编造事实、输出 JSON 数组、保留用户原意。示例见 <code>demos/advanced-01-query-transform-lab/rewrite-example.txt</code>。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Multi-query</strong>：LLM 生成 sub-query + RRF 融合；适合口语短问。</li>
+        <li><strong>HyDE</strong>：假设文档 embedding 检索；假文档不作最终答案。</li>
+        <li><strong>效果对比</strong>：recall/latency/token 三维度；路由级启用而非全开。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_advanced01">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="mq" /> 能描述 Multi-query 融合步骤</label></li>
+          <li><label><input type="checkbox" data-id="hyde" /> 能说明 HyDE 假文档的作用边界</label></li>
+          <li><label><input type="checkbox" data-id="ab" /> 能列出效果对比的三项指标</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；继续 <a href="#ch-advanced-02-graph-rag">GraphRAG 概念与边界</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://python.langchain.com/docs/how_to/MultiQueryRetriever/" target="_blank" rel="noopener">LangChain MultiQueryRetriever</a></li>
+      <li><a href="https://arxiv.org/abs/2212.10496" target="_blank" rel="noopener">HyDE 论文</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI RAG</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 rewrite-example 跑一轮「改写前后」对比，记录 recall 与延迟变化。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>选 5 条口语问法，手写 multi-query 的 3 条 sub-query。</li>
+      <li>为其中 1 条写 HyDE 假设段落（80～120 字），说明与 sub-query 差异。</li>
+      <li>填效果对比表（可虚构数值），给出是否上线的结论。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">Multi-query 与 HyDE 同时全开，可能带来哪两个副作用？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>① 延迟与 token 成本叠加；② 检索结果过多导致 context 冗余、faithfulness 下降。通常按 intent 二选一，或 multi-query 后再对 top 片段 rerank 截断。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：查询改写</h4>
+      <p>目录：<code>demos/advanced-01-query-transform-lab/</code>。<strong>验收</strong>：完成一条 rewrite-example 并对照 baseline 说明 recall 变化。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-07-code-rag">代码库 RAG 与研发助手</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-02-graph-rag">GraphRAG 概念与边界</a></li>
+      <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>：改写策略需进 eval report</li>
+    </ul>
+  </div>
+</section>

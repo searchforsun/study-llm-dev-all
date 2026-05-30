@@ -1,0 +1,283 @@
+<section id="ch-advanced-02-compliance" class="chapter" data-chapter="advanced-02-compliance">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>合规保留与删除</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-compliance" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>企业级治理</strong> · 能力：设计留存策略、执行被遗忘权与可审计删除</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>KB 不是「只进不出」的垃圾桶。劳动合同、客户咨询、员工 PII 进入向量库后，法务会问：<strong>留多久、谁能删、删干净没有、审计证据在哪</strong>。GDPR / 个保法下的 <span class="term" data-term-id="right-to-forget" tabindex="0">right to forget</span> 要求从原文、chunk、向量、缓存、日志中<strong>可证明地清除</strong>。本章把合规从「法务 PDF」落到 CorpAssist 索引管线。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>按文档类型制定 <span class="term" data-term-id="retention-policy" tabindex="0">retention policy</span> 与 <span class="term" data-term-id="retention-days" tabindex="0">retention days</span></li>
+          <li>设计 <span class="term" data-term-id="delete-cascade" tabindex="0">delete cascade</span>：对象存储 → chunk 表 → Milvus → embed 缓存</li>
+          <li>处理 <span class="term" data-term-id="legal-hold" tabindex="0">legal hold</span> 与删除请求的冲突</li>
+          <li>输出 <span class="term" data-term-id="audit-delete" tabindex="0">audit delete</span> 记录供合规抽检</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>留存是默认策略</strong>：没有 policy 的 KB 等于无限保留，合规风险最大。</li>
+          <li><strong>删除是级联作业</strong>：只删 Milvus 向量不够，LLM 上下文缓存也可能残留。</li>
+          <li><strong>hold 优先于删除</strong>：诉讼保全期间，<span class="term" data-term-id="purge-doc" tabindex="0">purge doc</span> 必须被拦截并告警。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>留存</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 客服录音转写入库（60 秒）</span>
+        客服对话含客户手机号，进入 <code>kb-support-transcript</code>。法务规定：工单关闭后<strong>保留 3 年</strong>用于纠纷举证，3 年后自动销毁；涉诉案件进入 <span class="term" data-term-id="legal-hold" tabindex="0">legal hold</span> 则暂停 TTL。运营需要一张表回答「这类 doc 何时该删」。
+      </aside>
+
+      <p><span class="term" data-term-id="compliance-kb" tabindex="0">compliance kb</span> 的留存层要回答三件事：<strong>分类、期限、触发器</strong>。</p>
+      <ul>
+        <li><strong>分类</strong> — 按 <code>doc_type</code>（合同 / HR / 客服 / 公开制度）映射不同 policy。</li>
+        <li><strong>期限</strong> — <span class="term" data-term-id="retention-days" tabindex="0">retention days</span> 或「事件 + N 天」（如离职 + 90 天）。</li>
+        <li><strong>触发器</strong> — 定时扫描 <code>expires_at</code>；或源系统 CDC 标记 deleted。</li>
+      </ul>
+
+      <h4>留存策略表示例</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>doc_type</th><th>retention_days</th><th>到期动作</th><th>例外</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>public_handbook</td>
+            <td>∞（直到新版本 supersede）</td>
+            <td>版本替换后旧版归档</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td>support_transcript</td>
+            <td>1095（3 年）</td>
+            <td><span class="term" data-term-id="purge-doc" tabindex="0">purge doc</span> 全链路</td>
+            <td>legal_hold = true</td>
+          </tr>
+          <tr>
+            <td>employee_pii</td>
+            <td>离职 + 90 天</td>
+            <td>硬删除 + 审计</td>
+            <td>劳动仲裁 open</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>retention policy 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">retention:
+  policies:
+    - doc_type: support_transcript
+      retention_days: 1095
+      anchor: closed_at
+      on_expire: purge_cascade
+    - doc_type: employee_pii
+      retention_days: 90
+      anchor: termination_date
+      on_expire: purge_cascade
+  scanner:
+    cron: "0 3 * * *"
+    batch_size: 500</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>留存扫描与到期删除</h5>
+        <pre class="mermaid">flowchart TD
+  Scan[Retention Scanner] --> Q{expires_at &lt; now?}
+  Q -->|否| Skip[跳过]
+  Q -->|是| Hold{legal_hold?}
+  Hold -->|是| Block[拦截 + 告警法务]
+  Hold -->|否| Purge[purge_cascade]
+  Purge --> S3[对象存储]
+  Purge --> CH[Chunk 元数据]
+  Purge --> MV[Milvus 向量]
+  Purge --> Cache[Embed / 检索缓存]</pre>
+        <p class="diagram-caption">到期删除必须走 <span class="term" data-term-id="delete-cascade" tabindex="0">delete cascade</span>，单点删向量视为不合规。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：公开制度「永久保留」是否意味着永不删除？</summary>
+        <p>不是。新版本发布后可对旧版做 soft retire + 冷归档；若制度废止，仍应按 policy 下线索引，只是 retention 锚点可能是 <code>superseded_at</code> 而非固定天数。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>被遗忘权</h3>
+      <p>用户或员工行使删除权时，系统必须在 SLA 内完成 <span class="term" data-term-id="right-to-forget" tabindex="0">right to forget</span>。KB 场景比传统 DB 更难：向量不可逆推原文，但<strong>仍可能通过检索召回关联 chunk</strong>。</p>
+
+      <h4>删除请求处理流程</h4>
+      <ol>
+        <li><strong>身份核验</strong> — 工单绑定 subject_id（员工工号 / 客户 ID）。</li>
+        <li><strong>范围定位</strong> — 按 <code>subject_id</code>、<code>source_doc_id</code> 查全库（含联邦子 KB）。</li>
+        <li><strong>hold 检查</strong> — 任一 doc 在 legal hold 则部分拒绝并说明法律依据。</li>
+        <li><strong>级联删除</strong> — 执行 <span class="term" data-term-id="delete-cascade" tabindex="0">delete cascade</span>。</li>
+        <li><strong>审计落库</strong> — <span class="term" data-term-id="audit-delete" tabindex="0">audit delete</span> 记录操作人、范围、条数、checksum（不存 PII 明文）。</li>
+      </ol>
+
+      <h4>级联删除实现要点</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def purge_cascade(doc_id: str, operator: str) -> PurgeReport:
+    chunks = chunk_repo.list_by_doc(doc_id)
+    chunk_ids = [c.id for c in chunks]
+    object_store.delete(doc_id)
+    chunk_repo.delete_by_doc(doc_id)
+    milvus.delete(expr=f'source_doc_id == "{doc_id}"')
+    embed_cache.invalidate(chunk_ids)
+    audit.log(event="purge_doc", doc_id=doc_id, count=len(chunk_ids), operator=operator)
+    return PurgeReport(deleted_chunks=len(chunk_ids))</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只在 UI 隐藏文档，向量仍可被检索</li>
+            <li>删除不记审计，无法应对监管问询</li>
+            <li>re-embed /job 队列仍引用已删 doc_id</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>删除前暂停该 doc 相关增量 job（见 <a href="#ch-practice-01-incremental">增量更新与重建</a>）</li>
+            <li>蓝绿索引双写时两版都删（见 <a href="#ch-basics-04-index-versions">索引版本与回滚</a>）</li>
+            <li>30 天内提供删除证明报告（chunk 数、库列表、时间戳）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>合规 vs 业务冲突决策表</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>场景</th><th>优先</th><th>处理</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>员工要求删 PII，无 hold</td>
+            <td>删除权</td>
+            <td>72h 内 purge_cascade</td>
+          </tr>
+          <tr>
+            <td>涉诉客服记录</td>
+            <td>legal hold</td>
+            <td>拒绝删除，出具 hold 编号</td>
+          </tr>
+          <tr>
+            <td>误删恢复请求</td>
+            <td>业务连续</td>
+            <td>仅从冷归档恢复（若有 backup policy）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>向量删了 = 合规完成</strong> — 对象存储、搜索日志、LLM 会话引用都要纳入范围。</li>
+          <li><strong>联邦只删一个库</strong> — 同一 doc 可能在多库，需全局 doc_id 索引。</li>
+          <li><strong>留存与质量运营冲突</strong> — stale 检测标记的 doc 若未到期，不能因「旧」而提前删。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>留存</strong>：按 doc_type 配置 retention_days 与 anchor；scanner + legal_hold 构成自动与人工两道闸。</li>
+        <li><strong>被遗忘权</strong>：核验 → 定位 → hold 检查 → purge_cascade → audit_delete；联邦场景需跨库 doc_id 索引。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="klg_advanced02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="policy" /> 能填一张三行 retention 策略表</label></li>
+          <li><label><input type="checkbox" data-id="cascade" /> 能列出 purge 至少 4 个下游存储</label></li>
+          <li><label><input type="checkbox" data-id="hold" /> 能说明 legal hold 与删除请求的优先级</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>客户行使删除权，你如何证明向量库中已无其 PII chunk？</li>
+              <li>蓝绿索引切换期间收到删除请求，要保证什么一致性？</li>
+              <li>留存到期自动删与人工删，审计字段有何不同？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-advanced-03-cost">存储与索引成本</a> 从 NS3 视角优化分层与归档。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://gdpr.eu/right-to-be-forgotten/" target="_blank" rel="noopener">GDPR — Right to be forgotten</a></li>
+      <li><a href="https://milvus.io/docs/delete_data.md" target="_blank" rel="noopener">Milvus Delete — 向量删除 API</a></li>
+      <li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html" target="_blank" rel="noopener">S3 Object Lock — 合规保留锁</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 客服转写场景填写<strong>留存策略表</strong>、绘制<strong>purge 级联清单</strong>并处理一条<strong>hold 冲突</strong>（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制正文留存策略表，新增一行 <code>vendor_contract</code>，retention 7 年，anchor 为 <code>contract_end</code>。</li>
+      <li>对照 Mermaid 流程图，列出 purge_cascade 必须触达的 5 个组件（含缓存）。</li>
+      <li>假设 ticket #8821 请求删除涉诉 transcript，legal_hold=true，写一句给用户的拒绝说明模板（含 hold 编号占位）。</li>
+      <li>（可选）完成 <code>demos/advanced-02-compliance-lab/retention-table.md</code> 填空。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）同事只调用 <code>milvus.delete</code> 就标记工单「已删除」。缺了哪两步关键动作？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>至少缺：① 对象存储 / chunk 元数据删除；② audit_delete 审计记录。还应 invalidate embed 缓存并检查增量 job 是否仍引用该 doc_id。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：合规保留与删除</h4>
+      <p><code>demos/advanced-02-compliance-lab/</code> — 补全 retention-table.md 三行策略；验收：每行含 doc_type、days、on_expire、hold 例外四列。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-advanced-01-multi-kb">多知识库联邦</a>：跨库 purge 范围定位</li>
+      <li><a href="#ch-advanced-03-cost">存储与索引成本</a>：冷归档与合规留存的关系</li>
+    </ul>
+  </div>
+</section>

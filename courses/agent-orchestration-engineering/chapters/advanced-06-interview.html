@@ -1,0 +1,339 @@
+<section id="ch-advanced-06-interview" class="chapter" data-chapter="advanced-06-interview">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：Agent 排障</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-06-interview" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产 Agent</strong> · 能力：结构化排障、死循环与工具失败案例、面试 STAR 表述</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>面试官常问：「线上 Agent 转人工暴增你怎么查？」「tool 一直失败为什么模型还重试？」本章把 <span class="term" data-term-id="troubleshoot" tabindex="0">troubleshoot</span> 变成可复述的 <span class="term" data-term-id="step-debug" tabindex="0">step debug</span> 流程与 <span class="term" data-term-id="agent-incident" tabindex="0">agent incident</span> 案例库，覆盖 CorpAssist S2/S3 真实 <span class="term" data-term-id="production-pitfall" tabindex="0">production pitfall</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用「现象 → trace → 根因 → 修复 → 防再发」五步法答排障题</li>
+          <li>诊断 <span class="term" data-term-id="debug-loop" tabindex="0">debug loop</span> 与 <span class="term" data-term-id="loop-detection" tabindex="0">loop detection</span> 失效</li>
+          <li>分析 <span class="term" data-term-id="tool-failure-case" tabindex="0">tool failure case</span> 与 <span class="term" data-term-id="circuit-break" tabindex="0">circuit break</span> 缺失</li>
+          <li>用 STAR 讲述 2 个 <span class="term" data-term-id="interview-agent" tabindex="0">interview agent</span> 案例</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>先 trace 后猜</strong>：LangSmith 定位 span，不在本地盲目改 prompt。</li>
+          <li><strong>区分症状与根因</strong>：转人工高可能是 loop、tool 超时或路由误判。</li>
+          <li><strong>修复要加门禁</strong>：坏例入库 dataset，eval gate 阻塞同类回归。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>死循环</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">Case A · S2 改址死循环</span>
+        用户要改地址，Agent 每轮 call <code>query_order</code> → 「请确认」→ 用户说「确认」→  again query_order，12 步后转人工，CSAT 1 分。
+      </aside>
+
+      <h4>排障五步法</h4>
+      <div class="mermaid-wrap">
+        <h5>Agent incident 排障流程</h5>
+        <pre class="mermaid">flowchart TD
+  P[现象/KPI 异常] --> T[LangSmith trace 抽样]
+  T --> S[定位异常 span]
+  S --> R[根因假设]
+  R --> V[本地 trace replay]
+  V --> F[修复 + 数据集回归]</pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>trace 信号</th><th>可能根因</th><th>修复方向</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>同一 tool+args 重复 ≥3</td>
+            <td>loop detection 未启用或指纹过宽</td>
+            <td>收紧指纹；超限 degrade</td>
+          </tr>
+          <tr>
+            <td>LLM 不调用 write tool</td>
+            <td>prompt 缺确认→行动映射</td>
+            <td>few-shot + 工具描述</td>
+          </tr>
+          <tr>
+            <td>steps 未递增</td>
+            <td>conditional edge 未接 increment</td>
+            <td>修图；见 <a href="#ch-advanced-01-cost">步数控制</a></td>
+          </tr>
+          <tr>
+            <td>tool OK 但 LLM 重复问</td>
+            <td>observation 未写入 state</td>
+            <td>检查 message reducer</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>Case A 根因与修复（面试 STAR）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">Situation: S2 改址会话 avg steps 14, transfer +10%
+Task: 24h 内止损并防复发
+Action:
+  - trace 发现 query_order 同 order_id 重复 5 次
+  - 根因: 缺 change_address tool，模型用 query 代替
+  - 加 tool + loop fingerprint (tool, order_id)
+  - 坏例写入 dataset s2-loop-014
+Result: avg steps 7.2, transfer 回基线; eval gate 新增序列断言</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">弱回答</span>
+          <ul>
+            <li>「加大 max_tokens」</li>
+            <li>「换更强模型」</li>
+            <li>未提 trace 与 dataset</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">强回答</span>
+          <ul>
+            <li>先 KPI 与时间线</li>
+            <li>trace 定位重复 span</li>
+            <li>工具/图/fix + eval 防回归</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>面试快问：loop detection 用「连续相同 tool 名」够吗？</summary>
+        <p>不够：须含<strong>关键 args 指纹</strong>（如 order_id）；否则合法重复查单误判。还要区分「用户改口」导致的新 query。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>工具失败</h3>
+      <p><span class="term" data-term-id="tool-failure" tabindex="0">tool failure</span> 分超时、4xx/5xx、schema 校验失败、权限拒绝。模型若未收到结构化 error，会无限重试——须 <span class="term" data-term-id="retry-policy" tabindex="0">retry policy</span> + <span class="term" data-term-id="circuit-break" tabindex="0">circuit break</span>。</p>
+
+      <h4>Case B · MCP 退款服务抖动</h4>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">S2 促销午高峰</span>
+        <code>refund_propose</code> 503 占 40%；Agent 仍每轮重试，p95 延迟 45s，用户放弃。
+      </aside>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">@tool
+def refund_propose(order_id: str) -&gt; str:
+    try:
+        return mcp_client.call("refund.propose", order_id, timeout=3.0)
+    except MCPTimeout:
+        return "ERROR: refund service timeout; ask user to retry later or handoff"
+    except MCPUnavailable:
+        raise CircuitOpen("refund_mcp")  # 后续 call 直接降级
+
+# conditional: circuit open -&gt; handoff_human</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>失败类型</th><th>给模型的 observation</th><th>图行为</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>超时</td>
+            <td>ERROR + 可否重试</td>
+            <td>最多 1 次 retry</td>
+          </tr>
+          <tr>
+            <td>403 allowlist</td>
+            <td>permission denied</td>
+            <td>停止 tool，转人工</td>
+          </tr>
+          <tr>
+            <td>503 持续</td>
+            <td>circuit open</td>
+            <td>跳过 tool，fallback 话术</td>
+          </tr>
+          <tr>
+            <td>schema 错</td>
+            <td>validation detail</td>
+            <td>让 LLM 改 args，≤2 次</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>面试强调：<strong>tool error 也是 observation</strong>，必须短、结构化、含下一步指引；不要把 Java stack trace 塞给模型。对照 <a href="#ch-practice-05-failure">失败与降级</a> 与 <a href="#ch-advanced-02-security">权限拒绝</a> 分支。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>案例</h3>
+      <p>整合 Case A/B 与 <code>demos/advanced-06-interview-lab/incident-template.md</code>，形成可背诵的 incident 报告。</p>
+
+      <h4>incident 模板（填写示例）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## 现象
+S3 报销 Agent 48h 内 approval_submit 失败率 22% (基线 2%)
+
+## trace
+- span: approval_submit 401 missing scope
+- 起始: role=end_user 误路由到 finance 图
+
+## 根因
+FastAPI 未校验 scene=s3 时 role 与 graph 绑定；Spring header 传错 X-Role
+
+## 修复
+- gateway 强制 role-scope 表
+- eval 增 must_not_call approval_submit for end_user
+- runbook 增 401 playbook
+
+## 防再发
+eval gate + 周度 trace 审计 sample 200</code></pre>
+      </div>
+
+      <h4>面试题速查</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>题目</th><th>答题要点（30 秒）</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Agent 和 ChatBot 排障有何不同</td>
+            <td>看 tool span 序列、步数、checkpoint；不只 final text</td>
+          </tr>
+          <tr>
+            <td>如何证明已修复</td>
+            <td>trace replay + dataset pass + KPI 24h</td>
+          </tr>
+          <tr>
+            <td>模型 vs 工程问题</td>
+            <td>同输入 replay：变=模型/prompt；不变=工具/权限/图</td>
+          </tr>
+          <tr>
+            <td>最高优先级 incident</td>
+            <td>越权 tool 成功 &gt; loop 成本 &gt; 文案差</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>生产陷阱 · 面试加分</strong>
+        <ul>
+          <li>提到 <span class="term" data-term-id="root-cause" tabindex="0">root cause</span> 层级：配置 &lt; 代码 &lt; 流程（缺 eval gate）</li>
+          <li>提到跨团队：Spring 网关 vs Python Agent 各守一段</li>
+          <li>提到 <span class="term" data-term-id="reasoning-trace" tabindex="0">reasoning trace</span> 隐私：排障脱敏后再给 LLM 分析</li>
+        </ul>
+      </div>
+
+      <h4>Case C · 综合排障题（自测）</h4>
+      <p>「S2 CSAT 跌 0.3，transfer 不变，cost +50%」——你的第一步？<em>（答案：LangSmith 按 scene=S2 过滤，对比 model_route 分布与 avg steps；若 turbo 占比降、plus 升，查路由 classifier 是否因促销话术 OOD。）</em></p>
+
+      <h4>90 秒口述模板（可背诵）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">1. 现象+时间线+影响面（KPI）
+2. 我先用 LangSmith 抽 20 条坏 trace，定位异常 span
+3. 根因是…（tool/图/权限/路由，一点）
+4. 修复：代码+配置+dataset 回归样例
+5. 验证：replay pass + KPI 24h 恢复 + runbook 补充</code></pre>
+      </div>
+      <p>无论 Case A/B/C，都按此五段说；面试官打断时优先保留第 2、3 步的<strong>证据与根因</strong>。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>死循环</strong>：trace 看重复 span；tool+args 指纹；补 tool/修图；坏例入库。</li>
+        <li><strong>工具失败</strong>：结构化 error、有限 retry、circuit break、handoff。</li>
+        <li><strong>案例</strong>：incident 五段式 + STAR；安全 &gt; 成本 &gt; 文案。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="aoe_advanced06_interview">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="five" /> 能背诵排障五步法</label></li>
+          <li><label><input type="checkbox" data-id="loop" /> 能讲述 Case A STAR 版本</label></li>
+          <li><label><input type="checkbox" data-id="tool" /> 能说明 circuit break 触发条件</label></li>
+          <li><label><input type="checkbox" data-id="incident" /> 能填完整 incident 模板</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">恭喜完成「生产 Agent」阶段！可回顾 <a href="#ch-advanced-05-capstone">Capstone 交付</a> 整包上线，或回到 <a href="#ch-basics-01-agent-model">Agent 基础</a> 巩固术语。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.smith.langchain.com/tracing/faq/tracing-faq" target="_blank" rel="noopener">LangSmith Tracing FAQ</a></li>
+      <li><a href="https://langchain-ai.github.io/langgraph/troubleshooting/" target="_blank" rel="noopener">LangGraph Troubleshooting</a></li>
+      <li><a href="https://sre.google/sre-book/effective-troubleshooting/" target="_blank" rel="noopener">Google SRE — Effective Troubleshooting</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成 2 份 incident 报告与 1 道模拟面试口述（约 40 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>用 <code>demos/advanced-06-interview-lab/incident-template.md</code> 完整填写 Case A（改址 loop）。</li>
+      <li>再填 Case B（MCP 503），在「修复」中写出 circuit break 阈值（如 5 分钟 50% 失败）。</li>
+      <li>从决策表选一题，录音 60 秒 STAR 回答（自检是否含 trace 与 eval）。</li>
+      <li>列出 Case C 的第二步、第三步排障动作（各一句）。</li>
+      <li>可选：在 LangSmith 找一条真实 trace 练 span 定位（脱敏）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（面试）面试官：「用户说 Agent 变笨，你怎么查？」给出优先级排序：①看 prompt 版本 ②看 trace tool 序列 ③换 GPT-4 ④查路由 classifier 数据漂移。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>② → ④ → ① → ③。先<strong>证据</strong>（trace）再<strong>配置/数据</strong>，换模型是最后手段且须 A/B。若涉及安全越权则跳过排序直接 P0。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（场景）tool 返回 500 原文 50KB HTML，模型仍重试 10 次。缺哪两层防护？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>缺 <strong>tool 层 truncate/结构化 error</strong> 与 <strong>step/retry 上限</strong>；可能还缺 circuit break。见 <span class="term" data-term-id="tool-return" tabindex="0">tool return</span> 规范。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：面试排障实验室</h4>
+      <p>目录：<code>demos/advanced-06-interview-lab/</code>。<strong>验收</strong>：提交 2 份 incident md；口述 Case A 不超过 90 秒；正确说出 loop fingerprint 应含哪些字段。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>前置</strong>：<a href="#ch-practice-05-failure">失败、重试与降级</a> · <a href="#ch-advanced-03-obs">LangSmith 追踪</a></li>
+      <li><strong>实战</strong>：<a href="#ch-advanced-05-capstone">CorpAssist Python Agent</a></li>
+    </ul>
+  </div>
+</section>

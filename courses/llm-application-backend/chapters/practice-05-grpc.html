@@ -1,0 +1,397 @@
+<section id="ch-practice-05-grpc" class="chapter" data-chapter="practice-05-grpc">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>gRPC 可选集成</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-grpc" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>弹性与多租户</strong> · 能力：定义 proto、server streaming 与 REST/gRPC 边界</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 对外 API 仍是 REST/SSE（经 Gateway），但 BFF 与 Python 之间高频 RAG 检索、批量 embedding 可能成为瓶颈。<span class="term" data-term-id="grpc-integration" tabindex="0">grpc integration</span> 在内网提供更低延迟与强类型契约；本章讲<strong>何时值得上</strong>，避免「全链路 gRPC」过度工程。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>编写 CorpAssist 风格的 <code>.proto</code>，定义 unary 与 <span class="term" data-term-id="grpc-stream" tabindex="0">grpc stream</span> RPC</li>
+          <li>说明 Gateway 不终结 gRPC 时，<span class="term" data-term-id="internal-rpc" tabindex="0">internal rpc</span> 与对外 REST 的分工</li>
+          <li>完成 Demo 选型表：列出一条采用 gRPC、一条坚持 REST 的理由</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>对外 REST</strong>：浏览器、第三方集成、OpenAPI 文档 — 走 Gateway。</li>
+          <li><strong>对内 gRPC</strong>：BFF ↔ Python 低延迟、<span class="term" data-term-id="performance-rpc" tabindex="0">performance rpc</span>、双向流可选。</li>
+          <li><strong>LLM 流式</strong>：用户侧仍 SSE；内网可用 server streaming 传 token chunk（与 <a href="#ch-basics-02-sse">SSE 流式端到端</a> 对照）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>proto 定义：契约先行</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · BFF 调 Python RAG（30 秒）</span>
+        用户经 Gateway 访问 <code>/v1/chat</code>（REST）。BFF 需内网调用 Python 做 retrieve + generate。OpenAPI HTTP 够用，但当 retrieve 要传大 batch、或要 server streaming 回传 token 时，<span class="term" data-term-id="proto-define" tabindex="0">proto define</span> 的强类型与 HTTP/2 多路复用更有优势。
+      </aside>
+
+      <p><span class="term" data-term-id="protobuf" tabindex="0">protobuf</span> 是 gRPC 的 IDL。CorpAssist 约定：proto 文件放 <code>contracts/proto/corpassist/v1/</code>，Java 与 Python 共用同一套生成代码，CI 校验 breaking change。</p>
+
+      <h4>RagService.proto（节选）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">protobuf</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-protobuf">syntax = "proto3";
+package corpassist.v1;
+
+option java_package = "com.corpassist.contracts.v1";
+option java_multiple_files = true;
+
+message RetrieveRequest {
+  string tenant_id = 1;
+  string query = 2;
+  int32 top_k = 3;
+  string collection_prefix = 4;
+}
+
+message RetrieveHit {
+  string doc_id = 1;
+  string snippet = 2;
+  float score = 3;
+}
+
+message RetrieveResponse {
+  repeated RetrieveHit hits = 1;
+}
+
+message ChatRequest {
+  string tenant_id = 1;
+  string session_id = 2;
+  string user_message = 3;
+  repeated RetrieveHit context = 4;
+}
+
+message ChatChunk {
+  string delta = 1;
+  bool finished = 2;
+  int32 token_count = 3;
+}
+
+service RagService {
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+  rpc StreamChat(ChatRequest) returns (stream ChatChunk);
+}</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>RPC</th><th>模式</th><th>CorpAssist 用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>Retrieve</code></td><td>Unary</td><td>向量检索，低延迟 batch query</td></tr>
+          <tr><td><code>StreamChat</code></td><td>Server streaming</td><td>内网 token 流；BFF 再转 SSE 给客户端</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>对外 REST · 对内 gRPC 双通道</h5>
+        <pre class="mermaid">flowchart TB
+  Client[App / Web]
+  GW[Spring Cloud Gateway]
+  BFF[corpassist-bff]
+  Py[corpassist-ai-py]
+  Client -->|REST / SSE| GW
+  GW -->|HTTP| BFF
+  BFF -->|gRPC h2| Py
+  BFF -->|可选 OpenAPI| Py</pre>
+        <p class="diagram-caption">Gateway 终结 HTTP/SSE；<span class="term" data-term-id="internal-rpc" tabindex="0">internal rpc</span> 不暴露公网。Python 同时可提供 REST 供调试。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 tenant_id 在 proto 里必填，而不只信 HTTP Header？</summary>
+        <p>gRPC metadata 可传 <code>x-tenant-id</code>，但 proto 字段强制校验更利于 codegen 与跨语言一致；BFF 从 JWT 解析后写入 request，Python 双检 metadata + body。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>流式 RPC 与 LLM 生成</h3>
+      <p><code>StreamChat</code> 使用 gRPC server streaming：Python 每生成一个 token 块就 <code>yield ChatChunk</code>，BFF 聚合后写 SSE <code>data:</code> 行。这比「HTTP 长 JSON 数组」更省缓冲，且便于 <span class="term" data-term-id="performance-rpc" tabindex="0">performance rpc</span> 背压控制。</p>
+
+      <div class="mermaid-wrap">
+        <h5>StreamChat：Python → BFF → SSE</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant GW as Gateway
+  participant B as BFF
+  participant P as Python gRPC
+  C->>GW: GET /v1/stream/chat (SSE)
+  GW->>B: 透传
+  B->>P: StreamChat RPC
+  loop token chunks
+    P-->>B: ChatChunk delta
+    B-->>C: SSE data
+  end
+  P-->>B: finished=true
+  B-->>C: SSE done</pre>
+        <p class="diagram-caption">用户侧协议仍是 SSE（<a href="#ch-basics-02-sse">basics-02</a>）；gRPC 流仅在服务间。Gateway 无需理解 protobuf。</p>
+      </div>
+
+      <h4>BFF 侧 gRPC 客户端（Java 示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">ManagedChannel channel = ManagedChannelBuilder
+    .forAddress("corpassist-ai-py", 50051)
+    .usePlaintext()  // 内网 mTLS 生产环境替换
+    .build();
+RagServiceGrpc.RagServiceBlockingStub stub =
+    RagServiceGrpc.newBlockingStub(channel)
+        .withDeadlineAfter(120, TimeUnit.SECONDS);
+
+Iterator&lt;ChatChunk&gt; stream = stub.streamChat(ChatRequest.newBuilder()
+    .setTenantId(tenantId)
+    .setSessionId(sessionId)
+    .setUserMessage(message)
+    .addAllContext(hits)
+    .build());
+
+while (stream.hasNext()) {
+  ChatChunk chunk = stream.next();
+  sseEmitter.send(chunk.getDelta());
+  if (chunk.getFinished()) break;
+}</code></pre>
+      </div>
+
+      <h4>Python 侧 server streaming（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class RagServicer(rag_pb2_grpc.RagServiceServicer):
+    async def StreamChat(self, request, context):
+        async for delta in llm_stream(request.user_message, request.context):
+            yield rag_pb2.ChatChunk(delta=delta, finished=False, token_count=1)
+        yield rag_pb2.ChatChunk(delta="", finished=True, token_count=0)</code></pre>
+      </div>
+
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>公网暴露 gRPC 50051，无 TLS</li>
+            <li>proto 随意改字段编号，无兼容性检查</li>
+            <li>用 gRPC 替代全部 MQ 索引任务（见 <a href="#ch-practice-04-mq">practice-04</a>）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>内网 mTLS；Gateway 对外只 REST/SSE</li>
+            <li>buf breaking change 或 protobuf 兼容规则 CI</li>
+            <li>长任务走 MQ；实时 RPC 走 gRPC</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>何时用 gRPC：<span class="term" data-term-id="when-grpc" tabindex="0">when grpc</span> 决策</h3>
+      <p><span class="term" data-term-id="rest-vs-grpc" tabindex="0">rest vs grpc</span> 不是信仰之争。CorpAssist 默认 BFF→Python 用 OpenAPI REST；当出现下列信号时再引入 gRPC：</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>信号</th><th>倾向 gRPC</th><th>保持 REST</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>内网 P99 延迟 &gt; 预算，HTTP 连接数高</td>
+            <td>HTTP/2 多路复用、二进制 payload</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td>需要 server/bidi streaming 传 token</td>
+            <td><code>StreamChat</code></td>
+            <td>HTTP chunked 也可但 BFF 代码更繁</td>
+          </tr>
+          <tr>
+            <td>第三方 / 浏览器直接调用</td>
+            <td>—</td>
+            <td>REST + OpenAPI 文档</td>
+          </tr>
+          <tr>
+            <td>团队无 proto 治理经验</td>
+            <td>—</td>
+            <td>先 REST，度量后再迁移</td>
+          </tr>
+          <tr>
+            <td>批量索引、削峰</td>
+            <td>—</td>
+            <td><a href="#ch-practice-04-mq">MQ 异步</a> 更合适</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-tabs" role="tablist" aria-label="REST vs gRPC">
+        <input type="radio" name="p05rpc" id="p05-tab-rest" class="learn-tab-input" checked />
+        <input type="radio" name="p05rpc" id="p05-tab-grpc" class="learn-tab-input" />
+        <label for="p05-tab-rest">对外 REST</label>
+        <label for="p05-tab-grpc">对内 gRPC</label>
+        <div class="learn-tab-panel" id="p05-panel-rest" role="tabpanel">
+          <p><strong>路径</strong>：<code>/v1/chat</code>、<code>/v1/rag/**</code> 经 Gateway。</p>
+          <p><strong>优势</strong>：curl 调试、Swagger、WAF 友好。</p>
+        </div>
+        <div class="learn-tab-panel" id="p05-panel-grpc" role="tabpanel">
+          <p><strong>路径</strong>：BFF → <code>corpassist-ai-py:50051</code>（ClusterIP）。</p>
+          <p><strong>优势</strong>：强类型、流式、更低序列化开销。</p>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>gRPC 一定比 REST 快</strong> — 小 payload 下差距可能不明显；先度量 P99。</li>
+          <li><strong>Gateway 转 gRPC</strong> — Spring Cloud Gateway 对 gRPC 需 grpc-proxy 插件；CorpAssist 选 BFF 直连 Python。</li>
+          <li><strong>流式 = 只要 gRPC</strong> — 对用户 SSE 足够；gRPC 流是内网优化项。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>关键术语速览</h3>
+      <p>
+        <span class="term" data-term-id="grpc-integration" tabindex="0">grpc integration</span> ·
+        <span class="term" data-term-id="proto-define" tabindex="0">proto define</span> ·
+        <span class="term" data-term-id="grpc-stream" tabindex="0">grpc stream</span> ·
+        <span class="term" data-term-id="when-grpc" tabindex="0">when grpc</span> ·
+        <span class="term" data-term-id="internal-rpc" tabindex="0">internal rpc</span> ·
+        <span class="term" data-term-id="protobuf" tabindex="0">protobuf</span> ·
+        <span class="term" data-term-id="performance-rpc" tabindex="0">performance rpc</span> ·
+        <span class="term" data-term-id="rest-vs-grpc" tabindex="0">rest vs grpc</span>
+      </p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>已有 OpenAPI，还要 gRPC 吗？</summary>
+          <div class="learn-faq-body">可选。REST 保留作调试与降级；gRPC 作内网热路径。BFF 可 feature flag 切换 stub。</div>
+        </details>
+        <details>
+          <summary>与 <a href="#ch-practice-04-mq">MQ 索引</a> 如何配合？</summary>
+          <div class="learn-faq-body">索引任务仍走 MQ；gRPC 适合同步 retrieve/chat。勿用 streaming RPC 传整库 PDF。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>proto</strong>：共享 <code>RagService</code> 契约；Retrieve unary + StreamChat server streaming。</li>
+        <li><strong>边界</strong>：Gateway/客户端 REST+SSE；BFF↔Python 可选 <span class="term" data-term-id="grpc-integration" tabindex="0">grpc integration</span>。</li>
+        <li><strong>选型</strong>：度量驱动；批量异步用 MQ，低延迟流式用 gRPC。</li>
+        <li><strong>下一步</strong>：<a href="#ch-practice-06-corpassist-gw">实战：CorpAssist 网关层</a> capstone。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_p05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="proto" /> 能解释 Retrieve 与 StreamChat 的模式差异</label></li>
+          <li><label><input type="checkbox" data-id="sse-grpc" /> 能说明 SSE 与 gRPC stream 在链路上的位置</label></li>
+          <li><label><input type="checkbox" data-id="when" /> 能列出 2 条适合上 gRPC 的信号</label></li>
+          <li><label><input type="checkbox" data-id="not-grpc" /> 能说出 1 条不应 gRPC 的场景（如公网 API）</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-practice-06-corpassist-gw">CorpAssist 网关 capstone</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://grpc.io/docs/languages/java/basics/" target="_blank" rel="noopener">gRPC Java Basics</a></li>
+      <li><a href="https://grpc.io/docs/languages/python/basics/" target="_blank" rel="noopener">gRPC Python Basics</a></li>
+      <li><a href="https://protobuf.dev/programming-guides/proto3/" target="_blank" rel="noopener">Protocol Buffers — Proto3 Guide</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-05-grpc-lab/grpc-vs-rest.md</code> 填写选型表，并用 grpcurl 验证 Python 服务（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>将正文 <code>RagService.proto</code> 复制到 Demo 目录，运行 <code>buf generate</code> 或项目脚本生成 Java/Python stub。</li>
+      <li>启动 Python gRPC 服务（端口 50051），用 grpcurl 调用 unary Retrieve：
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-bash">grpcurl -plaintext -d '{"tenant_id":"demo","query":"退款政策","top_k":3}' \
+  localhost:50051 corpassist.v1.RagService/Retrieve</code></pre>
+        </div>
+      </li>
+      <li>对比同一 query 的 REST 路径（若已启用）：
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-bash">curl -s "http://localhost:8000/v1/rag/retrieve?tenant_id=demo&amp;q=退款政策&amp;top_k=3" | jq .</code></pre>
+        </div>
+        记录两者延迟与 payload 大小（粗略即可）。</li>
+      <li>在 BFF 配置中增加 gRPC channel 地址（yaml 示意）：
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-yaml">corpassist:
+  ai:
+    grpc:
+      host: corpassist-ai-py
+      port: 50051
+      deadline-seconds: 120
+    rest:
+      base-url: http://corpassist-ai-py:8000
+      enabled: true  # 降级开关</code></pre>
+        </div>
+      </li>
+      <li>在 <code>grpc-vs-rest.md</code> 写<strong>一条采用 gRPC</strong>与<strong>一条坚持 REST</strong>的 CorpAssist 场景理由。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">方案：「把 Gateway 改成 gRPC 入口，App 全部换 stub」。请指出<strong>违反</strong>本章原则的 2 点。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>① 移动端/浏览器 gRPC 支持差，破坏 OpenAPI 生态；② Gateway 层 gRPC 治理复杂，与 CorpAssist「对外 REST」架构不符。应 BFF 内网 gRPC。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：索引 500 份 PDF 应走？A) <code>index_jobs</code> MQ B) <code>StreamChat</code> gRPC C) 同步 REST 长连接</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>A</strong>。批量离线任务用 MQ 削峰；B 适合 token 流；C 会占满连接。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：gRPC 可选集成</h4>
+      <p>目录：<code>demos/practice-05-grpc-lab/</code>。<strong>验收</strong>：<code>grpc-vs-rest.md</code> 含 2 条选型理由；grpcurl 成功调用 <code>Retrieve</code>；能画「REST 对外 / gRPC 对内」示意图。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-06-corpassist-gw">实战：CorpAssist 网关层</a></li>
+      <li><a href="#ch-basics-02-sse">SSE 流式端到端</a>：用户侧流式协议</li>
+      <li><a href="#ch-practice-04-mq">消息队列与异步任务</a>：与 gRPC 分工</li>
+    </ul>
+  </div>
+</section>

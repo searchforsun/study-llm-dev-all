@@ -1,0 +1,348 @@
+<section id="ch-practice-05-rest-api" class="chapter" data-chapter="practice-05-rest-api">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>暴露 REST 与 SSE</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-rest-api" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>RAG、工具与记忆</strong> · 能力：设计 Controller、SSE 流式、全局异常与 OpenAPI 文档</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>practice 前几章的能力需在 HTTP 边界对外可用。CorpAssist 门户调用 Spring 的 <span class="term" data-term-id="rest-controller" tabindex="0">rest controller</span>：同步 JSON 与 <span class="term" data-term-id="streaming-response" tabindex="0">streaming response</span>（SSE）并存；异常统一为 <span class="term" data-term-id="problem-detail" tabindex="0">problem detail</span>；契约由 <span class="term" data-term-id="openapi-springdoc" tabindex="0">openapi springdoc</span> 导出供 BFF 与 Python 对齐。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>拆分 Chat / RAG Controller 与 <span class="term" data-term-id="dto-validation" tabindex="0">dto validation</span></li>
+          <li>用 <span class="term" data-term-id="sse-emitter" tabindex="0">sse emitter</span> 或 <code>Flux</code> 推送 token 流</li>
+          <li><span class="term" data-term-id="global-exception" tabindex="0">Global exception</span> 映射模型超时与校验错误</li>
+          <li>配置 springdoc 与 <span class="term" data-term-id="api-versioning" tabindex="0">api versioning</span>（<code>/v1</code>）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Controller 薄、Service 厚</strong>：HTTP 层只做鉴权、校验、映射；ChatClient 在 Service。</li>
+          <li><strong>SSE 要心跳与超时</strong>：防网关断连；错误 event 也要规范 JSON。</li>
+          <li><strong>OpenAPI 即契约</strong>：与 <a href="#ch-advanced-05-corpassist-rag-api">实战：CorpAssist Spring RAG API</a> 交付物同源。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Controller 设计：分层与 DTO</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 API 网关后</span>
+        门户 BFF 调用 <code>/v1/chat</code>（同步）与 <code>/v1/chat/stream</code>（SSE）。Controller 注入 <code>CorpAssistChatService</code>，聚合 Memory、RAG、Tool（见前四章）。
+      </aside>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@RestController
+@RequestMapping("/v1/chat")
+@Validated
+public class ChatController {
+  private final CorpAssistChatService chatService;
+
+  @PostMapping
+  public ChatReply chat(@Valid @RequestBody ChatRequest req,
+      @AuthenticationPrincipal CorpUser user) {
+    return chatService.chat(user, req);
+  }
+
+  @PostMapping("/rag")
+  public RagResponse rag(@Valid @RequestBody RagRequest req,
+      @AuthenticationPrincipal CorpUser user) {
+    return chatService.rag(user, req);
+  }
+}
+
+public record ChatRequest(
+    @NotBlank @Size(max = 4000) String message,
+    String conversationId) {}
+
+public record ChatReply(String conversationId, String answer) {}</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>端点</th><th>方法</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/v1/chat</code></td><td>POST JSON</td><td>同步问答 + Memory</td></tr>
+          <tr><td><code>/v1/chat/stream</code></td><td>POST SSE</td><td>流式 token</td></tr>
+          <tr><td><code>/v1/chat/rag</code></td><td>POST JSON</td><td>RAG + citations</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Controller 内 ChatClient</span>
+          <ul>
+            <li>500 行 Controller</li>
+            <li>难以单测与复用</li>
+            <li>OpenAPI 难描述</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Service 封装 Advisor 链</span>
+          <ul>
+            <li>Controller 10 行</li>
+            <li>@WebMvcTest 测校验</li>
+            <li>契约稳定</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>SSE 流式：Flux 与事件格式</h3>
+      <p>Spring MVC 6 / Boot 3 可直接返回 <code>Flux&lt;ServerSentEvent&lt;String&gt;&gt;</code> 或 <code>text/event-stream</code>。Demo <code>chat-api.http</code> 指向 <code>POST /v1/chat/stream</code>。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;ServerSentEvent&lt;String&gt;&gt; stream(
+    @Valid @RequestBody ChatRequest req,
+    @AuthenticationPrincipal CorpUser user) {
+  return chatService.stream(user, req)
+      .map(token -> ServerSentEvent.builder(token).event("token").build())
+      .concatWith(Flux.just(ServerSentEvent.builder("[DONE]").event("done").build()))
+      .onErrorResume(ex -> Flux.just(
+          ServerSentEvent.builder("模型暂时不可用").event("error").build()));
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>SSE 事件流</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant C as 客户端
+  participant API as ChatController
+  participant S as ChatService
+  participant LLM as ChatModel Flux
+  C->>API: POST /stream
+  API->>S: stream()
+  S->>LLM: ChatClient.stream
+  loop tokens
+    LLM-->>S: chunk
+    S-->>C: event:token data:...
+  end
+  S-->>C: event:done</pre>
+      </div>
+
+      <ul>
+        <li><strong>event 类型</strong>：<code>token</code>、<code>done</code>、<code>error</code>，便于前端区分。</li>
+        <li><strong>网关</strong>：Nginx <code>proxy_buffering off</code>；超时大于模型首 token 延迟。</li>
+        <li>与 <a href="#ch-basics-02-chatclient">ChatClient 与 ChatModel</a> 的 <code>Flux&lt;String&gt;</code> 直接对接。</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>全局异常：ProblemDetail 与错误码</h3>
+      <p><code>@RestControllerAdvice</code> 将校验失败、模型超时、Tool 异常映射为 RFC 9457 ProblemDetail，避免泄露 stack trace。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@RestControllerAdvice
+public class CorpAssistExceptionHandler {
+
+  @ExceptionHandler(MethodArgumentNotValidException.class)
+  ResponseEntity&lt;ProblemDetail&gt; validation(MethodArgumentNotValidException ex) {
+    ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+    pd.setTitle("请求参数无效");
+    pd.setProperty("code", "VALIDATION_ERROR");
+    return ResponseEntity.badRequest().body(pd);
+  }
+
+  @ExceptionHandler(UncheckedIOException.class)
+  ResponseEntity&lt;ProblemDetail&gt; llmTimeout(UncheckedIOException ex) {
+    ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.GATEWAY_TIMEOUT);
+    pd.setTitle("模型调用超时");
+    pd.setProperty("code", "LLM_TIMEOUT");
+    return ResponseEntity.status(504).body(pd);
+  }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">500 + 原始异常信息</span>
+          <ul>
+            <li>暴露内部类名</li>
+            <li>BFF 无法分类重试</li>
+            <li>不符合企业 API 规范</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">ProblemDetail + code</span>
+          <ul>
+            <li>VALIDATION_ERROR / LLM_TIMEOUT</li>
+            <li>SSE error event 同码</li>
+            <li>日志含 traceId（advanced 可观测）</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OpenAPI：springdoc 与版本</h3>
+      <p>引入 <code>springdoc-openapi-starter-webmvc-ui</code>，Controller 与 record DTO 自动生成 schema；<code>/v3/api-docs</code> 供 Python 契约测试。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+corpassist:
+  api:
+    version: v1</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Operation(summary = "流式对话", description = "SSE token 流，event 类型 token|done|error")
+@PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;ServerSentEvent&lt;String&gt;&gt; stream(...) { ... }
+
+@Schema(description = "RAG 响应含引用")
+public record RagResponse(
+    String answer,
+    @Schema(requiredMode = Schema.RequiredMode.REQUIRED)
+    List&lt;Citation&gt; citations) {}</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 契约评审</span>
+        发布前导出 OpenAPI，与 BFF、Python eval 脚本三方 diff；<code>RagResponse.citations</code> 为必填，防止前端漏展示引用。
+      </aside>
+
+      <p>practice 阶段完整串联：<a href="#ch-practice-01-vectorstore">VectorStore 与 Embedding</a> → <a href="#ch-practice-02-rag-pipeline">RAG Pipeline 实现</a> → <a href="#ch-practice-03-tool-calling">Function Calling / Tools</a> → <a href="#ch-practice-04-chat-memory">Chat Memory 与会话</a> → 本章 HTTP 暴露。下一阶段 <a href="#ch-advanced-01-advisors-prod">生产 Advisor：安全与护栏</a> 加固输入输出。</p>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>CorpAssist /v1 API 速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>路径</th><th>Content-Type</th><th>响应</th></tr></thead>
+              <tbody>
+                <tr><td><code>POST /v1/chat</code></td><td>application/json</td><td>ChatReply</td></tr>
+                <tr><td><code>POST /v1/chat/stream</code></td><td>application/json</td><td>text/event-stream</td></tr>
+                <tr><td><code>POST /v1/chat/rag</code></td><td>application/json</td><td>RagResponse + citations</td></tr>
+                <tr><td><code>GET /v3/api-docs</code></td><td>—</td><td>OpenAPI JSON</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <h4>curl 流式 smoke（与 Demo 对齐）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">curl -N -X POST http://localhost:8080/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"message":"年假制度摘要","conversationId":"c-demo-1"}'</code></pre>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：ProblemDetail 与 SSE error event 如何统一 code？</summary>
+        <p>定义 <code>CorpAssistErrorCodes</code> 枚举；同步 API 写入 ProblemDetail.properties.code，SSE 的 error event data 用同一 JSON 字段，BFF 一套解析逻辑。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Controller</strong>：薄层 + @Valid DTO；/v1 前缀版本化。</li>
+        <li><strong>SSE</strong>：Flux + ServerSentEvent；token/done/error 事件。</li>
+        <li><strong>全局异常</strong>：ProblemDetail + 业务 code。</li>
+        <li><strong>OpenAPI</strong>：springdoc 导出；RagResponse citations 必填。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai_practice05_api">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="ctrl" /> 能列出 3 个端点及职责</label></li>
+          <li><label><input type="checkbox" data-id="sse" /> 能说明 SSE event 类型</label></li>
+          <li><label><input type="checkbox" data-id="problem" /> 能写出 ProblemDetail 字段</label></li>
+          <li><label><input type="checkbox" data-id="http-demo" /> 已试打 chat-api.http 或 curl</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一阶段：<a href="#ch-advanced-01-advisors-prod">生产 Advisor：安全与护栏</a></p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI — ChatClient</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html" target="_blank" rel="noopener">Spring MVC — Async & SSE</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-rest-exceptions.html" target="_blank" rel="noopener">Spring — ProblemDetail</a></li>
+      <li><a href="https://springdoc.org/" target="_blank" rel="noopener">springdoc-openapi</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 HTTP Client 或 curl 试打流式接口，并对照 OpenAPI 字段。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-05-rest-api-lab/chat-api.http</code>。</li>
+      <li>本地启动 corpassist-ai（或 Mock）后 POST <code>/v1/chat/stream</code>，观察 event 行。</li>
+      <li>故意发送空 message，记录 ProblemDetail 的 code。</li>
+      <li>在 swagger-ui 找到 RagResponse schema，确认 citations 必填。</li>
+      <li>完成章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">SSE 在网关后 30s 无数据断连。应改客户端还是服务端？列举 2 项。</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>两端协同：网关 proxy_read_timeout 加大、proxy_buffering off；服务端首 token 前发 comment 心跳或缩短模型首包延迟。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：暴露 REST 与 SSE</h4>
+      <p>目录：<code>demos/practice-05-rest-api-lab/</code>。<strong>验收</strong>：stream 收到 token 事件 + 空 message 返回 VALIDATION_ERROR。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-04-chat-memory">Chat Memory 与会话</a></li>
+      <li><strong>下一阶段</strong>：<a href="#ch-advanced-01-advisors-prod">生产 Advisor：安全与护栏</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 参考文档</a></li>
+    </ul>
+  </div>
+</section>

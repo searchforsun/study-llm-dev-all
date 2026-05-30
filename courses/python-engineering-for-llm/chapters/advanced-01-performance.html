@@ -1,0 +1,463 @@
+<section id="ch-advanced-01-performance" class="chapter" data-chapter="advanced-01-performance">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>性能与资源</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-performance" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产级 Python AI 服务</strong> · 能力：定位热点、复用连接、批处理 Embedding 并控制内存峰值</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist-python 在 RAG 索引与批量 Embedding 时，一次错误实现就可能拖垮整个 Pod：CPU 打满、内存 OOM、或向 LLM 网关发起数千条短连接。Spring BFF 侧有 JVM 调优与连接池经验；Python 侧同样需要<strong>先测量再优化</strong>的纪律。本章建立 <span class="term" data-term-id="profiling" tabindex="0">profiling</span>、<span class="term" data-term-id="connection-pool" tabindex="0">connection pool</span>、<span class="term" data-term-id="batch-embedding" tabindex="0">batch embedding</span> 与 <span class="term" data-term-id="memory-footprint" tabindex="0">memory footprint</span> 四类基线，让 Python AI 服务与 Java 治理栈在同一 SLA 下协作。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 cProfile / py-spy 定位 CorpAssist 索引链路中的 CPU 热点</li>
+          <li>在 <span class="term" data-term-id="lifespan" tabindex="0">lifespan</span> 中复用 <span class="term" data-term-id="httpx" tabindex="0">httpx</span> 客户端，避免每请求新建 TCP</li>
+          <li>按 <code>batch_size</code> 切块调用 Embedding API，平衡 <span class="term" data-term-id="throughput" tabindex="0">throughput</span> 与内存</li>
+          <li>向 Java 同事说明 Python 侧资源瓶颈与 JVM 堆/GC 的异同</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>先 profile 后改代码</strong>：没有数据支撑的「感觉慢」往往改错层。</li>
+          <li><strong>客户端单例</strong>：<span class="term" data-term-id="async-client" tabindex="0">AsyncClient</span> 经 lifespan 创建，类比 Spring <code>RestTemplate</code> Bean。</li>
+          <li><strong>批处理有上限</strong>：batch 越大吞吐越高，但向量与原文同时驻留内存。</li>
+          <li><strong>可观测对齐</strong>：慢请求日志带 <span class="term" data-term-id="correlation-id" tabindex="0">request_id</span>，便于与 Spring MDC 联查。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>profiling</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 索引变慢投诉</span>
+        运营反馈「昨晚知识库重建从 20 分钟变成 2 小时」。在没有 profiling 数据前，团队猜测是 Embedding 模型变慢——实际是 Python 侧 JSON 解析与重复建连吃掉了 70% CPU。本章先教你怎么<strong>用数据说话</strong>。
+      </aside>
+      <p><span class="term" data-term-id="profiling" tabindex="0">Profiling</span> 分两类：<strong>开发/压测</strong>用标准库 <span class="term" data-term-id="cprofile" tabindex="0">cProfile</span>；<strong>生产</strong>用 <span class="term" data-term-id="py-spy" tabindex="0">py-spy</span> 采样，无需改代码、可 attach 到运行中 uvicorn 进程（类似 Java 的 async-profiler）。</p>
+
+      <h4>开发环境：cProfile + pstats</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import cProfile
+import pstats
+from corpassist.rag.indexer import embed_chunks  # 伪路径
+
+def profile_index_run(chunks: list[str]) -&gt; None:
+    pr = cProfile.Profile()
+    pr.enable()
+    embed_chunks(chunks, batch_size=32)
+    pr.disable()
+    stats = pstats.Stats(pr).sort_stats("cumulative")
+    stats.print_stats(15)  # 看 cumulative 最高的 15 个函数</code></pre>
+      </div>
+      <p>阅读输出时关注：<code>cumulative</code>（含子调用总耗时）与 <code>ncalls</code>（调用次数）。若某工具函数 <code>ncalls == len(chunks)</code> 且 cumulative 高，优先考虑批处理或缓存。</p>
+
+      <h4>生产/预发：py-spy 无侵入采样</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 找到 uvicorn 主进程 PID 后采样 30 秒，生成火焰图 SVG
+py-spy record -o profile.svg --pid &lt;PID&gt; --duration 30 --rate 100</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>工具</th><th>适用阶段</th><th>对 CorpAssist 的典型用途</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>cProfile</strong></td>
+            <td>本地 / CI 压测脚本</td>
+            <td>对比索引算法改动前后热点变化</td>
+          </tr>
+          <tr>
+            <td><strong>py-spy</strong></td>
+            <td>预发 / 生产（只读采样）</td>
+            <td>定位 async 路由里隐藏的 <span class="term" data-term-id="blocking-io" tabindex="0">blocking IO</span></td>
+          </tr>
+          <tr>
+            <td><strong>structlog 耗时字段</strong></td>
+            <td>全环境</td>
+            <td>按 <code>request_id</code> 记录 <code>duration_ms</code>，与 Spring 网关日志对齐</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">盲目优化</span>
+          <ul>
+            <li>未 profile 就换更快的 JSON 库</li>
+            <li>生产直接开 cProfile 写文件（I/O 放大）</li>
+            <li>只看平均 RT，忽略 P99 与索引批任务</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">数据驱动</span>
+          <ul>
+            <li>压测脚本固定数据集，改前后对比 cumulative Top10</li>
+            <li>生产用 py-spy + 现有 <span class="term" data-term-id="structlog" tabindex="0">structlog</span> 指标</li>
+            <li>分 API 同步路径 vs 后台索引路径分别测量</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>structlog 耗时与 request_id 关联</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import time
+import structlog
+
+log = structlog.get_logger()
+
+async def embed_with_timing(chunks: list[str], request_id: str) -&gt; None:
+    t0 = time.perf_counter()
+    await embed_chunks(chunks, batch_size=32)
+    log.info(
+        "embed_batch_done",
+        request_id=request_id,
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        chunk_count=len(chunks),
+    )</code></pre>
+      </div>
+      <p>与 Spring 网关 access log 的 <code>duration_ms</code> 对照，可快速判断瓶颈在 Python 还是下游 LLM。P99 突增时优先 py-spy 采样，而非盲目加副本。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：async 路由里调用 <code>time.sleep(1)</code> 会怎样？profile 上如何体现？</summary>
+        <p>会阻塞整个 <span class="term" data-term-id="event-loop" tabindex="0">event loop</span>，所有并发请求卡顿；cProfile 可能显示 sleep 占比高，但更应在代码审查阶段禁止同步阻塞，改用 <code>asyncio.sleep</code> 或 <code>run_in_executor</code>。</p>
+      </details>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩题：Java async-profiler 与 py-spy 在 CorpAssist 联调中如何配合？</summary>
+          <p>用户投诉慢请求时，用 <code>request_id</code> 定位时间窗口；Java 侧查 BFF 与网关 span，Python 侧 py-spy attach uvicorn worker。两侧日志对齐后再决定优化 BFF 聚合还是 Python Embedding 批大小。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>连接池</h3>
+      <p>CorpAssist-python 通过 <span class="term" data-term-id="httpx" tabindex="0">httpx</span> 调用 LLM 网关与向量库 HTTP 接口。每次请求 <code>async with httpx.AsyncClient()</code> 都会新建连接池，高 QPS 下 TLS 握手与端口耗尽是常见瓶颈——类比 Spring 侧未复用 <code>WebClient</code> Bean。</p>
+
+      <div class="mermaid-wrap">
+        <h5>httpx 客户端生命周期（FastAPI lifespan）</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant Uvicorn
+  participant App as FastAPI lifespan
+  participant C as httpx.AsyncClient
+  participant GW as LLM Gateway
+  Uvicorn-&gt;&gt;App: startup
+  App-&gt;&gt;C: 创建单例 pool
+  loop 每个请求
+    App-&gt;&gt;C: Depends 注入
+    C-&gt;&gt;GW: 复用连接
+  end
+  Uvicorn-&gt;&gt;App: shutdown
+  App-&gt;&gt;C: await aclose()</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="connection-pool" tabindex="0">Connection pool</span> 在进程内共享；多 Worker 时每个 worker 各有一份池，需与网关 <code>max_connections</code> 配额对齐。</p>
+      </div>
+
+      <h4>lifespan 中创建与注入</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+import httpx
+from fastapi import Depends, FastAPI, Request
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -&gt; AsyncIterator[None]:
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    timeout = httpx.Timeout(30.0, connect=5.0)
+    app.state.http = httpx.AsyncClient(limits=limits, timeout=timeout)
+    yield
+    await app.state.http.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+async def get_http(request: Request) -&gt; httpx.AsyncClient:
+    return request.app.state.http</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>参数</th><th>建议起点</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>max_connections</code></td>
+            <td>50–200</td>
+            <td>与 Pod 副本数 × worker 数 × 并发乘积对照网关限流</td>
+          </tr>
+          <tr>
+            <td><code>max_keepalive_connections</code></td>
+            <td>10–20</td>
+            <td>空闲连接过多占内存，过少则频繁握手</td>
+          </tr>
+          <tr>
+            <td><code>Timeout</code></td>
+            <td>connect 5s / read 30s</td>
+            <td>与 <a href="#ch-practice-04-middleware">中间件超时</a> 及 Spring <code>RestTemplate</code> 一致</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>多 Worker 连接数估算</h4>
+      <p>uvicorn <code>--workers 4</code> 时，每 worker 各持一份 <span class="term" data-term-id="connection-pool" tabindex="0">connection pool</span>。若 <code>max_connections=100</code>，理论峰值 400 条到 LLM 网关——需与平台配额和 <span class="term" data-term-id="semaphore" tabindex="0">semaphore</span> 并发上限一并规划。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>部署参数</th><th>示例值</th><th>到网关最大连接</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>2 副本 × 2 workers × max_connections</td><td>2×2×100</td><td>400</td></tr>
+          <tr><td>加 semaphore 限 20/路由</td><td>—</td><td>实际并发受 semaphore 约束</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：向量库 SDK 自带连接池，还要 httpx 池吗？</summary>
+        <p>SDK 管的是到向量库的连接；到 LLM 网关仍走 httpx。两套池分别配置上限，避免某一侧慢请求占满全部连接。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>批处理 Embedding</h3>
+      <p>单条调用 Embedding API 简单，但索引 10 万 chunk 时 RTT 与序列化开销主导耗时。<span class="term" data-term-id="batch-embedding" tabindex="0">Batch embedding</span> 将多条文本合并一次请求（受模型 <code>max_batch_size</code> 与 token 上限约束），是提升 <span class="term" data-term-id="throughput" tabindex="0">throughput</span> 的首要手段。</p>
+
+      <h4>切块迭代器模式</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from itertools import batched  # Py 3.12+
+
+async def embed_all(
+    client: httpx.AsyncClient,
+    texts: list[str],
+    *,
+    batch_size: int = 32,
+) -&gt; list[list[float]]:
+    vectors: list[list[float]] = []
+    for batch in batched(texts, batch_size):
+        resp = await client.post(
+            "/v1/embeddings",
+            json={"input": list(batch), "model": "text-embedding-3-small"},
+        )
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        vectors.extend(item["embedding"] for item in data)
+    return vectors</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="batch_size 权衡">
+        <input type="radio" name="adv01-batch-tab" id="adv01-batch-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="adv01-batch-tab" id="adv01-batch-tab-b" class="learn-tab-input" />
+        <label for="adv01-batch-tab-a">偏小 batch（8–16）</label>
+        <label for="adv01-batch-tab-b">偏大 batch（64–128）</label>
+        <div class="learn-tab-panel" id="adv01-batch-panel-a" role="tabpanel">
+          <ul>
+            <li>内存峰值低，适合小 Pod（512Mi–1Gi）</li>
+            <li>429 限流时单批失败影响面小</li>
+            <li>适合在线补索引与混部 API 服务</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="adv01-batch-panel-b" role="tabpanel">
+          <ul>
+            <li>离线全量重建吞吐高</li>
+            <li>需监控单批响应体大小与超时</li>
+            <li>建议独立 Worker 进程，避免挤占 API <span class="term" data-term-id="semaphore" tabindex="0">semaphore</span> 配额</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>429 退避重试（Embedding 可重试）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def embed_batch_with_retry(client, batch: list[str], max_attempts: int = 3):
+    for attempt in range(max_attempts):
+        resp = await client.post("/v1/embeddings", json={"input": batch})
+        if resp.status_code not in (429, 503):
+            resp.raise_for_status()
+            return resp.json()
+        await asyncio.sleep(min(2 ** attempt, 30))
+    raise LlmRateLimitError("embedding batch exhausted retries")</code></pre>
+      </div>
+      <p>批处理与 <span class="term" data-term-id="retry-policy" tabindex="0">重试策略</span> 配合：对 429/503 做指数退避；非幂等场景（带随机噪声的 Chat）勿盲目重试整批，Embedding 通常可安全重试单批。</p>
+
+      <div class="notice">
+        <strong>监控指标</strong>
+        <p>向平台组暴露 <code>embedding_batch_size</code>、<code>embedding_latency_ms</code>、<code>http_pool_wait_ms</code>（若 SDK 支持），与 Java Micrometer 指标同 Grafana 看板，便于双栈容量规划。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>内存注意</h3>
+      <p>Python 进程常因「同时持有过多大对象」被 OOMKilled：全文列表 + 向量矩阵 + 中间 JSON 副本。Java 有堆上限与 GC 日志；Python 需主动控制 <span class="term" data-term-id="memory-footprint" tabindex="0">memory footprint</span> 并了解 <span class="term" data-term-id="gc-tuning" tabindex="0">GC</span> 行为。</p>
+
+      <h4>CorpAssist 索引内存 checklist</h4>
+      <ul>
+        <li><strong>流式读文档</strong>：不要 <code>read()</code> 整个 PDF 目录进 list；按文件迭代。</li>
+        <li><strong>及时释放</strong>：每批 embedding 写入向量库后 <code>del batch_vectors</code>，避免累积。</li>
+        <li><strong>避免巨型中间结构</strong>：优先生成器；必要时用 <code>__slots__</code> 或 dataclass 减小对象头开销。</li>
+        <li><strong>副本与 Worker</strong>：K8s <code>limits.memory</code> 要按「单 worker 峰值 × 1.2」留余量，不是按空载估算。</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import tracemalloc
+
+tracemalloc.start()
+# ... 跑一批索引 ...
+current, peak = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+# structlog: peak_kb=peak // 1024，随 request_id 打出</code></pre>
+      </div>
+
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python"># 反例：全量驻留
+all_texts = [f.read() for f in paths]
+all_vectors = await embed_all(client, all_texts, batch_size=256)
+save(all_vectors)</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python"># 推荐：按批落盘
+for path in paths:
+    chunks = chunk_file(path)
+    for batch in batched(chunks, 32):
+        vecs = await embed_batch(client, batch)
+        upsert_vectors(vecs)
+        del vecs</code></pre>
+        </div>
+      </div>
+
+      <h4>K8s memory limit 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">resources:
+  requests:
+    memory: "512Mi"
+    cpu: "250m"
+  limits:
+    memory: "1Gi"   # 按 tracemalloc 峰值 × 1.2 设置
+    cpu: "1000m"</code></pre>
+      </div>
+      <p><span class="term" data-term-id="gc-tuning" tabindex="0">GC tuning</span> 在 CPython 3.12 通常无需 JVM 级调参；若长任务分配大量短生命周期对象，可监控 GC 次数。更可靠的是减少峰值对象（流式 + 批完即释）。</p>
+
+      <div class="notice">
+        <strong>与 Spring 侧对齐</strong>
+        <p>Java BFF 转发大文件上传时应走对象存储 + 异步索引任务（见 <a href="#ch-advanced-02-background-jobs">后台任务与队列</a>），避免 HTTP 同步路径在 Python 内堆积整文件字节流。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>profiling</strong>：开发用 cProfile，生产用 py-spy；改代码前用 cumulative Top 函数证明瓶颈。</li>
+        <li><strong>连接池</strong>：httpx.AsyncClient 经 lifespan 单例；配置 limits/timeout 与网关配额一致。</li>
+        <li><strong>批处理 Embedding</strong>：按 batch_size 切块；在线小批、离线大批；429 退避重试。</li>
+        <li><strong>内存注意</strong>：流式处理、批完即释、tracemalloc 辅助；K8s memory limit 按峰值留余量。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_adv01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="profile" /> 能说出 cProfile 与 py-spy 的适用环境</label></li>
+          <li><label><input type="checkbox" data-id="pool" /> 能解释为何 AsyncClient 不应每请求 new</label></li>
+          <li><label><input type="checkbox" data-id="batch" /> 能根据 Pod 内存选 batch_size 区间</label></li>
+          <li><label><input type="checkbox" data-id="mem" /> 能列举索引链路 2 个 OOM 风险点</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-advanced-02-background-jobs">后台任务与队列</a>，把长耗时 RAG 索引移出 HTTP 同步路径。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.python.org/3/library/profile.html" target="_blank" rel="noopener">Python profile — cProfile</a></li>
+      <li><a href="https://github.com/benfred/py-spy" target="_blank" rel="noopener">py-spy — 生产采样</a></li>
+      <li><a href="https://www.python-httpx.org/advanced/resource-limits/" target="_blank" rel="noopener">httpx — Limits 与 Timeout</a></li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/events/" target="_blank" rel="noopener">FastAPI lifespan</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 Demo 脚本跑通 cProfile 输出，并对照正文「连接池参数表」与「批处理代码块」填写一份 CorpAssist 索引性能检查表（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读正文「profiling」节的 cProfile 代码块，说明 <code>sort_stats("cumulative")</code> 与 <code>ncalls</code> 各回答什么问题。</li>
+      <li>对照「连接池参数表」，为 2 副本 × 2 worker 的部署估算合理的 <code>max_connections</code> 上限（需写出乘积思路）。</li>
+      <li>在「批处理 Embedding」代码块中，若 <code>batch_size=128</code> 触发 413，应改哪两个参数或策略？</li>
+      <li>阅读「structlog 耗时」代码块，说明 <code>duration_ms</code> 与 <code>request_id</code> 在 ELK 联查中的作用。</li>
+      <li>用「多 Worker 连接数估算」表，计算 3 副本 × 4 workers × max_connections=50 的峰值连接数。</li>
+      <li>进入 <code>demos/advanced-01-performance-lab/</code>，运行 <code>python profile_demo.py</code>，记录输出中 cumulative 最高的函数名。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）索引任务在 async 路由里同步调用 <code>requests.get</code> 拉取 500 个文档 URL，QPS 下降且 event loop 卡顿。请按排障优先级列出应检查的 3 处（结合本章 profiling / 连接池 / 阻塞 IO）。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>① 立即改为 httpx 异步或 <code>run_in_executor</code>，消除 sync blocking；② py-spy 或 cProfile 确认热点是否在 HTTP 等待；③ 检查是否每 URL 新建 Client、未复用 lifespan 连接池；④ 长期应把全量索引移出 API 路由到后台 Worker。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：性能 profiling 入门</h4>
+      <p>目录：<code>demos/advanced-01-performance-lab/</code>。<strong>验收</strong>：执行 <code>python profile_demo.py</code>，终端打印 pstats 前 5 行且含 <code>cumulative</code> 列；你能指出热点函数对应本章哪一类优化（CPU / IO / 内存）。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-05-docker">容器化与本地 compose</a> — 镜像资源 limit 与 healthcheck</li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-02-background-jobs">后台任务与队列</a> — 长任务 RAG 索引</li>
+      <li><a href="https://docs.python.org/3/library/tracemalloc.html" target="_blank" rel="noopener">tracemalloc — 内存分配追踪</a></li>
+    </ul>
+  </div>
+</section>

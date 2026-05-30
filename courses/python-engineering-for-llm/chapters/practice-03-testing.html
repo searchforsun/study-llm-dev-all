@@ -1,0 +1,386 @@
+<section id="ch-practice-03-testing" class="chapter" data-chapter="practice-03-testing">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>测试策略</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-testing" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>FastAPI 与异步服务</strong> · 能力：pytest + TestClient 覆盖 API，mock LLM 不进 CI 外网</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>没有 <span class="term" data-term-id="mock-llm" tabindex="0">mock LLM</span> 的测试会在 CI 里烧钱且不稳定。CorpAssist-python 需在合并前验证路由、依赖与错误映射，并与 Spring 侧共享 OpenAPI 契约。本章建立可重复、零外部网络的测试基线。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="pytest" tabindex="0">pytest</span> 组织测试目录与 <span class="term" data-term-id="fixture" tabindex="0">fixture</span></li>
+          <li>用 httpx <span class="term" data-term-id="testclient" tabindex="0">ASGITransport</span> 测 async FastAPI，无需真实端口</li>
+          <li>用 <span class="term" data-term-id="mock-transport" tabindex="0">MockTransport</span> 模拟 LLM JSON 响应</li>
+          <li>入门 <span class="term" data-term-id="contract-test" tabindex="0">契约测试</span>，与 Java 消费方对齐 schema</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>CI 零外网</strong>：测试不得调用真实模型网关；mock 固定 JSON。</li>
+          <li><strong>测行为不测实现</strong>：断言 HTTP 状态与响应字段，少测私有函数。</li>
+          <li><strong>契约先于联调</strong>：OpenAPI/schema 快照失败则阻断发布。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>pytest</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · PR 门禁</span>
+        每次 PR 触发 GitHub Actions：ruff、mypy、pytest。测试必须在 2 分钟内跑完且不依赖 VPN 访问内网 LLM。
+      </aside>
+      <p><span class="term" data-term-id="pytest" tabindex="0">pytest</span> 是 Python 事实标准测试框架，类比 JUnit 5 + Spring Boot Test。CorpAssist 约定测试目录 <code>tests/</code>，文件命名 <code>test_*.py</code>，与源码分离。</p>
+
+      <h4>目录与 pyproject 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">toml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-toml">[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]</code></pre>
+      </div>
+
+      <h4>基础测试结构</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># tests/test_health.py
+import pytest
+
+@pytest.mark.parametrize("path", ["/health"])
+def test_paths_exist(path):
+    assert path.startswith("/")</code></pre>
+      </div>
+
+      <p>使用 <span class="term" data-term-id="parametrize" tabindex="0">parametrize</span> 覆盖多组输入；<span class="term" data-term-id="coverage" tabindex="0">coverage</span> 报告可选，PR 门槛建议核心包 ≥80%。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">CI 直连真实 LLM</span>
+          <ul>
+            <li>依赖外网与 API Key</li>
+            <li>429/503 导致 flaky</li>
+            <li>每次 PR 产生费用</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">MockTransport 固定 JSON</span>
+          <ul>
+            <li>毫秒级、零外网</li>
+            <li>断言 status 与字段</li>
+            <li>与 <span class="term" data-term-id="httpx-mock" tabindex="0">httpx mock</span> 同源</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>pytest 常用命令</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>命令</th><th>用途</th></tr></thead>
+              <tbody>
+                <tr><td><code>pytest -q</code></td><td>安静模式，CI 默认</td></tr>
+                <tr><td><code>pytest -k health</code></td><td>按名称过滤</td></tr>
+                <tr><td><code>pytest --cov=src --cov-report=term-missing</code></td><td>覆盖率与未覆盖行</td></tr>
+                <tr><td><code>pytest -x</code></td><td>首失败即停，本地快速迭代</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">手动脚本</span>
+          <ul>
+            <li><code>if __name__ == "__main__"</code> 里 assert</li>
+            <li>无 CI 集成</li>
+            <li>失败时堆栈难读</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">pytest</span>
+          <ul>
+            <li><code>pytest -q</code> 统一入口</li>
+            <li>fixture 复用 TestClient</li>
+            <li>丰富插件生态（asyncio、cov）</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>TestClient</h3>
+      <p>FastAPI 基于 ASGI，可用 httpx 的 <code>ASGITransport</code> 在进程内调用 app，无需 <code>uvicorn</code> 起端口。同步与异步测试均支持。</p>
+
+      <h4>异步 TestClient 测 /health</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import pytest
+from httpx import ASGITransport, AsyncClient
+from main import app
+
+@pytest.fixture
+async def client():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+@pytest.mark.asyncio
+async def test_health_ok(client):
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"</code></pre>
+      </div>
+
+      <h4>dependency_overrides 注入 mock Settings</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from main import app, get_settings
+
+@pytest.fixture
+def override_settings():
+    class FakeSettings:
+        service_name = "test-service"
+    app.dependency_overrides[get_settings] = lambda: FakeSettings()
+    yield
+    app.dependency_overrides.clear()</code></pre>
+      </div>
+
+      <p>类比 Spring <code>@MockBean</code> + <code>@WebMvcTest</code>：只替换被测边界外的依赖。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何测试用 ASGITransport 而非 localhost:8000？</summary>
+        <p>避免端口冲突与启动慢；测试与 app 同进程，fixture 可安全 override 依赖。集成环境仍保留少量 e2e 打真实端口。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>mock LLM</h3>
+      <p>LLM 响应体大、耗时长、带随机性。单元/集成测试应通过 <span class="term" data-term-id="httpx-mock" tabindex="0">httpx mock</span> 返回固定 JSON，验证业务解析与错误分支。</p>
+
+      <h4>MockTransport 固定 Chat 响应</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import httpx
+import pytest
+
+MOCK_CHAT_JSON = {
+    "id": "chatcmpl-demo",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "mock answer"}}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+}
+
+def handler(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json=MOCK_CHAT_JSON)
+
+@pytest.mark.asyncio
+async def test_llm_client_parses_mock():
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://llm") as client:
+        resp = await client.post("/v1/chat/completions", json={"model": "demo"})
+    assert resp.json()["choices"][0]["message"]["content"] == "mock answer"</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>测试分层：mock LLM 所在位置</h5>
+        <pre class="mermaid">flowchart TB
+  test["pytest"]
+  api["FastAPI route"]
+  svc["LlmService"]
+  mock["MockTransport"]
+  test --> api
+  api --> svc
+  svc --> mock
+  mock -.->|不触达| real["真实网关"]</pre>
+        <p class="diagram-caption">路由测试走完整 handler；仅 HTTP 边界被 mock。</p>
+      </div>
+
+      <ul>
+        <li>429/503 场景：handler 返回对应状态码，断言重试或错误映射。</li>
+        <li>禁止在 CI secret 里放真实 API Key 做「集成测试」。</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>契约测试入门</h3>
+      <p><span class="term" data-term-id="contract-test" tabindex="0">契约测试</span> 保证 Python 发布的 OpenAPI 与 Spring BFF 消费方期望一致。入门做法：导出 schema 快照，PR diff 失败则人工审查。</p>
+
+      <h4>OpenAPI schema 快照</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import json
+from main import app
+
+def test_openapi_schema_snapshot(snapshot):
+    schema = app.openapi()
+    # 或使用 pytest-snapshot / 黄金文件
+    assert schema["info"]["title"] == "CorpAssist Python"
+    paths = schema["paths"]
+    assert "/health" in paths
+    assert "/v1/rag/query" in paths
+    rag_post = paths["/v1/rag/query"]["post"]
+    assert "RagQueryRequest" in json.dumps(rag_post)</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>层级</th><th>测什么</th><th>工具</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>单元</td><td>Pydantic 解析、工具函数</td><td>pytest</td></tr>
+          <tr><td>API</td><td>HTTP 状态与 JSON 字段</td><td>ASGITransport</td></tr>
+          <tr><td>契约</td><td>OpenAPI paths/schemas</td><td>schema 快照</td></tr>
+          <tr><td>e2e</td><td>Compose 全栈</td><td>见 <a href="#ch-practice-05-docker">容器化与本地 compose</a></td></tr>
+        </tbody>
+      </table>
+
+      <p>进阶：<span class="term" data-term-id="consumer-driven" tabindex="0">consumer driven</span> 契约由 Java 团队提供期望 JSON，Python CI 校验（<a href="#ch-advanced-04-corpassist-api">实战：CorpAssist Python 服务 API</a> 展开）。</p>
+
+      <h4>错误分支也要测</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">@pytest.mark.asyncio
+async def test_rag_query_validation_error(client):
+    resp = await client.post("/v1/rag/query", json={"query": ""})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any("query" in str(e.get("loc", [])) for e in detail)</code></pre>
+      </div>
+      <p>（场景）测试应覆盖 422 校验、401 鉴权（见 <a href="#ch-practice-04-middleware">中间件、鉴权与 CORS</a>）与 504 超时映射，而非只测 happy path。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="测试金字塔">
+        <input type="radio" name="prac03-pyramid-tab" id="prac03-pyramid-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac03-pyramid-tab" id="prac03-pyramid-tab-b" class="learn-tab-input" />
+        <label for="prac03-pyramid-tab-a">PR 必跑</label>
+        <label for="prac03-pyramid-tab-b">发布前</label>
+        <div class="learn-tab-panel" id="prac03-pyramid-panel-a" role="tabpanel">
+          <ul>
+            <li>pytest + ASGITransport：路由与校验</li>
+            <li>MockTransport：LLM 客户端单元测试</li>
+            <li>OpenAPI path 断言：契约回归</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac03-pyramid-panel-b" role="tabpanel">
+          <ul>
+            <li><code>docker compose</code> e2e（见 <a href="#ch-practice-05-docker">容器化与本地 compose</a>）</li>
+            <li>Spring @SpringBootTest 调 Python /health</li>
+            <li>schema diff 与 Java 消费方对齐</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，测试策略四要素复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>pytest</strong>：<code>tests/</code> + asyncio_mode；parametrize 覆盖边界输入。</li>
+        <li><strong>TestClient</strong>：ASGITransport 进程内测 API；dependency_overrides 替换 Settings。</li>
+        <li><strong>mock LLM</strong>：MockTransport 固定响应；CI 零外网、零费用。</li>
+        <li><strong>契约测试</strong>：OpenAPI 快照守护与 Spring 的字段/path 一致。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pytest-run" /> 本地 <code>pytest -q</code> 全绿</label></li>
+          <li><label><input type="checkbox" data-id="async-test" /> 能写出 async TestClient 测 health 的 fixture</label></li>
+          <li><label><input type="checkbox" data-id="mock" /> 能说明 MockTransport 拦截在哪一层</label></li>
+          <li><label><input type="checkbox" data-id="contract" /> 能解释 schema 快照与联调的关系</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-04-middleware">中间件、鉴权与 CORS</a>，为 API 加上 request_id 与鉴权测试。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.pytest.org/" target="_blank" rel="noopener">pytest 文档</a></li>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/testing/" target="_blank" rel="noopener">FastAPI Testing</a></li>
+      <li><a href="https://www.python-httpx.org/advanced/#calling-into-python-web-apps" target="_blank" rel="noopener">httpx ASGITransport</a></li>
+      <li><a href="https://www.python-httpx.org/advanced/#mock-transports" target="_blank" rel="noopener">httpx MockTransport</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-03-testing-lab/</code> 运行 pytest，并对照正文补一条 mock LLM 的 MockTransport 测试与 OpenAPI path 断言。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「异步 TestClient 测 /health」代码块，确认 Demo <code>test_health.py</code> 中断言与之一致。</li>
+      <li>按「MockTransport 固定 Chat 响应」示例新增 <code>test_mock_llm.py</code>，断言 <code>content == "mock answer"</code>。</li>
+      <li>对照「测试分层」Mermaid，在笔记中标出 mock 应插在 LlmService 还是 route 层。</li>
+      <li>运行 <code>pytest -q</code>，期望至少 2 passed；加 <code>--cov=main</code>（可选）查看覆盖率。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">下列哪条违反 CorpAssist CI 测试约定？A) MockTransport 返回 200 JSON；B) PR 测试读取 <code>CORPASSIST_LLM_API_KEY</code> 调真实网关；C) schema 快照比对 <code>/health</code> path。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>选 B。CI 不得依赖真实 LLM 与外网密钥；费用、 flaky 与密钥泄露风险均不可接受。A、C 均为推荐做法。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">测试里忘记 <code>app.dependency_overrides.clear()</code> 会导致什么 flaky 现象？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>后续测试仍使用被 override 的 fake Settings，顺序敏感导致「单独跑过、全套失败」。fixture 应在 teardown 清除 overrides。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：pytest 健康检查</h4>
+      <p>目录：<code>demos/practice-03-testing-lab/</code>。<strong>验收</strong>：<code>pip install pytest pytest-asyncio httpx fastapi &amp;&amp; pytest -q</code> 输出 <code>1 passed</code> 或更多；无网络请求；失败时打印清晰 assertion。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-02-async-io">asyncio 与并发</a> · 被测 async 路由</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-middleware">中间件、鉴权与 CORS</a> · 中间件也可 TestClient 覆盖</li>
+      <li><a href="https://docs.spring.io/spring-boot/reference/testing/index.html" target="_blank" rel="noopener">Spring Boot Testing — 对照</a></li>
+    </ul>
+  </div>
+</section>

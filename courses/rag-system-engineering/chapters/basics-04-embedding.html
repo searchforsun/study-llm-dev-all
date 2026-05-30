@@ -1,0 +1,368 @@
+<section id="ch-basics-04-embedding" class="chapter" data-chapter="basics-04-embedding">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Embedding 与索引</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-embedding" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>RAG 架构与数据管线</strong> · 能力：选型 Embedding、批处理索引，Python 写 Spring 查</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>分块之后，文本必须变成向量才能进检索。<span class="term" data-term-id="corpassist-s1" tabindex="0">corpassist s1</span> 的制度库通常由 Python 离线批处理写入向量库，而 Spring BFF 负责在线查询——若<strong>模型、维度、版本</strong>不一致，召回会「看起来正常、实则全错」。本章把双栈索引契约讲清楚。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>按中英文与成本约束选出合适的 <span class="term" data-term-id="embedding-model" tabindex="0">embedding model</span>，并记录 <span class="term" data-term-id="model-version" tabindex="0">model version</span></li>
+          <li>设计 <span class="term" data-term-id="batch-index" tabindex="0">batch index</span> 任务：批大小、失败重试、与 <span class="term" data-term-id="re-embed" tabindex="0">re embed</span> 触发条件</li>
+          <li>说明 <span class="term" data-term-id="python-index" tabindex="0">python index</span> 与 <span class="term" data-term-id="spring-query" tabindex="0">spring query</span> 如何共用 collection 与 <span class="term" data-term-id="index-alias" tabindex="0">index alias</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>写与查分离</strong>：<span class="term" data-term-id="dual-stack-rag" tabindex="0">dual stack rag</span> 里 Python 负责索引管线，Spring 负责查询 API，共用同一向量库 schema。</li>
+          <li><strong>维度必须对齐</strong>：<span class="term" data-term-id="vector-dim" tabindex="0">vector dim</span> 与模型绑定；换模型必须全量 <span class="term" data-term-id="re-embed" tabindex="0">re embed</span>。</li>
+          <li><strong>版本可切换</strong>：用 <span class="term" data-term-id="index-alias" tabindex="0">index alias</span> 做蓝绿切换，避免查询打到半完成索引。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Embedding 模型选择</h3>
+
+      <p>模型决定「语义空间」——同一句话在不同模型下的向量不可比较。CorpAssist S1 人事制度库以中文条款为主，选型时至少看四维：</p>
+      <ul>
+        <li><strong>语种与领域</strong> — 通用 multilingual 模型 vs 中文优化模型；制度、合同类文本优先测 recall@5。</li>
+        <li><strong><span class="term" data-term-id="vector-dim" tabindex="0">vector dim</span></strong> — 常见 768 / 1024 / 1536；维度越高存储与检索成本越高，收益需用评测集验证。</li>
+        <li><strong>费用与 QPS</strong> — 索引阶段可离线慢速批处理；查询阶段 query embedding 需控延迟。</li>
+        <li><strong>版本治理</strong> — 模型升级写入 <span class="term" data-term-id="model-version" tabindex="0">model version</span> 元数据，便于审计与回滚。</li>
+      </ul>
+
+      <h4>反例 vs 推荐做法</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>索引用 A 模型、查询用 B 模型</li>
+            <li>换模型后直接覆盖旧向量，无版本号</li>
+            <li>只看 MTEB 榜单，不在 S1 制度集上实测</li>
+            <li>维度与向量库 schema 不一致仍强行写入</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>索引与查询共用同一 <span class="term" data-term-id="embedding-model" tabindex="0">embedding model</span> 配置</li>
+            <li>变更模型 → 新 collection + <span class="term" data-term-id="index-alias" tabindex="0">index alias</span> 切换</li>
+            <li>在 CorpAssist 基准问答集上对比 recall / MRR</li>
+            <li>collection meta 固定 <code>model</code>、<code>dim</code>、<code>version</code></li>
+          </ul>
+        </div>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>倾向选择</th><th>注意</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>S1 中文制度库</td>
+            <td>中文或多语 small 模型</td>
+            <td>条款编号、专有名词 recall</td>
+          </tr>
+          <tr>
+            <td>百万 chunk 规模</td>
+            <td>维度适中（768～1024）</td>
+            <td>存储与 ANN 索引内存</td>
+          </tr>
+          <tr>
+            <td>多租户隔离</td>
+            <td>同模型、分 collection</td>
+            <td>ACL 在 metadata 过滤</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么「索引与查询用同一模型」比「各用各的」更重要？</summary>
+        <p>向量相似度只在<strong>同一语义空间</strong>内有意义；混模型等于用不同坐标系比距离，TopK 结果不可信。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>批处理索引（Batch Index）</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 夜间全量索引（45 秒）</span>
+        HR 上传 200 份制度 PDF，经 <a href="#ch-basics-03-chunking">分块策略</a> 产出约 12 万 chunk。Python 索引任务在 02:00 启动：分批调用 Embedding API，写入 Milvus/PGVector，并在 meta 表记录 <code>job_id</code> 与进度。
+      </aside>
+
+      <p><span class="term" data-term-id="batch-index" tabindex="0">batch index</span> 的核心不是「一次 embed 很多条」，而是<strong>可恢复、可观测、可限流</strong>的离线管线：</p>
+      <ul>
+        <li><strong>批大小</strong> — 按 API 上限（如 64～256 条/请求）与内存折中；失败批次可单独重试。</li>
+        <li><strong>幂等写入</strong> — chunk_id 作主键，重复跑任务不 duplicated。</li>
+        <li><strong>checkpoint</strong> — 记录最后成功 doc_id，断点续跑。</li>
+        <li><strong>与查询隔离</strong> — 写入 staging collection，校验通过后 alias 切流。</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">BATCH_SIZE = 128
+for batch in chunked(chunks, BATCH_SIZE):
+    vectors = embed_client.embed_documents([c.text for c in batch])
+    store.upsert(
+        ids=[c.chunk_id for c in batch],
+        vectors=vectors,
+        metadatas=[{"doc_id": c.doc_id, "model_version": MODEL_VER} for c in batch],
+    )
+    job_repo.save_checkpoint(batch[-1].chunk_id)</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>批处理索引与 alias 切换</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph offline [Python 离线索引]
+    CH[分块结果] --> EM[Embedding 批处理]
+    EM --> STG[(staging collection)]
+    STG --> VAL[抽样 recall 校验]
+  end
+  VAL -->|通过| ALIAS[index alias 切换]
+  ALIAS --> PROD[(corpassist-hr-v3)]
+  subgraph online [Spring 在线查询]
+    Q[用户问题] --> QE[Query Embedding]
+    QE --> PROD
+    PROD --> RET[TopK 检索]
+  end</pre>
+        <p class="diagram-caption">索引完成前查询仍走旧 alias；切换是原子操作，避免「半新半旧」索引。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>向量维度与 Re-embed</h3>
+
+      <p><span class="term" data-term-id="vector-dim" tabindex="0">vector dim</span> 是模型输出长度，向量库建表时必须固定。常见陷阱：</p>
+      <ul>
+        <li>从 768 维模型升级到 1536 维 → 旧索引<strong>不能</strong>原地 patch，必须 <span class="term" data-term-id="re-embed" tabindex="0">re embed</span> 全库。</li>
+        <li>降维截断（MRL）需确认检索库与 API 均支持同一截断策略。</li>
+        <li>metadata 应存 <code>embedded_at</code>、<code>model_version</code>，便于增量补跑。</li>
+      </ul>
+
+      <h4>维度 × 存储粗算（教学示意）</h4>
+      <div class="learn-param-slider" data-storage-key="rag-system-engineering_basics04_dim">
+        <label for="basics04-dim-range">向量维度（float32，单条向量约 dim×4 字节）</label>
+        <input type="range" id="basics04-dim-range" min="384" max="1536" step="128" value="768" />
+        <output for="basics04-dim-range">768</output>
+        <p class="learn-param-hint">100 万 chunk × 768 维 ≈ 3 GB 向量本体（不含索引结构与 metadata）。</p>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只 re-embed 增量文档</strong> — 换模型后旧 chunk 与新 chunk 不在同一空间，必须全量或分版本 collection。</li>
+          <li><strong>查询端不校验 dim</strong> — Spring 启动时应读 collection schema，维度不符直接 fail-fast。</li>
+          <li><strong>忽略 embedding 缓存</strong> — 同一 chunk 文本未变时不应重复计费 embed。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Python 索引 + Spring 查询（双栈分工）</h3>
+
+      <p>CorpAssist <span class="term" data-term-id="dual-stack-rag" tabindex="0">dual stack rag</span> 的典型分工：</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>层</th><th>栈</th><th>职责</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>索引管线</td>
+            <td>Python / LangChain</td>
+            <td><span class="term" data-term-id="python-index" tabindex="0">python index</span>：接入、分块、embed、写入、alias 切换</td>
+          </tr>
+          <tr>
+            <td>查询 API</td>
+            <td>Spring AI</td>
+            <td><span class="term" data-term-id="spring-query" tabindex="0">spring query</span>：query embed、VectorStore 检索、Advisor 组装上下文</td>
+          </tr>
+          <tr>
+            <td>共用契约</td>
+            <td>JSON / OpenAPI</td>
+            <td>collection 名、dim、model_version、metadata 字段（doc_id、dept_acl）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>索引配置 vs Spring 查询（对照）</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label">Python · index-config</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">json</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-json">{
+  "model": "text-embedding-3-small",
+  "dim": 1536,
+  "model_version": "2026-03-01",
+  "collection": "corpassist-hr-v3",
+  "alias": "corpassist-hr-active"
+}</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label">Spring · application.yaml</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">yaml</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-yaml">spring:
+  ai:
+    vectorstore:
+      milvus:
+        collection-name: ${RAG_ALIAS:corpassist-hr-active}
+    openai:
+      embedding:
+        options:
+          model: text-embedding-3-small
+          dimensions: 1536</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Python 索引完成后，Spring 需要重启吗？</summary>
+          <div class="learn-faq-body">
+            若使用 <span class="term" data-term-id="index-alias" tabindex="0">index alias</span> 且 Spring 只读 alias 名，<strong>切换 alias 后通常无需重启</strong>；若改了 embedding 模型或 dim，必须同步配置并重启或热刷新。
+          </div>
+        </details>
+        <details>
+          <summary>能否 Spring 也跑批处理索引？</summary>
+          <div class="learn-faq-body">
+            可以但不推荐作为 S1 主路径：Python 生态在 PDF 解析、LangChain 管线、离线任务调度上更成熟；Spring 专注在线 <span class="term" data-term-id="spring-query" tabindex="0">spring query</span> 与 ACL。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">Embedding 是检索的「坐标系」；双栈共用同一模型与维度契约。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>模型选择</strong>：在 S1 基准集上实测，记录 <span class="term" data-term-id="model-version" tabindex="0">model version</span>，索引与查询禁止混模型。</li>
+        <li><strong>批处理</strong>：<span class="term" data-term-id="batch-index" tabindex="0">batch index</span> 要 checkpoint、幂等、staging + alias 切换。</li>
+        <li><strong>维度</strong>：<span class="term" data-term-id="vector-dim" tabindex="0">vector dim</span> 变更触发全量 <span class="term" data-term-id="re-embed" tabindex="0">re embed</span>，不能原地混用。</li>
+        <li><strong>双栈</strong>：<span class="term" data-term-id="python-index" tabindex="0">python index</span> 写、<span class="term" data-term-id="spring-query" tabindex="0">spring query</span> 读，共用 collection 与 metadata schema。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="model-pick" /> 能说出 S1 选 embedding 模型的 3 个维度</label></li>
+          <li><label><input type="checkbox" data-id="batch" /> 能解释 batch index 为何要 checkpoint 与 alias</label></li>
+          <li><label><input type="checkbox" data-id="re-embed" /> 能说明换模型为何必须 re-embed</label></li>
+          <li><label><input type="checkbox" data-id="dual-stack" /> 能画 Python 索引 → 向量库 ← Spring 查询</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>embedding model</td><td>索引与查询必须同一模型、同一 dim</td></tr>
+                <tr><td>batch index</td><td>离线、可恢复、写完再 alias 切流</td></tr>
+                <tr><td>re-embed</td><td>换模型 = 新坐标系 = 全量重算</td></tr>
+                <tr><td>index alias</td><td>蓝绿切换，查询无感</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 为什么索引用 Python、查询用 Spring？</li>
+              <li>Embedding 模型升级上线步骤是什么？</li>
+              <li>如何发现「索引与查询模型不一致」？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；下一章 <a href="#ch-basics-05-retrieval-gen">检索、重排与生成</a> 讲 TopK 之后如何 Rerank 与引用。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/embeddings.html" target="_blank" rel="noopener">Spring AI Embeddings</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI Vector Databases</a></li>
+      <li><a href="https://python.langchain.com/docs/concepts/embedding_models/" target="_blank" rel="noopener">LangChain Embedding Models</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 CorpAssist S1 人事制度库场景，完成<strong>模型选型表</strong>、<strong>批处理 checkpoint 设计</strong>与<strong>双栈配置对照</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/basics-04-embedding-lab/index-config.json</code>，将 <code>model</code>、<code>dim</code>、<code>collection</code> 改成你选型的一组值，并补充 <code>model_version</code> 字段。</li>
+      <li>对照正文「批处理索引」Mermaid，写出 staging → 校验 → alias 切换的三步 checklist（每步一句验收标准）。</li>
+      <li>为 Spring <code>application.yaml</code> 写一段与 index-config <strong>维度与模型名一致</strong> 的 embedding 配置（可纸面或注释块）。</li>
+      <li>假设要从 768 维升级到 1536 维：列出 re-embed 期间查询侧应读 old alias 还是 new alias，以及切换窗口如何定。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：召回率骤降。同事提出 ① 重启 Spring ② 索引换更强模型但未 re-embed ③ 检查 query 与 doc 是否同 model ④ 把 TopK 从 5 改 50。请排序<strong>应先排查</strong>项。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>应先：③ → ②</strong>。模型不一致或半库旧向量是最常见根因；换 TopK 不能修复坐标系错乱；重启无效。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：哪条违反双栈契约？① Python 写 corpassist-hr-v3，Spring 读 corpassist-hr-v2 ② 两侧 dim 都是 1536 ③ batch 任务写 metadata.dept_acl</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>答：①</strong>。索引与查询必须指向同一 active collection/alias。②③ 是正确做法。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Embedding 与索引实验室</h4>
+      <p>目录：<code>demos/basics-04-embedding-lab/</code>。<strong>验收</strong>：能解释 index-config 各字段含义，并说明 Embedding 变更时为何要 <span class="term" data-term-id="re-embed" tabindex="0">re embed</span>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-05-retrieval-gen">检索、重排与生成</a></li>
+      <li><a href="https://huggingface.co/spaces/mteb/leaderboard" target="_blank" rel="noopener">MTEB Leaderboard（选型参考）</a></li>
+      <li><a href="#ch-practice-02-spring-rag">Spring AI：RAG 实现</a> — VectorStore 查询落地</li>
+    </ul>
+  </div>
+</section>

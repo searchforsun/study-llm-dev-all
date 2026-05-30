@@ -1,0 +1,347 @@
+<section id="ch-practice-04-chat-memory" class="chapter" data-chapter="practice-04-chat-memory">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Chat Memory 与会话</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-chat-memory" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>RAG、工具与记忆</strong> · 能力：配置 Memory 类型、Redis 存储、多租户 session 并与 Python 会话同步</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>S2 客服需要「刚才说的工号是多少」这类多轮上下文。<span class="term" data-term-id="chat-memory" tabindex="0">Chat memory</span> 在 Advisor 链中自动读写消息历史。单机开发可用内存实现；生产必须 <span class="term" data-term-id="redis-memory" tabindex="0">redis memory</span> + <span class="term" data-term-id="multi-tenant" tabindex="0">multi tenant</span> 隔离，并与 Python 实验服务约定 <span class="term" data-term-id="python-session-sync" tabindex="0">python session sync</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>选择 MessageChatMemory 与 <span class="term" data-term-id="message-window" tabindex="0">message window</span> 策略</li>
+          <li>用 Redis 持久化 <span class="term" data-term-id="conversation-id" tabindex="0">conversation id</span> 维度历史</li>
+          <li>设计 <span class="term" data-term-id="session-id" tabindex="0">session id</span> 键：<code>tenant:user:conversation</code></li>
+          <li>处理双栈会话冲突与 <span class="term" data-term-id="memory-prune" tabindex="0">memory prune</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>conversationId 由客户端传</strong>：BFF 生成 UUID，Spring 不凭空造 session。</li>
+          <li><strong>窗口优于全量</strong>：保留最近 N 条 + 可选 summary，控制 token 与成本。</li>
+          <li><strong>键空间含 tenantId</strong>：避免 Redis 键碰撞与越权读历史。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Memory 类型：Advisor 与窗口</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 多轮追问</span>
+        用户：「查 E1024 年假」→ Bot 答 3 天 → 用户：「那差旅呢？」Bot 需记得工号。Memory Advisor 在 call 前加载历史，call 后写回。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>ChatMemory Advisor 位置</h5>
+        <pre class="mermaid">flowchart LR
+  Req[用户请求]
+  Mem[MessageChatMemoryAdvisor]
+  RAG[QuestionAnswerAdvisor]
+  Safe[安全 Advisor]
+  LLM[ChatModel]
+  Req --> Mem --> RAG --> Safe --> LLM</pre>
+        <p class="diagram-caption">Memory 通常在 RAG 之前，保证检索 query 含完整上下文（见 <a href="#ch-basics-03-prompt-advisor">Prompt 模板与 Advisor</a> 的 advisor order）。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Bean
+ChatMemory chatMemory() {
+  return MessageWindowChatMemory.builder()
+      .maxMessages(20)
+      .build();
+}
+
+@Bean
+ChatClient sessionChatClient(ChatModel model, ChatMemory chatMemory) {
+  var memoryAdvisor = MessageChatMemoryAdvisor.builder(chatMemory).build();
+  return ChatClient.builder(model)
+      .defaultAdvisors(memoryAdvisor)
+      .build();
+}
+
+// 每次请求传入 conversationId
+sessionChatClient.prompt()
+    .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+    .user("那差旅呢？")
+    .call()
+    .content();</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>实现</th><th>特点</th><th>CorpAssist</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>InMemoryChatMemory</strong></td><td>进程内，重启丢失</td><td>local 单测</td></tr>
+          <tr><td><strong>MessageWindowChatMemory</strong></td><td>滑动窗口 N 条</td><td>默认策略</td></tr>
+          <tr><td><strong>Summary + Window</strong></td><td>旧消息压缩摘要</td><td>长会话 optional</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>Redis 存储：持久化与 TTL</h3>
+      <p>多实例 Spring 服务必须共享 Memory。Spring AI 提供 Redis ChatMemory 实现（或自定义 <code>ChatMemoryRepository</code>），键格式见 Demo <code>session-key-template.txt</code>。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+corpassist:
+  chat:
+    memory:
+      key-prefix: corpassist:chat
+      ttl: 24h</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class RedisChatMemoryRepository implements ChatMemoryRepository {
+  private final StringRedisTemplate redis;
+  private final Duration ttl = Duration.ofHours(24);
+
+  public String key(String tenantId, String userId, String conversationId) {
+    return "corpassist:chat:" + tenantId + ":" + userId + ":" + conversationId;
+  }
+
+  public void saveMessages(String key, List&lt;Message&gt; messages) {
+    redis.opsForValue().set(key, serialize(messages), ttl);
+  }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">仅 conversationId 作键</span>
+          <ul>
+            <li>不同租户 id 碰撞</li>
+            <li>用户 A 读到用户 B 历史</li>
+            <li>合规事故</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">tenant:user:conversation</span>
+          <ul>
+            <li>与 Demo 模板一致</li>
+            <li>TTL 24h 自动 prune</li>
+            <li>审计按 tenant 分库</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户 session：鉴权与 conversationId</h3>
+      <p>BFF 从 JWT 解析 <code>tenantId</code>、<code>userId</code>，客户端只传 <code>conversationId</code>（或新建）。Spring Controller 禁止信任客户端传的 tenantId。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@PostMapping("/v1/chat")
+public ChatReply chat(@RequestBody ChatRequest req,
+    @AuthenticationPrincipal CorpUser user) {
+  String convId = Optional.ofNullable(req.conversationId())
+      .orElse(UUID.randomUUID().toString());
+  String compositeKey = memoryKey(user.tenantId(), user.userId(), convId);
+  String answer = chatService.reply(compositeKey, req.message());
+  return new ChatReply(convId, answer);
+}</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 门户</span>
+        同一员工在 Web 与移动端各开对话，应使用不同 conversationId；同一 conversationId 在多 Tab 共享历史。
+      </aside>
+
+      <details class="learn-faq">
+        <summary>FAQ：conversationId 过期后用户继续聊怎么办？</summary>
+        <p>Redis TTL 过期后 Memory 为空，模型无历史。API 可返回新 conversationId，或提供「继续上次主题」按钮由 BFF 显式传旧 id（未过期时）。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Python 会话同步：双栈仲裁</h3>
+      <p>Python 实验 Bot 可能与 Spring 共用同一 Redis 前缀，或各自存储。必须文档化<strong>权威源</strong>：生产以 Spring 为准；Python 只读或写 shadow key。</p>
+
+      <div class="mermaid-wrap">
+        <h5>会话冲突仲裁</h5>
+        <pre class="mermaid">flowchart TB
+  BFF[BFF / 门户]
+  Spring[Spring ChatMemory Redis]
+  Py[Python 实验 Bot]
+  BFF -->|写| Spring
+  Py -.->|eval only shadow key| Redis[(Redis)]
+  Spring --> Redis</pre>
+      </div>
+
+      <ul>
+        <li><strong>键前缀分离</strong>：生产 <code>corpassist:chat:</code>；Python eval <code>corpassist:py-eval:</code>。</li>
+        <li><strong>同步协议</strong>：若必须共享，JSON 序列化格式版本号写入 value 头。</li>
+        <li><strong>冲突</strong>：同时写同一 key 时，Spring 侧 wins；Python 脚本禁止写生产前缀。</li>
+        <li><strong>prune</strong>：定时任务按 tenant 统计 key 数量，超限触发 <span class="term" data-term-id="memory-prune" tabindex="0">memory prune</span> 或缩短 TTL。</li>
+      </ul>
+
+      <p>暴露 HTTP 时见 <a href="#ch-practice-05-rest-api">暴露 REST 与 SSE</a>；与 <a href="#ch-practice-03-tool-calling">Function Calling / Tools</a> 同会话内可连续 tool_call。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">全量历史进 prompt</span>
+          <ul>
+            <li>50 轮对话全部送模型</li>
+            <li>token 成本线性增长</li>
+            <li>超 context 窗口截断丢关键信息</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">MessageWindow + 可选摘要</span>
+          <ul>
+            <li>maxMessages=20 滑动窗口</li>
+            <li>旧消息 summary 压缩（可选）</li>
+            <li>Redis TTL 自动 prune 冷会话</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>Session 键与 TTL 速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>项</th><th>值</th></tr></thead>
+              <tbody>
+                <tr><td>生产前缀</td><td><code>corpassist:chat:{tenant}:{user}:{conv}</code></td></tr>
+                <tr><td>Python eval</td><td><code>corpassist:py-eval:...</code></td></tr>
+                <tr><td>TTL</td><td>24h（可配置 corpassist.chat.memory.ttl）</td></tr>
+                <tr><td>窗口</td><td>maxMessages=20</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：水平扩展时 Memory 会丢吗？</summary>
+        <p>使用 Redis 等共享 ChatMemoryRepository 时不会；InMemory 仅适合单实例 local。K8s 多 Pod 必须 Redis，且 conversationId 由 BFF 稳定传递。</p>
+      </details>
+
+      <div class="learn-tabs" role="tablist" aria-label="Memory 存储对比">
+        <input type="radio" name="prac04-tab" id="prac04-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac04-tab" id="prac04-tab-b" class="learn-tab-input" />
+        <label for="prac04-tab-a">InMemory</label>
+        <label for="prac04-tab-b">Redis</label>
+        <div class="learn-tab-panel" id="prac04-panel-a" role="tabpanel">
+          <p>适用：<code>@SpringBootTest</code>、本地单实例。重启丢失；conversationId 仅进程内有效。勿用于 K8s 多副本。</p>
+        </div>
+        <div class="learn-tab-panel" id="prac04-panel-b" role="tabpanel">
+          <p>适用：预发/生产。键 <code>corpassist:chat:{tenant}:{user}:{conv}</code>，TTL 24h。序列化 JSON 含 schemaVersion 便于 Python 只读解析。</p>
+        </div>
+      </div>
+
+      <h4>memory prune 策略（运维）</h4>
+      <ul>
+        <li><strong>TTL 到期</strong>：Redis 自动删除；用户新开 conversationId。</li>
+        <li><strong>窗口裁剪</strong>：MessageWindow 只保留最近 20 条，旧消息不落盘或异步归档。</li>
+        <li><strong>租户配额</strong>：每 tenant 活跃 conversation 超阈值时 LRU 淘汰或拒绝新 session。</li>
+        <li><strong>合规删除</strong>：员工离职 API 按 userId 批量 DEL 前缀键。</li>
+      </ul>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 多 Tab</span>
+        同一 conversationId 在 Web 多 Tab 共享 Redis 历史；移动端新开会话应生成新 conversationId，避免与桌面长对话混淆。
+      </aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Memory 类型</strong>：MessageWindow + MessageChatMemoryAdvisor；conversationId  per 请求。</li>
+        <li><strong>Redis</strong>：corpassist:chat:{tenant}:{user}:{conv}，TTL 24h。</li>
+        <li><strong>多租户</strong>：tenant/user 来自鉴权，不信任客户端。</li>
+        <li><strong>Python 同步</strong>：生产键权威在 Spring；eval 用 shadow 前缀或只读。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai_practice04_memory">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="advisor" /> 能说明 Memory Advisor 在链中的顺序</label></li>
+          <li><label><input type="checkbox" data-id="redis-key" /> 能写出 Redis key 模板</label></li>
+          <li><label><input type="checkbox" data-id="tenant" /> 能解释为何不信任客户端 tenantId</label></li>
+          <li><label><input type="checkbox" data-id="py-sync" /> 能描述 Python 冲突仲裁</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一章：<a href="#ch-practice-05-rest-api">暴露 REST 与 SSE</a></p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat-memory.html" target="_blank" rel="noopener">Spring AI — Chat Memory</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI — Advisors</a></li>
+      <li><a href="https://docs.spring.io/spring-data/redis/docs/current/reference/html/" target="_blank" rel="noopener">Spring Data Redis</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">设计多租户 session key，并说明与 Python 侧冲突时的仲裁策略。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读 <code>demos/practice-04-chat-memory-lab/session-key-template.txt</code>。</li>
+      <li>写出 tenant=t1、user=u9、conversation=c1 的完整 Redis key。</li>
+      <li>设计 BFF 在 JWT 失效但 conversationId 有效时的行为（笔记 3 条）。</li>
+      <li>说明 Python eval 应使用的前缀与禁止写入的生产前缀。</li>
+      <li>完成章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">客户端 JSON 传 <code>tenantId: "admin"</code> 覆盖 JWT。应如何处理？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>忽略请求体 tenantId，仅使用 @AuthenticationPrincipal 的 tenantId 拼 Redis key；必要时返回 403。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Chat Memory 与会话</h4>
+      <p>目录：<code>demos/practice-04-chat-memory-lab/</code>。<strong>验收</strong>：key 模板 + 仲裁策略各 1 段说明。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-03-tool-calling">Function Calling / Tools</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-rest-api">暴露 REST 与 SSE</a></li>
+    </ul>
+  </div>
+</section>

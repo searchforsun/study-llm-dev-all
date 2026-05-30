@@ -1,0 +1,422 @@
+<section id="ch-basics-04-idempotency" class="chapter" data-chapter="basics-04-idempotency">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>幂等与重试</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-idempotency" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>LLM 网关与流式</strong> · 能力：用幂等键、MQ 去重与安全重试处理重复请求</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>移动端弱网、Gateway 429 重试、MQ <span class="term" data-term-id="at-least-once" tabindex="0">at least once</span> 投递都会产生 <span class="term" data-term-id="duplicate-request" tabindex="0">duplicate request</span>。S2 客服下重复「改地址」或重复 LLM 调用会直接引发客诉与 NS3 Token 成本失控——<a href="#ch-basics-01-gateway">gateway rate limit</a> 触发的 429 若盲目重试 POST，更是典型事故源。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为写操作设计 <span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span> 与 <span class="term" data-term-id="token-store" tabindex="0">token store</span> 状态机</li>
+          <li>在 MQ 消费端实现 <span class="term" data-term-id="mq-dedup" tabindex="0">mq dedup</span> 与 <span class="term" data-term-id="retry-safe" tabindex="0">retry safe</span> 策略</li>
+          <li>区分工具改单的强幂等与 LLM 生成的弱幂等/缓存，理解 <span class="term" data-term-id="exactly-once" tabindex="0">exactly once</span> 的工程边界</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>写操作必须幂等</strong>：工具改单、发券、索引任务提交要有 Idempotency-Key（NS2 确定性写路径）。</li>
+          <li><strong>读/生成可接受 at-least-once + 去重</strong>：相同 key 返回缓存或相同 stream，避免双倍计费。</li>
+          <li><strong>exactly-once 端到端很难</strong>：组合幂等键 + 去重表 + 对账；SSE 续传用 Last-Event-ID 而非新 key（见 <a href="#ch-basics-02-sse">SSE 流式端到端</a>）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>令牌</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · 改地址重复提交（30 秒）</span>
+        用户在弱网下双击「确认改地址」。两次 POST 携带相同 <code>Idempotency-Key: idem-7c3f</code>。BFF 第一次进入 Processing 调 ERP；第二次命中 token store 返回相同 200 与 orderSnapshot——ERP 只改一次。若第二次无 key，可能产生两次改址与双倍审计日志。
+      </aside>
+
+      <p>客户端或 BFF 为每次<strong>写操作</strong>生成 UUID，放入 Header <code>Idempotency-Key</code>。服务端在 Redis/DB <span class="term" data-term-id="token-store" tabindex="0">token store</span> 记录「处理中 / 已完成 + 响应快照」。TTL 建议 24–72h，覆盖移动端重试窗口。</p>
+
+      <h4>幂等表状态机</h4>
+      <div class="mermaid-wrap">
+        <h5>Idempotency-Key 生命周期</h5>
+        <pre class="mermaid">stateDiagram-v2
+  [*] --> Received
+  Received --> Processing: 首次请求 SETNX lock
+  Received --> Replay: 重复 key 且 Completed
+  Processing --> Completed: 业务成功 存快照
+  Processing --> Failed: 可重试失败 释放 lock
+  Replay --> [*]: 返回原 HTTP 响应
+  Completed --> [*]</pre>
+        <p class="diagram-caption">Processing 中重复请求可返回 409 Conflict 或 202 Accepted，避免并发双写。</p>
+      </div>
+
+      <h4>BFF 幂等拦截器（Java）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public ResponseEntity&lt;?&gt; handle(String tenantId, String idempotencyKey, Supplier&lt;Result&gt; action) {
+  if (idempotencyKey == null || idempotencyKey.isBlank()) {
+    return ResponseEntity.badRequest().body("Idempotency-Key required");
+  }
+  String storeKey = "idem:" + tenantId + ":" + idempotencyKey;
+  Optional&lt;CachedResponse&gt; cached = store.findCompleted(storeKey);
+  if (cached.isPresent()) return cached.get().toResponse();  // Replay
+
+  if (!store.tryLock(storeKey, Duration.ofMinutes(5))) {
+    return ResponseEntity.status(HttpStatus.CONFLICT).build();
+  }
+  try {
+    Result r = action.get();
+    store.saveCompleted(storeKey, r, Duration.ofHours(48));
+    return ResponseEntity.ok(r);
+  } catch (Exception e) {
+    store.releaseLock(storeKey);
+    throw e;
+  }
+}</code></pre>
+      </div>
+
+      <h4>HTTP 语义对照</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>方法</th><th>默认幂等？</th><th>CorpAssist 要求</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>GET / HEAD</td><td>是</td><td>SSE 续传 GET 带 Last-Event-ID</td></tr>
+          <tr><td>PUT / DELETE</td><td>是（若资源 id 固定）</td><td>工具 API 仍建议 Idempotency-Key</td></tr>
+          <tr><td>POST</td><td><strong>否</strong></td><td>写操作<strong>必须</strong>带 key</td></tr>
+        </tbody>
+      </table>
+
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>用「订单号 + 时间戳秒」作 key，同一秒内双击仍重复</li>
+            <li>仅 DB 唯一约束，无响应快照，重试得到 409 但客户端不知原结果</li>
+            <li>幂等记录永不过期，Redis 内存泄漏</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>客户端 UUID v4 或 BFF 代生成并回传</li>
+            <li>Completed 存 status + body 快照，Replay 原样返回</li>
+            <li>TTL 48h + 归档审计日志</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：lookup_order 只读查询需要 Idempotency-Key 吗？</summary>
+        <p>只读 GET 天然幂等，通常不需要。但若 POST 包装「提交查询任务」或触发计费 LLM，则需 key 或改用 GET + 缓存。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>MQ</h3>
+      <p>异步索引、通知、会话归档任务经 RabbitMQ/Kafka 投递。中间件多为 <span class="term" data-term-id="at-least-once" tabindex="0">at least once</span>——消费端必须 <span class="term" data-term-id="mq-dedup" tabindex="0">mq dedup</span>，实现 <span class="term" data-term-id="retry-safe" tabindex="0">retry safe</span> 消费。CorpAssist 知识库索引任务 <code>documentId + version</code> 作业务去重键。</p>
+
+      <div class="mermaid-wrap">
+        <h5>MQ 消费去重流</h5>
+        <pre class="mermaid">flowchart TD
+  Q[Queue]
+  C[Consumer]
+  R[(Redis SETNX)]
+  DLQ[Dead Letter Queue]
+  Q --> C
+  C --> R
+  R -->|新消息| Work[执行业务]
+  R -->|已处理| Skip[ACK 跳过]
+  Work -->|失败超次| DLQ</pre>
+        <p class="diagram-caption">去重键 TTL 应覆盖「重投窗口 + 对账周期」；失败进 DLQ 而非无限 requeue。</p>
+      </div>
+
+      <h4>Redis 消费去重（Python 示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def handle_index_job(msg: IndexJob):
+    dedup_key = f"processed:{msg.tenant_id}:{msg.document_id}:{msg.version}"
+    if not await redis.set(dedup_key, "1", nx=True, ex=86400 * 7):
+        logger.info("duplicate skip %s", dedup_key)
+        return  # ACK without work
+    try:
+        await index_pipeline.run(msg)
+    except RetryableError:
+        await redis.delete(dedup_key)
+        raise  # requeue with backoff
+    except PermanentError:
+        await dlq.publish(msg)</code></pre>
+      </div>
+
+      <h4>Spring AMQP 消费（Java 示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@RabbitListener(queues = "corpassist.index")
+public void onIndex(IndexJobMessage msg) {
+  String dedup = "mq:dedup:" + msg.tenantId() + ":" + msg.messageId();
+  if (!dedupStore.markIfAbsent(dedup, Duration.ofDays(7))) return;
+  try {
+    indexService.process(msg);
+  } catch (TransientException e) {
+    dedupStore.remove(dedup);
+    throw e;
+  }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>消费失败无限 requeue，无 DLQ</li>
+            <li>同一 documentId 索引 N 次，向量库重复 chunk</li>
+            <li>先执行业务再 SETNX，并发下仍双写</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>SETNX / 唯一约束在业务<strong>之前</strong></li>
+            <li>业务键 upsert + 版本号</li>
+            <li>DLQ + 人工/脚本 replay（见 <a href="#ch-practice-04-mq">消息队列与异步任务</a>）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>投递语义对照</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>语义</th><th>含义</th><th>CorpAssist 落地</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>At-most-once</td><td>可能丢消息</td><td>非关键通知可接受</td></tr>
+          <tr><td>At-least-once</td><td>可能重复</td><td>默认；消费端 dedup</td></tr>
+          <tr><td>Exactly-once</td><td>端到端恰好一次</td><td>Kafka 事务 + 幂等写；工程贵，常用组合模式近似</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>重复请求</h3>
+      <p>除 MQ 外，HTTP 层重复同样常见：429 退避重试、移动端双击、负载均衡重试。须按接口类型设计 <span class="term" data-term-id="idempotent-api" tabindex="0">idempotent api</span> 策略。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>接口类型</th><th>幂等要求</th><th>实现要点</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>工具改单 / 改地址</td><td><strong>强幂等</strong></td><td>Idempotency-Key + ERP 业务键 + 响应快照</td></tr>
+          <tr><td>POST /v1/chat（触发 LLM）</td><td>弱幂等 / 缓存</td><td>相同 key 返回同一 conversationId + cached answer</td></tr>
+          <tr><td>SSE 断线重连</td><td>续传非新请求</td><td>Last-Event-ID GET，<strong>非</strong>新 Idempotency-Key</td></tr>
+          <tr><td>Gateway 429 重试</td><td>仅安全方法</td><td>POST 须带 key；无 key 禁止自动重试</td></tr>
+        </tbody>
+      </table>
+
+      <h4>LLM 重复 POST：代码对比</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">不推荐 · 429 盲重试</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">// 客户端 SDK：429 立即重试同一 POST，无 Idempotency-Key
+retryPolicy = RetryPolicy.ofDefaults(); // 10 次
+chatClient.post("/v1/chat", body);</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">推荐 · key + 缓存命中</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">headers.set("Idempotency-Key", clientRequestId);
+ResponseEntity&lt;ChatResult&gt; r = chatClient.post("/v1/chat", body, headers);
+// BFF：相同 key 返回 store 中 ChatResult，不二次调模型</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>重复 POST chat 与 Token 成本</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant App as Mobile App
+  participant BFF as BFF
+  participant LLM as Model API
+  App->>BFF: POST chat key=K (timeout)
+  BFF->>LLM: stream 已开始
+  Note over App: 以为失败 重试
+  App->>BFF: POST chat key=K2 缺失
+  BFF->>LLM: 第二次完整推理
+  Note over BFF: 双倍 Token NS3</pre>
+        <p class="diagram-caption">相同 Idempotency-Key 的第二次 POST 应 Replay 或返回 409 + 查询接口，而非再次调模型。</p>
+      </div>
+
+      <h4>429 重试决策（标签页）</h4>
+      <div class="learn-tabs" role="tablist" aria-label="重试策略">
+        <input type="radio" name="basics04retry" id="basics04-tab-get" class="learn-tab-input" checked />
+        <input type="radio" name="basics04retry" id="basics04-tab-post" class="learn-tab-input" />
+        <label for="basics04-tab-get">GET / SSE 续传</label>
+        <label for="basics04-tab-post">POST 写/生成</label>
+        <div class="learn-tab-panel" id="basics04-panel-get" role="tabpanel">
+          <p>可退避重试；SSE 用 Last-Event-ID，不重复计费（补帧或 replay_done）。</p>
+        </div>
+        <div class="learn-tab-panel" id="basics04-panel-post" role="tabpanel">
+          <p>必须 Idempotency-Key；无 key 时客户端应提示用户而非 SDK 自动重试。429 时读 <code>Retry-After</code>。</p>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>「LLM 输出随机，无法幂等」</strong> — 弱幂等指「相同 key 返回同一 cached 结果」，不是要求模型 deterministic。</li>
+          <li><strong>幂等只做 Gateway</strong> — 写路径在 BFF/ERP；Gateway 无法感知业务是否已执行。</li>
+          <li><strong>去重键永不过期</strong> — 与 session/idempotency 一样需要 TTL。</li>
+        </ul>
+      </div>
+
+      <h4>常见问题（FAQ）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>Idempotency-Key 由客户端还是 BFF 生成？</summary>
+          <div class="learn-faq-body">
+            <p>写操作推荐<strong>客户端</strong>生成 UUID（双击同 key）；BFF 可为无 SDK 的 Web 代生成并随响应回传。tenantId 来自 JWT，不应由客户端在 Body 指定。</p>
+          </div>
+        </details>
+        <details>
+          <summary>能否追求全链路 exactly-once？</summary>
+          <div class="learn-faq-body">
+            <p>跨 HTTP + MQ + ERP 的端到端 exactly-once 成本极高。CorpAssist 实践：<strong>at-least-once + 幂等键 + 对账</strong>；财务类写操作另加强一致与 Saga（见 advanced 集成章）。</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">放在正文与复习之间，便于串起全章再做题。每条对应上文一个小节标题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>令牌</strong>：Idempotency-Key + token store 状态机（Processing/Completed/Replay）；POST 写操作必带 key。</li>
+        <li><strong>MQ</strong>：at-least-once 投递 + 消费端 SETNX dedup + DLQ；去重先于业务执行。</li>
+        <li><strong>重复请求</strong>：工具写路径强幂等；LLM POST 用 cache；SSE 续传用 Last-Event-ID；429 禁止无 key 重试 POST。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="key" /> 能画出 Idempotency-Key 状态机四种状态</label></li>
+          <li><label><input type="checkbox" data-id="mq" /> 能说出 MQ 消费端去重一种实现（SETNX + TTL）</label></li>
+          <li><label><input type="checkbox" data-id="llm" /> 能区分工具改单强幂等与 LLM chat 弱幂等</label></li>
+          <li><label><input type="checkbox" data-id="429" /> 能解释 429 盲重试 POST 的 NS3 风险</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>idempotency key</td><td>POST 写操作必带；Replay 原响应</td></tr>
+                <tr><td>mq dedup</td><td>消费前 SETNX；失败删 key 再 requeue</td></tr>
+                <tr><td>at least once</td><td>默认投递；靠消费幂等兜</td></tr>
+                <tr><td>idempotent api</td><td>GET 天然；POST 要设计</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Processing 中收到相同 Idempotency-Key 的第二个请求，应返回什么？</li>
+              <li>为什么 SSE 断线续传不用新的 Idempotency-Key？</li>
+              <li>CorpAssist 为何不追求全链路 exactly-once？替代方案是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章进入 practice 阶段 <a href="#ch-practice-01-circuit">熔断、舱壁与降级</a>，保护 ERP 与模型下游。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://stripe.com/docs/api/idempotent_requests" target="_blank" rel="noopener">Stripe Idempotent Requests（行业参考）</a></li>
+      <li><a href="https://www.rabbitmq.com/docs/deduplication" target="_blank" rel="noopener">RabbitMQ — Message Deduplication</a></li>
+      <li><a href="https://kafka.apache.org/documentation/#semantics" target="_blank" rel="noopener">Kafka — Delivery Semantics</a></li>
+      <li><a href="https://docs.spring.io/spring-amqp/reference/retry/retry.html" target="_blank" rel="noopener">Spring AMQP Retry</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">阅读 <code>demos/basics-04-idempotency-lab/idempotency.md</code>，为「客服改地址」与「索引任务」补幂等设计（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>为 POST <code>/v1/tools/change-address</code> 定义 Idempotency-Key 来源（客户端 UUID）及 Header 名。</li>
+      <li>在 idempotency.md 填写状态机 Processing / Completed / Replay 的 HTTP 状态码与响应行为。</li>
+      <li>为 MQ 索引任务写 Redis dedup key 格式 <code>processed:{tenant}:{docId}:{version}</code> 与 TTL 7d 理由。</li>
+      <li>写一段「429 重试策略」：哪些接口可自动重试、POST chat 的前置条件。</li>
+      <li>（可选）用 curl 连续两次相同 Idempotency-Key 调用 mock API，验证第二次响应体一致。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">权衡：Gateway 对 429 自动重试 POST <code>/v1/chat</code>，未带 Idempotency-Key。主要风险是什么？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>可能产生两次 LLM 调用与双倍 Token（NS3）；若 POST 链接触发工具写操作则可能重复改单。应对：客户端或 BFF 必带 Idempotency-Key；429 只重试 GET/已 key 的 POST，并读 Retry-After。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：消费端「先写向量库，成功后再 SETNX dedup」。哪一步顺序错误？应如何改？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>SETNX 必须在业务<strong>之前</strong>。否则并发重复消息仍会双写索引。失败 transient 时删除 dedup key 再 requeue；永久失败进 DLQ。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：幂等与重试</h4>
+      <p>目录：<code>demos/basics-04-idempotency-lab/</code>。<strong>验收</strong>：idempotency.md 含改地址 API 的 key 策略、状态机 HTTP 语义与 MQ dedup key。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-circuit">熔断、舱壁与降级</a>：与 retry 配合的 Resilience4j</li>
+      <li><a href="#ch-practice-04-mq">消息队列与异步任务</a>：DLQ 与 replay</li>
+      <li><a href="#ch-basics-01-gateway">Spring Cloud Gateway 与 LLM</a>：429 与入口限流</li>
+    </ul>
+  </div>
+</section>

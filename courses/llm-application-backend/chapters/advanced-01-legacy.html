@@ -1,0 +1,437 @@
+<section id="ch-advanced-01-legacy" class="chapter" data-chapter="advanced-01-legacy">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>与存量 Java 系统集成</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-legacy" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>企业集成</strong> · 能力：Feign 调用存量 ERP、事件解耦与事务边界设计</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 不是 greenfield：工单、采购单、客户主数据仍在 2015 年起的 Java ERP 里。你在 <a href="#ch-practice-06-corpassist-gw">实战：CorpAssist 网关层</a> 搭好的 Gateway→BFF→Python 链路，必须能<strong>读存量订单、写回审批结果</strong>，又不能把 LLM 慢调用锁进数据库事务。本章用 Feign、<span class="term" data-term-id="domain-event" tabindex="0">领域事件</span> 与 <span class="term" data-term-id="transaction-boundary" tabindex="0">事务边界</span> 把「新 AI 层 + 老 ERP」接稳。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 BFF 设计 <span class="term" data-term-id="feign-client" tabindex="0">Feign 客户端</span>，带超时、熔断与幂等键调用存量订单服务</li>
+          <li>区分「同步查 ERP」与「异步通知 HR/工单」的事件路径，并说明 <span class="term" data-term-id="outbox-pattern" tabindex="0">Outbox</span> 为何比「先 commit 再发 MQ」可靠</li>
+          <li>画出 CorpAssist 一次智能审批的 <span class="term" data-term-id="transaction-boundary" tabindex="0">事务边界</span>：本地 DB 写路径 vs 外部 LLM/ERP 调用</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>存量不是敌人</strong>：<span class="term" data-term-id="legacy-integration" tabindex="0">存量集成</span> 用防腐层 + 明确契约，而不是把 ERP SQL 搬进 BFF。</li>
+          <li><strong>同步查、异步写</strong>：读主数据可 Feign；跨系统副作用优先事件 + <span class="term" data-term-id="saga-lite" tabindex="0">Saga 轻量补偿</span>。</li>
+          <li><strong>LLM 不进 @Transactional</strong>：长耗时推理必须在事务外；本地状态用 Outbox 保证与消息一致。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 企业集成全景：新 AI 层与 Java ERP</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 采购智能审批（45 秒）</span>
+        员工在 CorpAssist 提交采购申请；BFF 需从 ERP 拉取供应商信用与历史订单，再调 Python RAG 生成建议摘要，最后把「通过/驳回」写回 ERP 工单。Gateway 已在 <a href="#ch-practice-06-corpassist-gw">实战：CorpAssist 网关层</a> 完成鉴权与限流——本章关注 BFF 之后如何碰存量系统。
+      </aside>
+
+      <p>典型 <span class="term" data-term-id="legacy-integration" tabindex="0">legacy integration</span> 分层：</p>
+      <ul>
+        <li><strong>入口不变</strong> — 仍经 Gateway；BFF 是对外聚合层，不暴露 ERP 原始 URL。</li>
+        <li><strong><span class="term" data-term-id="system-bridge" tabindex="0">系统桥接</span></strong> — 专用 adapter 模块翻译 DTO：CorpAssist 的 <code>SupplierSnapshot</code> ≠ ERP 的 <code>T_Supplier</code> 宽表。</li>
+        <li><strong><span class="term" data-term-id="erp-connector" tabindex="0">ERP 连接器</span></strong> — 封装认证、分页、错误码映射；Feign 或 REST 模板二选一，团队统一即可。</li>
+      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist × 存量 ERP 逻辑拓扑</h5>
+        <pre class="mermaid">flowchart LR
+  GW[Gateway]
+  BFF[corpassist-bff]
+  Py[Python RAG]
+  ERP[(Legacy ERP)]
+  MQ[(Kafka)]
+  GW --> BFF
+  BFF -->|Feign 同步读| ERP
+  BFF -->|HTTP SSE| Py
+  BFF -->|Outbox 事件| MQ
+  MQ -.->|消费| ERP</pre>
+        <p class="diagram-caption">实线：用户请求路径；虚线：异步回写 ERP。Python 不参与 ERP 事务。</p>
+      </div>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">Gateway / BFF</span>
+          <p class="role-card-desc">聚合、鉴权、租户隔离；Feign 调用存量服务的唯一出口。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Legacy ERP</span>
+          <p class="role-card-desc">订单/工单/主数据权威源；接口慢、版本老、变更需排期。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Python AI</span>
+          <p class="role-card-desc">RAG 与 LLM 推理；无 ERP 写权限，只返回结构化建议。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Feign 调用存量服务：契约、超时与幂等</h3>
+
+      <p>BFF 通过 <span class="term" data-term-id="feign-client" tabindex="0">OpenFeign</span> 声明式 HTTP 访问 ERP 暴露的 REST（或经 ESB 转发的接口）。生产必备：</p>
+      <ul>
+        <li><strong>显式超时</strong> — ERP 常比 BFF 慢一个数量级；connect/read 分开设，并与 Resilience4j 熔断对齐。</li>
+        <li><strong>幂等键</strong> — 写工单时带 <code>X-Idempotency-Key</code>，避免 Feign 重试造成重复审批。</li>
+        <li><strong>降级语义</strong> — 读失败返回缓存快照 + <code>DEGRADED</code> 标记，而不是 500 拖垮整条 chat 链路。</li>
+      </ul>
+
+      <h4>Feign 配置：反例 vs 推荐</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">不推荐 · 裸 Feign</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">@FeignClient(name = "erp-order")
+public interface ErpOrderClient {
+  @PostMapping("/orders/approve")
+  void approve(@RequestBody ApproveCmd cmd);
+}</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">推荐 · 超时 + Fallback</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">@FeignClient(
+  name = "erp-order",
+  configuration = ErpFeignConfig.class,
+  fallbackFactory = ErpOrderFallbackFactory.class)
+public interface ErpOrderClient {
+  @GetMapping("/orders/{id}")
+  OrderDto getOrder(@PathVariable String id);
+
+  @PostMapping("/orders/{id}/approve")
+  ApproveResult approve(
+    @PathVariable String id,
+    @RequestHeader("X-Idempotency-Key") String key,
+    @RequestBody ApproveCmd cmd);
+}</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  cloud:
+    openfeign:
+      client:
+        config:
+          erp-order:
+            connectTimeout: 3000
+            readTimeout: 8000
+resilience4j:
+  circuitbreaker:
+    instances:
+      erpOrder:
+        slidingWindowSize: 20
+        failureRateThreshold: 50</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：ERP 读超时，chat 接口该直接 504 还是降级继续？</summary>
+        <p>取决于产品：若<strong>必须</strong>实时订单号，应快速失败并提示；若只是增强上下文，可用缓存快照 + 免责声明继续 SSE。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>领域事件：解耦写回与跨系统通知</h3>
+
+      <p>同步 Feign 适合<strong>当场需要结果</strong>的读路径。写 ERP、通知 OA、触发索引任务等副作用，应发布 <span class="term" data-term-id="domain-event" tabindex="0">领域事件</span>，由消费者异步执行——这与 <a href="#ch-practice-04-mq">消息队列与异步任务</a> 一脉相承，但事件名应体现业务语义（如 <code>PurchaseApproved</code>）。</p>
+
+      <div class="mermaid-wrap">
+        <h5>审批通过：事件驱动写回 ERP</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant BFF as corpassist-bff
+  participant DB as 本地库
+  participant OB as outbox
+  participant K as Kafka
+  participant ERP as Legacy ERP
+  BFF->>DB: 更新申请状态 APPROVED
+  BFF->>OB: 同事务写入 Outbox 行
+  Note over BFF,OB: 本地事务提交
+  OB->>K: relay 发布 PurchaseApproved
+  K->>ERP: erp-connector 消费写工单</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="outbox-pattern" tabindex="0">Outbox 模式</span> 保证「DB 状态」与「待发消息」同事务一致，避免 commit 成功但 MQ 发送失败。</p>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>事务内直接 <code>kafkaTemplate.send</code></li>
+            <li>Feign 写 ERP 成功后再改本地库（双写不一致）</li>
+            <li>事件 payload 塞整行 ERP 宽表</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>本地状态 + Outbox 同一 <code>@Transactional</code></li>
+            <li>消费者 <span class="term" data-term-id="erp-connector" tabindex="0">erp-connector</span> 幂等消费</li>
+            <li>事件只带业务键与摘要字段</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>事务边界：LLM、ERP 与本地库如何划分</h3>
+
+      <p><span class="term" data-term-id="transaction-boundary" tabindex="0">事务边界</span> 的核心问题：<strong>哪些操作必须在同一 ACID 事务里，哪些必须拆到事务外。</strong> CorpAssist 典型错误是把「调 Python LLM 30s」包进 <code>@Transactional</code>，导致连接池耗尽、锁持有过久。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>操作</th><th>是否进本地 DB 事务</th><th>一致性策略</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>保存用户草稿、租户配额扣减</td>
+            <td><strong>是</strong></td>
+            <td>本地 ACID</td>
+          </tr>
+          <tr>
+            <td>写入 Outbox + 更新申请状态</td>
+            <td><strong>是</strong></td>
+            <td>Outbox 保证与消息一致</td>
+          </tr>
+          <tr>
+            <td>调用 Python RAG / LLM</td>
+            <td><strong>否</strong></td>
+            <td>超时 + 熔断；结果落库单独短事务</td>
+          </tr>
+          <tr>
+            <td>Feign 写 ERP 工单</td>
+            <td><strong>否</strong>（异步）</td>
+            <td><span class="term" data-term-id="saga-lite" tabindex="0">Saga 轻量</span>：失败事件触发补偿/人工工单</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>补偿路径（Saga-lite，无需 Seata）</h5>
+        <pre class="mermaid">stateDiagram-v2
+  [*] --> Pending
+  Pending --> ApprovedLocal: BFF 本地通过
+  ApprovedLocal --> ErpSynced: 消费者写 ERP 成功
+  ApprovedLocal --> NeedsReconcile: ERP 失败 N 次
+  NeedsReconcile --> ErpSynced: 人工/批任务补偿
+  NeedsReconcile --> Revoked: 撤销本地批准</pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Transactional
+public UUID startReview(StartReviewCmd cmd) {
+  UUID reviewId = reviewRepo.savePending(cmd);
+  outbox.enqueue(new ReviewStarted(reviewId, cmd.tenantId()));
+  return reviewId;
+}
+
+public void enrichWithLlm(UUID reviewId) {
+  LlmSuggestion s = pythonClient.suggest(reviewId);
+  reviewRepo.saveSuggestion(reviewId, s);
+}</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>Feign 当本地方法</strong> — ERP 超时要可预期，并有熔断与降级。</li>
+          <li><strong>先 LLM 后开事务</strong> — 用户取消请求时本地无记录，难以审计。</li>
+          <li><strong>双写 ERP + 本地库</strong> — 任一失败即不一致；写 ERP 走 Outbox 消费者。</li>
+          <li><strong>事件不带 tenantId</strong> — 多租户场景下消费者无法隔离。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>system-bridge 模块职责与对接清单</h3>
+
+      <p><span class="term" data-term-id="system-bridge" tabindex="0">System bridge</span> 是 BFF 内独立包：对外只暴露 CorpAssist 语义 API，对内集中处理 ERP quirks（时区、枚举码表、分页上限）。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>集成点</th><th>方式</th><th>失败语义</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>读订单/供应商</td>
+            <td>Feign GET + 缓存 60s</td>
+            <td>降级快照 / 明确错误码</td>
+          </tr>
+          <tr>
+            <td>写审批结果</td>
+            <td>Outbox → erp-connector</td>
+            <td>重试 + NeedsReconcile 状态</td>
+          </tr>
+          <tr>
+            <td>LLM 建议摘要</td>
+            <td>HTTP → Python</td>
+            <td>熔断返回模板文案</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-faq">
+        <details>
+          <summary>能否让 Python 直接 Feign ERP？</summary>
+          <div class="learn-faq-body">
+            不推荐。ERP 契约与 Java 团队共管，<strong>BFF 作为唯一桥</strong> 便于鉴权、审计与租户隔离；Python 只处理 AI 域。
+          </div>
+        </details>
+        <details>
+          <summary>Outbox 和 MQ 章节的索引任务有何不同？</summary>
+          <div class="learn-faq-body">
+            模式相同：可靠投递。ERP 回写偏<strong>强业务语义与幂等</strong>，需独立 consumer group 与 DLQ 告警。
+          </div>
+        </details>
+        <details>
+          <summary>Feign 契约如何进 CI？</summary>
+          <div class="learn-faq-body">
+            见 <a href="#ch-advanced-04-ci">CI/CD 与发布</a>：WireMock/契约测试失败则阻断镜像推送。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">CorpAssist 企业集成的「稳」来自边界清晰，而不是更多同步调用。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>存量集成</strong>：BFF + system-bridge 对接 ERP；Feign 同步读，带超时熔断与幂等写。</li>
+        <li><strong>事件解耦</strong>：写 ERP 走 Outbox + 领域事件，避免事务内外部 IO。</li>
+        <li><strong>事务边界</strong>：LLM/ERP 长调用不进 @Transactional；失败用 Saga-lite 状态机补偿。</li>
+        <li><strong>与前置章节</strong>：<a href="#ch-practice-06-corpassist-gw">网关 capstone</a> 提供入口治理。</li>
+        <li><strong>与后续章节</strong>：Nacos/Vault 管理 ERP 端点；<a href="#ch-advanced-04-ci">CI/CD</a> 对 Feign 契约设门禁。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_advanced01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="feign-timeout" /> 能说明 Feign 调 ERP 为何要单独设 readTimeout</label></li>
+          <li><label><input type="checkbox" data-id="outbox-why" /> 能解释 Outbox 相对「事务后 send MQ」的优势</label></li>
+          <li><label><input type="checkbox" data-id="tx-boundary" /> 能列举 2 项必须/禁止进 @Transactional 的操作</label></li>
+          <li><label><input type="checkbox" data-id="saga-lite" /> 能口述 ERP 写失败后的补偿状态</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Feign</td><td>声明式 HTTP；必须超时 + 幂等写</td></tr>
+                <tr><td>Outbox</td><td>DB 与待发消息同事务</td></tr>
+                <tr><td>事务边界</td><td>LLM/ERP 长 IO 在事务外</td></tr>
+                <tr><td>Saga-lite</td><td>状态机 + 重试 + 对账</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 为何不让 Python 直接写 ERP？</li>
+              <li>Feign 读 ERP 超时，你会返回 500 还是降级？依据是什么？</li>
+              <li>本地已 APPROVED、ERP consumer 失败三次，架构上如何兜底？</li>
+              <li>Outbox 与分布式事务（2PC/Seata）各适合什么规模的问题？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-advanced-02-config">配置中心与密钥</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-cloud-openfeign/docs/current/reference/html/" target="_blank" rel="noopener">Spring Cloud OpenFeign Reference</a></li>
+      <li><a href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" rel="noopener">Transactional Outbox — microservices.io</a></li>
+      <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j CircuitBreaker</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 CorpAssist 采购审批场景，完成<strong>集成拓扑</strong>、<strong>事务边界表</strong>与<strong>Feign 契约</strong>三份产出（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照正文 Mermaid，标出同步读与异步写各一条箭头，并注明协议（Feign / Kafka）。</li>
+      <li>填写「事务边界」决策表：为「调 Python LLM」「写 Outbox」「Feign 写 ERP」三行补全「是否进事务」列。</li>
+      <li>为 <code>ErpOrderClient#getOrder</code> 写 connect/read 超时 YAML 片段。</li>
+      <li>（可选）完成 <code>demos/advanced-01-legacy-lab/</code> 的 integration-map。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事在 @Transactional 内顺序执行「扣配额 → 调 LLM → Feign 写 ERP → send Kafka」。指出<strong>最危险</strong>的两处。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>调 LLM</strong> 占用 DB 连接过久；<strong>Feign 写 ERP + send Kafka</strong> 与本地 commit 非原子。应：短事务写本地+Outbox；LLM 与 ERP 写放事务外。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：哪条违反 Outbox 原则？① 同事务写 outbox 行 ② commit 后 kafkaTemplate.send ③ relay 扫 outbox 发 MQ</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>答：②</strong>。commit 成功但 send 失败会丢事件。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：存量系统集成映射实验室</h4>
+      <p>目录：<code>demos/advanced-01-legacy-lab/</code>。<strong>验收</strong>：integration-map 中列出至少 1 个 ERP 集成点（读/写）、Feign 或事件名，并标注事务边界。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-06-corpassist-gw">实战：CorpAssist 网关层</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-02-config">配置中心与密钥</a></li>
+      <li><strong>发布</strong>：<a href="#ch-advanced-04-ci">CI/CD 与发布</a></li>
+      <li><a href="https://martinfowler.com/articles/201701-event-driven.html" target="_blank" rel="noopener">Martin Fowler — Event-Driven</a></li>
+    </ul>
+  </div>
+</section>

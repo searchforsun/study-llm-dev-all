@@ -1,0 +1,256 @@
+<section id="ch-practice-03-json-output" class="chapter" data-chapter="practice-03-json-output">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>结构化输出 Prompt</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-json-output" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>场景化 Prompt</strong> · 能力：JSON schema、修复循环、校验与 CorpAssist 工单结构化</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>BFF 与下游服务需要<strong>可解析</strong>的模型输出。自由文本无法直接入库；<span class="term" data-term-id="structured-output" tabindex="0">structured output</span> 通过 <span class="term" data-term-id="json-schema-prompt" tabindex="0">json schema prompt</span>、厂商 <span class="term" data-term-id="response-format" tabindex="0">response format</span> 与 <span class="term" data-term-id="output-validate" tabindex="0">output validate</span> 闭环，把「像 JSON」变成「真 JSON」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>将 JSON Schema <span class="term" data-term-id="schema-inject" tabindex="0">schema inject</span> 进 System/User 模板（双栈）</li>
+          <li>实现 <span class="term" data-term-id="repair-loop" tabindex="0">repair loop</span> 与 <span class="term" data-term-id="parse-retry" tabindex="0">parse retry</span>（最多 N 次）</li>
+          <li>为 CorpAssist <span class="term" data-term-id="ticket-json" tabindex="0">ticket json</span> 编写生产 Prompt 与校验规则</li>
+          <li>选择 Prompt-only vs 原生 response_format 的权衡</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>Schema 进 Prompt</strong>：字段名、类型、enum 与后端 DTO 一致。</li>
+          <li><strong>只输出 JSON</strong>：禁止 markdown 围栏外的解释（或约定 <code>raw_json</code> 字段）。</li>
+          <li><strong>校验失败可修复</strong>：把 parser 错误喂回模型做 repair-loop。</li>
+          <li><strong>工单场景</strong>：intent、priority、summary 等字段有业务校验，不只 JSON 语法。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>JSON schema</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 对话转工单</span>
+        客服对话结束需生成 <span class="term" data-term-id="ticket-json" tabindex="0">ticket json</span> 写入 ITSM。字段：<code>intent</code>、<code>priority</code>、<code>summary</code>、<code>order_id</code>（可选）。Schema 必须与 <code>ticket-service</code> DTO 一致，否则 400。
+      </aside>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CorpAssistTicket",
+  "type": "object",
+  "required": ["intent", "priority", "summary"],
+  "properties": {
+    "intent": { "type": "string", "enum": ["refund", "shipping", "account", "other"] },
+    "priority": { "type": "string", "enum": ["P1", "P2", "P3"] },
+    "summary": { "type": "string", "maxLength": 500 },
+    "order_id": { "type": "string", "pattern": "^PO-\\d{4}-\\d+$" }
+  },
+  "additionalProperties": false
+}</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># json-schema-prompt · LangChain + Jinja schema-inject
+from jinja2 import Template
+import json
+
+SCHEMA_PROMPT = Template("""\
+仅输出符合下列 JSON Schema 的单个 JSON 对象，不要 markdown 围栏，不要解释。
+Schema:
+{{ schema_json }}
+
+对话摘要:
+{{ dialogue_summary }}
+""")
+
+prompt = SCHEMA_PROMPT.render(
+    schema_json=json.dumps(TICKET_SCHEMA, ensure_ascii=False, indent=2),
+    dialogue_summary=summary,
+)
+# 可选: model.with_structured_output(TicketModel)  # response-format 原生</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// Spring AI · BeanOutputConverter + PromptTemplate
+BeanOutputConverter&lt;CorpAssistTicket&gt; converter =
+    new BeanOutputConverter&lt;&gt;(CorpAssistTicket.class);
+
+PromptTemplate tpl = new PromptTemplate("""
+  {format}
+  根据对话生成工单 JSON。
+  对话: {dialogue}
+  """);
+
+Map&lt;String, Object&gt; vars = Map.of(
+    "format", converter.getFormat(),
+    "dialogue", dialogueSummary
+);
+String raw = chatClient.prompt(tpl.create(vars)).call().content();</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">坏 Prompt</span>
+          <ul>
+            <li>「返回 JSON，包含 intent 等」无 schema</li>
+            <li>字段 <code>priority: high</code> 而非 enum P1/P2/P3</li>
+            <li>模型输出 ```json 围栏未剥离</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">好 Prompt</span>
+          <ul>
+            <li>完整 schema-inject + additionalProperties: false</li>
+            <li>双栈与 ticket-schema.json 同源</li>
+            <li>配合 response_format / BeanOutputConverter</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>修复循环</h3>
+      <p><span class="term" data-term-id="repair-loop" tabindex="0">repair loop</span>：parse → validate 失败 → 将错误信息作为 user 消息追加 → 再生成。配合 <span class="term" data-term-id="parse-retry" tabindex="0">parse retry</span> 上限（通常 2～3 次），避免无限循环与 Token 爆炸。</p>
+
+      <div class="mermaid-wrap">
+        <h5>结构化输出 repair-loop</h5>
+        <pre class="mermaid">flowchart TD
+  P[json-schema-prompt] --> G[LLM 生成]
+  G --> X{JSON.parse OK?}
+  X -->|否| E[提取错误行/列]
+  E --> R[repair user: Fix JSON: ...]
+  R --> G
+  X -->|是| V[JSON Schema / Bean 校验]
+  V -->|失败| R
+  V -->|通过| OK[写入 ticket-service]
+  G --> L{retry &gt; max?}
+  L -->|是| F[降级: 人工队列]</pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def generate_ticket_with_repair(llm, prompt: str, max_retries: int = 2) -&gt; dict:
+    messages = [{"role": "user", "content": prompt}]
+    for attempt in range(max_retries + 1):
+        raw = llm.invoke(messages).content
+        try:
+            data = json.loads(strip_markdown_fence(raw))
+            jsonschema.validate(data, TICKET_SCHEMA)
+            return data
+        except (json.JSONDecodeError, jsonschema.ValidationError) as e:
+            if attempt == max_retries:
+                raise
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"Fix JSON. Error: {e}"})
+    raise RuntimeError("unreachable")</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>校验</h3>
+      <p><span class="term" data-term-id="output-validate" tabindex="0">output validate</span> 分两层：<strong>语法</strong>（JSON.parse）、<strong>语义</strong>（Schema + 业务规则，如 P1 必须含 order_id）。Prompt 层写清 enum；代码层不信任模型，必须校验后再调用 ITSM。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>校验项</th><th>Prompt 侧</th><th>代码侧</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>enum</td><td>schema 列举</td><td>jsonschema / @NotNull</td></tr>
+          <tr><td>pattern</td><td>PO 单号格式示例</td><td>regex 二次验证</td></tr>
+          <tr><td>长度</td><td>maxLength in schema</td><td>截断或 repair</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 工单</h3>
+      <p>端到端：<code>dialog-orchestrator</code> 在多轮结束后调用 <code>ticket-json</code> 专用模板（版本 <code>ticket-v1.2</code>），经 repair-loop 得到对象，POST 至 <code>ticket-service</code>。失败进人工队列并记录 <code>prompt_version</code> 便于 <a href="#ch-practice-04-ab-test">A/B</a> 回滚。</p>
+
+      <div class="notice">
+        <strong>关键术语速览</strong>
+        <p><span class="term" data-term-id="json-schema-prompt" tabindex="0">json schema prompt</span> · <span class="term" data-term-id="repair-loop" tabindex="0">repair loop</span> · <span class="term" data-term-id="output-validate" tabindex="0">output validate</span> · <span class="term" data-term-id="structured-output" tabindex="0">structured output</span> · <span class="term" data-term-id="schema-inject" tabindex="0">schema inject</span> · <span class="term" data-term-id="parse-retry" tabindex="0">parse retry</span> · <span class="term" data-term-id="ticket-json" tabindex="0">ticket json</span> · <span class="term" data-term-id="response-format" tabindex="0">response format</span></p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>JSON schema</strong>：<span class="term" data-term-id="schema-inject" tabindex="0">schema inject</span> 与 DTO 同源；禁止 additionalProperties 漂移。</li>
+        <li><strong>修复循环</strong>：<span class="term" data-term-id="repair-loop" tabindex="0">repair loop</span> + <span class="term" data-term-id="parse-retry" tabindex="0">parse retry</span> 上限；失败降级人工。</li>
+        <li><strong>校验</strong>：<span class="term" data-term-id="output-validate" tabindex="0">output validate</span> 语法+语义；不信任裸模型输出。</li>
+        <li><strong>CorpAssist 工单</strong>：<span class="term" data-term-id="ticket-json" tabindex="0">ticket json</span> 模板版本化，对接 ITSM。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="production-prompt-engineering_practice03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="schema" /> 能写出含 enum 的 ticket schema</label></li>
+          <li><label><input type="checkbox" data-id="repair" /> 能描述 repair-loop 三步</label></li>
+          <li><label><input type="checkbox" data-id="validate" /> 能区分语法校验与业务校验</label></li>
+          <li><label><input type="checkbox" data-id="dual" /> 能对照 Python 与 Spring 结构化输出 API</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-04-ab-test">A/B 与迭代流程</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html#_structured_output" target="_blank" rel="noopener">Spring AI — Structured Output</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/structured_output/" target="_blank" rel="noopener">LangChain — Structured Output</a></li>
+      <li><a href="https://platform.openai.com/docs/guides/structured-outputs" target="_blank" rel="noopener">OpenAI — Structured Outputs</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/prompts.html" target="_blank" rel="noopener">Spring AI — Prompts</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完善 ticket-schema.json 与 repair-loop 伪代码，并完成 2 个坏 JSON 修复推演。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-03-json-output-lab/ticket-schema.json</code>，补全 enum 与 pattern。</li>
+      <li>编写 <code>json-schema-prompt.md</code>：schema-inject 模板 + 「仅 JSON」禁令。</li>
+      <li>对 <code>broken-samples.json</code> 中 2 条坏输出，写 repair user 消息。</li>
+      <li>列出 output-validate 业务规则 3 条（如 P1 必含 order_id）。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：工单 JSON 实验</h4>
+      <p><code>demos/practice-03-json-output-lab/</code> — schema 完整；2 条 repair 推演。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-02-agent-prompt">Agent 与工具 Prompt</a></li>
+      <li><a href="#ch-practice-04-ab-test">A/B 与迭代流程</a></li>
+      <li><a href="#ch-basics-03-variables">变量、版本与配置管理</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,178 @@
+<section id="ch-advanced-03-capacity" class="chapter" data-chapter="advanced-03-capacity">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>容量规划入门</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-capacity" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>生产部署</strong> · 能力：<span class="term" data-term-id="capacity-plan" tabindex="0">capacity plan</span> 粗算（QPS · 显存）</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>采购 GPU 前需要 <span class="term" data-term-id="rough-sizing" tabindex="0">rough sizing</span>：CorpAssist S4 峰值 <span class="term" data-term-id="s4-load" tabindex="0">s4 load</span> 多少、单卡能扛多少并发、要不要第二张卡。本章不做精确仿真，只建立 <span class="term" data-term-id="qps-estimate" tabindex="0">qps estimate</span> 与 <span class="term" data-term-id="vram-estimate" tabindex="0">vram estimate</span> 的可沟通算法。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用「并发 × 平均延迟」反推所需吞吐与 <span class="term" data-term-id="gpu-count" tabindex="0">gpu count</span></li>
+          <li>按模型大小 + 量化 + 上下文估显存是否够（链到 <a href="#ch-basics-04-quant">量化</a>、<a href="#ch-basics-05-kv-cache-app">KV</a>）</li>
+          <li>输出一页 <span class="term" data-term-id="scale-plan" tabindex="0">scale plan</span> 给架构评审</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>QPS 粗算</strong>：先估并发用户与单次补全耗时，再算所需 tokens/s。</li>
+          <li><strong>显存</strong>：权重 + KV；max-model-len 与并发数乘在一起。</li>
+          <li><strong>留余量</strong>：灰度、峰值、OOM 缓冲 20～30%。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>QPS 粗算</h3>
+      <p><span class="term" data-term-id="concurrency-math" tabindex="0">Concurrency math</span>（Little 定律直觉）：</p>
+      <p class="formula-block"><code>并发请求数 N ≈ 到达率 λ × 平均响应时间 W</code></p>
+      <p>例：200 在线开发者，每人平均每 30s 触发 1 次补全，单次生成 3s → 并发约 <code>200/30*3 ≈ 20</code>。若单卡 vLLM 稳定支撑 15 并发，则需至少 2 卡或降 max-num-seqs。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>输入</th><th>来源</th><th>CorpAssist 提示</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>活跃用户数</td>
+            <td>IDE 遥测 / 登录会话</td>
+            <td>区分「打开 IDE」与「真调补全」</td>
+          </tr>
+          <tr>
+            <td>平均 tokens / 请求</td>
+            <td>网关日志</td>
+            <td>FIM 常 32～128 completion tokens</td>
+          </tr>
+          <tr>
+            <td>目标 P95 延迟</td>
+            <td>SLA</td>
+            <td>与 <a href="#ch-practice-03-stream">TTFT</a> 分开看</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown"># demos/advanced-03-capacity-lab/capacity-worksheet.md 填空示例
+峰值并发 N = ___
+单卡可持续并发 = ___（压测或厂商参考）
+建议 GPU 数 = ceil(N / 单卡并发) × 1.25 余量</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：QPS 翻倍但平均生成长度减半，GPU 压力怎样？</summary>
+        <p>tokens/s 可能相近；若 KV 与批处理仍占满，压力不一定减半——要看 vLLM 批处理效率与 max-model-len。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>显存</h3>
+      <p><span class="term" data-term-id="vram-estimate" tabindex="0">VRAM estimate</span> 分项（应用层粗算）：</p>
+      <ul>
+        <li><strong>权重</strong>：7B AWQ 约 5～6GB 级（以实测为准）</li>
+        <li><strong>KV cache</strong>：随 <code>max-model-len</code> × 并发槽位上升（见 basics-05）</li>
+        <li><strong>框架开销</strong>：预留 1～2GB</li>
+      </ul>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">低估显存</span>
+          <ul>
+            <li>只算权重，忽略 KV</li>
+            <li>把 max-model-len 拉到 32K 却按 8K 估并发</li>
+            <li>灰度双版本两套路权重同卡</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">稳妥估法</span>
+          <ul>
+            <li>压测 目标并发 + 观察 nvidia-smi 峰值</li>
+            <li>量化降权重，再调 max-num-seqs</li>
+            <li>写进 <span class="term" data-term-id="scale-plan" tabindex="0">scale plan</span> 的扩容触发条件</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>容量规划输入输出</h5>
+        <pre class="mermaid">flowchart LR
+  Biz[S4 用户负载] --> Q[qps estimate]
+  Model[模型+量化] --> V[vram estimate]
+  Q --> G[gpu count]
+  V --> G
+  G --> P[scale plan / 采购]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="capacity-plan" tabindex="0">capacity plan</span> 连接业务、模型与基础设施评审。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>QPS</strong>：用并发与延迟估副本，不迷信峰值 QPS 宣传值。</li>
+        <li><strong>显存</strong>：权重 + KV + 余量；与量化、max-model-len 联动。</li>
+        <li><strong>交付</strong>：worksheet 一页纸即可支撑 <span class="term" data-term-id="s4-load" tabindex="0">s4 load</span> 评审。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一章 <a href="#ch-advanced-04-interview">面试：私有化部署题</a> — 把容量与架构话术合并。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener">vLLM Performance</a></li>
+      <li><a href="https://developer.nvidia.com/cuda-gpus" target="_blank" rel="noopener">NVIDIA GPU 规格</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">填写 <code>demos/advanced-03-capacity-lab/capacity-worksheet.md</code>。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>假设 500 活跃用户、每 60s 1 次补全、单次 4s，计算并发 N。</li>
+      <li>给定单卡并发 12，计算建议 <span class="term" data-term-id="gpu-count" tabindex="0">gpu count</span>（含 25% 余量）。</li>
+      <li>说明 AWQ 7B 在 24GB 卡上你还会保留多少 GB 给 KV（定性即可）。</li>
+      <li>完成测验 lsfa-a03。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">厂商宣称单卡 100 QPS，你是否直接写入 <span class="term" data-term-id="scale-plan" tabindex="0">scale plan</span>？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>否；需用 CorpAssist 真实 prompt 长度、stream、并发压测，并区分 chat 与 FIM。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：容量 worksheet</h4>
+      <p><code>demos/advanced-03-capacity-lab/capacity-worksheet.md</code> — 填完并发、GPU 数、余量说明三段。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-05-kv-cache-app">KV 缓存与性能</a></li>
+      <li><a href="#ch-advanced-02-k8s-serve">K8s 部署清单</a></li>
+    </ul>
+  </div>
+</section>

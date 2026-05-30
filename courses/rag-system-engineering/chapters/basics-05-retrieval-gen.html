@@ -1,0 +1,327 @@
+<section id="ch-basics-05-retrieval-gen" class="chapter" data-chapter="basics-05-retrieval-gen">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>检索、重排与生成</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05-retrieval-gen" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>RAG 架构与数据管线</strong> · 能力：TopK、Rerank 位、引用与流式输出</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>向量检索只解决「召回」；<span class="term" data-term-id="corpassist-s1" tabindex="0">corpassist s1</span> 制度问答还要<strong>精排、标注出处、流式呈现</strong>。若 TopK 过小漏召回、过大撑爆 context；若无 <span class="term" data-term-id="rerank" tabindex="0">rerank</span> 则噪声进 prompt；若无 <span class="term" data-term-id="citation" tabindex="0">citation</span> 则合规无法审计。本章把检索→生成链路的工程位点讲透。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 S1 场景设定 <span class="term" data-term-id="top-k" tabindex="0">top k</span> 召回与进 prompt 条数，并解释差异原因</li>
+          <li>在检索与生成之间插入 <span class="term" data-term-id="rerank" tabindex="0">rerank</span>，组装 <span class="term" data-term-id="context-pack" tabindex="0">context pack</span></li>
+          <li>设计带 <span class="term" data-term-id="citation" tabindex="0">citation</span> 的答案格式与 <span class="term" data-term-id="stream-gen" tabindex="0">stream gen</span> / <span class="term" data-term-id="sse-rag" tabindex="0">sse rag</span> 推送协议</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>两阶段 K</strong>：召回 TopK（宽）≠ 进 LLM 条数（窄），中间常靠 rerank 截断。</li>
+          <li><strong>引用是交付物</strong>：答案每个事实点应对应 chunk_id / doc_id，便于复核。</li>
+          <li><strong>流式先 citation 后 token</strong>：<span class="term" data-term-id="sse-rag" tabindex="0">sse rag</span> 可先推引用列表再推正文，降低首字延迟感知。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>TopK 召回与阈值</h3>
+
+      <p><span class="term" data-term-id="top-k" tabindex="0">top k</span> 是向量检索返回的候选 chunk 数。CorpAssist S1 常见配置：</p>
+      <ul>
+        <li><strong>召回 K=20～50</strong> — 保证制度条款编号、同义词不被漏掉。</li>
+        <li><strong>进 prompt K=3～5</strong> — 受 LLM context 与噪声约束。</li>
+        <li><strong><span class="term" data-term-id="score-threshold" tabindex="0">score threshold</span></strong> — 低于阈值直接丢弃，为后续拒答铺垫（见 <a href="#ch-basics-06-hallucination">幻觉治理</a>）。</li>
+        <li><strong><span class="term" data-term-id="mmr" tabindex="0">mmr</span></strong> — 在 TopK 内做多样性，避免多条重复条款占满 context。</li>
+      </ul>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>参数</th><th>典型值</th><th>调大影响</th><th>调小影响</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>召回 TopK</td>
+            <td>20</td>
+            <td>召回↑、延迟↑、rerank 成本↑</td>
+            <td>漏召回、专有名词 miss</td>
+          </tr>
+          <tr>
+            <td>score threshold</td>
+            <td>0.65～0.75</td>
+            <td>更多 chunk 进 rerank</td>
+            <td>更早触发拒答</td>
+          </tr>
+          <tr>
+            <td>MMR λ</td>
+            <td>0.5～0.7</td>
+            <td>更偏相关、少多样性</td>
+            <td>更分散、可能丢最佳条</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么「召回 20、进 prompt 5」比「全程 TopK=5」更好？</summary>
+        <p>向量召回是<strong>粗排</strong>；宽召回 + rerank 精排能在不撑爆 context 的前提下提高 relevant chunk 进入 prompt 的概率。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Rerank 在链路中的位置</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 「年假天数」查询（30 秒）</span>
+        员工问「入职满一年年假几天？」。向量 TopK=30 召回了「考勤总则」「福利手册」「年假细则」等 chunk，但细则条款 cosine 仅排第 8。<span class="term" data-term-id="rerank" tabindex="0">rerank</span>（cross-encoder 或 API）将「年假细则 §3.2」升至第 1，再进入 <span class="term" data-term-id="context-pack" tabindex="0">context pack</span>。
+      </aside>
+
+      <p>Rerank 应放在<strong>向量召回之后、LLM 之前</strong>：</p>
+      <ol>
+        <li>Query → Query Embedding → VectorStore.similaritySearch(topK=30)</li>
+        <li>可选：MMR / 阈值过滤</li>
+        <li>Rerank(query, candidates) → 取 top 5</li>
+        <li>组装 context pack（含 doc_id、section、score）</li>
+        <li>LLM generate</li>
+      </ol>
+
+      <div class="mermaid-wrap">
+        <h5>检索 → Rerank → 生成</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 用户
+  participant SP as Spring RAG API
+  participant VS as 向量库
+  participant RR as Rerank 服务
+  participant LLM as 模型网关
+  U->>SP: 年假几天？
+  SP->>VS: similaritySearch TopK=30
+  VS-->>SP: 30 chunks
+  SP->>RR: rerank(query, chunks)
+  RR-->>SP: top 5
+  SP->>LLM: prompt + context pack
+  LLM-->>SP: 流式 token + citations
+  SP-->>U: SSE 推送</pre>
+        <p class="diagram-caption">Spring 侧可用 Advisor 钩子插入 rerank；Python 离线评测可复用同一 rerank 模块做 parity。</p>
+      </div>
+
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>直接把 TopK=30 全塞进 prompt</li>
+            <li>无 rerank，仅靠向量分数排序</li>
+            <li>rerank 与召回用不同 query 文本</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>召回宽、rerank 窄、context 有上限 token</li>
+            <li>context pack 带 score 供拒答/审核</li>
+            <li>双栈共用 rerank 配置与 cutoff</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">RECALL_K, PROMPT_K = 30, 5
+hits = vector_store.similarity_search(query, k=RECALL_K)
+hits = [h for h in hits if h.score >= MIN_SCORE]
+reranked = rerank_client.rerank(query, hits, top_n=PROMPT_K)
+context_pack = build_context_pack(reranked)  # doc_id, section, text</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>引用（Citation）设计</h3>
+
+      <p>S1 制度问答的合规要求是：<strong>用户看到的每条结论可追溯到库内文档</strong>。<span class="term" data-term-id="citation" tabindex="0">citation</span> 常见形态：</p>
+      <ul>
+        <li><strong>行内标记</strong> — 「年假 10 天<sup>[1]</sup>」，脚注链到 doc 标题 + 章节。</li>
+        <li><strong>结构化 JSON</strong> — <code>citations: [{chunk_id, doc_id, page, score}]</code> 随 API 返回。</li>
+        <li><strong>Prompt 约束</strong> — 要求模型「仅依据 context，每句末尾标注 [n]」。</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public record RagResponse(
+    String answer,
+    List&lt;Citation&gt; citations,
+    List&lt;ContextChunk&gt; sources
+) {}
+
+// Citation: chunkId, documentTitle, sectionPath, relevanceScore</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只返回纯文本</strong> — 前端无法跳转 PDF 原文，审计失败。</li>
+          <li><strong>引用与 context 不一致</strong> — 模型编造 [3] 但 context 只有 2 条；需后验校验。</li>
+          <li><strong>ACL 泄漏</strong> — citation 暴露用户无权 doc 标题；检索层须先过滤。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>流式输出（Stream Gen）</h3>
+
+      <p>用户感知延迟取决于<strong>首 token 时间</strong>。<span class="term" data-term-id="stream-gen" tabindex="0">stream gen</span> 通过 <span class="term" data-term-id="sse-rag" tabindex="0">sse rag</span> 分事件推送：</p>
+
+      <h4>SSE 事件类型（标签页）</h4>
+      <div class="learn-tabs" role="tablist" aria-label="SSE 事件">
+        <input type="radio" name="basics05sse" id="basics05-tab-cite" class="learn-tab-input" checked />
+        <input type="radio" name="basics05sse" id="basics05-tab-token" class="learn-tab-input" />
+        <label for="basics05-tab-cite">citations 事件</label>
+        <label for="basics05-tab-token">token 事件</label>
+        <div class="learn-tab-panel" id="basics05-panel-cite" role="tabpanel">
+          <p><strong>时机</strong>：rerank 完成后、LLM 首 token 前。</p>
+          <p><strong>内容</strong>：sources 列表，前端可先渲染「参考文档」侧栏。</p>
+          <p><strong>收益</strong>：用户 200ms 内看到「有依据」，降低焦虑。</p>
+        </div>
+        <div class="learn-tab-panel" id="basics05-panel-token" role="tabpanel">
+          <p><strong>时机</strong>：LLM 流式生成期间。</p>
+          <p><strong>内容</strong>：<code>data: {"type":"token","text":"..."}</code></p>
+          <p><strong>结束</strong>：<code>type: done</code> + 完整 citation 校验结果。</p>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">event: citations
+data: {"sources":[{"doc_id":"hr-2024-annual","section":"§3.2"}]}
+
+event: token
+data: {"text":"根据制度，入职满一年享有 "}
+
+event: done
+data: {"faithfulness":"pass"}</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>流式输出下如何做 citation 校验？</summary>
+          <div class="learn-faq-body">
+            可在 <code>done</code> 事件前跑轻量校验：抽取答案中的 [n] 是否 ⊆ context_pack；严重不符则改写或拒答（衔接 <a href="#ch-basics-06-hallucination">幻觉治理</a>）。
+          </div>
+        </details>
+        <details>
+          <summary>Python FastAPI 与 Spring 流式协议要对齐吗？</summary>
+          <div class="learn-faq-body">
+            双栈应对齐 SSE event 名与 JSON schema，便于 BFF 聚合与前端一套组件复用。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>TopK</strong>：召回宽、进 prompt 窄；配合 <span class="term" data-term-id="score-threshold" tabindex="0">score threshold</span> 与 <span class="term" data-term-id="mmr" tabindex="0">mmr</span>。</li>
+        <li><strong>Rerank</strong>：放在向量检索与 LLM 之间，输出 <span class="term" data-term-id="context-pack" tabindex="0">context pack</span>。</li>
+        <li><strong>Citation</strong>：结构化返回 + Prompt 约束，满足 S1 合规审计。</li>
+        <li><strong>流式</strong>：<span class="term" data-term-id="sse-rag" tabindex="0">sse rag</span> 先 citations 后 token，优化体验。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_basics05">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="topk" /> 能解释召回 K 与 prompt K 为何不同</label></li>
+          <li><label><input type="checkbox" data-id="rerank" /> 能画出 rerank 在 sequence 图中的位置</label></li>
+          <li><label><input type="checkbox" data-id="cite" /> 能设计一条 API 的 citations 字段</label></li>
+          <li><label><input type="checkbox" data-id="sse" /> 能列举两种 SSE 事件类型</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 为何召回 20 条却只把 5 条给 LLM？</li>
+              <li>Rerank 不用可以吗？什么场景可以省略？</li>
+              <li>流式 RAG 如何同时返回引用与正文？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-basics-06-hallucination">幻觉治理</a> — 检索仍不足时如何拒答与审核。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI RAG / Advisors</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/qa/streaming/" target="_blank" rel="noopener">LangChain Streaming QA</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html#mvc-ann-async-sse" target="_blank" rel="noopener">Spring SSE</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 <code>demos/basics-05-retrieval-gen-lab/retrieval-flow.md</code>，完成<strong>参数表</strong>、<strong>引用 schema</strong>与<strong>SSE 序列</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读 retrieval-flow.md「召回 20 → 重排 5 → 生成+引用」，为 CorpAssist 年假场景填一张参数表：RECALL_K、PROMPT_K、MIN_SCORE。</li>
+      <li>设计 <code>RagResponse</code> JSON：含 answer、citations（至少 3 字段）、sources。</li>
+      <li>写出 SSE 三条事件（citations / token / done）的示例 payload。</li>
+      <li>说明 Spring Advisor 链中 rerank 应插在 Retriever 与 ChatClient 之间的哪一步。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">方案对比：A 召回 TopK=5 直接生成；B 召回 30 + rerank 5 + citation。S1 制度问答应选哪个？各写 1 条理由。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>选 B</strong>。宽召回降 miss；rerank 提 precision；citation 满足合规。A 实现简单但漏条款与无出处。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：① rerank 在 embed 之前 ② citations 先于 token 推送 ③ TopK 越大一定越好</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>错：① 和 ③</strong>。rerank 需先有召回结果；TopK 过大增加噪声与成本。② 是推荐做法。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：检索、重排与生成实验室</h4>
+      <p>目录：<code>demos/basics-05-retrieval-gen-lab/</code>。<strong>验收</strong>：能写出 TopK 与最终进 prompt 条数差异原因，并草绘 SSE 事件序。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-06-hallucination">幻觉治理</a></li>
+      <li><a href="#ch-practice-03-hybrid">混合检索接入</a> — 关键词 + 向量融合</li>
+      <li><a href="#ch-advanced-01-query-transform">查询改写与 HyDE</a> — 召回前置增强</li>
+    </ul>
+  </div>
+</section>

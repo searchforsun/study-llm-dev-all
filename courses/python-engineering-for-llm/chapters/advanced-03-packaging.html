@@ -1,0 +1,370 @@
+<section id="ch-advanced-03-packaging" class="chapter" data-chapter="advanced-03-packaging">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>打包、版本与发布</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-packaging" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>生产级 Python AI 服务</strong> · 能力：semver 发版、内部 PyPI、分环境配置与 CI 门禁</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist-python 从「本机能跑」到「平台组可部署」，需要与 Java 侧同等的版本纪律：<span class="term" data-term-id="semver" tabindex="0">语义化版本</span>、可审计的 <span class="term" data-term-id="artifact" tabindex="0">制品</span>、分环境配置与 <span class="term" data-term-id="ci-pipeline" tabindex="0">CI pipeline</span> 钩子。Python 包发布到 <span class="term" data-term-id="internal-pypi" tabindex="0">internal PyPI</span> 后，Worker 与 API 镜像才能像 Maven 依赖一样被锁定与回滚。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>解释 MAJOR/MINOR/PATCH 对 CorpAssist API 与 Java BFF 的影响</li>
+          <li>配置 uv/pip 从私服安装 <code>corpassist-*</code> <span class="term" data-term-id="wheel" tabindex="0">wheel</span></li>
+          <li>用 <span class="term" data-term-id="pydantic-settings" tabindex="0">pydantic-settings</span> 实现 <span class="term" data-term-id="config-env" tabindex="0">配置与环境分离</span></li>
+          <li>预览 CI 中 lint、test、build 与 <span class="term" data-term-id="tag-release" tabindex="0">tag release</span> 顺序</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>版本即契约</strong>：MINOR 可加字段，MAJOR 才允许破坏性变更。</li>
+          <li><strong>锁 + 制品</strong>：<code>uv.lock</code> 与 wheel 版本双轨，CI 拒绝漂移。</li>
+          <li><strong>镜像无密钥</strong>：<span class="term" data-term-id="twelve-factor" tabindex="0">12-factor</span> 配置仅经环境注入。</li>
+          <li><strong>变更可追溯</strong>：<span class="term" data-term-id="changelog" tabindex="0">CHANGELOG</span> 与 Git tag 对齐。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>语义化版本</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 双栈发版窗口</span>
+        Python 组准备发 <code>0.2.0</code>：新增 RAG search 可选字段 <code>filters</code>。Java BFF 需在同一个 release train 内升级 openapi-generator 客户端；若 Python 误 bump 到 <code>1.0.0</code> 却未删旧路径，前端会收到两套不兼容响应。
+      </aside>
+      <p><span class="term" data-term-id="semver" tabindex="0">Semver</span> 格式 <code>MAJOR.MINOR.PATCH</code>，与 Maven <code>${revision}</code> 策略类似。CorpAssist-python 服务版本写在 <code>pyproject.toml</code> 与 Docker 标签，Java BFF 依赖的 OpenAPI <code>info.version</code> 应同步 bump。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>变更类型</th><th>版本位</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>修复索引 bug、无 API 变化</td>
+            <td>PATCH</td>
+            <td><code>0.1.0</code> → <code>0.1.1</code></td>
+          </tr>
+          <tr>
+            <td>新增可选 API 字段、向后兼容</td>
+            <td>MINOR</td>
+            <td><code>0.1.1</code> → <code>0.2.0</code></td>
+          </tr>
+          <tr>
+            <td>删除/重命名 API 路径</td>
+            <td>MAJOR</td>
+            <td><code>0.2.0</code> → <code>1.0.0</code>，需 Java 侧同步发版</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>pyproject 版本与 __version__ 同步</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">toml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-toml">[project]
+name = "corpassist-python"
+version = "0.2.0"
+description = "CorpAssist Python RAG 服务"
+
+[tool.hatch.version]
+path = "src/corpassist/__init__.py"</code></pre>
+      </div>
+      <p><span class="term" data-term-id="version-bump" tabindex="0">Version bump</span> 应伴随 CHANGELOG 条目与 Git tag <code>v0.2.0</code>，CI 在 tag 推送时触发 release 流水线。</p>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩题：预发布版本 <code>0.2.0-rc.1</code> 何时用？</summary>
+          <p>给 Java 联调或 staging 验证用，不应进生产私服 default 通道。CorpAssist 约定：rc 仅 internal index；正式 tag 去掉后缀并同步 Docker <code>:0.2.0</code> 与 OpenAPI <code>info.version</code>。</p>
+        </details>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：仅修复 Worker 内存泄漏、HTTP JSON 完全不变，应 bump 哪一位？</summary>
+        <p>PATCH（如 <code>0.2.0</code> → <code>0.2.1</code>）。BFF 无需改客户端；平台组只需滚动 Worker 镜像。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>内部 PyPI</h3>
+      <p>企业私服（DevPI、Artifactory PyPI、Nexus）托管内部 <span class="term" data-term-id="wheel" tabindex="0">wheel</span>。共享库如 <code>corpassist-schemas</code>（Pydantic 模型）可独立发包，供 Python 服务与代码生成工具使用——类比 Maven 私服上的 <code>corpassist-api</code> jar。</p>
+
+      <div class="mermaid-wrap">
+        <h5>构建物从 CI 到运行时</h5>
+        <pre class="mermaid">flowchart LR
+  git["Git tag v0.2.0"]
+  ci["CI: uv build"]
+  pypi["internal PyPI"]
+  docker["Docker 镜像"]
+  k8s["K8s 部署"]
+  git --> ci --> pypi
+  ci --> docker --> k8s
+  k8s -->|"uv sync --index"| pypi</pre>
+        <p class="diagram-caption">生产镜像可只 COPY wheel 或直接 <code>uv sync --frozen</code> 从 lock 安装；私服用于跨项目复用 schemas 包。</p>
+      </div>
+
+      <h4>uv 配置私服 index</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">toml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-toml">[[tool.uv.index]]
+name = "corp"
+url = "https://pypi.corp.example/simple/"
+default = true
+
+[tool.uv.sources]
+corpassist-schemas = { index = "corp" }</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">风险做法</span>
+          <ul>
+            <li>从 Git URL 直接 pip install 无版本 pin</li>
+            <li>私服凭证写进 pyproject 提交 Git</li>
+            <li>本地 <code>pip install -e</code> 与生产 wheel 行为不一致</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>CI 用 <code>UV_INDEX_CORP_PASSWORD</code> 环境变量</li>
+            <li>lock 文件锁定私服包精确版本</li>
+            <li>发布前 <code>uv build</code> 本地验证 wheel 可安装</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>本地 build 与 publish 命令</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">uv build                          # dist/corpassist_python-0.2.0-py3-none-any.whl
+uv publish --index corp             # CI 中执行；本地需 UV_PUBLISH_TOKEN
+pip install corpassist-schemas==0.2.0 --index-url https://pypi.corp.example/simple/</code></pre>
+      </div>
+      <p>共享 schemas 包独立 semver：仅改 Pydantic 模型时 bump schemas MINOR，API 服务依赖 <code>corpassist-schemas&gt;=0.2,&lt;0.3</code>，与 Maven BOM 对齐。</p>
+
+      <details class="learn-faq">
+        <summary>FAQ：wheel 与 Docker 镜像都要发吗？</summary>
+        <p>API/Worker 运行时通常以 Docker 为主；wheel 用于跨仓库复用 schemas 与 CLI 工具。两者 version tag 应同源 Git commit，避免「镜像 0.2.0 内嵌 schemas 0.1.9」漂移。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>配置分环境</h3>
+      <p>镜像构建一次，多环境运行靠环境变量——与 Spring <code>application-{profile}.yml</code> 同构。CorpAssist 使用 <code>CORPASSIST_*</code> 前缀与 <span class="term" data-term-id="settings-model" tabindex="0">Settings 模型</span> 校验。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="环境配置">
+        <input type="radio" name="adv03-env-tab" id="adv03-env-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="adv03-env-tab" id="adv03-env-tab-b" class="learn-tab-input" />
+        <label for="adv03-env-tab-a">local / compose</label>
+        <label for="adv03-env-tab-b">staging / prod</label>
+        <div class="learn-tab-panel" id="adv03-env-panel-a" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">bash</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-bash">CORPASSIST_ENV=local
+CORPASSIST_LLM_BASE_URL=http://mock-llm:8080
+CORPASSIST_LOG_LEVEL=DEBUG
+CORPASSIST_REDIS_URL=redis://redis:6379/0</code></pre>
+          </div>
+        </div>
+        <div class="learn-tab-panel" id="adv03-env-panel-b" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">bash</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-bash">CORPASSIST_ENV=prod
+CORPASSIST_LLM_BASE_URL=https://llm-gateway.corp.example
+CORPASSIST_LOG_LEVEL=INFO
+# 密钥来自 K8s Secret，不进镜像</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <h4>Settings 分环境校验</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="CORPASSIST_", env_file=".env", extra="ignore")
+
+    env: Literal["local", "staging", "prod"] = "local"
+    llm_base_url: HttpUrl
+    log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def prod_requires_https(self) -&gt; Self:
+        if self.env == "prod" and str(self.llm_base_url).startswith("http://"):
+            raise ValueError("prod 必须 https")
+        return self</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不把 <code>.env.production</code> 打进 Docker 镜像？</summary>
+        <p>违反 <span class="term" data-term-id="config-env" tabindex="0">配置与环境分离</span>；同一镜像无法多环境复用，且易泄露密钥。应使用 K8s ConfigMap/Secret 或 CI 注入。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>CI 钩子预览</h3>
+      <p><span class="term" data-term-id="ci-pipeline" tabindex="0">CI pipeline</span> 在 merge 与 tag 两阶段职责不同：PR 验证质量，tag 产出 <span class="term" data-term-id="artifact" tabindex="0">制品</span>。</p>
+
+      <div class="mermaid-wrap">
+        <h5>PR 与 tag 流水线分叉</h5>
+        <pre class="mermaid">flowchart TB
+  pr["PR push"]
+  tag["tag v0.2.0"]
+  verify["verify: lint test lock"]
+  release["release: build publish docker"]
+  pr --> verify
+  tag --> verify --> release</pre>
+        <p class="diagram-caption">release job 仅在 tag 且 verify 绿时运行；PR 不得 publish 到生产私服。</p>
+      </div>
+
+      <h4>典型阶段（GitHub Actions / GitLab CI）</h4>
+      <ol class="steps">
+        <li><strong>lint</strong> — <code>uv run ruff check</code> + <code>mypy</code></li>
+        <li><strong>test</strong> — <code>uv run pytest</code>（Mock LLM，见 <a href="#ch-practice-03-testing">测试章</a>）</li>
+        <li><strong>lock 校验</strong> — <code>uv lock --check</code> 或 <code>uv sync --frozen</code></li>
+        <li><strong>build</strong> — <code>uv build</code> 生成 wheel；Docker build push</li>
+        <li><strong>release</strong> — tag <code>v*</code> 时上传私服 + 写 <span class="term" data-term-id="changelog" tabindex="0">CHANGELOG</span></li>
+      </ol>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># .github/workflows/ci.yml 片段
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install uv &amp;&amp; uv sync --frozen
+      - run: uv run ruff check &amp;&amp; uv run mypy src
+      - run: uv run pytest -q
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    steps:
+      - run: uv build &amp;&amp; uv publish --index corp</code></pre>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>CI 失败常见原因</summary>
+          <div class="learn-cheat-body">
+            <ul>
+              <li>改了 pyproject 未提交 <span class="term" data-term-id="lockfile" tabindex="0">uv.lock</span></li>
+              <li>semver 与 __version__ 不一致</li>
+              <li>集成测试误连真实 LLM（缺 Mock）</li>
+              <li>tag release 未等 verify job 绿</li>
+            </ul>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩题：Python 服务为何仍要发 wheel 而不只发 Docker 镜像？</summary>
+          <p><code>corpassist-schemas</code> 等库供多服务复用；wheel + 私服让 Worker/API 共享同一 DTO 版本。镜像负责运行时，wheel 负责可复用 <span class="term" data-term-id="artifact" tabindex="0">制品</span> 与 <span class="term" data-term-id="pyproject" tabindex="0">pyproject</span> 元数据。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>语义化版本</strong>：PATCH/MINOR/MAJOR 与 OpenAPI、Java 发版联动。</li>
+        <li><strong>内部 PyPI</strong>：wheel + lock + 私服 index；凭证仅 CI 环境变量。</li>
+        <li><strong>配置分环境</strong>：CORPASSIST_* + Settings 校验；镜像无环境专属文件。</li>
+        <li><strong>CI 钩子</strong>：PR 跑 lint/test/lock；tag 触发 build 与 publish。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_adv03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="semver" /> 能举例 MINOR vs MAJOR 各一种 API 变更</label></li>
+          <li><label><input type="checkbox" data-id="pypi" /> 能说明 uv index 与 lock 的关系</label></li>
+          <li><label><input type="checkbox" data-id="env" /> 能列出 prod 禁止 http:// 的校验理由</label></li>
+          <li><label><input type="checkbox" data-id="ci" /> 能排序 lint → test → build</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；继续 <a href="#ch-advanced-04-corpassist-api">实战：CorpAssist Python 服务 API</a>，导出 OpenAPI 供 Java 消费。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://semver.org/lang/zh-CN/" target="_blank" rel="noopener">Semantic Versioning 2.0.0</a></li>
+      <li><a href="https://docs.astral.sh/uv/guides/publish/" target="_blank" rel="noopener">uv — 发布包</a></li>
+      <li><a href="https://docs.pydantic.dev/latest/concepts/pydantic_settings/" target="_blank" rel="noopener">pydantic-settings</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 Demo 校验 semver 格式，并对照「semver 决策表」判断一次 API 变更应 bump 哪一位。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「语义化版本」决策表：删除 <code>/v1/search</code> 路径应 bump MAJOR 还是 PATCH？</li>
+      <li>打开 <code>demos/advanced-03-packaging-lab/pyproject.snippet.toml</code>，找出 <code>version</code> 字段。</li>
+      <li>在 packaging demo 目录运行 <code>python version_check.py</code>，确认输出 <code>semver ok</code>。</li>
+      <li>对照「CI 钩子」yaml 片段，写出 PR 阶段不应执行哪一步（release 还是 verify）。</li>
+      <li>阅读 Mermaid「PR 与 tag 流水线分叉」图，说明 tag 推送后 verify 失败时 release 是否应执行。</li>
+      <li>对照「本地 build 与 publish 命令」，说明 <code>uv publish</code> 为何不应在开发者笔记本对生产 index 随意执行。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）CI 在 PR 中执行 <code>uv publish</code>，且 pyproject 含私服密码。指出 2 处违规及修复方式。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>① publish 应仅在 tag release job，PR 只 verify；② 密码改为 CI Secret 环境变量，pyproject 只保留 index URL。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：版本号校验</h4>
+      <p>目录：<code>demos/advanced-03-packaging-lab/</code>。<strong>验收</strong>：<code>python version_check.py</code> 退出码 0 且打印 <code>semver ok: x.y.z</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-02-background-jobs">后台任务与队列</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-04-corpassist-api">实战：CorpAssist Python 服务 API</a></li>
+    </ul>
+  </div>
+</section>

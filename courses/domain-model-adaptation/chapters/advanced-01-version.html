@@ -1,0 +1,390 @@
+<section id="ch-advanced-01-version" class="chapter" data-chapter="advanced-01-version">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>模型版本与 AB</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-version" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产与治理</strong> · 能力：注册微调产物、灰度切换 model id 与 A/B 治理</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist capstone 上线后，LoRA adapter 与 DashScope 定制模型会像<strong>代码制品</strong>一样频繁迭代。<span class="term" data-term-id="ns1-flywheel" tabindex="0">NS1 飞轮</span> 每轮偏好数据训练都会产出新 <span class="term" data-term-id="ft-version" tabindex="0">ft version</span>。若没有 <span class="term" data-term-id="model-registry" tabindex="0">model registry</span> 与 <span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span> 门禁，一次错误切换就会把客服话术打回基座模型水平。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 CorpAssist 微调产物设计<strong>注册元数据</strong>（语料版本、基座、评测 win rate、合规签核）</li>
+          <li>用 <span class="term" data-term-id="canary-model" tabindex="0">canary model</span> + <span class="term" data-term-id="ab-model" tabindex="0">ab model</span> 做 5%→20%→100% 晋级，并写 Spring/DashScope 切换配置</li>
+          <li>把 <span class="term" data-term-id="preference-flywheel" tabindex="0">preference flywheel</span> 新批次与版本号绑定，避免「换了模型却不知道用了哪份语料」</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>注册</strong>：每个 adapter 是可追溯制品，不是「某个同事机器上的文件夹」。</li>
+          <li><strong>切换</strong>：生产流量走 <span class="term" data-term-id="model-alias" tabindex="0">model alias</span>，底层 id 可灰度替换。</li>
+          <li><strong>治理</strong>：评测未过、合规未签、飞轮语料未归档 — 三者任一缺失则禁止晋级。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>注册：把 adapter 当制品入库</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · v2.3 话术 adapter 注册（90 秒）</span>
+        数据组交付 <code>corpassist-tone-v2.3-lora</code>：基于 Qwen2.5-7B、语料 <code>jsonl-20260528</code>、holdout win rate 67%。MLOps 在 registry 创建记录，绑定 DashScope 上传 job id 与内部 artifact 路径，等待评测与合规 gate 通过后才能挂到 <code>prod</code> alias。
+      </aside>
+
+      <p>应用侧微调工程的「注册」不是算法论文里的模型发布，而是<strong>可追溯制品登记</strong>：谁训练的、用什么语料、相对基座提升多少、能否回滚。Registry 可以是 MLflow Model Registry、内部 Git+S3、或 DashScope 控制台中的定制模型列表 — 关键是<strong>统一元数据 schema</strong>。</p>
+
+      <h4>注册元数据最小字段</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>字段</th><th>示例</th><th>治理用途</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="term" data-term-id="ft-version" tabindex="0">ft version</span></td>
+              <td><code>corpassist-tone-v2.3</code></td>
+              <td>与语料批次、飞轮轮次一一对应</td>
+            </tr>
+            <tr>
+              <td><span class="term" data-term-id="artifact-tag" tabindex="0">artifact tag</span></td>
+              <td><code>lora-r16-a32-3epoch</code></td>
+              <td>训练超参与 checkpoint 定位</td>
+            </tr>
+            <tr>
+              <td>base model</td>
+              <td><code>qwen2.5-7b-instruct</code></td>
+              <td>禁止 silent 换基座</td>
+            </tr>
+            <tr>
+              <td>eval snapshot</td>
+              <td>win rate 67%、违规率 0.2%</td>
+              <td><span class="term" data-term-id="rollback-gate" tabindex="0">rollback gate</span> 对比依据</td>
+            </tr>
+            <tr>
+              <td>dataset id</td>
+              <td><code>jsonl-20260528-dedup</code></td>
+              <td>审计与再训练溯源</td>
+            </tr>
+            <tr>
+              <td>deploy target</td>
+              <td>DashScope <code>ft-xxx</code> / vLLM merged</td>
+              <td>双栈路径明确</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>注册流程：Python 产物 → Registry</h4>
+      <div class="mermaid-wrap">
+        <h5>微调制品注册与签核</h5>
+        <pre class="mermaid">flowchart TD
+  Train[LoRA 训练完成] --> Art[adapter artifact]
+  Art --> Meta[写入 registry 元数据]
+  Meta --> Eval{holdout 优于 base?}
+  Eval -->|否| Reject[标记 rejected]
+  Eval -->|是| Safety[合规/偏见抽检]
+  Safety -->|过| Staged[staged 状态]
+  Safety -->|否| Reject
+  Staged --> Canary[可挂 canary alias]</pre>
+        <p class="diagram-caption">评测与合规是注册后的<strong>状态机</strong>，不是训练脚本里的 print。详见 <a href="#ch-basics-04-eval">微调评测</a> 与 <a href="#ch-practice-04-safety">合规与偏见</a>。</p>
+      </div>
+
+      <h4>Registry 记录示例（YAML）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># demos/advanced-01-version-lab/version-policy.md 扩展
+model_id: corpassist-tone-v2.3
+status: staged
+base_model: qwen2.5-7b-instruct
+artifact:
+  type: lora
+  path: s3://ft-artifacts/corpassist/v2.3/adapter_model.safetensors
+  tag: lora-r16-a32-3epoch
+dataset:
+  id: jsonl-20260528-dedup
+  rows: 2140
+  flywheel_round: ns1-r7
+eval:
+  holdout_win_rate: 0.67
+  baseline_win_rate: 0.52
+  violation_rate: 0.002
+  regression_suite: pass
+deploy:
+  dashscope_model_id: ft-corpassist-v2.3-xxxxx
+  spring_alias: corpassist-chat-prod
+signoffs:
+  ml_owner: zhang@corp
+  compliance: li@corp
+  approved_at: 2026-05-28T14:00:00Z</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只存 adapter 文件，无 dataset / eval 绑定</li>
+            <li>同事口头说「这个更好」就替换 prod</li>
+            <li>DashScope id 与内部版本号无映射表</li>
+            <li>飞轮新语料训练后覆盖旧 artifact 不留档</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Registry 为唯一真源，Spring 只读 alias</li>
+            <li>每次注册自动生成 changelog</li>
+            <li><span class="term" data-term-id="ns1-flywheel" tabindex="0">NS1 飞轮</span> 轮次写入 <code>flywheel_round</code></li>
+            <li>rejected 版本保留 90 天供审计</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：没有 registry 时，线上 bug 你怎么证明「昨天用的是哪个 adapter」？</summary>
+        <p>通常不能。Registry 的价值是<strong>事后审计与一键回滚</strong>，不是给 MLOps 看的花架子。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>切换：alias、灰度与 A/B</h3>
+      <p>生产环境不应硬编码 DashScope <code>ft-xxx</code> 或 vLLM 路径。对外暴露 <span class="term" data-term-id="model-alias" tabindex="0">model alias</span>（如 <code>corpassist-chat-prod</code>），由配置中心或 Spring 属性解析到具体 <span class="term" data-term-id="version-switch" tabindex="0">version switch</span> 目标。切换分三层：<strong>配置切换</strong>（改 alias 指向）、<strong>流量灰度</strong>（canary percent）、<strong>实验 A/B</strong>（对比业务指标）。</p>
+
+      <h4>切换策略对照</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>策略</th><th>流量比例</th><th>适用</th><th>回滚成本</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="term" data-term-id="canary-model" tabindex="0">canary model</span></td>
+            <td>5% → 20% → 50%</td>
+            <td>话术微调、低风险域</td>
+            <td>改配置，秒级</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="ab-model" tabindex="0">ab model</span></td>
+            <td>固定 50/50 或 90/10</td>
+            <td>需统计显著的业务指标</td>
+            <td>需实验平台记录</td>
+          </tr>
+          <tr>
+            <td>蓝绿</td>
+            <td>0% 或 100%</td>
+            <td>大版本、合并权重后</td>
+            <td>切回旧 alias</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span></td>
+            <td>100% 指回上一 stable</td>
+            <td>违规率/spike、CSAT 跌</td>
+            <td>预注册 <code>prod-1</code> 快照</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>Canary 晋级条件（与 Demo 对齐）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># 生产治理：advanced-01-version-lab/version-policy.md
+models:
+  production: ft-corpassist-v2.2
+  canary: ft-corpassist-v2.3
+  canary_percent: 5
+
+promotion_gates:
+  min_canary_hours: 24
+  max_violation_rate_delta: 0.001
+  min_csat_delta: -0.02        # 不得低于 -2%
+  min_sample_size: 500
+  auto_rollback_on_breach: true
+
+rollback:
+  stable_snapshot: ft-corpassist-v2.2
+  notify: ml-oncall@corp</code></pre>
+      </div>
+
+      <h4>Spring AI 调用：alias 解析</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># application-prod.yaml — 切换时只改这一处
+spring:
+  ai:
+    dashscope:
+      chat:
+        options:
+          model: ${CORPASSIST_MODEL_ALIAS:ft-corpassist-v2.2}
+          # 灰度层可在网关按 userId hash 分流到 canary model id
+
+corpassist:
+  model-routing:
+    prod: ft-corpassist-v2.2
+    canary: ft-corpassist-v2.3
+    canary-percent: 5</code></pre>
+      </div>
+
+      <h4>NS1 飞轮驱动的版本迭代</h4>
+      <div class="mermaid-wrap">
+        <h5>飞轮批次 → 新版本 → 灰度</h5>
+        <pre class="mermaid">flowchart LR
+  Prod[线上 v2.2] --> Bad[坏例采集]
+  Bad --> Label[标注 ns1-r8]
+  Label --> Train[SFT v2.3]
+  Train --> Reg[registry staged]
+  Reg --> Canary[5% canary]
+  Canary -->|gate pass| Prod2[100% v2.3]
+  Canary -->|gate fail| Roll[rollback v2.2]</pre>
+        <p class="diagram-caption">每一轮 <span class="term" data-term-id="ns1-flywheel" tabindex="0">NS1 飞轮</span> 产出<strong>新版本号</strong>，而非覆盖旧 adapter。详见 <a href="#ch-basics-05-preference-flywheel">偏好数据飞轮（应用侧）</a>。</p>
+      </div>
+
+      <h4>A/B 实验：工程侧要记录什么</h4>
+      <ul>
+        <li><strong>分流键</strong>：userId 或 sessionId 哈希，保证同用户稳定分组。</li>
+        <li><strong>暴露日志</strong>：<code>{request_id, model_version, variant}</code> 写入 OLAP，供 CSAT / 违规率按组聚合。</li>
+        <li><strong>护栏指标</strong>：违规率、PII 泄露、平均延迟；任一超阈自动 <span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span>。</li>
+        <li><strong>与 RAG 共存</strong>：A/B 只换生成模型，检索链路基线一致，避免混淆变量。</li>
+      </ul>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>Canary 只看 loss</strong> — 训练 loss 降不代表 CSAT 升；必须看 holdout 与线上护栏。</li>
+          <li><strong>同时改 Prompt 和模型</strong> — A/B 无法归因；一次只变一个因子。</li>
+          <li><strong>无 rollback 快照</strong> — 晋级前把当前 prod 注册为 <code>stable_snapshot</code>。</li>
+          <li><strong>飞轮语料未归档就切换</strong> — 出事无法复现训练集。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>生产治理：谁有权切换、何时禁止</h3>
+      <p>版本切换是<strong>生产变更</strong>，不是数据科学家的本地实验。建议 RACI：</p>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">ML 工程</span>
+          <p class="role-card-desc">训练、注册、提交 canary 申请；无 prod 写权限。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">MLOps / SRE</span>
+          <p class="role-card-desc">执行 alias 切换、监控护栏、一键 rollback。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">合规</span>
+          <p class="role-card-desc">抽检违规率、签核 staged → canary。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">产品</span>
+          <p class="role-card-desc">定义 A/B 成功指标（CSAT、转人工率）。</p>
+        </article>
+      </div>
+
+      <h4>禁止切换的硬条件</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>条件</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>holdout win rate ≤ baseline</td><td>评测 gate 未过</td></tr>
+            <tr><td>regression suite 失败</td><td>核心话术模板退化</td></tr>
+            <tr><td>合规未签核</td><td>见 <a href="#ch-practice-04-safety">合规与偏见</a></td></tr>
+            <tr><td>大促封网期</td><td>变更窗口策略</td></tr>
+            <tr><td>canary 护栏触发</td><td>自动 rollback，人工复核后再提</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">生产与治理阶段的第一块拼图：让 CorpAssist 微调产物可登记、可灰度、可回滚。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>注册</strong>：adapter 入库须绑定语料、评测、飞轮轮次与 deploy id；registry 是唯一真源。</li>
+        <li><strong>切换</strong>：prod 走 alias；canary 5% 起，护栏指标 breach 则 <span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span>。</li>
+        <li><strong>NS1 飞轮</strong>：每轮标注数据 → 新版本号 → staged → canary，禁止 silent 覆盖。</li>
+        <li><strong>双栈</strong>：DashScope <code>ft-xxx</code> 与自托管 vLLM 均须映射到同一 logical version。</li>
+        <li><strong>下一步</strong>：版本稳定后算<strong>训练与推理成本</strong> ROI，见 <a href="#ch-advanced-02-cost">训练与推理成本</a>。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="domain-model-adaptation_adv01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="registry-fields" /> 能列出 registry 至少 5 个元数据字段及用途</label></li>
+          <li><label><input type="checkbox" data-id="canary-gate" /> 能写出 canary 晋级的 2 条护栏指标</label></li>
+          <li><label><input type="checkbox" data-id="flywheel-version" /> 能说明 NS1 飞轮如何驱动新版本号</label></li>
+          <li><label><input type="checkbox" data-id="rollback" /> 能描述 rollback 触发条件与操作步骤</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>model registry</td><td>微调制品唯一真源，含语料与评测</td></tr>
+                <tr><td>model alias</td><td>生产配置不硬编码 ft-id</td></tr>
+                <tr><td>canary</td><td>小流量 + 护栏，过 gate 再全量</td></tr>
+                <tr><td>rollback</td><td>晋级前快照 stable，breach 秒级切回</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；下一章 <a href="#ch-advanced-02-cost">训练与推理成本</a> 估算 GPU 租约与云训练 ROI。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">Hugging Face PEFT — adapter 产物格式</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">百炼 Model Studio — 定制模型部署与 model id</a></li>
+      <li><a href="https://mlflow.org/docs/latest/model-registry.html" target="_blank" rel="noopener">MLflow Model Registry — 开源 registry 参考</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 CorpAssist v2.2→v2.3 升级场景，完成<strong>registry 条目</strong>、<strong>canary 策略</strong>与<strong>rollback 预案</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/advanced-01-version-lab/version-policy.md</code>，补充 v2.3 的 <code>promotion_gates</code> 与 <code>rollback.stable_snapshot</code>。</li>
+      <li>按正文 YAML 模板写一条完整 registry 记录（含 <code>flywheel_round: ns1-r7</code> 与 eval 字段）。</li>
+      <li>画 canary 5%→20%→100% 时间线，标注每阶段需观测的 2 个指标。</li>
+      <li>说明 Spring <code>application-prod.yaml</code> 切换时改哪几个键、谁有权限改。</li>
+      <li>完成右侧章节测验。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：模型版本与 AB</h4>
+      <p><code>demos/advanced-01-version-lab/</code> — 编写 version-policy：v1 废弃策略、canary 晋级条件、rollback 联系人。README 含验收标准。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-05-corpassist-ft">实战：CorpAssist 领域适配</a>：capstone 交付与 A/B 上线</li>
+      <li><a href="#ch-basics-05-preference-flywheel">偏好数据飞轮（应用侧）</a>：NS1 飞轮与版本迭代来源</li>
+      <li><a href="#ch-advanced-02-cost">训练与推理成本</a>：下一章</li>
+    </ul>
+  </div>
+</section>

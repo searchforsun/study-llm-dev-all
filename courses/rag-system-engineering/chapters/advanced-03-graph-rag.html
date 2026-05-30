@@ -1,0 +1,237 @@
+<section id="ch-advanced-03-graph-rag" class="chapter" data-chapter="advanced-03-graph-rag">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>GraphRAG 与知识库治理衔接</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-graph-rag" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>进阶 RAG</strong> · 能力：图谱治理、增量更新与知识库课衔接</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-advanced-02-graph-rag">上一章</a> 讨论了 GraphRAG 边界；一旦上图，图谱与向量索引、文档 ACL、下线流程必须<strong>同版本治理</strong>，否则会出现「向量已删、图边仍在」的越权或多跳幻觉。本章聚焦 <span class="term" data-term-id="graph-governance" tabindex="0">graph governance</span>、<span class="term" data-term-id="incremental-graph" tabindex="0">incremental graph</span>、<span class="term" data-term-id="kg-version" tabindex="0">kg version</span>，并与企业知识库治理课形成 <span class="term" data-term-id="governance-bridge" tabindex="0">governance bridge</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>制定图与向量 <span class="term" data-term-id="kg-version" tabindex="0">kg version</span> 对齐策略</li>
+          <li>设计文档下线时的图节点级联删除与 <span class="term" data-term-id="graph-refresh" tabindex="0">graph refresh</span></li>
+          <li>实现 <span class="term" data-term-id="incremental-graph" tabindex="0">incremental graph</span> 更新而非全量重抽</li>
+          <li>说明 <span class="term" data-term-id="graph-acl" tabindex="0">graph acl</span> 与 <span class="term" data-term-id="policy-sync" tabindex="0">policy sync</span> 如何与 S1 多库路由一致</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>图向量同版本</strong>：alias 切换必须同时覆盖向量库与图存储 snapshot。</li>
+          <li><strong>下线要删边</strong>：文档失效 → chunk 删 → 实体/边 tombstone。</li>
+          <li><strong>增量优先</strong>：仅对变更文档子图重算社区摘要。</li>
+          <li><strong>治理课衔接</strong>：元数据、审计、合规流程与向量 RAG 共用同一治理面。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>何时需要</h3>
+      <p>进入<strong>治理级 GraphRAG</strong> 的前提，仍是 <span class="term" data-term-id="when-to-use" tabindex="0">when to use</span> 成立（多跳/global 问法），且已通过 <a href="#ch-practice-05-eval-loop">评测闭环</a> 证明简化方案不足。治理视角额外要求：</p>
+      <ul>
+        <li>图谱变更可审计（谁触发、影响哪些社区摘要）</li>
+        <li>租户/部门 ACL 在图遍历中可 enforcement</li>
+        <li>与文档生命周期（发布/修订/废止）绑定</li>
+      </ul>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度废止</span>
+        HR-2023 差旅制度废止后，向量 chunk 已删，但 GraphRAG 仍沿旧边回答「出差标准」——典型治理缺失。
+      </aside>
+
+      <h4>治理就绪检查（节选）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown"># demos/advanced-03-graph-rag-lab/graph-governance-checklist.md
+- [ ] 图与向量索引版本对齐（kg-version）
+- [ ] 下线文档删图节点与关联边
+- [ ] 增量更新 job 可观测、可回滚
+- [ ] graph-acl 与 doc-acl 同源策略</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>成本</h3>
+      <p>治理不会消除 <span class="term" data-term-id="graph-cost" tabindex="0">graph cost</span>，但可通过<strong>增量</strong>与<strong>范围控制</strong>降低反复全量抽取：</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>策略</th><th>触发</th><th>成本</th><th>治理收益</th></tr></thead>
+          <tbody>
+            <tr><td>全量重抽</td><td>major 模型变更</td><td>最高</td><td>一致性最简单</td></tr>
+            <tr><td>incremental-graph</td><td>单文档更新</td><td>中</td><td>需 kg-version 追踪</td></tr>
+            <tr><td>社区局部重摘要</td><td>子图变更 &gt; 阈值</td><td>中低</td><td>避免全库社区重算</td></tr>
+            <tr><td>仅向量、图延迟</td><td>新库试点</td><td>低</td><td>双轨期需标注答案来源</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><span class="term" data-term-id="entity-resolution" tabindex="0">entity resolution</span>（同一实体多写法合并）应在增量更新中重跑，否则边会分裂，查询期多跳断裂。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>简化方案</h3>
+      <p>治理语境下的 <span class="term" data-term-id="simple-alternative" tabindex="0">simple alternative</span> 不是「不用图」，而是<strong>降低图治理复杂度</strong>：</p>
+      <ol>
+        <li><strong>子图 scope</strong>：仅「跨制度引用」类目建图，其余仍向量</li>
+        <li><strong>共现边替代 LLM 关系</strong>：规则边 + 人工审核，减少抽取噪声</li>
+        <li><strong>社区摘要缓存</strong>：版本化 object store，未变更社区只读缓存</li>
+        <li><strong>双轨发布</strong>：向量先上线，图检索 beta 路由，共用 eval gate</li>
+      </ol>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">无治理上图</span>
+          <ul>
+            <li>向量/图不同步</li>
+            <li>废止文档仍多跳可达</li>
+            <li>无法回答「用的哪版图」</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">graph-governance</span>
+          <ul>
+            <li>kg-version 绑定 release</li>
+            <li>tombstone + graph-refresh</li>
+            <li>audit trail 到社区摘要 job</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与知识库治理课衔接</h3>
+      <p><span class="term" data-term-id="governance-bridge" tabindex="0">governance bridge</span> 将本课 RAG 双栈与企业知识库治理课（文档元数据、合规分级、保留策略）对齐：</p>
+
+      <div class="mermaid-wrap">
+        <h5>治理面统一</h5>
+        <pre class="mermaid">flowchart TB
+  DOC[文档生命周期] --> META[元数据/ACL]
+  META --> V[向量索引]
+  META --> G[Graph 实体/边]
+  META --> POL[policy sync]
+  V --> API[Spring RAG API]
+  G --> API
+  EV[评测 release gate] --> V
+  EV --> G</pre>
+      </div>
+
+      <h4>kg-version 与 alias 切换</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "kg_version": "corp-s1-20260530",
+  "vector_snapshot": "vs://corp-hr/v12",
+  "graph_snapshot": "neo4j://graph/corp-hr/v12",
+  "community_summary_hash": "sha256:abc...",
+  "eval_bind": "faithfulness=0.88"
+}</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="graph-acl" tabindex="0">graph acl</span>：遍历边时过滤无权限实体；与 <a href="#ch-practice-04-multi-kb">多知识库路由</a> 的 dept_scope 同源。<span class="term" data-term-id="policy-sync" tabindex="0">policy sync</span> 监听文档系统事件：publish → 增量索引；revoke → tombstone + 社区重摘要。</p>
+
+      <h4>incremental-graph job（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def on_document_revoked(doc_id: str, kg_version: str):
+    chunk_ids = vector_index.delete_by_doc(doc_id)
+    entity_ids = graph.unlink_chunks(chunk_ids)
+    graph.mark_tombstone(entity_ids)
+    communities = graph.affected_communities(entity_ids)
+    regen_community_summaries(communities, kg_version=kg_version)
+    audit.log("graph_refresh", doc_id=doc_id, version=kg_version)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 governance bridge 强调与向量课共用 audit trail？</summary>
+        <p>合规审计需一条时间线：用户看到的答案来自哪版索引、哪条边、哪份文档。向量与图分裂审计时，无法解释 cross-policy 多跳答案来源。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>何时需要</strong>：GraphRAG 生效且须满足文档生命周期与 ACL 治理就绪。</li>
+        <li><strong>成本</strong>：incremental-graph + 局部社区重摘要；避免无脑全量重抽。</li>
+        <li><strong>简化方案</strong>：子图 scope、规则边、双轨发布降低治理复杂度。</li>
+        <li><strong>与知识库治理课衔接</strong>：kg-version、graph-acl、policy-sync 与向量共用治理面。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_advanced03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="version" /> 能解释 kg-version 三元组（向量/图/摘要）</label></li>
+          <li><label><input type="checkbox" data-id="revoke" /> 能描述文档废止时的级联删除步骤</label></li>
+          <li><label><input type="checkbox" data-id="incr" /> 能说明 incremental-graph 与全量重抽取舍</label></li>
+          <li><label><input type="checkbox" data-id="bridge" /> 能画出 governance bridge 与文档生命周期关系</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；继续 <a href="#ch-advanced-04-performance">性能与成本优化</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://microsoft.github.io/graphrag/" target="_blank" rel="noopener">Microsoft GraphRAG · 索引与查询</a></li>
+      <li><a href="https://neo4j.com/docs/operations-manual/current/backup-restore/" target="_blank" rel="noopener">Neo4j · 备份与版本</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI · 检索与元数据</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成 graph-governance-checklist，并写一段 kg-version 发布说明。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>勾选 checklist 四项，对未完成项写 remediation 计划（各 1 句）。</li>
+      <li>设计 kg-version JSON：含 vector_snapshot、graph_snapshot、eval_bind。</li>
+      <li>写 <code>on_document_revoked</code> 伪代码的 Spring 侧等价流程（事件监听即可）。</li>
+      <li>说明 graph-acl 与 practice-04 中 acl-filter 如何共用同一 YAML 策略源。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">向量 alias 已切 v12，graph_snapshot 仍 v11。用户问跨制度冲突，最可能出现什么风险？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>向量检索到新制度 chunk，但多跳沿 v11 旧边连到已废止节点，答案<strong>半新半旧</strong>，faithfulness 与合规风险极高。release gate 应要求 kg-version 三元组同时切换。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">仅对变更文档跑 incremental-graph，未 regen 受影响 community summary。查询「全局主题分布」会怎样？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>global 检索仍读旧社区摘要，与局部向量结果矛盾。应在 incremental job 中计算 <code>affected_communities</code> 并触发 <span class="term" data-term-id="graph-refresh" tabindex="0">graph refresh</span> 重摘要。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：图谱治理</h4>
+      <p>目录：<code>demos/advanced-03-graph-rag-lab/</code>。<strong>验收</strong>：checklist 全勾选或有明确 remediation + 1 份 kg-version 样例。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-02-graph-rag">GraphRAG 概念与边界</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-04-performance">性能与成本优化</a></li>
+      <li><a href="#ch-practice-04-multi-kb">多知识库与路由</a>：ACL 策略同源</li>
+      <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>：图/向量联合 release gate</li>
+    </ul>
+  </div>
+</section>

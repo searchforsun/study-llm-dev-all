@@ -1,0 +1,134 @@
+<section id="ch-basics-02-ingestion-ops" class="chapter" data-chapter="basics-02-ingestion-ops">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>采集调度与数据质量</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-ingestion-ops" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生命周期模型</strong> · 能力：设计 ingest 调度、质量门禁与血缘追踪（C6）</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>脏 PDF、扫描件乱码、重复入库是 S1 召回上限的<strong>头号杀手</strong>。没有 <span class="term" data-term-id="ingestion-ops" tabindex="0">ingestion ops</span>，后面 Rerank 与 Prompt 都在垃圾上优化。</p></div>
+      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
+        <li>为 CorpAssist 选择 <span class="term" data-term-id="ingest-schedule" tabindex="0">ingest schedule</span>（cron / 事件 / CDC）</li>
+        <li>定义 <span class="term" data-term-id="quality-gate-ingest" tabindex="0">quality gate ingest</span> 拦截规则</li>
+        <li>用 <span class="term" data-term-id="data-lineage" tabindex="0">data lineage</span> 从 chunk 追溯到源文档</li>
+      </ul></div>
+      <div class="notice"><strong>本章先记住 3 件事</strong><ul>
+        <li><strong>调度</strong>：全量窗口 + 增量 CDC，避免 peak 时段 rebuild。</li>
+        <li><strong>校验</strong>：解析成功率、空页率、字符集、最小长度——不过 gate 不入库。</li>
+        <li><strong>血缘</strong>：每个 chunk 必须能回答「来自哪份源、哪次 ingest job」。</li>
+      </ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>调度</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · 制度库 nightly ingest</span>Wiki 每天 02:00 批量导出；财务 PDF 在月末全量。需避免与大促检索高峰同时 re-embed。</aside>
+      <table class="outline-table learn-decision-table">
+        <thead><tr><th>模式</th><th>适用</th><th>注意</th></tr></thead>
+        <tbody>
+          <tr><td><span class="term" data-term-id="cron-ingest" tabindex="0">cron ingest</span></td><td>可预测批量源（Wiki 导出）</td><td>设 <code>rebuild_window</code> 与并发上限</td></tr>
+          <tr><td>事件/Webhook</td><td>单文档审批通过即入库</td><td>需幂等 job_id</td></tr>
+          <tr><td>CDC / 增量</td><td>DB/对象存储变更流</td><td>见 <a href="#ch-practice-01-incremental">增量更新与重建</a></td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap"><h5>调度与队列</h5>
+      <pre class="mermaid">flowchart TB
+  CRON[cron 02:00] --> Q[ingest 队列]
+  WH[Webhook] --> Q
+  Q --> WORKER[Python worker]
+  WORKER --> GATE{quality gate}
+  GATE -->|pass| PIPE[分块+embed]
+  GATE -->|fail| DLQ[死信+告警]</pre></div>
+      <details class="learn-micro-check"><summary>先想 10 秒：为什么 ingest 不要和业务高峰重叠？</summary><p>re-embed 占 GPU/CPU 与 Milvus 写入 IO，会拉高检索 P95（NS3）。</p></details>
+    </div>
+
+    <div class="section-block">
+      <h3>校验</h3>
+      <p><span class="term" data-term-id="data-validate" tabindex="0">data validate</span> 在 Embedding 之前执行，失败文档进入人工队列而非静默跳过：</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不推荐</span><ul>
+          <li>PDF 解析失败仍写空 chunk</li>
+          <li>扫描件无 OCR 直接入库</li>
+          <li>重复 MD5 不 dedup</li>
+        </ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐</span><ul>
+          <li>空文本率 &gt; 30% → reject</li>
+          <li>OCR 置信度阈值</li>
+          <li>源 URL + content_hash 去重</li>
+        </ul></div>
+      </div>
+      <h4>质量门禁配置示例</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-yaml">quality_gate:
+  min_chars: 80
+  max_blank_page_ratio: 0.3
+  require_ocr_for_scanned_pdf: true
+  allowed_mime: [application/pdf, text/markdown]
+  on_fail: route_to_review_queue  # c6-ingest 质量门禁</code></pre></div>
+      <p>上述规则对应能力 <span class="term" data-term-id="c6-ingest" tabindex="0">c6 ingest</span>：未过 gate 的文档不得进入 Embedding 队列。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>血缘</h3>
+      <p><span class="term" data-term-id="source-trace" tabindex="0">source trace</span> 让用户 citation 可点击回到源系统，也是合规删除的依据：</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-json">{
+  "chunk_id": "hr-remote-2026-sec3-p2",
+  "source_uri": "confluence://HR/remote-policy-v3",
+  "source_version": "v3.2",
+  "ingest_job_id": "job-20260315-0200",
+  "ingested_at": "2026-03-15T02:14:00Z",
+  "content_hash": "sha256:abc..."
+}</code></pre></div>
+      <p>Spring 侧返回引用时应带 <code>source_uri</code>；purge 时按 <code>source_uri</code> 级联删 Milvus 实体（<a href="#ch-advanced-02-compliance">合规保留与删除</a>）。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>调度</strong>：cron/事件/CDC 按源系统特性选型，避开检索高峰。</li>
+        <li><strong>校验</strong>：quality gate 在 embed 前拦截脏数据，失败进 review 而非空 chunk。</li>
+        <li><strong>血缘</strong>：chunk 必带 source_uri、job_id、content_hash，支撑溯源与删除。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="knowledge-lifecycle-governance_basics02">
+        <p class="learn-checklist-lead">过关清单</p><ul>
+          <li><label><input type="checkbox" data-id="schedule" /> 能对比 cron 与 CDC 适用场景</label></li>
+          <li><label><input type="checkbox" data-id="gate" /> 能列举 2 条 quality gate 规则</label></li>
+          <li><label><input type="checkbox" data-id="lineage" /> 能说明 chunk 血缘 JSON 各字段用途</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一章 <a href="#ch-basics-03-chunk-metadata">分块与元数据规范</a>：CorpAssist schema 与 ACL 标签（C7）。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方文档</h3><ul>
+    <li><a href="https://milvus.io/docs" target="_blank" rel="noopener">Milvus 文档</a></li>
+    <li><a href="https://airflow.apache.org/docs/" target="_blank" rel="noopener">Apache Airflow — 调度参考</a></li>
+  </ul></div>
+
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 制度库编写 ingest 调度说明与 quality_gate yaml（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>根据决策表，为 Wiki 导出与 PDF 月末批分别选 cron 或事件模式并写触发条件。</li>
+      <li>修改正文 <code>quality_gate</code> 示例：为扫描件 PDF 增加 <code>ocr_confidence_min: 0.85</code>。</li>
+      <li>为一条虚构 chunk 补全血缘 JSON 五个字段。</li>
+      <li>（可选）<code>demos/basics-02-ingestion-ops-lab/validate-checklist.md</code> 勾选校验项。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list"><li>
+      <p class="judgment-stem">找错：① 解析失败写空 chunk ② ingest_job_id 幂等 ③ 峰值时段全量 re-embed。哪条违反 C6？</p>
+      <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p><strong>① 和 ③</strong>。① 污染索引；③ 损害 NS3 延迟。② 是正确做法。</p></div></details></div>
+    </li></ol>
+    <div class="demo-box"><h4 class="demo-box-title">Demo：采集调度与数据质量</h4>
+    <p><code>demos/basics-02-ingestion-ops-lab/</code> — 验收：validate-checklist 全部勾选并写 1 条 OCR 规则。</p></div>
+  </div>
+
+  <div class="resources content-section"><h3>延伸学习</h3><ul>
+    <li><a href="#ch-basics-03-chunk-metadata">分块与元数据规范</a></li>
+    <li><a href="#ch-basics-01-lifecycle">知识库生命周期全景</a></li>
+  </ul></div>
+</section>

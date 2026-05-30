@@ -1,0 +1,273 @@
+<section id="ch-practice-04-multi-kb" class="chapter" data-chapter="practice-04-multi-kb">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多知识库与路由</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-multi-kb" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>双栈实现 CorpAssist 知识库</strong> · 能力：<span class="term" data-term-id="kb-routing" tabindex="0">知识库路由</span>、<span class="term" data-term-id="acl-filter" tabindex="0">ACL 过滤</span>、<span class="term" data-term-id="multi-tenant" tabindex="0">多租户</span> 与配置驱动</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 不只有 HR 政策：还有 IT 手册、财务制度等多个 <span class="term" data-term-id="kb-config" tabindex="0">知识库</span>。若所有问题都打向默认 collection，会<strong>串库回答</strong>或<strong>越权引用</strong>。本章在 practice-03 混合检索之上，用 <span class="term" data-term-id="intent-router" tabindex="0">意图路由</span> 选库，并在检索层施加 <span class="term" data-term-id="acl-filter" tabindex="0">acl filter</span> 与 <span class="term" data-term-id="tenant-isolation" tabindex="0">租户隔离</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 <code>kb-routing.yaml</code> 映射意图 → collection</li>
+          <li>在 Python/Spring 检索前应用 <span class="term" data-term-id="dept-scope" tabindex="0">部门范围</span> 与 tenant filter</li>
+          <li>说明 <span class="term" data-term-id="router-chain" tabindex="0">router chain</span> 与单一 RAG 链的关系</li>
+          <li>用 curl 带不同 <code>X-Tenant-Id</code> / 问题类型验证不串库</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>先路由后检索</strong>：选错库比检索算法差更致命。</li>
+          <li><strong>权限在检索层</strong>：Prompt 禁止越权不能替代 metadata filter。</li>
+          <li><strong>配置真源</strong>：新增库只改 yaml，不改 Java/Python 分支地狱。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>意图路由：选 HR 还是 IT</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 企业助手入口</span>
+        员工问「VPN 连不上」应路由 <code>it</code> 库；问「产假天数」应路由 <code>hr</code> 库。路由可规则（关键词）或小模型分类器，结果写入 <code>kb</code> 字段供检索 filter 使用。
+      </aside>
+      <p><span class="term" data-term-id="intent-router" tabindex="0">Intent router</span> 输出 <code>{intent, kb, confidence}</code>。低置信度时走澄清或默认库（需产品定义）。<span class="term" data-term-id="kb-routing" tabindex="0">kb routing</span> 配置应与混合检索、RAG 链解耦，便于运营增库。</p>
+
+      <div class="mermaid-wrap">
+        <h5>多库 RAG 路由</h5>
+        <pre class="mermaid">flowchart TB
+  Q[用户问题] --> IR[Intent Router]
+  IR -->|hr| R1[HR Retriever]
+  IR -->|it| R2[IT Retriever]
+  R1 --> ACL[ACL filter]
+  R2 --> ACL
+  ACL --> RAG[RAG 生成]</pre>
+        <p class="diagram-caption">每个 Retriever 指向不同 collection，但共用同一套 ACL 规则引擎。</p>
+      </div>
+
+      <h4>kb-routing.yaml（Demo 真源）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># demos/practice-04-multi-kb-lab/kb-routing.yaml
+knowledge_bases:
+  hr:
+    collection: corpassist-hr-v2
+    intents: [leave, benefit, policy]
+    keywords: [年假, 产假, 人事]
+  it:
+    collection: corpassist-it-v1
+    intents: [vpn, account, device]
+    keywords: [VPN, 密码, 工单]
+  finance:
+    collection: corpassist-fin-v1
+    intents: [expense, invoice]
+    keywords: [报销, 发票]
+
+default_kb: hr
+router:
+  mode: keyword_first   # keyword_first | classifier
+  min_confidence: 0.6</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">路由反模式</span>
+          <ul>
+            <li><code>if (q.contains("VPN"))</code> 散落在 Controller</li>
+            <li>默认检索「全库合并」无 ACL</li>
+            <li>路由与 collection 名硬编码在 10 个文件</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">配置驱动</span>
+          <ul>
+            <li>单文件 <code>kb-routing.yaml</code> 增删库</li>
+            <li><span class="term" data-term-id="router-chain" tabindex="0">router chain</span> → 具体 Retriever</li>
+            <li>路由日志进审计（advanced-05）</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>权限与租户：acl filter 在检索层</h3>
+      <p><span class="term" data-term-id="acl-filter" tabindex="0">ACL filter</span> 将用户 JWT 中的 <code>tenant_id</code>、<code>dept_ids</code>、<code>roles</code> 转为向量库/倒排 filter。与 <a href="#ch-basics-06-hallucination">幻觉治理</a> 的拒答互补：<strong>检不到</strong>优于<strong>检到无权限文档</strong>。</p>
+
+      <h4>Python：路由 + ACL 片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def build_filter(user, kb: str) -> dict:
+    return {
+        "tenant_id": user.tenant_id,
+        "kb": kb,
+        "dept": {"$in": user.dept_ids},
+    }
+
+def route_and_ask(question: str, user) -> dict:
+    kb = route_kb(question)  # 读 kb-routing.yaml
+    retriever = get_retriever(cfg.knowledge_bases[kb].collection)
+    docs = retriever.invoke(question, filter=build_filter(user, kb))
+    return rag_with_docs(question, docs)</code></pre>
+      </div>
+
+      <h4>Spring：filterExpression 与请求头</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// 从 SecurityContext 取 tenantId、deptIds
+String kb = kbRoutingService.route(request.question());
+String filter = String.format(
+    "tenant_id == '%s' &amp;&amp; kb == '%s' &amp;&amp; dept in [%s]",
+    tenantId, kb, deptCsv);
+
+SearchRequest search = SearchRequest.builder()
+    .topK(4)
+    .filterExpression(filter)
+    .build();</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="multi-tenant" tabindex="0">Multi-tenant</span> 要求：索引 metadata 必含 <code>tenant_id</code>；禁止跨租户默认库。<span class="term" data-term-id="tenant-isolation" tabindex="0">Tenant isolation</span> 需在 ingest 与 query 双侧校验。</p>
+
+      <details class="learn-faq">
+        <summary>FAQ：路由错了怎么办？</summary>
+        <p>产品层：低置信度澄清；技术层：记录 <code>routed_kb</code> 与 <code>sources</code> 供评测；运营层：在 yaml 补关键词。不要用「检索全库」兜底。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>配置驱动：增库不改代码</h3>
+      <p>新增「法务库」时，理想 diff 仅为 <code>kb-routing.yaml</code> + 新 collection 的 ingest job，而非改 5 个 Java 类。Spring 用 <code>@ConfigurationProperties</code> 绑定；Python 启动时 load yaml。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="配置加载">
+        <input type="radio" name="prac04-cfg-tab" id="prac04-cfg-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac04-cfg-tab" id="prac04-cfg-tab-b" class="learn-tab-input" />
+        <label for="prac04-cfg-tab-a">Spring application.yml</label>
+        <label for="prac04-cfg-tab-b">curl 带租户头</label>
+        <div class="learn-tab-panel" id="prac04-cfg-panel-a" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">yaml</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-yaml">corpassist:
+  rag:
+    routing-config: classpath:kb-routing.yaml
+    enforce-acl: true</code></pre>
+          </div>
+        </div>
+        <div class="learn-tab-panel" id="prac04-cfg-panel-b" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">bash</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-bash">curl -s -X POST http://localhost:8080/v1/rag/ask \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-Id: corp-b" \
+  -d '{"question":"VPN 无法连接"}' | jq .sources[].doc_id
+
+# 期望：it 库 doc_id；且无 corp-a 租户文档</code></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>路由</strong>：<code>kb-routing.yaml</code> 定义库、意图、关键词；先路由后检索。</li>
+        <li><strong>权限</strong>：<code>acl filter</code> 在 Retriever/SearchRequest，含 tenant + dept + kb。</li>
+        <li><strong>租户</strong>：metadata 与请求头一致，禁止跨租户 fallback 全库。</li>
+        <li><strong>配置</strong>：增库以 yaml 为真源，双栈共享路由文件。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_practice04">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="route" /> 能解释 keyword_first 路由流程</label></li>
+          <li><label><input type="checkbox" data-id="acl" /> 能写出检索层 filter 三字段</label></li>
+          <li><label><input type="checkbox" data-id="yaml" /> 能在 kb-routing.yaml 新增测试库条目</label></li>
+          <li><label><input type="checkbox" data-id="curl" /> curl 验证 VPN 问题命中 it 库</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>，为路由与混合权重建立回归集。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI RAG</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/routing/" target="_blank" rel="noopener">LangChain Routing</a></li>
+      <li><a href="https://owasp.org/www-project-top-10-for-large-language-model-applications/" target="_blank" rel="noopener">OWASP LLM Top 10（越权参考）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">编辑 <code>kb-routing.yaml</code> 与 curl 请求头，验证路由与租户隔离。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 <code>kb-routing.yaml</code> 为 <code>it</code> 库增加关键词 <code>Outlook</code>，保存后重启 Spring/Python 服务（或热加载若已实现）。</li>
+      <li>curl 提问「Outlook 收不到邮件」，确认 <code>sources</code> 的 metadata 含 <code>kb: it</code>（或 it 库 doc_id 前缀）。</li>
+      <li>用 <code>X-Tenant-Id: corp-b</code> 提问 HR 问题，确认不出现 corp-a 专属 doc_id。</li>
+      <li>将 <code>default_kb</code> 改为 <code>it</code>，对模糊问题「请假」观察误路由，再改回 <code>hr</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障）用户有 hr 角色，却检索到 finance 库文档。列出 yaml、filter、ingest metadata 各 1 个排查点。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>yaml：关键词/意图是否误匹配 finance；filter：是否缺少 <code>kb</code> 条件；ingest：chunk 是否错标 <code>kb</code> 或 tenant。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（排障）路由正确但 sources 为空。ACL 与混合检索配置中优先检查哪 2 项？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>filter 中 dept/tenant 是否过严；collection 名是否与 kb-routing 中该库一致（非 default 库名）。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：多知识库路由</h4>
+      <p>目录：<code>demos/practice-04-multi-kb-lab/</code>（<code>kb-routing.yaml</code>）。<strong>验收</strong>：VPN→it；年假→hr；换租户无越权 doc_id。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-03-hybrid">混合检索接入</a></li>
+      <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a></li>
+      <li><a href="#ch-advanced-05-security">RAG 安全</a></li>
+    </ul>
+  </div>
+</section>

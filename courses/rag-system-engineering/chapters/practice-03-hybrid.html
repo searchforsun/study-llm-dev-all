@@ -1,0 +1,245 @@
+<section id="ch-practice-03-hybrid" class="chapter" data-chapter="practice-03-hybrid">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>混合检索接入</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-hybrid" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>双栈实现 CorpAssist 知识库</strong> · 能力：<span class="term" data-term-id="hybrid-search" tabindex="0">混合检索</span>（<span class="term" data-term-id="bm25" tabindex="0">BM25</span> + 向量）、权重调优与 <span class="term" data-term-id="shared-index" tabindex="0">共用索引</span></p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>纯向量对<strong>专有名词、政策编号、英文缩写</strong>不稳；纯关键词对<strong> paraphrase 问法</strong>召回差。CorpAssist HR 政策库常见「年假」「Annual Leave」「第 7.2 条」混问——需在<strong>同一套文档索引</strong>上融合两路分数，而不是建第二套孤立库。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>解释 <span class="term" data-term-id="hybrid-search" tabindex="0">hybrid search</span> 在 RAG 中的位置（检索层，非生成层）</li>
+          <li>配置 <span class="term" data-term-id="vector-weight" tabindex="0">vector weight</span> 与 <span class="term" data-term-id="bm25" tabindex="0">bm25</span> 权重并做 A/B</li>
+          <li>让 Python 与 Spring 读取同一份 <code>hybrid-config.json</code></li>
+          <li>用 <span class="term" data-term-id="rrf" tabindex="0">RRF</span> 或加权融合理解 <span class="term" data-term-id="fusion-score" tabindex="0">fusion score</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>一路索引、两路打分</strong>：BM25 与向量命中同一 doc_id 集合。</li>
+          <li><strong>权重可配置</strong>：调参写 JSON/yaml，禁止硬编码在业务代码。</li>
+          <li><strong>先召回后重排</strong>：融合后仍可接 basics-05 的 rerank。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>关键词 + 向量：为什么需要混合</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 政策编号检索</span>
+        用户问「制度里 7.2 条怎么说」——向量可能偏离；BM25 对「7.2」更敏感。反之用户问「带薪休假有多少天」——向量更稳。
+      </aside>
+      <p><span class="term" data-term-id="hybrid-search" tabindex="0">Hybrid search</span> 在检索阶段并行（或串行）执行稀疏与稠密检索，再融合排序。双栈实现：Python 可在 LangChain 自定义 Retriever；Spring 可在 VectorStore 外加 Elasticsearch/OpenSearch 客户端，或平台原生 hybrid API。</p>
+
+      <div class="mermaid-wrap">
+        <h5>混合检索数据流</h5>
+        <pre class="mermaid">flowchart LR
+  Q[query] --> B[BM25 倒排]
+  Q --> V[向量 ANN]
+  B --> F[融合 RRF/加权]
+  V --> F
+  F --> R[Rerank 可选]
+  R --> C[context 进 RAG]</pre>
+        <p class="diagram-caption">融合发生在 Advisor/Retriever <strong>之前</strong>，与 practice-01/02 的 RAG 链衔接。</p>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">常见误区</span>
+          <ul>
+            <li>为 BM25 单独复制一份未同步的文档库</li>
+            <li>只对向量结果做关键词 contains 过滤</li>
+            <li>权重写死在 Java/Python 代码里</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐做法</span>
+          <ul>
+            <li><span class="term" data-term-id="shared-index" tabindex="0">shared index</span>：同一 doc_id 主键</li>
+            <li>融合配置进 <code>hybrid-config.json</code></li>
+            <li><span class="term" data-term-id="hybrid-tuning" tabindex="0">hybrid tuning</span> 用评测集扫权重</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>权重与融合：RRF 与加权分</h3>
+      <p>融合策略二选一或组合：<strong>加权线性</strong>（需归一化分数）与 <strong>Reciprocal Rank Fusion（RRF）</strong>（只看排名，对尺度不敏感）。CorpAssist 入门先用加权，便于理解 <span class="term" data-term-id="keyword-boost" tabindex="0">keyword boost</span>。</p>
+
+      <h4>共用配置 hybrid-config.json</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "collection": "corpassist-hr-v2",
+  "bm25_weight": 0.45,
+  "vector_weight": 0.55,
+  "fusion": "weighted",
+  "top_k_each": 20,
+  "final_top_k": 4,
+  "rrf_k": 60
+}</code></pre>
+      </div>
+
+      <p>Python 读取示例：</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import json
+from pathlib import Path
+
+cfg = json.loads(Path("demos/practice-03-hybrid-lab/hybrid-config.json").read_text())
+# score = cfg["vector_weight"] * vec_score + cfg["bm25_weight"] * bm25_score
+# 按 doc_id 合并后取 final_top_k</code></pre>
+      </div>
+
+      <p>Spring 在 <code>application.yml</code> 引用同文件或镜像字段：</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">corpassist:
+  rag:
+    hybrid:
+      config-path: classpath:hybrid-config.json
+      bm25-weight: 0.45
+      vector-weight: 0.55</code></pre>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：bm25_weight + vector_weight 必须等于 1 吗？</summary>
+        <p>加权融合时常归一化为 1；RRF 不使用权重和。调参时固定 final_top_k，只扫相对比例，并在 practice-05 评测集上看 recall@k 变化。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>共用索引：doc_id 与元数据一致</h3>
+      <p><span class="term" data-term-id="shared-index" tabindex="0">共用索引</span> 要求：倒排索引与向量库指向<strong>同一批 chunk</strong>，<code>doc_id</code>、<code>tenant_id</code>、<code>kb</code> 元数据一致。索引 job（Python）写入时同时 upsert BM25 与向量；禁止两路 ingest 不同步。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>检查项</th><th>Python</th><th>Spring</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>collection 名</td>
+            <td>ingest 脚本读 hybrid-config</td>
+            <td>VectorStore + BM25 客户端同读</td>
+          </tr>
+          <tr>
+            <td>filter</td>
+            <td>Retriever metadata filter</td>
+            <td>SearchRequest filterExpression</td>
+          </tr>
+          <tr>
+            <td>融合后 TopK</td>
+            <td><code>final_top_k</code></td>
+            <td>Advisor 前自定义 Retriever</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不让 LLM 同时「猜关键词」？</summary>
+        <p>混合检索是确定性召回；让 LLM 猜关键词成本高且不可复现。查询改写放在 advanced-01，与本章检索融合正交。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>动机</strong>：专有名词/编号偏 BM25，语义 paraphrase 偏向量；混合提升召回。</li>
+        <li><strong>权重</strong>：<code>hybrid-config.json</code> 双栈共享；加权或 RRF 融合。</li>
+        <li><strong>索引</strong>：一路 doc_id，双路 ingest 同步；检索 filter 与 practice-02 一致。</li>
+        <li><strong>衔接</strong>：融合结果进入既有 RAG Advisor/链，后续可 rerank。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_practice03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="why" /> 能举例向量 vs BM25 各擅长什么问法</label></li>
+          <li><label><input type="checkbox" data-id="cfg" /> 能修改 hybrid-config 并解释 final_top_k</label></li>
+          <li><label><input type="checkbox" data-id="shared" /> 能说明 shared index 对 doc_id 的要求</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-04-multi-kb">多知识库与路由</a>，在混合检索之上按意图选 HR/IT 库。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/hybrid-search.html" target="_blank" rel="noopener">Elasticsearch Hybrid Search</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/ensemble_retriever/" target="_blank" rel="noopener">LangChain Ensemble Retriever</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI Vector Stores</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">改 <code>demos/practice-03-hybrid-lab/hybrid-config.json</code> 权重，用 curl 对比「7.2 条」与「年假」两题的 sources 排序。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制 <code>hybrid-config.json</code> 为 <code>hybrid-config.baseline.json</code> 备份。</li>
+      <li>设 <code>bm25_weight: 0.7</code>、<code>vector_weight: 0.3</code>，对问题「7.2 条」curl，记录 top1 doc_id。</li>
+      <li>改回 <code>0.3 / 0.7</code>，对「年假几天」再 curl，对比 top1 是否变化。</li>
+      <li>在双栈对照笔记写：何时应提高 bm25_weight（1 句话 + 1 个 CorpAssist 例子）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（配置）要把专有名词召回拉高，应调大还是调小 <code>bm25_weight</code>？若同时 <code>final_top_k: 2</code> 过小会有何副作用？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>调大 bm25_weight。final_top_k 过小会丢掉融合后排在 3～4 位的相关片段，导致 RAG 上下文不足或拒答增多。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（配置）Spring yaml 写 0.45/0.55，Python 仍用默认 0.5/0.5。parity 失败时优先改哪一处真源？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>以仓库内 <code>hybrid-config.json</code> 为真源，双栈启动时加载同路径；禁止两处手写不同默认值。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：混合检索配置</h4>
+      <p>目录：<code>demos/practice-03-hybrid-lab/</code>（<code>hybrid-config.json</code>）。<strong>验收</strong>：调权重后「7.2 条」与「年假」top1 doc_id 有可解释差异。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-02-spring-rag">Spring AI：RAG 实现</a></li>
+      <li><a href="#ch-practice-04-multi-kb">多知识库与路由</a></li>
+      <li><a href="#ch-advanced-01-query-transform">查询改写与 HyDE</a></li>
+    </ul>
+  </div>
+</section>

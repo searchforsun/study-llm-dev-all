@@ -1,0 +1,368 @@
+<section id="ch-practice-02-rag-pipeline" class="chapter" data-chapter="practice-02-rag-pipeline">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>RAG Pipeline 实现</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-rag-pipeline" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>RAG、工具与记忆</strong> · 能力：串联 DocumentReader、Splitter、RetrievalAugmentation 并实现引用溯源</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-practice-01-vectorstore">VectorStore 与 Embedding</a> 提供了检索底座；本章把「读文档 → 切块 → 检索 → 增强生成」串成可维护的 <span class="term" data-term-id="ingest-pipeline" tabindex="0">ingest pipeline</span>。CorpAssist S2 必须能回答「依据哪条制度」，<span class="term" data-term-id="citation" tabindex="0">citation</span> 与 <span class="term" data-term-id="source-attribution" tabindex="0">source attribution</span> 是合规刚需。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="document-reader" tabindex="0">document reader</span> 解析 PDF/Markdown 制度文件</li>
+          <li>配置 <span class="term" data-term-id="text-splitter" tabindex="0">text splitter</span> 的 chunk 与 overlap</li>
+          <li>通过 <span class="term" data-term-id="advisor-rag" tabindex="0">advisor rag</span> 把检索上下文注入 ChatClient</li>
+          <li>在 API 响应中返回可点击的引用列表</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>摄取与问答分离</strong>：ingest 可离线批处理；在线只 similaritySearch + Advisor。</li>
+          <li><strong>chunk 影响召回</strong>：<span class="term" data-term-id="chunk-size" tabindex="0">chunk size</span> 过大稀释语义，过小丢失上下文。</li>
+          <li><strong>Advisor 顺序</strong>：RAG Advisor 通常在 Memory Advisor 之后、安全 Advisor 之前（见 <a href="#ch-basics-03-prompt-advisor">Prompt 模板与 Advisor</a>）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>DocumentReader：从制度 PDF 到 Document</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 制度库更新</span>
+        每季度 HR 上传新版《员工手册》PDF。Python 批处理可用 LangChain Loader；Java 侧 Spring AI 提供 <code>PagePdfDocumentReader</code>、<code>TikaDocumentReader</code> 等，统一输出 <code>List&lt;Document&gt;</code>。
+      </aside>
+      <p><span class="term" data-term-id="document-reader" tabindex="0">Document reader</span> 负责格式解析与初始 metadata（文件名、页码）。CorpAssist 约定在 reader 后立刻补齐 <code>dept</code>、<code>docVersion</code>、<code>tenantId</code>。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class HandbookIngestService {
+  private final VectorStore vectorStore;
+
+  public int ingestPdf(Path pdfPath, String dept, String version) {
+    PagePdfDocumentReader reader = new PagePdfDocumentReader(pdfPath.toString());
+    List&lt;Document&gt; pages = reader.get();
+    pages.forEach(doc -> {
+      doc.getMetadata().put("dept", dept);
+      doc.getMetadata().put("docVersion", version);
+      doc.getMetadata().put("source", pdfPath.getFileName().toString());
+    });
+    List&lt;Document&gt; chunks = splitter.split(pages);
+    vectorStore.add(chunks);
+    return chunks.size();
+  }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">整 PDF 单向量</span>
+          <ul>
+            <li>一次 embed 整本书</li>
+            <li>检索命中整本 PDF 噪声大</li>
+            <li>无法精确 citation 到条款</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Reader + Splitter</span>
+          <ul>
+            <li>按页/段读取再切块</li>
+            <li>metadata 保留 page、source</li>
+            <li>引用可定位到具体 chunk id</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：大文件 ingest 要不要放请求线程？</summary>
+        <p>不要。使用 <code>@Async</code> 或消息队列触发 ingest 任务，在线 API 只读 VectorStore。Demo 的 rag-flow.md 第 1 步即离线上传。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Splitter：chunk size 与 overlap</h3>
+      <p><span class="term" data-term-id="text-splitter" tabindex="0">Text splitter</span> 将长 Document 切为适合 embedding 的片段。CorpAssist 与 Python 轨统一：<strong>500 tokens / overlap 50</strong>（见 Demo rag-flow.md）。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>参数</th><th>偏小</th><th>CorpAssist 默认</th><th>偏大</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>chunk size</strong></td>
+            <td>召回细、易断章</td>
+            <td>500</td>
+            <td>上下文全、噪声多</td>
+          </tr>
+          <tr>
+            <td><strong>overlap</strong></td>
+            <td>边界丢信息</td>
+            <td>50</td>
+            <td>存储与成本上升</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Bean
+TokenTextSplitter handbookSplitter() {
+  return new TokenTextSplitter(500, 50, 5, 10_000, true);
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>Splitter 边界与 overlap</h5>
+        <pre class="mermaid">flowchart LR
+  P1["Page 1 text........"]
+  P2["........Page 1 end"]
+  C1["Chunk A"]
+  C2["Chunk B overlap"]
+  P1 --> C1
+  P1 --> C2
+  P2 --> C2</pre>
+        <p class="diagram-caption">overlap 保证跨段问题（如「年假+审批流程」）仍能在相邻 chunk 中被检索到。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：chunk id 如何生成才利于溯源？</summary>
+        <p>建议 <code>{source}-{page}-{index}</code>，写入 metadata；回答时 citation 直接返回 id 与 source 链接。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>RetrievalAugmentation：QuestionAnswerAdvisor</h3>
+      <p><span class="term" data-term-id="retrieval-augmentation" tabindex="0">Retrieval augmentation</span> 在模型生成前注入检索片段。Spring AI 1.0 推荐 <code>QuestionAnswerAdvisor</code> 挂到 <code>ChatClient</code> 的 Advisor 链。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Configuration
+public class RagAdvisorConfig {
+  @Bean
+  ChatClient ragChatClient(ChatModel chatModel, VectorStore vectorStore) {
+    var qaAdvisor = QuestionAnswerAdvisor.builder(vectorStore)
+        .searchRequest(SearchRequest.builder().topK(4).build())
+        .build();
+    return ChatClient.builder(chatModel)
+        .defaultAdvisors(qaAdvisor)
+        .build();
+  }
+}
+
+@Service
+public class CorpAssistRagService {
+  private final ChatClient ragChatClient;
+
+  public String ask(String question, String dept) {
+    return ragChatClient.prompt()
+        .advisors(a -> a.param(QuestionAnswerAdvisor.FILTER_EXPRESSION,
+            "dept == '" + dept + "'"))
+        .user(question)
+        .call()
+        .content();
+  }
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>RAG 在线问答序列（rag-flow.md）</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 员工
+  participant API as Spring API
+  participant VS as VectorStore
+  participant LLM as ChatModel
+  U->>API: 提问 + dept
+  API->>VS: similaritySearch topK
+  VS-->>API: chunks
+  API->>LLM: system+context+question
+  LLM-->>API: 答案
+  API-->>U: 答案 + citations</pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 在线链路</span>
+        门户 BFF 调用 Spring <code>/v1/rag/ask</code>，传 <code>tenantId</code> 与 <code>dept</code>；Advisor 自动检索并拼 prompt，业务 Service 不写 prompt 字符串拼接。
+      </aside>
+
+      <p>与 <a href="#ch-practice-03-tool-calling">Function Calling / Tools</a> 组合时，先 RAG 再 Tool：模型先读制度，再决定是否调用 <code>createTicket</code> 等工具。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>引用溯源：citation 与审计</h3>
+      <p>企业场景不能只返回答案文本。<span class="term" data-term-id="source-attribution" tabindex="0">Source attribution</span> 要求列出引用的 document id、source 文件名与可选页码，供员工点开原文核对。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public record RagResponse(String answer, List&lt;Citation&gt; citations) {}
+
+public record Citation(String documentId, String source, String excerpt) {}
+
+@Service
+public class RagResponseMapper {
+  public RagResponse map(ChatResponse response, List&lt;Document&gt; retrieved) {
+    List&lt;Citation&gt; cites = retrieved.stream()
+        .map(d -> new Citation(
+            d.getId(),
+            (String) d.getMetadata().get("source"),
+            d.getText().substring(0, Math.min(120, d.getText().length()))))
+        .toList();
+    return new RagResponse(response.getResult().getOutput().getText(), cites);
+  }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">无 citation</span>
+          <ul>
+            <li>模型 hallucinate 制度条款</li>
+            <li>合规审计无法复核</li>
+            <li>用户信任度低</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">结构化 citations</span>
+          <ul>
+            <li>返回 id + source + 摘要</li>
+            <li>日志记录 retrieval set</li>
+            <li>评测可对比 gold chunk id</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Prompt 侧约束（system message 片段）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">properties</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-properties">corpassist.rag.system=你是 CorpAssist 制度助手。仅依据检索上下文回答；
+若上下文不足，明确说「未找到相关规定」；勿编造条款编号。</code></pre>
+      </div>
+
+      <p>高级阶段 <a href="#ch-advanced-05-corpassist-rag-api">实战：CorpAssist Spring RAG API</a> 将把 citation 写入 OpenAPI 响应 schema，并与 Python eval hook 对齐。</p>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>RAG 流水线五步对照表</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>步骤</th><th>组件</th><th>在线/离线</th></tr></thead>
+              <tbody>
+                <tr><td>1 上传</td><td>Object Storage / 管理台</td><td>离线</td></tr>
+                <tr><td>2 读取</td><td>DocumentReader</td><td>离线 ingest</td></tr>
+                <tr><td>3 切块</td><td>TokenTextSplitter</td><td>离线 ingest</td></tr>
+                <tr><td>4 索引</td><td>EmbeddingModel + VectorStore</td><td>离线 ingest</td></tr>
+                <tr><td>5 问答</td><td>QuestionAnswerAdvisor + ChatClient</td><td>在线</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：RAG Advisor 与手写 prompt 拼接谁优先？</summary>
+        <p>优先 Advisor：检索、模板、filter 由框架统一；业务仅配置 SearchRequest 与 system message。手写拼接难测试且易漏 filter。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>DocumentReader</strong>：统一输出 Document；ingest 时补齐 dept/version/source metadata。</li>
+        <li><strong>Splitter</strong>：500/50 与 Python 同源；稳定 chunk id 服务 citation。</li>
+        <li><strong>RetrievalAugmentation</strong>：QuestionAnswerAdvisor + filter；ingest 与在线问答分离。</li>
+        <li><strong>引用溯源</strong>：RagResponse 带 citations；system prompt 禁止无依据编造。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai_practice02_rag">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="reader" /> 能说明 Reader 输出与 metadata 补齐时机</label></li>
+          <li><label><input type="checkbox" data-id="split" /> 能解释 500/50 对召回的影响</label></li>
+          <li><label><input type="checkbox" data-id="advisor" /> 能写出 QuestionAnswerAdvisor 注册片段</label></li>
+          <li><label><input type="checkbox" data-id="cite" /> 能设计 Citation record 字段</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：Demo 画序列图；继续 <a href="#ch-practice-03-tool-calling">Function Calling / Tools</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html" target="_blank" rel="noopener">Spring AI — Retrieval Augmented Generation</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI — Advisors</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html" target="_blank" rel="noopener">Spring AI — ETL Pipeline</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI — ChatClient</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">根据 rag-flow.md 画出 Mermaid 序列图，并对照 Advisor 代码标注各步骤。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读 <code>demos/practice-02-rag-pipeline-lab/rag-flow.md</code> 五步流水线。</li>
+      <li>在笔记绘制 sequenceDiagram：上传 PDF → Reader → Splitter → VectorStore → 用户提问 → Advisor → LLM → citations。</li>
+      <li>标注 QuestionAnswerAdvisor 在哪一步注入 context。</li>
+      <li>写一条 system message 约束「无上下文时不编造」。</li>
+      <li>完成章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事把 ingest 放在 <code>@PostMapping("/ask")</code> 里每次上传 PDF。问题与改法？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>延迟爆炸且重复 embedding。改：离线 ingest 任务写 VectorStore；在线 API 只检索+生成。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">回答正确但 citations 为空。审计能否通过？如何改 RagResponseMapper？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不能。Mapper 必须从 Advisor 检索到的 Document 列表构建 citations，并持久化 retrieval log。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：RAG Pipeline 实现</h4>
+      <p>目录：<code>demos/practice-02-rag-pipeline-lab/</code>。<strong>验收</strong>：序列图含 5 步且标注 Advisor 注入点。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-01-vectorstore">VectorStore 与 Embedding</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-tool-calling">Function Calling / Tools</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">VectorStore API</a></li>
+    </ul>
+  </div>
+</section>

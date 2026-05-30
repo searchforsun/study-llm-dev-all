@@ -1,0 +1,3 @@
+- POST /v1/jobs → 202
+- GET /v1/jobs/{id}
+- 回调 BFF

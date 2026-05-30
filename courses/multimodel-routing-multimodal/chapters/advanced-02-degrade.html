@@ -1,0 +1,306 @@
+<section id="ch-advanced-02-degrade" class="chapter" data-chapter="advanced-02-degrade">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>降级与容灾</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-degrade" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产路由</strong> · 能力：模型不可用、区域故障时的四级降级链</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist <strong>NS3 · S5 内容创作</strong> 在营销高峰或 DashScope 区域维护时，单一 <code>qwen-vl-max</code> 端点会 503/429。若路由层没有 <span class="term" data-term-id="model-degrade" tabindex="0">model degrade</span> 链，用户只会看到空白页。本章把<strong>健康检查 → 同厂商备用 → 跨厂商 → 静态话术</strong>落成可配置策略，Spring Router 与 Python route-service 共用 degrade 配置，并与上一章 <span class="term" data-term-id="cost-aware-route" tabindex="0">cost aware route</span> 的 spend cap 联动。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计四级 <span class="term" data-term-id="unavailable-fallback" tabindex="0">unavailable fallback</span> 链，并说明 VL 与纯文本降级差异</li>
+          <li>配置 <span class="term" data-term-id="429-handling" tabindex="0">429 handling</span>、<span class="term" data-term-id="region-failover" tabindex="0">region failover</span> 与 <span class="term" data-term-id="circuit-route" tabindex="0">circuit route</span> 熔断</li>
+          <li>为 S5 附件问答编写用户可见的 <span class="term" data-term-id="degrade-text" tabindex="0">degrade text</span>，并完成 Demo 验收</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>降级是路由决策</strong>：失败切换下一跳，不是 Controller 里 catch 后随便 return。</li>
+          <li><strong>429 要退避</strong>：重试带 jitter，避免雪崩；仍失败则走链下一级。</li>
+          <li><strong>静态话术也是产品</strong>：<span class="term" data-term-id="degrade-text" tabindex="0">degrade text</span> 需可配置、可审计、可 A/B。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>模型不可用</h3>
+      <p>当主模型返回 5xx、超时或连续失败，<span class="term" data-term-id="model-degrade" tabindex="0">model degrade</span> 按预定义顺序尝试备用模型，最后落到静态响应。CorpAssist S5 典型链：DashScope 主区 VL → 同区 plus 文本摘要 → OpenAI 兼容备用 → 品牌方预设 FAQ 话术。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>级别</th><th>目标</th><th>S5 示例</th><th>质量预期</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>L1 主模型</td><td>qwen-vl-max</td><td>海报 + 附件联合理解</td><td>最高</td></tr>
+          <tr><td>L2 同厂商备用</td><td>qwen-vl-plus / qwen-plus</td><td>VL 不可用，文本描述附件</td><td>中高</td></tr>
+          <tr><td>L3 跨厂商</td><td>openai-fallback gpt-4o-mini</td><td>DashScope 全区域故障</td><td>中（需合规审批）</td></tr>
+          <tr><td>L4 静态</td><td>degrade_text 模板</td><td>「服务繁忙，已为您保留草稿」</td><td>保底可用</td></tr>
+        </tbody>
+      </table>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">health check</span>
+          <p class="role-card-desc">后台探活主端点；连续 N 次失败则 <span class="term" data-term-id="circuit-route" tabindex="0">circuit route</span> 打开，请求直接跳过 L1。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">429 handling</span>
+          <p class="role-card-desc">指数退避 2 次；仍 429 则视为不可用，进入 L2，并打 <code>rate_limited=true</code> 审计。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">multi vendor</span>
+          <p class="role-card-desc">L3 需密钥隔离与数据出境策略；NS3 合规路由在 governance 章有字段清单。</p>
+        </article>
+      </div>
+      <h4>降级链配置（双栈共用）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">degrade:
+  version: "2026.05.2"
+  chain:
+    vision_qa: [qwen-vl-max, qwen-vl-plus, qwen-plus, static]
+    content_draft: [qwen-plus, qwen-turbo, openai-fallback, static]
+  on_429:
+    max_retries: 2
+    backoff_ms: [200, 800]
+    then: next_in_chain
+  circuit_route:
+    failure_threshold: 5
+    open_duration_sec: 60
+  static_fallback:
+    vision_qa: "附件分析暂不可用，请稍后重试或联系运营。"
+    content_draft: "文案生成排队中，您的草稿已保存。"</code></pre>
+      </div>
+      <h4>Spring：Fallback 链执行</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">public ChatResponse executeWithDegrade(RouteRequest req) {
+  List&lt;String&gt; chain = degradePolicy.chainFor(req.intent());
+  for (int i = 0; i &lt; chain.size(); i++) {
+    String hop = chain.get(i);
+    if ("static".equals(hop)) {
+      return staticDegrade.reply(req, degradePolicy.textFor(req.intent()));
+    }
+    try {
+      return invokeModel(hop, req);
+    } catch (RateLimitException ex) {
+      rateLimitHandler.backoffOrSkip(ex, i, chain);
+    } catch (ModelUnavailableException ex) {
+      audit.logDegrade(req, hop, ex.getReason());
+    }
+  }
+  throw new RouteExhaustedException(req.intent());
+}</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>S5 · 四级 model degrade</h5>
+        <pre class="mermaid">flowchart TB
+  Req[NS3/S5 请求]
+  HC[health check]
+  L1[L1 主模型 VL-max]
+  L2[L2 同厂商 plus/vl-plus]
+  L3[L3 multi-vendor fallback]
+  L4[L4 degrade text]
+  Req --> HC
+  HC -->|可用| L1
+  HC -->|熔断| L2
+  L1 -->|失败/429| L2
+  L2 -->|失败| L3
+  L3 -->|失败| L4</pre>
+        <p class="diagram-caption">每一跳失败都写 audit；L4 仍返回 200 + 用户可见文案，避免裸 500。</p>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>catch Exception 后 silent retry 同一模型 10 次</li>
+            <li>VL 失败直接 500，无静态话术</li>
+            <li>跨厂商 L3 无合规字段，审计缺失</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>chain 配置化，与 <a href="#ch-basics-02-routing">路由策略</a> intent 对齐</li>
+            <li><span class="term" data-term-id="429-handling" tabindex="0">429 handling</span> 有上限与 jitter</li>
+            <li>响应头 <code>X-Route-Degraded: L2</code> 供前端展示提示</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S5 大促 · VL 限流</span>
+        DashScope 返回 429；Router 退避 2 次后切 <code>qwen-plus</code> 仅根据附件文件名与 OCR 摘要作答，响应带「当前为简化模式」；cost 章的 spend cap 仍生效。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 L4 静态话术仍返回 200？</summary>
+        <p>S5 用户已上传素材并等待生成；HTTP 500 会导致前端丢草稿。L4 返回 200 + <code>degraded=true</code> 保留会话态，运营可在 governance 审计里统计降级率。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>区域</h3>
+      <p><span class="term" data-term-id="region-failover" tabindex="0">region failover</span> 在端点级不可用时切换地域或读副本 API。DashScope 多 region 部署时，Router 维护 region 权重与健康度；Python 批处理与 Spring 在线 API 读同一份 region 表，避免「Java 走华东、Python 仍打华北坏节点」。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>策略</th><th>触发</th><th>行为</th><th>注意</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>主动 failover</td><td>region 探活失败</td><td>权重归零，流量切 backup region</td><td>需同步 model 名映射</td></tr>
+          <tr><td>被动 failover</td><td>单次 503 + region 头</td><td>重试指定 backup endpoint</td><td>仅一次，防延迟放大</td></tr>
+          <tr><td>sticky region</td><td>多轮会话</td><td>同 session 尽量同 region</td><td>缓存与附件 URL 一致</td></tr>
+          <tr><td>global static</td><td>全 region 不可用</td><td>直接进入 L4 degrade text</td><td>告警 P1</td></tr>
+        </tbody>
+      </table>
+      <h4>Python route-service：区域感知路由</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">async def route_with_region(body: RouteRequest) -&gt; RouteDecision:
+    primary = region_pool.pick(body.tenant_id, sticky=body.session_id)
+    if circuit.is_open(primary.endpoint):
+        backup = region_pool.failover(primary.region)
+        return RouteDecision(
+            endpoint=backup.endpoint,
+            model_id=body.model,
+            region_failover=True,
+            degrade_level="region",
+        )
+    return RouteDecision(endpoint=primary.endpoint, model_id=body.model)</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>region failover 与 degrade 链组合</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant BFF as corpassist-bff
+  participant R as Route Middleware
+  participant R1 as Region 华东
+  participant R2 as Region 华北
+  participant M as LLM
+  BFF->>R: vision_qa + session
+  R->>R1: health OK?
+  alt 华东熔断
+    R->>R2: region failover
+    R2->>M: qwen-vl-plus
+  else 华东可用但 429
+    R->>R1: retry backoff
+    R->>M: next hop in degrade chain
+  end
+  M-->>R: response + audit</pre>
+      </div>
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>区域切换不更新 model 映射</strong> — 备用 region 可能无 vl-max，应降级到 vl-plus 并记录。</li>
+          <li><strong>忽略附件 URL 地域</strong> — OSS 链接与推理 region 不一致会导致超时，需 BFF 预签名同区。</li>
+          <li><strong>failover 无上限</strong> — 跨 region 重试应 ≤1 次，否则 P99 延迟爆炸。</li>
+        </ul>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：S5 全区域故障时 cost 章的 spend cap 还有意义吗？</summary>
+        <p>有。L4 静态响应零 LLM 成本；若错误重试 L3 跨厂商，spend cap 仍可阻止账单失控。降级与成本策略应同版本发布。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">可用性 = 四级 degrade 链 + region failover + 429 退避，双栈共用 degrade.yaml。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>模型不可用</strong>：L1→L4 链；<span class="term" data-term-id="health-check" tabindex="0">health check</span> 与 <span class="term" data-term-id="circuit-route" tabindex="0">circuit route</span> 跳过坏端点。</li>
+        <li><strong>429</strong>：<span class="term" data-term-id="429-handling" tabindex="0">429 handling</span> 有限重试后进链下一跳。</li>
+        <li><strong>区域</strong>：<span class="term" data-term-id="region-failover" tabindex="0">region failover</span> 与 sticky session；全挂走 L4 <span class="term" data-term-id="degrade-text" tabindex="0">degrade text</span>。</li>
+        <li><strong>多厂商</strong>：<span class="term" data-term-id="multi-vendor" tabindex="0">multi vendor</span> L3 需合规与 audit 字段（见 governance 章）。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="multimodel-routing-multimodal_advanced02_degrade">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="chain" /> 能画出四级 degrade 链并举例 S5 intent</label></li>
+          <li><label><input type="checkbox" data-id="429" /> 能说明 429 退避次数与进链条件</label></li>
+          <li><label><input type="checkbox" data-id="region" /> 能解释 region failover 与 sticky session</label></li>
+          <li><label><input type="checkbox" data-id="static" /> 能写一条可上线的 degrade text</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>术语</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>model degrade</td><td>主模型失败按链降级，不是无限重试</td></tr>
+                <tr><td>region failover</td><td>坏 region 切 backup，注意附件同区</td></tr>
+                <tr><td>circuit route</td><td>连续失败打开熔断，跳过 L1</td></tr>
+                <tr><td>degrade text</td><td>L4 静态话术，200 + degraded 标志</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成下方 Demo 与右侧测验；下一章 <a href="#ch-advanced-03-governance">路由治理与审计</a> 讲策略版本与 who-called-what。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">百炼 Model Studio — 配额与限流</a></li>
+      <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j CircuitBreaker</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient · 异常与重试</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 30 分钟 · 对照 <strong>CorpAssist S5</strong> 在 Demo 中画出四级降级链，并标注每级触发条件。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/advanced-02-degrade-lab/README.md</code> 与 <code>degrade-chain.md</code>。</li>
+      <li>为 <code>vision_qa</code> 与 <code>content_draft</code> 各写一条四级 chain（主→备→跨厂商→静态）。</li>
+      <li>在 YAML 中补全 <code>on_429</code> 与 <code>static_fallback</code> 文案。</li>
+      <li>对照 <a href="../spring-ai-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI 工程化</span><code class="course-ref-slug">spring-ai-engineering</code></a> 的异常处理，标出 Router 应捕获的异常类型。</li>
+      <li>完成右侧「降级与容灾 · 测验」。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">VL 主模型 429 时，工程师在 Controller 里 <code>Thread.sleep(5000)</code> 后重试同一模型 20 次。请指出<strong>违反本章哪条原则</strong>及推荐改法。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反 <span class="term" data-term-id="429-handling" tabindex="0">429 handling</span> 上限与 degrade 链原则。应在 Router 层有限退避（如 2 次）后切 L2，并打审计；sleep 不应散落在 Controller。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">华东 region 探活失败，但 failover 后附件仍从华东 OSS 拉取导致超时。根因与改法？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><span class="term" data-term-id="region-failover" tabindex="0">region failover</span> 只切了推理 endpoint，未切附件存储区。BFF 应在 failover 时重新签发同区预签名 URL，或 sticky 会话绑定 region 三元组（推理+存储+缓存）。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：降级与容灾</h4>
+      <p>目录：<code>demos/advanced-02-degrade-lab/</code>。<strong>验收</strong>：提交四级 degrade 链图（Mermaid 或手绘拍照），并说明 L3 <span class="term" data-term-id="multi-vendor" tabindex="0">multi vendor</span> 需哪些合规字段。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-03-governance">路由治理与审计</a></li>
+      <li><a href="#ch-advanced-01-cost-router">成本感知路由</a> — spend cap 与降级联动</li>
+      <li><a href="../llm-application-backend/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">LLM 应用后端</span><code class="course-ref-slug">llm-application-backend</code></a> — 熔断与限流</li>
+    </ul>
+  </div>
+</section>

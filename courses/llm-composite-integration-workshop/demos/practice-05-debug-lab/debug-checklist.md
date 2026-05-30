@@ -1,0 +1,3 @@
+- [ ] request_id 一致
+- [ ] 契约版本
+- [ ] 租户 Header

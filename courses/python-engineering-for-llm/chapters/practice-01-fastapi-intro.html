@@ -1,0 +1,385 @@
+<section id="ch-practice-01-fastapi-intro" class="chapter" data-chapter="practice-01-fastapi-intro">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>FastAPI 路由与依赖注入</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-fastapi-intro" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>FastAPI 与异步服务</strong> · 能力：搭建 CorpAssist Python 健康检查与 RAG 占位 API</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Basics 阶段搭好了包结构与 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a>；现在要对外暴露 HTTP。<span class="term" data-term-id="fastapi" tabindex="0">FastAPI</span> 用类型注解驱动路由与 OpenAPI，心智模型接近 <span class="term" data-term-id="spring-mvc" tabindex="0">Spring MVC</span> + <span class="term" data-term-id="validation" tabindex="0">Bean Validation</span>。CorpAssist-python 的检索与 Chat 代理将从本章的 <span class="term" data-term-id="router" tabindex="0">APIRouter</span> 起步。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>对照 Spring <code>@RestController</code> 写出 FastAPI 路由与模块拆分</li>
+          <li>用 <span class="term" data-term-id="pydantic" tabindex="0">Pydantic v2</span> 定义请求/响应 DTO 并与 OpenAPI 对齐</li>
+          <li>用 <span class="term" data-term-id="depends" tabindex="0">Depends</span> 注入 Settings 与 HTTP 客户端占位</li>
+          <li>实现 <code>/health</code> 供 Spring BFF 与 K8s 探活，不调用付费 LLM</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>路由即契约</strong>：函数签名 + Pydantic 模型自动生成 OpenAPI，与 Java DTO 同源。</li>
+          <li><strong>Depends 集中装配</strong>：配置、客户端、鉴权通过依赖注入，handler 只写业务。</li>
+          <li><strong>先探活后业务</strong>：<code>/health</code> 先于 RAG 真实逻辑交付，便于 <a href="#ch-practice-05-docker">容器化与本地 compose</a> 联调。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Spring MVC 对照</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Spring BFF 调 Python</span>
+        Java 网关/BFF 通过 HTTP JSON 调用 Python 侧 RAG 服务。团队多数成员熟悉 Spring MVC；FastAPI 路由与注解一一对应，降低双栈协作沟通成本。
+      </aside>
+      <p>CorpAssist 双栈约定：Spring 侧 <code>corpassist-bff</code> 聚合用户会话，Python 侧 <code>corpassist-python</code> 专注检索与向量计算。Web 层映射如下表。</p>
+
+      <h4>Spring MVC ↔ FastAPI 映射</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>Spring Boot</th><th>FastAPI</th><th>CorpAssist 例子</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>@RestController</code> + <code>@RequestMapping</code></td>
+            <td><code>APIRouter</code> + <code>app.include_router</code></td>
+            <td><code>rag_router</code> 挂载 <code>/v1/rag</code></td>
+          </tr>
+          <tr>
+            <td><code>@GetMapping("/health")</code></td>
+            <td><code>@app.get("/health")</code></td>
+            <td>探活 JSON <code>{"status":"ok"}</code></td>
+          </tr>
+          <tr>
+            <td><code>@RequestBody CreateOrderRequest</code></td>
+            <td>函数参数 + Pydantic <code>BaseModel</code></td>
+            <td><code>RagQueryRequest</code></td>
+          </tr>
+          <tr>
+            <td><code>@Autowired Settings</code></td>
+            <td><code>Depends(get_settings)</code></td>
+            <td>注入 <code>CorpAssistSettings</code></td>
+          </tr>
+          <tr>
+            <td><code>ResponseEntity&lt;T&gt;</code></td>
+            <td>返回类型注解 + <code>response_model</code></td>
+            <td><code>RagQueryResponse</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist-python 请求路径</h5>
+        <pre class="mermaid">flowchart LR
+  spring["Spring BFF"]
+  py["FastAPI :8000"]
+  spring -->|HTTP JSON| py
+  py --> health["/health"]
+  py --> rag["/v1/rag/query"]
+  rag --> llm["llm 包 httpx"]</pre>
+        <p class="diagram-caption">BFF 只认稳定路径与 JSON 字段；实现细节封装在 Python 包内。</p>
+      </div>
+
+      <h4>最小应用入口</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from fastapi import FastAPI
+from corpassist.api.rag import router as rag_router
+
+app = FastAPI(title="CorpAssist Python", version="0.1.0")
+app.include_router(rag_router)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 BFF 只依赖 OpenAPI 路径而不 import Python 包？</summary>
+        <p>双栈进程隔离；契约是 HTTP JSON + OpenAPI，不是共享 JVM classpath。Python 内部重构包名不影响 BFF，只要路径与 schema 不变。</p>
+      </details>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">单文件堆路由</span>
+          <ul>
+            <li>所有 <code>@app.post</code> 写在 <code>main.py</code></li>
+            <li>无 tags，OpenAPI 难以分组</li>
+            <li>与 Maven 多模块边界不对齐</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">APIRouter 分模块</span>
+          <ul>
+            <li><code>api/rag.py</code>、<code>api/health.py</code> 各一 router</li>
+            <li><code>tags=["rag"]</code> 便于 /docs 分组</li>
+            <li>对应 <code>corpassist.rag</code> 包职责</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Pydantic 模型</h3>
+      <p><span class="term" data-term-id="base-model" tabindex="0">BaseModel</span> 承担 Java DTO + Bean Validation 双重角色：字段类型、长度、范围在入站时校验，出站时序列化为 JSON。CorpAssist RAG 查询契约如下。</p>
+
+      <h4>RagQuery 请求/响应模型</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pydantic import BaseModel, Field, ConfigDict
+
+class RagQueryRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    query: str = Field(min_length=1, max_length=2000, description="用户问题")
+    top_k: int = Field(default=5, ge=1, le=20)
+
+class RagQueryResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    request_id: str | None = None</code></pre>
+      </div>
+
+      <p>与 Spring 侧 JSON 对齐时注意 <span class="term" data-term-id="snake-camel" tabindex="0">snake_case</span>：Python 字段 <code>top_k</code> 在 OpenAPI 中保持一致；若 BFF 用 camelCase，在网关层转换而非 Python 内混用两种风格。</p>
+
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-python"># 反例：裸 dict，无校验
+@app.post("/v1/rag/query")
+async def bad(body: dict):
+    q = body.get("query")  # 可能 None，运行时才发现</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-python"># 推荐：Pydantic 自动 422
+@app.post("/v1/rag/query", response_model=RagQueryResponse)
+async def good(body: RagQueryRequest) -> RagQueryResponse:
+    ...</code></pre>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：校验失败返回什么？</summary>
+        <p>FastAPI 默认 HTTP 422 + <code>detail</code> 数组，字段路径与错误类型清晰。CorpAssist 可在全局 <code>exception_handler</code> 中映射为与 Java 统一的错误码（见 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a>）。</p>
+      </details>
+
+      <div class="notice">
+        <strong>与 OpenAPI 对齐</strong>
+        <p><code>Field(description=...)</code> 会出现在 <code>/docs</code> 与导出的 schema 中，便于 Java 团队对照生成 DTO。修改 Pydantic 模型后应跑契约快照测试（见 <a href="#ch-practice-03-testing">测试策略</a>）。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>依赖注入</h3>
+      <p><span class="term" data-term-id="depends" tabindex="0">Depends</span> 类似 Spring 的构造器/方法注入：FastAPI 在调用路由前解析依赖图。常用模式：Settings 单例、按请求注入客户端、鉴权占位。</p>
+
+      <h4>Settings 与工厂函数</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from functools import lru_cache
+from fastapi import Depends
+from corpassist.config import CorpAssistSettings
+
+@lru_cache
+def get_settings() -> CorpAssistSettings:
+    return CorpAssistSettings()
+
+def get_llm_client(settings: CorpAssistSettings = Depends(get_settings)):
+    # practice-02 改为 httpx.AsyncClient + lifespan
+    return {"base_url": str(settings.llm_base_url)}</code></pre>
+      </div>
+
+      <h4>路由中使用 Depends</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends
+
+router = APIRouter(prefix="/v1/rag", tags=["rag"])
+
+@router.post("/query", response_model=RagQueryResponse)
+async def rag_query(
+    body: RagQueryRequest,
+    settings: CorpAssistSettings = Depends(get_settings),
+) -> RagQueryResponse:
+    return RagQueryResponse(
+        answer=f"[demo] 收到: {body.query[:80]}",
+        sources=["demo-doc-1"],
+    )</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="lifespan" tabindex="0">lifespan</span> 上下文在应用启动时创建 <span class="term" data-term-id="async-client" tabindex="0">httpx.AsyncClient</span> 连接池，关闭时释放；比在每个 handler 内 <code>Depends</code> new 客户端更省资源，详见 <a href="#ch-practice-02-async-io">asyncio 与并发</a>。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不在 handler 里直接 <code>CorpAssistSettings()</code>？</summary>
+        <p>每次请求重复读环境并校验浪费 CPU；<code>@lru_cache</code> 或 lifespan 保证进程内单例。测试时可通过 <code>app.dependency_overrides[get_settings]</code> 注入 mock，类似 Spring <code>@MockBean</code>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>健康检查</h3>
+      <p>Spring Cloud Gateway 与 K8s 探针依赖稳定的 <code>/health</code>。CorpAssist 约定：返回 200、JSON 含 <code>status</code> 与 <code>service</code>，<strong>不调用</strong>模型网关（避免探活产生费用）。</p>
+
+      <h4>健康检查实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">@app.get("/health")
+async def health(settings: CorpAssistSettings = Depends(get_settings)) -> dict[str, str]:
+    # 只验证配置可读，不 ping LLM
+    _ = settings.service_name
+    return {"status": "ok", "service": settings.service_name}</code></pre>
+      </div>
+
+      <ul>
+        <li><strong>liveness</strong>：进程存活，默认 <code>/health</code> 即可。</li>
+        <li><strong>readiness</strong>：后续可加向量库连通性；本章保持轻量。</li>
+        <li>与 Java <code>/actuator/health</code> 一同出现在监控面板，字段命名保持一致。</li>
+      </ul>
+
+      <div class="learn-tabs" role="tablist" aria-label="探活端点对比">
+        <input type="radio" name="prac01-health-tab" id="prac01-health-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac01-health-tab" id="prac01-health-tab-b" class="learn-tab-input" />
+        <label for="prac01-health-tab-a">Python /health</label>
+        <label for="prac01-health-tab-b">Spring Actuator</label>
+        <div class="learn-tab-panel" id="prac01-health-panel-a" role="tabpanel">
+          <ul>
+            <li>路径 <code>/health</code>，JSON <code>status</code> + <code>service</code></li>
+            <li>不调 LLM；Compose/K8s 探针默认 GET</li>
+            <li>与 Demo <code>main.py</code> 返回值一致</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac01-health-panel-b" role="tabpanel">
+          <ul>
+            <li>路径 <code>/actuator/health</code>，<code>{"status":"UP"}</code></li>
+            <li>Gateway 可同时配置两后端探活</li>
+            <li>字段名不同，监控面板需分别映射</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>探活命令速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>命令</th><th>期望</th></tr></thead>
+              <tbody>
+                <tr><td><code>curl -s localhost:8000/health</code></td><td><code>{"status":"ok","service":"corpassist-python"}</code></td></tr>
+                <tr><td><code>curl -s -o /dev/null -w "%{http_code}" localhost:8000/health</code></td><td><code>200</code></td></tr>
+                <tr><td>浏览器 <code>/docs</code></td><td>Swagger UI 可打开</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：OpenAPI 文档要对外暴露吗？</summary>
+        <p>内网 dev/staging 可开 <code>/docs</code>；生产通常由网关限制或关闭，改导出静态 OpenAPI 给 Java 团队（见 <a href="#ch-advanced-04-corpassist-api">实战：CorpAssist Python 服务 API</a>）。</p>
+      </details>
+
+      <div class="learn-interview">
+        <p><strong>答辩题</strong>：为何 CorpAssist 把 <code>/health</code> 与 <code>/v1/rag/query</code> 分在不同 router？</p>
+        <p>探活路由<strong>不挂载</strong> API Key 与 JWT，避免 K8s 探针因鉴权失败误杀 Pod；业务路由走完整中间件链（见 <a href="#ch-practice-04-middleware">中间件、鉴权与 CORS</a>）。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，practice 阶段起步复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Spring 对照</strong>：<code>APIRouter</code> + 装饰器路由 ≈ <code>@RestController</code>；OpenAPI 由类型注解自动生成。</li>
+        <li><strong>Pydantic 模型</strong>：<code>BaseModel</code> + <code>Field</code> 校验入参/出参，拒绝裸 dict。</li>
+        <li><strong>依赖注入</strong>：<code>Depends(get_settings)</code> 集中装配；测试用 <code>dependency_overrides</code> 替换。</li>
+        <li><strong>健康检查</strong>：<code>/health</code> 轻量探活，不调 LLM，供 BFF 与容器编排使用。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="mapping" /> 能写出 Spring MVC 与 FastAPI 的 4 行对照</label></li>
+          <li><label><input type="checkbox" data-id="pydantic" /> 能解释 <code>RagQueryRequest</code> 中 <code>Field</code> 约束</label></li>
+          <li><label><input type="checkbox" data-id="depends" /> 能说明 <code>Depends</code> 与 <code>@lru_cache</code> 配合原因</label></li>
+          <li><label><input type="checkbox" data-id="health" /> 本地 curl <code>/health</code> 返回 200 且含 <code>service</code></label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-02-async-io">asyncio 与并发</a>，把占位 RAG 改为 async httpx 与流式响应。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/first-steps/" target="_blank" rel="noopener">FastAPI 入门</a></li>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/dependencies/" target="_blank" rel="noopener">依赖注入 Depends</a></li>
+      <li><a href="https://docs.pydantic.dev/latest/" target="_blank" rel="noopener">Pydantic v2 文档</a></li>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/path-operation-configuration/" target="_blank" rel="noopener">路由与 response_model</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照正文「Spring MVC ↔ FastAPI 映射」表与 Demo <code>main.py</code>，本地启动服务并完成 <code>/health</code> 与 <code>POST /v1/rag/query</code> 的命令级验收。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开正文「Spring MVC ↔ FastAPI 映射」表，在笔记中为 <code>@RequestBody</code>、<code>@Autowired</code> 各写一行 FastAPI 等价写法。</li>
+      <li>阅读「RagQuery 请求/响应模型」代码块，给 <code>query</code> 字段增加 <code>max_length=500</code>，用 <code>/docs</code> 发送超长字符串观察 422 响应。</li>
+      <li>在 Demo 的 <code>rag_query</code> handler 签名中加入 <code>Depends(get_settings)</code> 占位（可先返回固定 dict），理解依赖解析顺序。</li>
+      <li>进入 <code>demos/practice-01-fastapi-intro-lab/</code>，<code>uvicorn main:app --reload --port 8000</code>，<code>curl -s localhost:8000/health</code> 与 <code>curl -s -X POST localhost:8000/v1/rag/query -H "Content-Type: application/json" -d "{\"query\":\"hello\"}"</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事把全部路由写在 <code>main.py</code> 且 handler 参数用 <code>body: dict</code>。违反本章哪两条约定？应如何改？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反「APIRouter 分模块」与「Pydantic 模型校验」。应拆 <code>api/rag.py</code> router，请求体改为 <code>RagQueryRequest</code>，并设置 <code>response_model=RagQueryResponse</code>。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">探活 handler 内调用 <code>await llm_client.chat(...)</code> 验证网关可达。为何不符合 CorpAssist 健康检查约定？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>探活高频触发会产生 LLM 费用与延迟抖动；网关故障会导致 Pod 被误杀。健康检查应只验证进程与配置可读，外部依赖检查放到 readiness 或独立诊断端点。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：最小 FastAPI 应用</h4>
+      <p>目录：<code>demos/practice-01-fastapi-intro-lab/</code>。<strong>验收</strong>：<code>uvicorn main:app --reload</code> 后 <code>curl -s localhost:8000/health</code> 含 <code>"status":"ok"</code>；<code>POST /v1/rag/query</code> 返回 <code>answer</code> 与 <code>sources</code>；<code>/docs</code> 可见 rag 分组。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章回顾</strong>：<a href="#ch-basics-04-errors-logging">异常、日志与配置</a> · AppError 与 structlog 基线</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-async-io">asyncio 与并发</a> · async httpx 与 SSE 流式</li>
+      <li><a href="https://spring.io/guides/gs/rest-service/" target="_blank" rel="noopener">Spring REST 指南 — 对照阅读</a></li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/testing-dependencies/" target="_blank" rel="noopener">Testing Dependencies</a></li>
+    </ul>
+  </div>
+</section>

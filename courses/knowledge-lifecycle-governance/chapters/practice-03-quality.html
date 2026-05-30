@@ -1,0 +1,265 @@
+<section id="ch-practice-03-quality" class="chapter" data-chapter="practice-03-quality">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>知识质量运营</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-quality" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>36 分钟</strong> · 阶段：<strong>治理实战</strong> · 能力：建立陈旧检测、冲突识别与人工审核闭环</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>索引「能搜到」不等于「该用」。CorpAssist 运营台每周收到「答案引用 2023 版报销制度」类工单——根因是 <span class="term" data-term-id="outdated-doc" tabindex="0">outdated doc</span> 仍在索引中，或新旧两版 <span class="term" data-term-id="duplicate-chunk" tabindex="0">duplicate chunk</span> 并存。Basics 采集校验拦不住「源站已过期但仍在 sync」；practice 用 <span class="term" data-term-id="quality-ops" tabindex="0">quality ops</span> 规则 + <span class="term" data-term-id="human-review-kb" tabindex="0">human review kb</span> 队列持续治理。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>配置 <span class="term" data-term-id="stale-detect" tabindex="0">stale detect</span> 规则（TTL、源站 etag、业务有效期）</li>
+          <li>运行 <span class="term" data-term-id="conflict-detect" tabindex="0">conflict detect</span> 发现同主题多版本 chunk</li>
+          <li>设计 <span class="term" data-term-id="review-queue" tabindex="0">review queue</span> 工作流与 SLA</li>
+          <li>将质量事件关联到 <a href="#ch-practice-01-incremental">增量更新</a> 触发 re-ingest 或 tombstone</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>陈旧 ≠ 删除</strong>：先降权/打标，审核后再 tombstone 或归档。</li>
+          <li><strong>冲突要合并</strong>：同 doc_key 多 version 只保留 canonical 一条。</li>
+          <li><strong>人工不可省</strong>：自动规则产出 review queue，运营确认后才改索引。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>陈旧检测</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 政策过期</span>
+        「远程办公政策 v3」2026-04-01 生效，v2 应在 2026-03-31 后标记 stale。Confluence 标签未及时更新，CDC 仍增量 sync v2 正文。质量规则需在 <code>valid_until</code> 过期后自动入队。
+      </aside>
+      <p><span class="term" data-term-id="stale-detect" tabindex="0">stale detect</span> 综合三类信号：</p>
+      <ul>
+        <li><strong>元数据 TTL</strong>：<code>valid_until &lt; now()</code></li>
+        <li><strong>源站状态</strong>：HTTP 404 / archived flag</li>
+        <li><strong>使用反馈</strong>：用户点「答案过时」≥ N 次</li>
+      </ul>
+
+      <h4>质量规则配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist/quality/stale_rules.yaml
+rules:
+  - id: meta_expired
+    when: "metadata.valid_until &lt; now()"
+    action: enqueue_review
+    priority: high
+  - id: source_gone
+    when: "source.status in ['404','archived']"
+    action: tombstone_candidate
+  - id: feedback_stale
+    when: "feedback.outdated_count &gt;= 5"
+    action: enqueue_review
+    priority: medium</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">直接删索引</span>
+          <ul>
+            <li>误删仍有效的归档副本</li>
+            <li>无审计记录</li>
+            <li>用户突然大量空答</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">review queue</span>
+          <ul>
+            <li>运营确认后再 tombstone</li>
+            <li>保留 decision 日志</li>
+            <li>可触发增量 delete</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-micro-check">
+        <p><strong>先想 10 秒：</strong><code>valid_until</code> 过期但源站仍显示 published，应先 tombstone 还是 enqueue_review？</p>
+        <details><summary>参考思路</summary><p>优先 enqueue_review：可能是元数据错误；确认后再 tombstone + 增量 delete。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>冲突</h3>
+      <p><span class="term" data-term-id="conflict-detect" tabindex="0">conflict detect</span> 识别「同一业务键多版本并存」。CorpAssist 用 <code>doc_key</code>（如 <code>policy:remote-work</code>）+ <code>version_tag</code> 检测冲突：若 index 中存在 2+ 个 active <code>version_tag</code> 且 embedding 相似度 &gt; 0.92，标记 conflict。</p>
+
+      <div class="mermaid-wrap">
+        <h5>冲突处理流程</h5>
+        <pre class="mermaid">flowchart TD
+  Scan[ nightly quality scan ] --> Found{发现 conflict?}
+  Found -->|是| Queue[review queue]
+  Queue --> Decide{运营裁决}
+  Decide -->|保留 v3| Deprecate[降权 v2 + 增量 delete]
+  Decide -->|合并| Merge[canonical chunk 重写]
+  Found -->|否| OK[记录 OK]</pre>
+        <p class="diagram-caption">自动扫描不直接改索引，一律经人工审核。</p>
+      </div>
+
+      <h4>冲突检测脚本</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def detect_conflicts(index_version: str) -&gt; list[ConflictCase]:
+    groups = group_by_doc_key(index_version)
+    cases = []
+    for key, chunks in groups.items():
+        active = [c for c in chunks if c.status == "active"]
+        if len(active) &gt; 1 and max_pair_similarity(active) &gt; 0.92:
+            cases.append(ConflictCase(doc_key=key, versions=[c.version_tag for c in active]))
+    return cases</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>冲突类型</th><th>典型原因</th><th>处理</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>版本并存</td>
+            <td>增量未 delete 旧版</td>
+            <td>tombstone 旧 version_tag</td>
+          </tr>
+          <tr>
+            <td>重复 ingest</td>
+            <td>doc_id 变更但 doc_key 相同</td>
+            <td>合并 canonical doc_id</td>
+          </tr>
+          <tr>
+            <td>跨源重复</td>
+            <td>Confluence + SharePoint 各一份</td>
+            <td>运营指定主源</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>人工审核</h3>
+      <p><span class="term" data-term-id="kb-quality" tabindex="0">kb quality</span> 闭环依赖 <span class="term" data-term-id="review-queue" tabindex="0">review queue</span>：每条工单含 doc_key、规则 id、优先级、建议动作。运营在 CorpAssist 后台执行 approve/reject，通过后触发 <a href="#ch-practice-01-incremental">增量管道</a> 或 tombstone API。</p>
+
+      <h4>审核工单 JSON</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "ticket_id": "QR-20260530-001",
+  "rule_id": "meta_expired",
+  "doc_key": "policy:remote-work",
+  "suggested_action": "tombstone",
+  "priority": "high",
+  "assignee": "kb-ops",
+  "sla_hours": 24
+}</code></pre>
+      </div>
+
+      <h4>审核 SLA 与角色</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>优先级</th><th>SLA</th><th>处理人</th><th>典型规则</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>high</td><td>24h</td><td>kb-ops</td><td>meta_expired、合规风险</td></tr>
+          <tr><td>medium</td><td>72h</td><td>kb-ops</td><td>feedback_stale</td></tr>
+          <tr><td>low</td><td>7d</td><td>业务供数</td><td>跨源重复待确认</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-tabs" role="tablist" aria-label="审核动作">
+        <input type="radio" name="qual-tab" id="qual-tab-tomb" class="learn-tab-input" checked />
+        <input type="radio" name="qual-tab" id="qual-tab-reing" class="learn-tab-input" />
+        <label for="qual-tab-tomb">tombstone</label>
+        <label for="qual-tab-reing">re-ingest</label>
+        <div class="learn-tab-panel" id="qual-panel-tomb" role="tabpanel">
+          <p>文档确认失效：增量 delete + 源站停止 sync。适用于过期政策、下架公告。</p>
+        </div>
+        <div class="learn-tab-panel" id="qual-panel-reing" role="tabpanel">
+          <p>内容仍有效但 chunk/元数据错误：触发单 doc 增量 re-ingest，保留 doc_id。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>陈旧检测</strong>：TTL + 源站状态 + 用户反馈；默认 enqueue_review 而非直接删。</li>
+        <li><strong>冲突</strong>：doc_key 分组 + 相似度；多 version 并存经运营裁决后 tombstone 或合并。</li>
+        <li><strong>人工审核</strong>：review queue 带 SLA；approve 后驱动增量 delete/re-ingest，留审计。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="klg_practice03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="stale" /> 能列举 stale 检测三类信号</label></li>
+          <li><label><input type="checkbox" data-id="conflict" /> 能说明 doc_key 冲突检测逻辑</label></li>
+          <li><label><input type="checkbox" data-id="queue" /> 能区分 tombstone 与 re-ingest 适用场景</label></li>
+          <li><label><input type="checkbox" data-id="sla" /> 能写出 review queue SLA 角色分工</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <details class="learn-faq">
+        <summary>FAQ：质量规则与 incremental 如何衔接？</summary>
+        <p>approve tombstone → governance API 触发 incremental delete；approve re-ingest → 单 doc 进入 changed 集合 re-embed。二者均写 audit 并更新 chunk status。</p>
+      </details>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-04-obs-kb">知识库可观测</a>，用覆盖率与空答率验证质量改进效果。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://milvus.io/docs/delete_entities.md" target="_blank" rel="noopener">Milvus Delete（tombstone 落地）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">填写 quality-rules.md：为远程办公政策 v2/v3 冲突写一条 stale 规则与审核工单。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 <code>quality-rules.md</code> 为 <code>meta_expired</code> 写一条 when 表达式示例。</li>
+      <li>假设 v2/v3 同时 active，列出 conflict 检测脚本的输出字段。</li>
+      <li>填写审核工单 JSON 的 <code>suggested_action</code>：v2 应 tombstone 还是 re-ingest？</li>
+      <li>说明 approve tombstone 后应调用增量管道哪一步（delete/upsert）。</li>
+      <li>可选：<code>python validate_quality.py</code> 检查规则 yaml 语法。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（权衡）自动 tombstone 可将 stale 处理从 24h 缩到 5min，但误删成本极高。CorpAssist 为何仍选 review queue？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>政策类文档误删导致合规风险与大量空答；人工确认平衡速度与准确性，且 audit 可追溯。</p></div></details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：知识质量运营</h4>
+      <p>目录：<code>demos/practice-03-quality-lab/</code>。<strong>验收</strong>：<code>python validate_quality.py</code> 输出 <code>PASS: 3 rules, 1 conflict case</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-02-permission">权限与多租户</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-obs-kb">知识库可观测</a></li>
+    </ul>
+  </div>
+</section>

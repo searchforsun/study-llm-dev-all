@@ -1,0 +1,2 @@
+- Gateway → BFF → route-service → LLM
+- 与《合成集成工坊》衔接

@@ -1,0 +1,381 @@
+<section id="ch-practice-03-multi-tenant" class="chapter" data-chapter="practice-03-multi-tenant">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多租户隔离</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-multi-tenant" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>弹性与多租户</strong> · 能力：实现 CorpAssist 数据、配置与向量索引的全链路多租户隔离与可测边界</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 同时服务多家企业。缺少 <span class="term" data-term-id="data-isolation" tabindex="0">data isolation</span> 时，A 租户客服可能检索到 B 租户制度 PDF——比模型幻觉更严重，属于合规与信任事故。须在 DB、向量库、配置全链路传递并强制校验 <span class="term" data-term-id="tenant-id" tabindex="0">tenant id</span>，且<strong>不能</strong>仅靠 Prompt 约束模型「别泄露」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>在 PostgreSQL 落地共享库 + <span class="term" data-term-id="row-level-security" tabindex="0">row level security</span>，或评估 schema 隔离</li>
+          <li>为 Milvus / ES 配置 <span class="term" data-term-id="index-prefix" tabindex="0">index prefix</span> 与 <span class="term" data-term-id="namespace" tabindex="0">namespace</span>，检索 API 强制 <span class="term" data-term-id="tenant-boundary" tabindex="0">tenant boundary</span></li>
+          <li>实现 Nacos <span class="term" data-term-id="config-isolation" tabindex="0">config isolation</span>，并编写 cross-tenant 负例契约测试</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>tenantId 来自 JWT</strong>，Gateway 注入后贯穿 BFF→Python→DB/向量库，禁止信任 Body。</li>
+          <li><strong>检索必须带 tenant 过滤</strong>：ACL 在检索层做，不在生成后「靠模型自觉」。</li>
+          <li><strong>隔离要可测</strong>：CI 含 A token 访问 B 资源的 403 负例。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>数据</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 交叉租户事故复盘（35 秒）</span>
+        客服提问「年假制度」；RAG 返回了<strong>另一家企业</strong>的员工手册片段——根因是向量检索未带 <code>tenant_id</code> filter，且会话表 INSERT 时漏写 tenant 列。修复：PostgreSQL RLS + Milvus partition + 契约测试负例。
+      </aside>
+
+      <p><span class="term" data-term-id="multi-tenant" tabindex="0">Multi tenant</span> 数据层常见三种模式：</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>模式</th><th>适用</th><th>隔离强度</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>共享库 + tenant_id 列</td><td>标准企业 tier</td><td>中（依赖 RLS + 代码）</td><td>默认</td></tr>
+          <tr><td>独立 schema</td><td>大客 / 合规要求高</td><td>高</td><td>可选 premium</td></tr>
+          <tr><td>独立实例</td><td>金融、政务</td><td>最高</td><td>项目制，非本章默认</td></tr>
+        </tbody>
+      </table>
+
+      <h4>PostgreSQL RLS 策略</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">sql</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-sql">ALTER TABLE conversation ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON conversation
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+-- BFF 每次获取连接后执行（或连接池包装）：
+-- SET LOCAL app.tenant_id = '550e8400-e29b-41d4-a716-446655440000';</code></pre>
+      </div>
+
+      <h4>BFF 设置 tenant 上下文（Java）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class TenantContextFilter implements Filter {
+  @Override
+  public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+      throws IOException, ServletException {
+    String tenantId = ((HttpServletRequest) req).getHeader("X-Tenant-Id");
+    if (tenantId == null || tenantId.isBlank()) {
+      throw new UnauthorizedException("missing tenant");
+    }
+    TenantContext.set(tenantId);
+    try {
+      jdbcTemplate.execute("SET LOCAL app.tenant_id = '" + sanitize(tenantId) + "'");
+      chain.doFilter(req, res);
+    } finally {
+      TenantContext.clear();
+    }
+  }
+}</code></pre>
+      </div>
+
+      <h4>数据层：反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>仅 WHERE tenant_id = ? 靠开发者记得写</li>
+            <li>从 Request Body 读取 tenantId 写库</li>
+            <li>管理后台 SQL 无 RLS，运维误查全表</li>
+            <li>日志打印完整对话含他租户 PII</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>RLS 兜底 + Repository 层强制 tenant 谓词</li>
+            <li>tenantId 只信 Gateway 注入 Header</li>
+            <li>审计表同样 ENABLE RLS</li>
+            <li>日志脱敏 + tenantId 标签化</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：RLS 已启用，是否可以不写 WHERE tenant_id？</summary>
+        <p>RLS 是<strong>最后一道防线</strong>，不能替代显式查询条件——ORM 原生 SQL、报表库、迁移脚本可能绕过。代码层仍应带 tenant 谓词，RLS 防人为失误。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>配置</h3>
+      <p><span class="term" data-term-id="config-isolation" tabindex="0">Config isolation</span> 保证租户 A 不能读取 B 的模型 Key、Prompt 模板与 <a href="#ch-practice-02-rate-limit">配额 tier</a>。CorpAssist 使用 Nacos 按 <span class="term" data-term-id="namespace" tabindex="0">namespace</span> 隔离：</p>
+
+      <h4>Nacos 命名约定</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>资源</th><th>dataId / group</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>租户覆盖</td><td><code>corpassist-{tenantSlug}.yaml</code> / DEFAULT_GROUP</td><td>模型路由、Prompt、quota tier</td></tr>
+          <tr><td>全局默认</td><td><code>corpassist-default.yaml</code></td><td>未覆盖项 fallback</td></tr>
+          <tr><td>密钥引用</td><td>Vault path <code>secret/corpassist/{tenantId}/llm</code></td><td>API Key 不落 Nacos 明文</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist-acme-corp.yaml — 仅 acme-corp 租户可见
+corpassist:
+  tenantId: acme-corp
+  llm:
+    primaryModel: qwen-max
+    fallbackModel: qwen-turbo
+  quota:
+    tier: standard
+    monthlyTokens: 5000000
+  prompt:
+    systemTemplate: "你是 Acme 公司客服，仅依据 Acme 知识库回答。"</code></pre>
+      </div>
+
+      <p>BFF 启动时按 JWT <code>tenantId</code> 加载对应 dataId；<strong>禁止</strong> Admin API 接受任意 tenantSlug 而不校验调用者权限。Python 侧通过 BFF 内网调用获取已解析配置，不直连 Nacos 全量 namespace。</p>
+
+      <div class="notice">
+        <strong>配置隔离检查项</strong>
+        <ul>
+          <li>租户 A 的 JWT 请求 <code>/v1/admin/config?tenant=B</code> 必须 403</li>
+          <li>Nacos ACL：服务账号仅能读授权 namespace</li>
+          <li>配置变更审计 log 含 operator + targetTenant</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>索引前缀</h3>
+      <p>向量库与全文索引是 RAG <span class="term" data-term-id="data-isolation" tabindex="0">data isolation</span> 的高危面：chunk 一旦入错 collection，RLS 也救不了检索结果。CorpAssist 约定<strong>物理或逻辑隔离 + API 强制校验</strong>。</p>
+
+      <h4>命名与校验规则</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>存储</th><th>命名</th><th>校验点</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Milvus collection</td><td><code>{tenantSlug}_kb_v{version}</code></td><td>slug 与 JWT tenant 一致</td></tr>
+          <tr><td>Elasticsearch index</td><td><code>corpassist-{tenantSlug}-docs</code></td><td>alias 不可跨 tenant</td></tr>
+          <tr><td>Redis 缓存 key</td><td><code>rag:{tenantId}:chunk:{docId}</code></td><td>禁止 SCAN 全库</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">COLLECTION_PATTERN = re.compile(r"^[a-z0-9-]+_kb_v\d+$")
+
+def resolve_collection(tenant_slug: str, requested: str | None) -&gt; str:
+    expected = f"{tenant_slug}_kb_v3"
+    if requested and requested != expected:
+        raise HTTPException(status_code=403, detail="tenant boundary violation")
+    if not COLLECTION_PATTERN.match(expected):
+        raise HTTPException(status_code=400, detail="invalid collection name")
+    return expected
+
+@router.post("/v1/rag/query")
+async def rag_query(req: RagQuery, tenant: Tenant = Depends(trust_gateway_tenant)):
+    collection = resolve_collection(tenant.slug, req.collection)
+    return await vector_store.search(collection, req.query, top_k=req.top_k)</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>多租户 RAG 边界</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph TenantA[租户 A]
+    JWT_A[JWT tenant=A]
+  end
+  subgraph TenantB[租户 B]
+    JWT_B[JWT tenant=B]
+  end
+  GW[Gateway 注入 X-Tenant-Id]
+  Py[Python RAG]
+  IA[(Milvus A_kb_v3)]
+  IB[(Milvus B_kb_v3)]
+  JWT_A --> GW --> Py
+  JWT_B --> GW --> Py
+  Py -->|filter A| IA
+  Py -->|filter B| IB</pre>
+        <p class="diagram-caption">用 A 的 token 指定 B 的 collection 名必须 403；渗透测试为 <span class="term" data-term-id="tenant-boundary" tabindex="0">tenant boundary</span> 验收项。</p>
+      </div>
+
+      <h4>全链路 tenant 传递</h4>
+      <div class="mermaid-wrap">
+        <h5>Gateway → BFF → Python → 存储</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant G as Gateway
+  participant B as BFF
+  participant P as FastAPI
+  participant V as Vector DB
+  C->>G: Authorization Bearer
+  G->>G: 验签 JWT → tenantId
+  G->>B: X-Tenant-Id
+  B->>B: SET LOCAL app.tenant_id
+  B->>P: X-Tenant-Id + traceId
+  P->>P: resolve_collection(tenant)
+  P->>V: search tenant collection only</pre>
+      </div>
+
+      <h4>负例契约测试（必做）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Test
+void crossTenantRagMust403() {
+  String tokenA = jwtForTenant("tenant-a");
+  var resp = rest.post("/v1/rag/query")
+      .header("Authorization", "Bearer " + tokenA)
+      .body(Map.of("collection", "tenant-b_kb_v3", "query", "年假"))
+      .exchange();
+  assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+}</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>「检索后在 Prompt 里告诉模型只能答本租户资料」为何不够？</summary>
+          <div class="learn-faq-body">
+            错误 chunk 已进入 context，模型仍可能复述或间接泄露；Prompt 是软约束。必须在检索层按 <span class="term" data-term-id="index-prefix" tabindex="0">index prefix</span> / filter 物理隔离，这是 S1/S2 生产坑。
+          </div>
+        </details>
+        <details>
+          <summary>共享 Milvus 实例 vs 每租户独立 collection？</summary>
+          <div class="learn-faq-body">
+            CorpAssist 默认<strong>同实例不同 collection + 强校验</strong>，成本低于每租户独立集群。金融大客可升级独立实例，属 <span class="term" data-term-id="tenant-boundary" tabindex="0">tenant boundary</span> 商业条款。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">多租户隔离是配额与熔断有效的前提；每条对应上文一节。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>数据</strong>：共享库 + tenant_id + RLS；连接级 <code>SET LOCAL app.tenant_id</code>；会话/工单/审计表同策略。</li>
+        <li><strong>配置</strong>：Nacos 按租户 dataId / namespace；密钥 Vault 引用；Admin API 禁止跨 tenant 读写。</li>
+        <li><strong>索引前缀</strong>：Milvus/ES 命名含 tenantSlug；Python API 校验 collection 与 JWT 一致；CI 含 cross-tenant 403。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_practice03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="rls" /> 能解释 RLS 与 app.tenant_id 设置时机</label></li>
+          <li><label><input type="checkbox" data-id="idx-name" /> 能写出 Milvus collection 命名 convention</label></li>
+          <li><label><input type="checkbox" data-id="403" /> 能说明 cross-tenant 检索负例期望状态码</label></li>
+          <li><label><input type="checkbox" data-id="prompt-trap" /> 能反驳「只靠 Prompt 隔离」的方案</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>tenant id</td><td>来自 JWT，Gateway 注入，禁止信 Body</td></tr>
+                <tr><td>row level security</td><td>DB 最后一道 tenant 隔离防线</td></tr>
+                <tr><td>index prefix</td><td>向量/ES 物理隔离命名</td></tr>
+                <tr><td>tenant boundary</td><td>A token 访问 B 资源必须 403</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：测验与 Demo；下一章 <a href="#ch-practice-04-mq">消息队列与异步任务</a> 在隔离前提下处理索引构建与通知。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html" target="_blank" rel="noopener">PostgreSQL Row Security Policies</a></li>
+      <li><a href="https://nacos.io/en/docs/v2/guide/user/auth/" target="_blank" rel="noopener">Nacos — 权限与 namespace</a></li>
+      <li><a href="https://milvus.io/docs/manage-collections.md" target="_blank" rel="noopener">Milvus — Manage Collections</a></li>
+      <li><a href="../knowledge-lifecycle-governance/index.html">知识库全生命周期治理</a>：ACL 与脏数据</li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照正文 RLS、Nacos 与 Milvus 命名规则，完成 <code>demos/practice-03-multi-tenant-lab/isolation-checklist.md</code>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>列出 3 条必须带 tenantId 的 API（chat / rag / admin 各一），说明 tenantId 来源（Header 名）。</li>
+      <li>在 isolation-checklist.md 写 ≥5 项隔离检查，含 cross-tenant RAG 负例期望 HTTP 403。</li>
+      <li>为 Milvus collection 写 regex 校验规则（含 tenant slug，参考正文 <code>COLLECTION_PATTERN</code>）。</li>
+      <li>写一条 PostgreSQL RLS 启用语句 + <code>SET LOCAL app.tenant_id</code> 示例（与正文 SQL 一致）。</li>
+      <li>（可选）为 Nacos <code>corpassist-acme-corp.yaml</code> 补 2 个 tenant 专属字段（model + quota tier）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">找错：「检索后在 System Prompt 里写：你只能回答本租户资料」。为何不够？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>错误 chunk 已进入 context，模型仍可能泄露；必须在检索层按 <span class="term" data-term-id="index-prefix" tabindex="0">index prefix</span> / tenant filter 隔离，Prompt 只是软约束（S1/S2 生产坑）。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">排障：RLS 已开，仍出现跨租户会话串读。最可能 3 个漏点？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>① 连接池未 <code>SET LOCAL app.tenant_id</code>；② 原生 SQL / 报表绕过 ORM；③ 缓存 key 未含 tenantId（Redis 串读）。向量库需单独排查 collection 校验。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">权衡：每租户独立 Milvus 集群，隔离最强，但运维成本 ×N。何时值得？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>金融、政务、合同明确要求<strong>物理隔离</strong>时；或单租户向量规模极大影响邻居性能。标准 S2 先用同实例 + collection 前缀 + 403 负例测试，多数场景足够。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：多租户隔离</h4>
+      <p>目录：<code>demos/practice-03-multi-tenant-lab/</code>。<strong>验收</strong>：isolation-checklist.md ≥5 项、含 cross-tenant 403 负例、collection regex、RLS 语句。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-mq">消息队列与异步任务</a></li>
+      <li><a href="#ch-practice-02-rate-limit">限流与配额</a>：tenantId 是配额 key 的基础</li>
+      <li><a href="#ch-basics-01-gateway">Spring Cloud Gateway 与 LLM</a>：JWT 与 X-Tenant-Id 注入</li>
+    </ul>
+  </div>
+</section>

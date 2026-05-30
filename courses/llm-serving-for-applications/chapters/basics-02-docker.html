@@ -1,0 +1,229 @@
+<section id="ch-basics-02-docker" class="chapter" data-chapter="basics-02-docker">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>容器化 LLM 服务</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-docker" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>Serving 基础</strong> · 能力：用 Docker 运行 vLLM 镜像、申请 GPU 并设置资源 limit</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>私有化 Serving 若直接在宿主机装 CUDA、Python、vLLM，环境不可复现且难以灰度。容器把 <span class="term" data-term-id="docker-llm" tabindex="0">Docker LLM</span> 运行时与权重挂载标准化，是 CorpAssist S4 推理集群的<strong>最小交付单元</strong>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>解释官方 <code>vllm/vllm-openai</code> 镜像与 <span class="term" data-term-id="cuda-base" tabindex="0">CUDA base</span> 的关系</li>
+          <li>编写带 <span class="term" data-term-id="compose-gpu" tabindex="0">compose GPU</span> 的 Compose 文件并声明 <span class="term" data-term-id="resource-limit" tabindex="0">resource limit</span></li>
+          <li>排查「容器内看不到 GPU」类问题（runtime / driver / 设备映射）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>镜像</strong>：优先官方 OpenAI 入口镜像，权重用 volume 挂载。</li>
+          <li><strong>GPU</strong>：需要 <span class="term" data-term-id="nvidia-runtime" tabindex="0">NVIDIA runtime</span> + 正确 <span class="term" data-term-id="gpu-schedule" tabindex="0">GPU 调度</span>（Compose <code>deploy.resources</code> 或 K8s，见 advanced）。</li>
+          <li><strong>资源</strong>：显存由模型+KV 决定，CPU/内存 limit 防止 OOM 拖垮节点。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>镜像</h3>
+      <p><span class="term" data-term-id="container-image" tabindex="0">container image</span> 封装 CUDA、PyTorch 与 vLLM 版本对齐。生产推荐 <code>vllm/vllm-openai</code>（随 vLLM 发版），开发机可用同标签保证与 CI 一致。模型权重<strong>不要</strong> bake 进镜像（体积与合规），用 volume 或对象存储 init 容器拉取。</p>
+
+      <h4>最小 Compose 服务定义</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model /models/Qwen2.5-Coder-7B-Instruct-AWQ
+      --served-model-name corp-coder-7b
+      --max-model-len 8192
+    volumes:
+      - ./models:/models:ro
+    ports:
+      - "8000:8000"
+    shm_size: "2gb"   # vLLM 多进程通信需要足够共享内存</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>自构建镜像却不锁 vLLM/CUDA 版本</li>
+            <li>把 14B 全精度权重打进镜像层</li>
+            <li><code>shm_size</code> 默认 64MB 导致 worker 崩溃</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>镜像 tag 与 <a href="#ch-basics-03-vllm">vLLM 使用</a> 文档版本一致</li>
+            <li>AWQ/GPTQ 权重挂载只读</li>
+            <li>健康检查打 <code>/v1/models</code></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>GPU 调度入门</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 单卡 PoC（45 秒）</span>
+        一台 24GB RTX 4090 跑 7B AWQ 代码模型，Compose 本地验证；后续同一镜像上 K8s。<strong>GPU 调度</strong>要确保容器独占或共享策略明确，避免两个 vLLM 抢一张卡 OOM。
+      </aside>
+
+      <p>Docker Desktop / Linux 需安装 NVIDIA Container Toolkit，使 <span class="term" data-term-id="infer-container" tabindex="0">infer container</span> 内 <code>nvidia-smi</code> 可见设备。Compose v2 写法：</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>宿主机 GPU 到容器</h5>
+        <pre class="mermaid">flowchart LR
+  Host[NVIDIA Driver]
+  RT[Container Runtime]
+  C1[vLLM 容器 GPU0]
+  Host --> RT
+  RT --> C1</pre>
+        <p class="diagram-caption">K8s 场景改用 <code>nvidia.com/gpu</code> 资源请求，见 <a href="#ch-advanced-02-k8s-serve">K8s 部署清单</a>。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：两实例共一张 24G 卡各加载 7B FP16，最可能发生什么？</summary>
+        <p>显存双倍占用，第二个实例启动失败或运行时 OOM；应量化、合并实例用 continuous batching，或一卡一 Pod。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>资源</h3>
+      <p>除 GPU 外，vLLM 仍吃 CPU（tokenizer、调度）与<strong>主机内存</strong>。<span class="term" data-term-id="resource-limit" tabindex="0">resource limit</span> 防止异常请求拖垮节点：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>资源</th><th>典型配置</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>GPU 显存</td>
+            <td>由模型+KV 占满</td>
+            <td>用 <code>--gpu-memory-utilization 0.9</code> 留余量，见 <a href="#ch-basics-05-kv-cache-app">KV 缓存与性能</a></td>
+          </tr>
+          <tr>
+            <td><code>shm_size</code></td>
+            <td>≥ 2GB</td>
+            <td>tensor parallel 时更大</td>
+          </tr>
+          <tr>
+            <td>CPU / 内存 limit</td>
+            <td>例如 8 CPU / 32Gi</td>
+            <td>Compose <code>mem_limit</code> 或 K8s limits</td>
+          </tr>
+          <tr>
+            <td>ulimit</td>
+            <td>文件句柄</td>
+            <td>高并发 SSE 连接时调高</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>带 limit 的完整片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">services:
+  vllm:
+    mem_limit: 32g
+    cpus: 8
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>镜像</strong>：官方 vLLM OpenAI 镜像 + 外挂权重；锁版本、放大 <code>shm_size</code>。</li>
+        <li><strong>GPU 调度</strong>：NVIDIA runtime + 明确 <code>count/capabilities</code>；一卡多实例需算清显存。</li>
+        <li><strong>资源</strong>：CPU/内存/句柄 limit 与 GPU 利用率参数一起设，避免「能启动但高并发崩溃」。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：在 Demo 中启动 Compose；下一章 <a href="#ch-basics-03-vllm">vLLM 使用</a> 讲解启动参数与 OpenAI 兼容 API。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.docker.com/compose/how-tos/gpu-support/" target="_blank" rel="noopener">Docker Compose GPU 支持</a></li>
+      <li><a href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html" target="_blank" rel="noopener">NVIDIA Container Toolkit</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html" target="_blank" rel="noopener">vLLM Docker 部署</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于正文 Compose 片段，补全 GPU 设备声明与 <code>shm_size</code>，并列出启动后两条验收命令。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>合并正文两段 yaml：为 vLLM 服务同时加上 <code>deploy.resources.reservations.devices</code> 与 <code>shm_size: 2gb</code>。</li>
+      <li>写出启动后验证 GPU 可见的命令：<code>docker compose exec vllm nvidia-smi</code> 与期望输出要点（能看到 GPU 名称）。</li>
+      <li>对照资源表，为 7B AWQ 估算是否适合 24GB 卡（权重约 5～6GB + KV 余量）。</li>
+      <li>（可选）运行 <code>demos/basics-02-docker-lab/compose-gpu.yaml</code> 并记录一条踩坑。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：容器内 <code>nvidia-smi</code> 报错「Driver not loaded」。最应先检查哪一层？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>先查<strong>宿主机</strong>驱动与 <code>nvidia-container-toolkit</code> 是否安装；再查 Compose 是否声明 <code>capabilities: [gpu]</code>。不是先改 vLLM 参数。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：容器化 LLM 服务</h4>
+      <p><code>demos/basics-02-docker-lab/</code> — 执行 <code>docker compose -f compose-gpu.yaml up</code>，验收 <code>curl localhost:8000/v1/models</code> 返回模型列表。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-03-vllm">vLLM 使用</a></li>
+      <li><a href="#ch-advanced-02-k8s-serve">K8s 部署清单</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,194 @@
+<section id="ch-advanced-02-k8s-serve" class="chapter" data-chapter="advanced-02-k8s-serve">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>K8s 部署清单</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-k8s-serve" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产部署</strong> · 能力：推理 <span class="term" data-term-id="deploy-manifest" tabindex="0">deploy manifest</span>（Service / Ingress / 监控）</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Compose 适合单机 capstone；CorpAssist 生产多副本 vLLM 要上 K8s。<span class="term" data-term-id="k8s-serve" tabindex="0">k8s serve</span> 要求应用工程师读懂 <span class="term" data-term-id="service-infer" tabindex="0">service infer</span>、<span class="term" data-term-id="ingress-llm" tabindex="0">ingress llm</span> 与 <span class="term" data-term-id="infer-monitor" tabindex="0">infer monitor</span>，并与 <a href="#ch-practice-04-gray">灰度</a> 策略对齐。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>草拟 vLLM Deployment + <span class="term" data-term-id="gpu-node" tabindex="0">gpu node</span> 调度</li>
+          <li>配置 ClusterIP Service 与 Ingress 超时</li>
+          <li>说明 <span class="term" data-term-id="liveness-infer" tabindex="0">liveness infer</span> 与 <span class="term" data-term-id="hpa-infer" tabindex="0">hpa infer</span> 在 LLM 上的局限</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Service</strong>：集群内稳定 DNS，Spring/Python 的 base_url 指向它。</li>
+          <li><strong>Ingress</strong>：对外 TLS、超时、金丝雀权重（配合灰度）。</li>
+          <li><strong>监控</strong>：GPU、TTFT、队列深度比 CPU HPA 更重要。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Service</h3>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-infer
+  namespace: corpassist
+spec:
+  selector:
+    app: vllm-coder
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP</code></pre>
+      </div>
+      <p>双栈客户端：<code>http://vllm-infer.corpassist.svc:8000/v1</code>。多版本灰度时可拆 <code>vllm-v1</code> / <code>vllm-v2</code> 两个 Service，由 Ingress 加权（见 practice-04）。</p>
+
+      <h4>Deployment 片段（GPU）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">resources:
+  limits:
+    nvidia.com/gpu: 1
+nodeSelector:
+  accelerator: nvidia-a10
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 120
+  periodSeconds: 30</code></pre>
+      </div>
+      <p><span class="term" data-term-id="liveness-infer" tabindex="0">liveness infer</span> 启动慢（加载权重），<code>initialDelaySeconds</code> 要大于冷启动时间，避免误杀 Pod。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Ingress</h3>
+      <p><span class="term" data-term-id="ingress-llm" tabindex="0">Ingress LLM</span> 需放宽<strong>读超时</strong>以支撑 stream； CorpAssist S4 长生成常见 60～180s。</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: infer-gateway
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+spec:
+  rules:
+    - host: infer.corp.internal
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-infer
+                port:
+                  number: 8000</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>K8s 推理访问路径</h5>
+        <pre class="mermaid">flowchart LR
+  IDE[IDE / 用户] --> Ing[Ingress infer.corp.internal]
+  Ing --> Svc[Service vllm-infer]
+  Svc --> Pod1[Pod vLLM]
+  Svc --> Pod2[Pod vLLM]
+  Pod1 --> GPU[GPU Node]</pre>
+        <p class="diagram-caption">监控应打在 Ingress 与 Pod 两侧，区分网关排队与 GPU 算力瓶颈。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>监控</h3>
+      <p><span class="term" data-term-id="infer-monitor" tabindex="0">Infer monitor</span> 最小集：</p>
+      <ul>
+        <li>GPU：利用率、显存、温度（DCGM / exporter）</li>
+        <li>API：QPS、P95 TTFT、5xx 率（按 model 版本标签）</li>
+        <li>vLLM：队列长度、KV cache 使用率（若 exporter 可用）</li>
+      </ul>
+      <p><span class="term" data-term-id="hpa-infer" tabindex="0">hpa infer</span> 对 LLM 往往<strong>不灵敏</strong>：GPU 副本扩容慢、权重加载贵。更常见是固定副本 + <a href="#ch-advanced-03-capacity">容量规划</a>，或按队列深度定制 scaler。</p>
+
+      <details class="learn-faq">
+        <summary>FAQ：HPA 按 CPU 扩容 vLLM 有用吗？</summary>
+        <p>通常无效：瓶颈在 GPU 与 KV 显存。CPU HPA 可能在 GPU 已饱和时仍扩容，浪费调度。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Service</strong>：集群内稳定入口，多版本可多 Service。</li>
+        <li><strong>Ingress</strong>：长超时 + 可选金丝雀，对外统一 /v1。</li>
+        <li><strong>监控</strong>：GPU + TTFT + 错误率；慎用语义不明的 CPU HPA。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一章 <a href="#ch-advanced-03-capacity">容量规划入门</a>：副本数与显存粗算。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">Kubernetes Service</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/" target="_blank" rel="noopener">Kubernetes Ingress</a></li>
+      <li><a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/" target="_blank" rel="noopener">NVIDIA GPU Operator</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照 <code>demos/advanced-02-k8s-serve-lab/k8s-checklist.md</code> 勾选自检项。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>写出 CorpAssist 集群内 Spring 的 <code>base-url</code>（Service DNS 形式）。</li>
+      <li>为 Ingress 设 read-timeout 并说明与 <a href="#ch-practice-03-stream">流式</a> 的关系。</li>
+      <li>列出 3 个应接入 Prometheus 的推理指标名（可自定义）。</li>
+      <li>完成测验 lsfa-a02。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">liveness 探活失败导致 Pod 反复重启，但手动 curl 正常。可能原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>initialDelay 过短、探针路径错误（应用无 /health）、启动中 GPU 初始化慢；应调 probe 或改用 startupProbe。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：K8s 清单自检</h4>
+      <p><code>demos/advanced-02-k8s-serve-lab/k8s-checklist.md</code> — Service / Ingress / 监控各至少 1 条勾选。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-05-corpassist-deploy">CorpAssist 推理部署</a></li>
+      <li><a href="#ch-advanced-03-capacity">容量规划入门</a></li>
+      <li><a href="#ch-advanced-04-interview">面试：私有化部署题</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,224 @@
+<section id="ch-practice-05-corpassist-deploy" class="chapter" data-chapter="practice-05-corpassist-deploy">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>实战：CorpAssist 推理部署</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-corpassist-deploy" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：<span class="term" data-term-id="corpassist-deploy" tabindex="0">corpassist deploy</span> 与 <span class="term" data-term-id="compose-verify" tabindex="0">compose verify</span></p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>practice 前几章分别讲了客户端、Spring、流式与灰度；本章把 <span class="term" data-term-id="infer-stack" tabindex="0">infer stack</span> 收成可交付的 <span class="term" data-term-id="deploy-capstone" tabindex="0">deploy capstone</span>：Docker Compose 拉起 vLLM + <span class="term" data-term-id="health-check" tabindex="0">health check</span> + 双栈 <span class="term" data-term-id="smoke-test" tabindex="0">smoke test</span>，完成 CorpAssist S4 <span class="term" data-term-id="s4-deploy" tabindex="0">s4 deploy</span> 最小闭环。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 Compose 描述 GPU vLLM 与依赖服务（参考 <a href="#ch-basics-02-docker">容器化 LLM</a>）</li>
+          <li>跑通 <span class="term" data-term-id="e2e-infer" tabindex="0">e2e infer</span>：models → chat stream → Spring 探活</li>
+          <li>勾选 delivery-checklist 作为上线门禁</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>compose</strong>：vLLM 服务 + GPU runtime + 卷挂载权重。</li>
+          <li><strong>验证</strong>：先 health，再 smoke，再双栈各一条请求。</li>
+          <li><strong>契约</strong>：<code>served-model-name</code> 与双栈 <code>model</code> 一致（见 <a href="#ch-basics-03-vllm">vLLM 使用</a>）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>compose</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S4 · 私有化交付包</span>
+        客户机房一台 24GB GPU 服务器：运维只需 <code>docker compose up -d</code>，研发用统一 <code>INFER_BASE_URL</code> 做代码补全与对话。
+      </aside>
+
+      <h4>Compose 骨架（与 basics-02 lab 对齐）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># demos/practice-05-corpassist-deploy-lab/compose 思路（可对照 basics-02 compose-gpu.yaml）
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./models:/models:ro
+    command: >
+      --model /models/Qwen2.5-Coder-7B-Instruct-AWQ
+      --quantization awq
+      --served-model-name corp-coder-7b
+      --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3</code></pre>
+      </div>
+
+      <p>环境变量约定：<code>INFER_BASE_URL=http://vllm:8000/v1</code> 供 Python；Spring 使用 <code>spring.ai.openai.base-url</code> 同源。若启用 <a href="#ch-practice-04-gray">灰度网关</a>，则 base_url 指向网关而非直连 vLLM。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · infer stack</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph host["单机 Compose"]
+    V[vLLM OpenAI :8000]
+    G[可选 推理网关]
+  end
+  Py[Python 补全服务] --> G
+  Sp[Spring BFF] --> G
+  G --> V
+  V --> GPU[NVIDIA GPU]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="infer-stack" tabindex="0">infer stack</span> 最小集：vLLM + 双栈客户端；网关与监控可在 advanced 阶段扩展。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>验证</h3>
+      <p><span class="term" data-term-id="compose-verify" tabindex="0">Compose verify</span> 分三层：<span class="term" data-term-id="health-check" tabindex="0">health check</span>（进程存活）→ <span class="term" data-term-id="smoke-test" tabindex="0">smoke test</span>（API 契约）→ <span class="term" data-term-id="e2e-infer" tabindex="0">e2e infer</span>（IDE → BFF → 推理）。</p>
+
+      <h4>Smoke：chat completions</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">http</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-http">### demos/practice-05-corpassist-deploy-lab/smoke.http
+GET http://localhost:8000/v1/models
+
+###
+POST http://localhost:8000/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "corp-coder-7b",
+  "messages": [{"role": "user", "content": "写一个 Java 单例"}],
+  "max_tokens": 64,
+  "stream": true
+}</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>检查项</th><th>命令 / 动作</th><th>通过标准</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>vLLM healthy</td>
+            <td><code>curl /health</code> 或 compose healthcheck</td>
+            <td>HTTP 200</td>
+          </tr>
+          <tr>
+            <td>双栈 client</td>
+            <td>Python + Spring 各 1 次非 stream</td>
+            <td>200 且有 content</td>
+          </tr>
+          <tr>
+            <td>流式补全</td>
+            <td>stream=true</td>
+            <td>SSE 有 data 行、TTFT &lt; SLA</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>delivery-checklist（Lab）</strong>
+        <ul>
+          <li>vLLM healthy</li>
+          <li>双栈 client 指向同一 <code>corp-coder-7b</code></li>
+          <li>流式补全通过（S4 路径）</li>
+        </ul>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：health 200 但 chat 500，优先查什么？</summary>
+        <p>模型路径/量化参数错误、GPU OOM、<code>model</code> 名与 served-model-name 不一致；health 只说明进程在听端口。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>compose</strong>：GPU + vLLM + healthcheck + 权重卷，一条命令交付。</li>
+        <li><strong>验证</strong>：models → chat stream → 双栈 e2e，对照 checklist。</li>
+        <li><strong>capstone</strong>：与灰度、容量、K8s 章衔接，形成 S4 私有化交付叙事。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">进入 advanced：<a href="#ch-advanced-01-tgi-alt">TGI 与其他引擎</a> 对比选型；生产多机见 <a href="#ch-advanced-02-k8s-serve">K8s 部署清单</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.docker.com/compose/" target="_blank" rel="noopener">Docker Compose</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/serving/deploying_with_docker.html" target="_blank" rel="noopener">vLLM Docker</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html" target="_blank" rel="noopener">Spring AI OpenAI Chat</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成 <code>demos/practice-05-corpassist-deploy-lab/</code> 交付清单，并记录一次失败探活的原因。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>根据 lab <code>delivery-checklist.md</code> 勾选三项检查。</li>
+      <li>用 <code>smoke.http</code> 或 curl 验证 <code>/v1/models</code> 与 stream chat。</li>
+      <li>写 Spring <code>application.yml</code> 片段：<code>base-url</code> + <code>model</code> + read timeout（链接 practice-02）。</li>
+      <li>完成章节测验 lsfa-p05。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">客户要求「只交付镜像、不交付 compose」。你会丢失本章哪些 <span class="term" data-term-id="compose-verify" tabindex="0">compose verify</span> 能力？如何补救？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>丢失 GPU 绑定、卷挂载、healthcheck 的一键编排；需改成交付 Helm/K8s manifest 或安装脚本 + 同等 smoke 文档。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">双栈 smoke 通过，但 IDE 补全仍超时。列出 e2e 路径上 3 个非 vLLM 的排查点。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>BFF 网关 timeout、IDE 插件 base_url、公司代理；以及流式缓冲未刷新（见 practice-03）。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist 推理部署</h4>
+      <p>目录：<code>demos/practice-05-corpassist-deploy-lab/</code>（<code>delivery-checklist.md</code>、<code>smoke.http</code>）。<strong>验收</strong>：checklist 全勾；stream 补全有 token 输出。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-04-gray">灰度与版本</a></li>
+      <li><strong>advanced</strong>：<a href="#ch-advanced-01-tgi-alt">TGI 与其他引擎</a> · <a href="#ch-advanced-03-capacity">容量规划入门</a></li>
+    </ul>
+  </div>
+</section>

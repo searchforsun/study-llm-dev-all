@@ -1,0 +1,409 @@
+<section id="ch-basics-03-spring-python" class="chapter" data-chapter="basics-03-spring-python">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>双栈路由实现</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-spring-python" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>多模型路由</strong> · 能力：在 Spring AI 与 Python 双栈落地统一路由策略</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist <strong>S5 内容创作 / 附件问答</strong> 同时有 Java 在线 API 与 Python 批处理/多模态管线。若两栈各自维护一份路由规则，FAQ 走 <code>qwen-turbo</code>、视觉走 <code>qwen-vl-plus</code> 的决策会在联调时打架。本章把<strong>策略真源 → 双栈消费 → 审计对齐</strong>一次讲透，为后续 NS3 成本路由与 DashScope 多模态接入打底。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 Spring AI 实现 <span class="term" data-term-id="chat-client-router" tabindex="0">chat client router</span>，按意图选择 ChatModel 并执行 Fallback</li>
+          <li>搭建 Python <span class="term" data-term-id="route-service" tabindex="0">route service</span>，与 Java 栈共用 <span class="term" data-term-id="shared-config" tabindex="0">shared config</span>（<code>routing.yaml</code>）</li>
+          <li>说明 <span class="term" data-term-id="config-sync" tabindex="0">config sync</span> 与 <span class="term" data-term-id="unified-policy" tabindex="0">unified policy</span> 在 CorpAssist S5 中的落点</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>策略单源</strong>：<code>routing.yaml</code> 是 <span class="term" data-term-id="unified-policy" tabindex="0">unified policy</span> 真源，Java/Python 只读不各写一份。</li>
+          <li><strong>分工清晰</strong>：Spring 管同步客服与网关鉴权；Python 管批处理、评测脚本与 VL 预处理。</li>
+          <li><strong>可观测</strong>：每次路由决策记录 <code>intent</code>、<code>model</code>、<code>fallback_used</code>，便于 NS3 成本对账。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring Router</h3>
+      <p>CorpAssist Java 轨通过 <span class="term" data-term-id="spring-router" tabindex="0">spring router</span> 在请求入口解析意图，再委托对应 <code>ChatClient</code> 调用 DashScope 兼容网关。核心不是「写 if-else 选模型」，而是把 <a href="#ch-basics-02-routing">路由策略</a> 章节的 <span class="term" data-term-id="route-rule" tabindex="0">route rule</span> 编译成可测试的 Bean。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>组件</th><th>职责</th><th>S5 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>RoutePolicyLoader</code></td>
+            <td>加载 <code>routing.yaml</code>，校验 model 在能力矩阵内</td>
+            <td>启动期 + 配置热刷新</td>
+          </tr>
+          <tr>
+            <td><code>IntentClassifier</code></td>
+            <td>规则/轻量模型判定 intent</td>
+            <td><code>faq</code> / <code>vision_qa</code> / <code>content_draft</code></td>
+          </tr>
+          <tr>
+            <td><code>ChatClientRouter</code></td>
+            <td>按 intent 选 ChatClient，失败走 Fallback</td>
+            <td>附件问答超时切备用 VL</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">多 ChatModel Bean</span>
+          <p class="role-card-desc">为 turbo / plus / vl-plus 各注册 ChatModel，Router 用 @Qualifier 注入，避免单模型硬编码。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">ChatClient 门面</span>
+          <p class="role-card-desc">业务 Service 只依赖 Router 返回的 ChatClient，不感知底层模型名。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Advisor 链</span>
+          <p class="role-card-desc">路由前后可挂成本计数、审计日志 Advisor，与 NS3 指标衔接。</p>
+        </article>
+      </div>
+      <h4>共享 routing.yaml（策略真源）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">version: "2026.05"
+policy:
+  default_intent: chat
+  rules:
+    - intent: faq
+      model: qwen-turbo
+      temperature: 0.2
+    - intent: vision_qa
+      model: qwen-vl-plus
+      temperature: 0.1
+    - intent: content_draft
+      model: qwen-plus
+      temperature: 0.7
+  fallback:
+    faq: [qwen-turbo, qwen-plus]
+    vision_qa: [qwen-vl-plus, qwen-plus]
+  cost_tier:
+    qwen-turbo: low
+    qwen-vl-plus: medium
+    qwen-plus: high</code></pre>
+      </div>
+      <h4>Spring Router 核心实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Service
+public class ChatClientRouter {
+
+  private final RoutePolicy policy;
+  private final Map&lt;String, ChatClient&gt; clientsByModel;
+  private final IntentClassifier classifier;
+
+  public ChatResponse route(RouteRequest req) {
+    String intent = classifier.classify(req);
+    RouteRule rule = policy.ruleFor(intent);
+    List&lt;String&gt; chain = policy.fallbackChain(intent);
+
+    for (String model : chain) {
+      try {
+        ChatClient client = clientsByModel.get(model);
+        return client.prompt()
+            .options(ChatOptions.builder()
+                .model(model)
+                .temperature(rule.temperature())
+                .build())
+            .user(req.userMessage())
+            .call()
+            .chatResponse();
+      } catch (Exception ex) {
+        log.warn("model {} failed, try next in fallback", model, ex);
+      }
+    }
+    throw new RouteExhaustedException(intent);
+  }
+}</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist S5 · Spring 侧路由时序</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant GW as corpassist-gateway
+  participant R as ChatClientRouter
+  participant IC as IntentClassifier
+  participant CC as ChatClient
+  participant DS as DashScope 网关
+  GW->>R: RouteRequest(文本/附件元数据)
+  R->>IC: classify()
+  IC-->>R: intent=vision_qa
+  R->>CC: qwen-vl-plus + prompt
+  CC->>DS: OpenAI 兼容 API
+  DS-->>CC: 响应
+  CC-->>R: ChatResponse
+  R-->>GW: 附带 model/fallback 审计字段</pre>
+        <p class="diagram-caption">同步路径走 Spring；批处理与离线评测走 Python <span class="term" data-term-id="route-service" tabindex="0">route service</span>，共用同一 YAML。</p>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Controller 内 <code>if (hasImage) model = "qwen-vl-plus"</code></li>
+            <li>Java 与 Python 各维护一份路由 JSON，版本不同步</li>
+            <li>Fallback 吞掉异常，审计日志无 <code>fallback_used</code></li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li><span class="term" data-term-id="shared-config" tabindex="0">shared config</span> 单文件 + Git 版本号</li>
+            <li><span class="term" data-term-id="chat-client-router" tabindex="0">chat client router</span> 封装选模型与重试</li>
+            <li>Micrometer 记录 <code>router.model.selected</code> 与成本 tier</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S5 附件问答 · 同步路由</span>
+        用户上传 PDF 缩略图提问：Gateway 带 <code>attachment_type=image</code> 进入 Router，<code>IntentClassifier</code> 命中 <code>vision_qa</code>，首选 <code>qwen-vl-plus</code>；若 DashScope 返回 429，自动切 Fallback 链第二项，响应头回写实际模型供前端展示。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何业务 Service 不直接 @Autowired 三个 ChatClient？</summary>
+        <p>因为路由规则会随 NS3 成本策略与 A/B 实验变化；集中 Router 可热更新 <code>routing.yaml</code>，Service 签名保持稳定，测试时只需 Mock Router。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Python 路由服务</h3>
+      <p><span class="term" data-term-id="python-router" tabindex="0">python router</span> 承担 CorpAssist 中<strong>不适合放进 Spring 容器</strong>的工作： nightly 批处理、200 条离线评测、多模态预处理流水线。它与 Java 栈构成 <span class="term" data-term-id="dual-stack-route" tabindex="0">dual stack route</span>——同一策略、不同运行时。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>Python 职责</th><th>Java 职责</th><th>共用契约</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>批量附件解析 + VL 调用</td><td>在线附件问答 API</td><td><code>routing.yaml</code> intent → model</td></tr>
+          <tr><td>路由回归脚本（见下一章）</td><td>Gateway 限流与鉴权</td><td>DashScope <code>base_url</code> 环境变量</td></tr>
+          <tr><td>实验性级联策略原型</td><td>生产 Fallback 执行</td><td>审计字段 JSON Schema</td></tr>
+        </tbody>
+      </table>
+      <h4>Python RouteService：读取同一 YAML</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from dataclasses import dataclass
+from pathlib import Path
+import yaml
+from openai import OpenAI
+
+@dataclass
+class RouteDecision:
+    intent: str
+    model: str
+    fallback_chain: list[str]
+
+class RouteService:
+    def __init__(self, config_path: Path, client: OpenAI):
+        self._policy = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self._client = client
+
+    def decide(self, intent: str) -> RouteDecision:
+        rules = {r["intent"]: r for r in self._policy["policy"]["rules"]}
+        rule = rules.get(intent, rules[self._policy["policy"]["default_intent"]])
+        chain = self._policy["policy"]["fallback"].get(intent, [rule["model"]])
+        return RouteDecision(intent=intent, model=rule["model"], fallback_chain=chain)
+
+    def complete(self, intent: str, messages: list[dict]) -> dict:
+        decision = self.decide(intent)
+        for model in decision.fallback_chain:
+            try:
+                resp = self._client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=next(
+                        r["temperature"] for r in self._policy["policy"]["rules"]
+                        if r["model"] == model
+                    ),
+                )
+                return {"model": model, "content": resp.choices[0].message.content}
+            except Exception:
+                continue
+        raise RuntimeError(f"fallback exhausted for intent={intent}")</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>双栈共用 unified policy</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph config["策略真源"]
+    YAML[routing.yaml]
+  end
+  subgraph spring["Spring 轨"]
+    SR[spring router]
+    GW[corpassist-gateway]
+    GW --> SR
+  end
+  subgraph python["Python 轨"]
+    PR[python route service]
+    BATCH[批处理 / 评测]
+    PR --> BATCH
+  end
+  YAML --> SR
+  YAML --> PR
+  SR --> DS[(DashScope)]
+  PR --> DS
+  SR -.->|config sync| PR</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="config-sync" tabindex="0">config sync</span> 可通过 Git 提交、ConfigMap 挂载或 CI 校验「Java/Python 读同一 commit」。</p>
+      </div>
+      <h4>config-sync 验收清单</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># CI：双栈策略哈希必须一致
+SHA=$(sha256sum config/routing.yaml | awk '{print $1}')
+echo "routing policy sha256=$SHA"
+# Spring 启动日志应打印相同 version 字段
+grep 'version:' config/routing.yaml</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Python 脚本硬编码 <code>model="gpt-4o"</code>，与 Java 不一致</li>
+            <li>仅人工对照 YAML，无 CI 哈希校验</li>
+            <li>批处理走公网 DashScope，在线走内网网关，密钥混用</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>环境变量 <code>DASHSCOPE_BASE_URL</code> / <code>CORPASSIST_LLM_BASE_URL</code> 双栈对齐</li>
+            <li>Python <code>RouteService</code> 与 Java <code>RoutePolicyLoader</code> 同 schema 单测</li>
+            <li>策略变更 PR 必须同时跑 Java 集成测 + Python 回归脚本</li>
+          </ul>
+        </div>
+      </div>
+      <div class="notice">
+        <strong>关键术语速览</strong>
+        <p>
+          <span class="term" data-term-id="spring-router" tabindex="0">spring router</span> ·
+          <span class="term" data-term-id="python-router" tabindex="0">python router</span> ·
+          <span class="term" data-term-id="dual-stack-route" tabindex="0">dual stack route</span> ·
+          <span class="term" data-term-id="shared-config" tabindex="0">shared config</span> ·
+          <span class="term" data-term-id="chat-client-router" tabindex="0">chat client router</span> ·
+          <span class="term" data-term-id="route-service" tabindex="0">route service</span> ·
+          <span class="term" data-term-id="config-sync" tabindex="0">config sync</span> ·
+          <span class="term" data-term-id="unified-policy" tabindex="0">unified policy</span>
+        </p>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：Python 批处理选了 qwen-max，Java 在线仍走 turbo，算双栈成功吗？</summary>
+        <p>不算。双栈成功指<strong>同一 intent 映射同一 primary model</strong>；若批处理需更高质量，应新增 intent（如 <code>content_draft_premium</code>）写入 YAML，而非两栈各写各的。</p>
+      </details>
+      <div class="learn-faq">
+        <details>
+          <summary>NS3 成本路由会在哪一层介入？</summary>
+          <div class="learn-faq-body">advanced 章在 Router 前增加 cost-aware 前置分类；本章只需保证 Router 读 YAML 的 <code>cost_tier</code> 字段并暴露指标，便于 NS3 仪表盘聚合。</div>
+        </details>
+        <details>
+          <summary>DashScope VL 是否走同一 OpenAI 兼容客户端？</summary>
+          <div class="learn-faq-body">是。Spring AI 与 Python OpenAI SDK 均配置 <code>base_url=https://dashscope.aliyuncs.com/compatible-mode/v1</code>；VL 差异在 message 多模态字段，路由层仍按 intent 选 <code>qwen-vl-plus</code>。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Spring Router</strong>：<code>ChatClientRouter</code> + 多 ChatModel Bean，按 YAML 意图选模型并执行 Fallback，同步 S5 附件问答。</li>
+        <li><strong>Python 路由服务</strong>：<code>RouteService</code> 读同一 <code>routing.yaml</code>，负责批处理/评测，与 Java 构成 <span class="term" data-term-id="dual-stack-route" tabindex="0">dual stack route</span>。</li>
+        <li><strong>统一策略</strong>：<span class="term" data-term-id="unified-policy" tabindex="0">unified policy</span> 单源 + <span class="term" data-term-id="config-sync" tabindex="0">config sync</span> CI 校验，避免双栈路由漂移。</li>
+        <li><strong>下一步</strong>：对路由效果做离线评测与 A/B（<a href="#ch-basics-04-eval-routing">路由效果评测</a>），再进入 <a href="#ch-practice-01-vision-rag">图文 RAG</a> 实践。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="multimodel-routing-multimodal_basics03_spring_python">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="yaml" /> 能说出 <code>routing.yaml</code> 中 rules / fallback / cost_tier 各管什么</label></li>
+          <li><label><input type="checkbox" data-id="spring" /> 能口述 ChatClientRouter 与 IntentClassifier 的分工</label></li>
+          <li><label><input type="checkbox" data-id="python" /> 能说明 Python RouteService 与 Spring 轨如何共用策略</label></li>
+          <li><label><input type="checkbox" data-id="sync" /> 能列举一种 config-sync 验收方式（如 CI 哈希）</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>spring router</td><td>在线 API 按 intent 选 ChatClient + Fallback</td></tr>
+                <tr><td>python router</td><td>批处理/评测读同一 YAML</td></tr>
+                <tr><td>shared config</td><td>routing.yaml 是策略真源</td></tr>
+                <tr><td>config sync</td><td>双栈必须同 version / 同哈希</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成下方 Demo 与右侧测验；下一章 <a href="#ch-basics-04-eval-routing">路由效果评测</a> 讲指标与 A/B；再进入 <a href="#ch-practice-01-vision-rag">图文 RAG 与 OCR</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI — ChatClient</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/compatibility-of-openai-with-dashscope" target="_blank" rel="noopener">DashScope OpenAI 兼容模式</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">百炼 Model Studio</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 30 分钟 · 对照 CorpAssist S5 双栈清单，完成策略对齐与一次 Fallback 演练。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/basics-03-spring-python-lab/README.md</code> 与 <code>dual-stack.md</code>，阅读双栈分工。</li>
+      <li>在 <code>routing.yaml</code> 新增 <code>content_draft</code> 规则，指定 <code>qwen-plus</code> 与 temperature。</li>
+      <li>画出 Java Gateway → Router → DashScope 与 Python RouteService 共用 YAML 的数据流。</li>
+      <li>模拟 VL 模型 429：确认 Fallback 链第二项被调用且日志含 <code>fallback_used=true</code>。</li>
+      <li>运行 CI 片段校验 YAML 哈希，完成右侧「双栈路由实现 · 测验」。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事在 Python 评测脚本里把 <code>vision_qa</code> 硬编码为 <code>qwen-max</code>，称「评测要用最强模型」。请指出<strong>违反本章哪条原则</strong>及改法。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反<strong>策略单源</strong>与 <span class="term" data-term-id="unified-policy" tabindex="0">unified policy</span>。评测应走 <code>RouteService.decide("vision_qa")</code> 读 YAML；若需对比 max，应新增实验 intent 而非绕过配置。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">联调时 Java 路由到 <code>qwen-turbo</code>，Python 批处理却走 <code>qwen-plus</code>，YAML 内容相同。最可能原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><span class="term" data-term-id="config-sync" tabindex="0">config sync</span> 失败：两栈挂载了不同 commit 的 YAML，或 Python 用了缓存旧文件。应用 CI 哈希 + 启动日志打印 <code>version</code> 字段排查。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：双栈路由实现</h4>
+      <p>目录：<code>demos/basics-03-spring-python-lab/</code>。<strong>验收</strong>：能说明 Spring 同步客服与 Python 批处理如何共用 <code>routing.yaml</code>，并完成一次 Fallback 日志核对。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-02-routing">路由策略</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-eval-routing">路由效果评测</a></li>
+      <li><strong>实践</strong>：<a href="#ch-practice-01-vision-rag">图文 RAG 与 OCR</a></li>
+      <li><a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 工程轨</span><code class="course-ref-slug">python-engineering-for-llm</code></a> — OpenAI 客户端与配置对照</li>
+    </ul>
+  </div>
+</section>

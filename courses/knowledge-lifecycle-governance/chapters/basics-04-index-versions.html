@@ -1,0 +1,356 @@
+<section id="ch-basics-04-index-versions" class="chapter" data-chapter="basics-04-index-versions">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>索引版本与回滚</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-index-versions" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30 分钟</strong> · 阶段：<strong>生命周期模型</strong> · 能力：执行 CorpAssist 蓝绿切换、回滚与索引对账</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-03-chunk-metadata">分块与元数据规范</a> 变更或 Embedding 模型升级时，直接在原 Milvus collection 上覆盖 upsert 风险极高：用户可能瞬间检索到空库或混合两个<span class="term" data-term-id="index-version" tabindex="0">index version</span>。CorpAssist 用<span class="term" data-term-id="blue-green-index" tabindex="0">blue green index</span> + <span class="term" data-term-id="alias-switch" tabindex="0">alias switch</span> 实现零停机发布，并保留<span class="term" data-term-id="index-rollback" tabindex="0">index rollback</span> 与<span class="term" data-term-id="index-reconcile" tabindex="0">index reconcile</span> 能力。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>描述 Python 管线建 green collection、Spring 通过 alias 切换的完整步骤</li>
+          <li>在 smoke 失败时执行<span class="term" data-term-id="rollback-plan" tabindex="0">rollback plan</span>（alias 指回 blue）</li>
+          <li>运行对账脚本，比较 staging chunk 数与 Milvus entity 数、<code>version_tag</code> 分布</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>物理双库、逻辑单 alias</strong>：线上只读 <code>corpassist_kb_active</code>，背后 blue/green 可切换。</li>
+          <li><strong>切换前必须对账</strong>：<span class="term" data-term-id="index-reconcile" tabindex="0">index reconcile</span> 不通过禁止 <span class="term" data-term-id="alias-switch" tabindex="0">alias switch</span>。</li>
+          <li><strong>模型变更必 re-embed</strong>：<span class="term" data-term-id="re-embed" tabindex="0">re embed</span> 产生新 collection，不是原地改向量。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>蓝绿索引</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · HR v3.2 发布窗口（50 秒）</span>
+        当前线上 alias 指向 <code>corpassist_kb_blue</code>（v3.1）。Python 管线已将 v3.2 写入 <code>corpassist_kb_green</code>，共 412 chunks。运营 smoke 通过后，运维执行 alias 切换；Spring <code>VectorStore</code> 无需改 collectionName，只刷新配置缓存。
+      </aside>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>对象</th><th>命名示例</th><th>角色</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Logical alias</td>
+            <td><code>corpassist_kb_active</code></td>
+            <td>Spring / 检索唯一入口</td>
+          </tr>
+          <tr>
+            <td>Blue collection</td>
+            <td><code>corpassist_kb_blue</code></td>
+            <td>当前或回滚目标</td>
+          </tr>
+          <tr>
+            <td>Green collection</td>
+            <td><code>corpassist_kb_green</code></td>
+            <td>新建/待切换</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="version-tag" tabindex="0">version tag</span></td>
+            <td><code>2026-05-28-hr-v3.2</code></td>
+            <td>metadata 对账维度</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>蓝绿切换序列（Mermaid）</h4>
+      <div class="mermaid-wrap">
+        <h5>alias switch：Python 写 green，Spring 读 alias</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant PY as Python 管线
+  participant MV as Milvus
+  participant OP as 运维/治理台
+  participant SP as Spring VectorStore
+  PY->>MV: 建 green + upsert v3.2
+  PY->>OP: reconcile 报告 PASS
+  OP->>MV: alias corpassist_kb_active → green
+  OP->>SP: 刷新 alias 配置 / 健康检查
+  SP->>MV: similaritySearch via alias
+  Note over MV,SP: blue 保留 N 天供 rollback</pre>
+        <p class="diagram-caption">切换的是 alias，不是 Spring 硬编码 collection 名（对照 <a href="#ch-basics-01-lifecycle">知识库生命周期全景</a> 双栈配置）。</p>
+      </div>
+
+      <h4>Python：创建 green 并写入</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># CorpAssist 发布：写入 green（示意）
+GREEN = "corpassist_kb_green"
+ensure_collection(GREEN, schema=C7_SCHEMA, dim=1536)
+for batch in load_staging(version_tag="2026-05-28-hr-v3.2"):
+    upsert(GREEN, batch)
+# 切换 alias 前禁止删除 blue</code></pre>
+      </div>
+
+      <h4>Spring：固定 alias</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    vectorstore:
+      milvus:
+        collectionName: corpassist_kb_active  # logical alias only
+        embeddingDimension: 1536</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>原地 delete+insert 同一 collection</li>
+            <li>切换 alias 前不做 smoke</li>
+            <li>green 建完立刻删 blue</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>blue/green 物理隔离 + reconcile</li>
+            <li>黄金问句 smoke + 指标对比</li>
+            <li>blue 保留<span class="term" data-term-id="rollback-plan" tabindex="0">rollback plan</span> 窗口（如 7 天）</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Embedding 模型从 text-embedding-3-small 换 large，能否只 re-embed 增量 doc？</summary>
+        <p>维度或模型空间变时，需<strong>全量 re-embed 新 green</strong>；增量仅适用于同模型同维度下的内容变更（见 <a href="#ch-practice-01-incremental">增量更新与重建</a>）。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>回滚</h3>
+      <p><span class="term" data-term-id="index-rollback" tabindex="0">index rollback</span> 在 CorpAssist 中定义为：<strong>alias 指回上一稳定 physical collection</strong>，并在治理台记录事件。不是「从备份恢复单个 chunk」。</p>
+
+      <h4>回滚触发条件</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>信号</th><th>阈值示例</th><th>动作</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Smoke recall@3</td>
+            <td>&lt; 0.85（相对 blue 降 &gt;10%）</td>
+            <td>自动 No-Go，保持 blue</td>
+          </tr>
+          <tr>
+            <td>空答率 spike</td>
+            <td>15 分钟内 +5pp</td>
+            <td>alias 切回 blue + 告警</td>
+          </tr>
+          <tr>
+            <td>对账 FAIL</td>
+            <td>chunk 数偏差 &gt;0.5%</td>
+            <td>禁止切换；修复 green</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>回滚命令（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 1. alias 指回 blue（Milvus 2.x alias API 示意）
+python -m corpassist.index.alias_switch \
+  --alias corpassist_kb_active \
+  --target corpassist_kb_blue \
+  --reason "smoke_fail_hr_v3.2"
+
+# 2. 通知 Spring 刷新 + 复测 smoke
+curl -X POST http://rag-api/actuator/refresh</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>回滚后 green collection 要不要删？</summary>
+          <div class="learn-faq-body">
+            先保留用于根因分析。确认 parser/embedding 问题修复后，可在下次发布窗口<strong>复用 green 名</strong> drop+recreate，或轮换 blue/green 角色。
+          </div>
+        </details>
+        <details>
+          <summary>只回滚 Spring 配置不改 alias 行吗？</summary>
+          <div class="learn-faq-body">
+            不行。双栈必须以 Milvus alias 为<strong>单一真相</strong>；只改 Spring 会导致 Python 对账与线上不一致。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>对账</h3>
+      <p><span class="term" data-term-id="index-reconcile" tabindex="0">index reconcile</span> 在 alias 切换前比较：<strong>staging manifest</strong> vs <strong>Milvus green 统计</strong> vs <strong>抽样向量质量</strong>。</p>
+
+      <h4>对账项清单</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>对账项</th><th>数据源 A</th><th>数据源 B</th><th>容差</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>chunk 总数</td>
+            <td>staging JSONL 行数</td>
+            <td>Milvus green num_entities</td>
+            <td>0</td>
+          </tr>
+          <tr>
+            <td>version_tag 分布</td>
+            <td>manifest 聚合</td>
+            <td>Milvus query group by</td>
+            <td>0 偏差</td>
+          </tr>
+          <tr>
+            <td>doc_id 集合</td>
+            <td>源登记册</td>
+            <td>metadata doc_id distinct</td>
+            <td>仅允许已标记 retire</td>
+          </tr>
+          <tr>
+            <td>随机向量非零</td>
+            <td>抽样 100</td>
+            <td>L2 norm &gt; 0</td>
+            <td>100% pass</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>对账脚本输出（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "green": "corpassist_kb_green",
+  "version_tag": "2026-05-28-hr-v3.2",
+  "staging_count": 412,
+  "milvus_count": 412,
+  "version_tag_match": true,
+  "orphan_doc_ids": [],
+  "status": "PASS"
+}</code></pre>
+      </div>
+
+      <p>对账 FAIL 时，常见根因：<span class="term" data-term-id="re-embed" tabindex="0">re embed</span> 中断、metadata <code>schema_version</code> 不匹配、upsert 幂等键冲突。修复后重新跑 reconcile，再进入 alias 切换。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>蓝绿索引</strong>：物理 blue/green + 逻辑 alias；Python 写 green，Spring 只读 <code>corpassist_kb_active</code>。</li>
+        <li><strong>回滚</strong>：<span class="term" data-term-id="index-rollback" tabindex="0">index rollback</span> = alias 指回 blue + 刷新 Spring；保留 rollback 窗口与事件审计。</li>
+        <li><strong>对账</strong>：<span class="term" data-term-id="index-reconcile" tabindex="0">index reconcile</span> PASS 是切换前置条件；chunk 数与 version_tag 零容差。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="klg-governance_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="blue-green" /> 能画出 alias、blue、green 三者关系</label></li>
+          <li><label><input type="checkbox" data-id="switch-order" /> 能按顺序说出 reconcile → smoke → alias switch</label></li>
+          <li><label><input type="checkbox" data-id="rollback" /> 能写一条回滚命令的核心参数（alias + target）</label></li>
+          <li><label><input type="checkbox" data-id="reconcile" /> 能列举对账表 4 行中的任意 3 项</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>blue green index</td><td>双 physical、单 alias</td></tr>
+                <tr><td>alias switch</td><td>切换入口，不是改 Spring 硬编码</td></tr>
+                <tr><td>index rollback</td><td>alias 指回上一稳定库</td></tr>
+                <tr><td>index reconcile</td><td>切换前 staging vs Milvus</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为何不在原 collection 上原地全量覆盖？举 CorpAssist 一个失败场景。</li>
+              <li>reconcile PASS 但 smoke FAIL，该不该切换？回滚步骤是什么？</li>
+              <li>Python 与 Spring 如何共享「当前活跃 version_tag」？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">basics 阶段完结。下一步：测验与 Demo，然后进入 <a href="#ch-practice-01-incremental">增量更新与重建</a> 实战增量与双栈触发。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://milvus.io/docs/manage_collections.md#Alter-collection-alias" target="_blank" rel="noopener">Milvus — Collection Alias</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/milvus.html" target="_blank" rel="noopener">Spring AI — Milvus VectorStore</a></li>
+      <li><a href="https://martinfowler.com/bliki/BlueGreenDeployment.html" target="_blank" rel="noopener">BlueGreenDeployment — Martin Fowler</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">模拟 HR v3.2 发布窗口，完成<strong>蓝绿对象表</strong>、<strong>对账 JSON 判读</strong>与<strong>回滚顺序</strong>三份产出（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>填写正文「蓝绿对象表」：说明 Spring <code>collectionName</code> 应对应哪一行对象。</li>
+      <li>给定 reconcile JSON（staging_count=412, milvus_count=410），判定 status 并写出最可能的 2 个排查方向。</li>
+      <li>按 Mermaid 序列图，列出 alias 切换前的 3 个硬门禁（含 reconcile 与 smoke）。</li>
+      <li>（可选）完成 <code>demos/basics-04-index-versions-lab/</code> 回滚步骤文档。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障顺序：smoke 失败后同事建议 ① 删 green ② alias 切回 blue ③ 改 Spring collectionName 为 blue ④ 发版复盘。请排序<strong>应先做</strong>的一步与<strong>最应先避免</strong>的一步。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>应先做：② alias 切回 blue</strong>（恢复线上），再 refresh Spring。<strong>最应先避免：① 立刻删 green</strong>，需保留现场分析 reconcile/smoke 失败根因；③ 违反 alias 单一真相原则。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：索引版本与回滚实验室</h4>
+      <p>目录：<code>demos/basics-04-index-versions-lab/</code>。<strong>验收</strong>：在 <code>rollback-steps.md</code> 写满 4 步回滚（含 alias 命令与 Spring refresh），并在 README 验收区粘贴 reconcile PASS 样例一行。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一阶段</strong>：<a href="#ch-practice-01-incremental">增量更新与重建</a>：日常增量与全量重建</li>
+      <li><strong>上一章</strong>：<a href="#ch-basics-03-chunk-metadata">分块与元数据规范</a>：C7 schema 与 version_tag</li>
+      <li><a href="#ch-practice-04-obs-kb">知识库可观测</a>：发布后监控空答与 recall gap</li>
+    </ul>
+  </div>
+</section>

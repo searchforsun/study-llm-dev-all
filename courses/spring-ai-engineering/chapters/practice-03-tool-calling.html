@@ -1,0 +1,355 @@
+<section id="ch-practice-03-tool-calling" class="chapter" data-chapter="practice-03-tool-calling">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Function Calling / Tools</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-tool-calling" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>RAG、工具与记忆</strong> · 能力：用 @Tool 定义可调用函数、约束参数 schema、处理错误重试并与 Agent 课衔接</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>RAG 解决「读制度」；S2 还要「查余额、开工单」。<span class="term" data-term-id="function-calling" tabindex="0">Function calling</span> 让模型在对话中触发 Java 方法。Spring AI 的 <span class="term" data-term-id="tool-annotation" tabindex="0">tool annotation</span> 把 POJO 方法暴露为工具，比手写 JSON schema 更安全、更可测。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <code>@Tool</code> 定义 <span class="term" data-term-id="idempotent-tool" tabindex="0">idempotent tool</span> 与需确认的工具</li>
+          <li>通过方法参数与 Javadoc 生成 <span class="term" data-term-id="parameter-schema" tabindex="0">parameter schema</span></li>
+          <li>捕获 <span class="term" data-term-id="tool-error" tabindex="0">tool error</span> 并配置 <span class="term" data-term-id="retry" tabindex="0">retry</span> 策略</li>
+          <li>说明与 Agent 课程的 <span class="term" data-term-id="agent-bridge" tabindex="0">agent bridge</span> 边界</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>白名单</strong>：仅注册 <span class="term" data-term-id="whitelist" tabindex="0">whitelist</span> 内工具，禁止模型 arbitrary 代码执行。</li>
+          <li><strong>幂等与确认</strong>：查询类工具可重试；写操作需 confirm 或 idempotency key。</li>
+          <li><strong>Spring 轨 vs Agent 轨</strong>：本章是单轮/少轮 Tool；Agent 课做多步规划与外部 MCP。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>@Tool 定义：从 POJO 到模型可见工具</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 查年假</span>
+        员工问「我还剩几天年假？」模型应调用 <code>leaveBalance</code> 而非编造数字。工具类放在 <code>corpassist-ai-chat</code> 模块，由 ChatClient 注册。
+      </aside>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class HrTools {
+  private final LeaveService leaveService;
+
+  @Tool(description = "查询当前登录员工的年假剩余天数")
+  public int leaveBalance(
+      @ToolParam(description = "员工工号，如 E1024") String employeeId) {
+    return leaveService.remainingDays(employeeId);
+  }
+
+  @Tool(description = "创建 IT 工单，非幂等，需用户确认后调用")
+  public TicketResult createTicket(
+      @ToolParam(description = "工单标题") String title,
+      @ToolParam(description = "问题描述") String body) {
+    return ticketService.create(title, body);
+  }
+}</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Bean
+ChatClient toolChatClient(ChatModel chatModel, HrTools hrTools) {
+  return ChatClient.builder(chatModel)
+      .defaultTools(hrTools)
+      .build();
+}
+
+// 调用
+toolChatClient.prompt()
+    .user("帮我查一下 E1024 还剩多少年假")
+    .call()
+    .content();</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>Tool 调用链</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 用户
+  participant CC as ChatClient
+  participant LLM as ChatModel
+  participant T as @Tool 方法
+  U->>CC: 自然语言
+  CC->>LLM: messages + tools schema
+  LLM-->>CC: tool_call leaveBalance
+  CC->>T: invoke(employeeId)
+  T-->>CC: 3 天
+  CC->>LLM: tool result
+  LLM-->>CC: 自然语言答复
+  CC-->>U: 您还剩 3 天年假</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>参数 schema：描述、校验与类型</h3>
+      <p>模型依据 schema 生成 tool_call 参数。<code>@ToolParam</code> 的 description 要<strong>业务化</strong>（工号格式、枚举值），减少 parse 失败。复杂对象可用 record + 校验注解。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>类型</th><th>Spring AI 映射</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>String</code></td><td>string</td><td>employeeId、title</td></tr>
+          <tr><td><code>int</code> / <code>Integer</code></td><td>integer</td><td>topK（内部工具）</td></tr>
+          <tr><td><code>boolean</code></td><td>boolean</td><td>confirmCreate</td></tr>
+          <tr><td><code>enum</code></td><td>enum 值列表</td><td>TicketPriority</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">模糊 description</span>
+          <ul>
+            <li><code>@ToolParam String id</code> 无说明</li>
+            <li>模型传姓名而非工号</li>
+            <li>下游 404 变成 tool error</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">可执行 description</span>
+          <ul>
+            <li>「员工工号 E 开头 + 数字」</li>
+            <li>Service 层 @Valid 二次校验</li>
+            <li>错误 message 回灌模型重试</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public record CreateTicketRequest(
+    @NotBlank @Size(max = 80) String title,
+    @NotBlank String body,
+    @NotNull TicketPriority priority) {}
+
+@Tool(description = "创建工单，priority 为 LOW|MEDIUM|HIGH")
+public TicketResult createTicketValidated(CreateTicketRequest req) {
+  return ticketService.create(req);
+}</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>自检：createTicket 为何要在 ToolWhitelist 标「非幂等」？</summary>
+        <p>模型可能重复调用导致多个工单；需 confirm 参数或业务 idempotency key，见 Demo ToolWhitelist.md。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>错误重试：tool error 与模型回灌</h3>
+      <p>工具失败时，应返回<strong>结构化错误</strong>给模型，而非抛 500 到用户。Spring AI 将 tool 异常序列化为 tool result；可配合 Advisor 限制重试次数。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Tool(description = "查询年假")
+public String leaveBalanceSafe(String employeeId) {
+  try {
+    int days = leaveService.remainingDays(employeeId);
+    return "REMAINING:" + days;
+  } catch (EmployeeNotFoundException ex) {
+    return "ERROR:工号不存在，请让用户提供 E 开头工号";
+  } catch (TimeoutException ex) {
+    return "ERROR:HR 系统超时，请稍后重试";
+  }
+}</code></pre>
+      </div>
+
+      <ul>
+        <li><strong>可重试</strong>：超时、503 — 模型可再次调用（上限 2 次）。</li>
+        <li><strong>不可重试</strong>：参数非法 — 让模型向用户澄清。</li>
+        <li><strong>写操作</strong>：<code>createTicket</code> 失败时不自动 retry，避免重复单。</li>
+      </ul>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">异常直抛到 Controller</span>
+          <ul>
+            <li>用户看到 stack trace</li>
+            <li>模型无法自我纠正</li>
+            <li>审计缺少 tool_call 记录</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">ERROR: 前缀回灌</span>
+          <ul>
+            <li>模型改写为用户友好话术</li>
+            <li>日志保留 tool_call id</li>
+            <li>结合 <a href="#ch-practice-05-rest-api">暴露 REST 与 SSE</a> 统一 ProblemDetail</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Agent 课衔接：边界与 bridge</h3>
+      <p>本课 Spring AI Tool 适合<strong>少步、强类型、企业内系统</strong>调用。Agent 课（LangGraph / MCP）适合多步规划、外部插件与长时任务。CorpAssist 用 <span class="term" data-term-id="agent-bridge" tabindex="0">agent bridge</span> 划分职责：</p>
+
+      <div class="mermaid-wrap">
+        <h5>Spring Tool 轨 vs Agent 轨</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph spring [Spring AI 轨 S2]
+    CC[ChatClient + @Tool]
+    RAG[RAG Advisor]
+    CC --> RAG
+  end
+  subgraph agent [Agent 课 · 实验轨]
+    MCP[MCP Server]
+    Plan[多步 Planner]
+    Plan --> MCP
+  end
+  Portal[企业门户] --> spring
+  Portal -.->|复杂任务| agent
+  spring -.->|OpenAPI 契约| agent</pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>场景</th><th>Spring @Tool</th><th>Agent / MCP</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>查年假、开标准工单</td><td>✓ 首选</td><td>过度设计</td></tr>
+          <tr><td>跨 5 个外部 SaaS 编排</td><td>难维护</td><td>✓</td></tr>
+          <tr><td>需 Java 事务与审计</td><td>✓</td><td>需 bridge API</td></tr>
+        </tbody>
+      </table>
+
+      <p>衔接方式：Agent 服务通过 HTTP 调用 Spring 已暴露的 Tool 等价 REST（见 advanced RAG API）；ToolWhitelist 两边一致。与 <a href="#ch-practice-02-rag-pipeline">RAG Pipeline 实现</a> 组合：先检索制度，再决定是否 createTicket。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 扩展</span>
+        Demo 要求为 S3 补充 2 个白名单工具行：例如 <code>roomBooking</code>（幂等查询）、<code>submitExpense</code>（需 confirm）。说明 description 与幂等列如何填写。
+      </aside>
+
+      <div class="learn-tabs" role="tablist" aria-label="Tool 轨与 Agent 轨">
+        <input type="radio" name="prac03-agent-tab" id="prac03-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac03-agent-tab" id="prac03-tab-b" class="learn-tab-input" />
+        <label for="prac03-tab-a">Spring @Tool</label>
+        <label for="prac03-tab-b">Agent / MCP</label>
+        <div class="learn-tab-panel" id="prac03-panel-a" role="tabpanel">
+          <ul>
+            <li>强类型 Java 方法 + 单元测试</li>
+            <li>与企业 HR/工单系统同事务</li>
+            <li>ChatClient 内置 tool_call 循环</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac03-panel-b" role="tabpanel">
+          <ul>
+            <li>多步规划、长时任务、外部插件</li>
+            <li>通过 OpenAPI bridge 回调 Spring</li>
+            <li>ToolWhitelist 与 Spring 表一致</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>ToolWhitelist 列说明</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>列</th><th>含义</th></tr></thead>
+              <tbody>
+                <tr><td>工具名</td><td>与 @Tool 方法名或显式 name 一致</td></tr>
+                <tr><td>说明</td><td>给模型看的业务描述</td></tr>
+                <tr><td>幂等</td><td>是=可 retry；否=需 confirm</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>@Tool 定义</strong>：Component + defaultTools；ChatClient 自动完成 tool_call 循环。</li>
+        <li><strong>参数 schema</strong>：@ToolParam description 要可执行；record + @Valid 二次校验。</li>
+        <li><strong>错误重试</strong>：ERROR 前缀回灌模型；写操作慎 retry。</li>
+        <li><strong>Agent 衔接</strong>：Spring 管企业内短链 Tool；Agent 管多步；OpenAPI bridge 对齐白名单。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai_practice03_tools">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="tool-def" /> 能写出 @Tool + defaultTools 片段</label></li>
+          <li><label><input type="checkbox" data-id="schema" /> 能说明 description 如何减少参数错误</label></li>
+          <li><label><input type="checkbox" data-id="error" /> 能区分可 retry 与不可 retry 的 tool error</label></li>
+          <li><label><input type="checkbox" data-id="whitelist-demo" /> 已为 S3 补充 2 个白名单工具</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一章：<a href="#ch-practice-04-chat-memory">Chat Memory 与会话</a></p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI — Tool Calling</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI — ChatClient</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatmodel.html" target="_blank" rel="noopener">Spring AI — ChatModel</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">扩展 ToolWhitelist，并设计 leaveBalance 的错误回灌字符串。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-03-tool-calling-lab/ToolWhitelist.md</code>。</li>
+      <li>为 CorpAssist S3 增加 <code>roomBooking</code>、<code>submitExpense</code> 两行，填写说明与幂等列。</li>
+      <li>为 <code>createTicket</code> 设计 confirm 流程（对话中让用户说「确认」再调工具）。</li>
+      <li>写出 leaveBalance 在工号不存在时的 ERROR 回灌示例。</li>
+      <li>完成章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">模型连续 3 次 createTicket 产生 3 张单。根因与防护？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>非幂等工具被 retry/重复 tool_call。防护：confirm 参数、idempotency key、Advisor 限制写工具调用次数。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Function Calling / Tools</h4>
+      <p>目录：<code>demos/practice-03-tool-calling-lab/</code>。<strong>验收</strong>：ToolWhitelist 新增 2 行且幂等列正确。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-02-rag-pipeline">RAG Pipeline 实现</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-chat-memory">Chat Memory 与会话</a></li>
+    </ul>
+  </div>
+</section>

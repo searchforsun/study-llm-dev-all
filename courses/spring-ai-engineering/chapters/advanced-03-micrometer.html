@@ -1,0 +1,298 @@
+<section id="ch-advanced-03-micrometer" class="chapter" data-chapter="advanced-03-micrometer">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Micrometer 与可观测</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-micrometer" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产化与可移植</strong> · 能力：埋点 LLM 指标、分布式 Tracing、与 OTel 打通并搭建 Grafana Dashboard</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>没有延迟、错误率、<span class="term" data-term-id="token-usage" tabindex="0">token usage</span> 指标，无法证明 S2 客服 SLA，也无法验证 <a href="#ch-advanced-02-multimodel">NS3 成本路由</a> 是否生效。Spring Boot 3 + <span class="term" data-term-id="micrometer" tabindex="0">micrometer</span> 可导出 Prometheus；配合 <span class="term" data-term-id="otel" tabindex="0">otel</span> 与 Python 检索服务共 traceId，双栈联调才能「一条请求查到底」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 ChatClient 调用注册 <span class="term" data-term-id="llm-metrics" tabindex="0">llm metrics</span>：请求数、Token、<span class="term" data-term-id="latency-histogram" tabindex="0">latency histogram</span></li>
+          <li>用 Observation / Tracer 把 model 名、tenantId 写入 <span class="term" data-term-id="distributed-tracing" tabindex="0">distributed tracing</span></li>
+          <li>配置 Micrometer Tracing → OTLP，与 Jaeger/Tempo 及 Python 侧对齐</li>
+          <li>搭建 <span class="term" data-term-id="grafana-dashboard" tabindex="0">grafana dashboard</span> 看板：P95 延迟、Token 日趋势、熔断次数</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>指标带维度</strong>：至少 tag <code>model</code>、<code>tenant</code>、<code>intent</code>、<code>cache_hit</code>。</li>
+          <li><strong>Trace 贯穿 BFF</strong>：<span class="term" data-term-id="mdc-trace" tabindex="0">mdc trace</span> 把 traceId 写入日志与响应头 <code>X-Request-Id</code>。</li>
+          <li><strong>LLM 不是黑盒</strong>：Advisor 链每一环可嵌套 span，定位慢在 RAG 还是模型。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>指标埋点</h3>
+      <p>CorpAssist 推荐三类 <span class="term" data-term-id="llm-metrics" tabindex="0">llm metrics</span>（见 demo <code>metrics-list.md</code>）：</p>
+      <ul>
+        <li><code>corpassist.chat.requests</code> — Counter，tag: model, status</li>
+        <li><code>corpassist.chat.tokens</code> — Counter，tag: model, type=prompt|completion</li>
+        <li><code>corpassist.chat.latency</code> — Timer，发布 histogram 供 P95</li>
+      </ul>
+
+      <h4>LlmMetricsAdvisor</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Component
+public class LlmMetricsAdvisor implements CallAroundAdvisor {
+
+  private final MeterRegistry registry;
+
+  @Override
+  public AdvisedResponse aroundCall(AdvisedRequest request, CallAroundAdvisorChain chain) {
+    String model = (String) request.adviseContext().getOrDefault("model", "unknown");
+    Timer.Sample sample = Timer.start(registry);
+    try {
+      AdvisedResponse resp = chain.nextAroundCall(request);
+      registry.counter("corpassist.chat.requests", "model", model, "status", "ok").increment();
+      recordTokens(resp, model);
+      return resp;
+    } catch (Exception ex) {
+      registry.counter("corpassist.chat.requests", "model", model, "status", "error").increment();
+      throw ex;
+    } finally {
+      sample.stop(registry.timer("corpassist.chat.latency", "model", model));
+    }
+  }
+
+  private void recordTokens(AdvisedResponse resp, String model) {
+    var usage = resp.response().getMetadata().getUsage();
+    if (usage != null) {
+      registry.counter("corpassist.chat.tokens", "model", model, "type", "prompt")
+          .increment(usage.getPromptTokens());
+      registry.counter("corpassist.chat.tokens", "model", model, "type", "completion")
+          .increment(usage.getCompletionTokens());
+    }
+  }
+}</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,metrics
+  metrics:
+    distribution:
+      percentiles-histogram:
+        corpassist.chat.latency: true</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 客服 SLA</span>
+        门户承诺首 token P95 &lt; 2s。Dashboard 需按 model tier 拆分：若 reasoning 档 P95 超标，应触发 NS3 路由调优而非盲目扩容。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Tracing</h3>
+      <p>单次问答可能经过：Gateway → Spring Controller → RAG 检索（HTTP 调 Python）→ ChatModel → Tool。用 Micrometer Observation 为每段创建 span，并在调用 Python 时注入 W3C <code>traceparent</code>。</p>
+
+      <h4>Observation 包装 ChatService</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Service
+public class ChatService {
+
+  private final ObservationRegistry observationRegistry;
+  private final ChatClient chatClient;
+
+  public String chat(String tenantId, String message) {
+    return Observation.createNotStarted("corpassist.chat", observationRegistry)
+        .lowCardinalityKeyValue("tenant", tenantId)
+        .observe(() -> chatClient.prompt().user(message).call().content());
+  }
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>分布式 Trace · Spring ↔ Python</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant P as 门户
+  participant S as Spring AI
+  participant Py as Python 检索
+  participant L as 模型网关
+  P->>S: POST /v1/rag/query traceparent
+  S->>Py: /search traceparent
+  Py-->>S: chunks
+  S->>L: chat/completions
+  L-->>S: answer
+  S-->>P: JSON + X-Request-Id</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="mdc-trace" tabindex="0">mdc trace</span>：在 Filter 中把 traceId 放入 MDC，日志 pattern 含 <code>%X{traceId}</code>。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Component
+public class TraceIdFilter extends OncePerRequestFilter {
+  @Override
+  protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res,
+      FilterChain chain) throws ServletException, IOException {
+    String traceId = Optional.ofNullable(req.getHeader("traceparent"))
+        .orElse(UUID.randomUUID().toString());
+    MDC.put("traceId", traceId);
+    res.setHeader("X-Request-Id", traceId);
+    try { chain.doFilter(req, res); } finally { MDC.clear(); }
+  }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 OTel 打通</h3>
+      <p>Spring Boot 3.2+ 可通过 <code>micrometer-tracing-bridge-otel</code> + OTLP exporter 把 span 送到 Tempo/Jaeger，与 Python OpenTelemetry SDK 共用 Collector。</p>
+
+      <h4>依赖与配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">xml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-xml">&lt;dependency&gt;
+  &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+  &lt;artifactId&gt;micrometer-tracing-bridge-otel&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;io.opentelemetry&lt;/groupId&gt;
+  &lt;artifactId&gt;opentelemetry-exporter-otlp&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">management:
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: http://otel-collector:4318/v1/traces
+spring:
+  application:
+    name: corpassist-spring</code></pre>
+      </div>
+
+      <p>Python 检索服务在 FastAPI 中间件解析同一 <code>traceparent</code>，span 名 <code>python.search</code> 与 Spring <code>corpassist.rag.retrieve</code> 同 trace，联调时可在 Jaeger 一眼看到慢在 embedding 还是 LLM。</p>
+
+      <details class="learn-micro-check">
+        <summary>自检：生产 sampling probability 是否应永远 1.0？</summary>
+        <p>高流量环境通常 0.1–0.3；CorpAssist 预发可 1.0 便于评测。指标（Counter/Timer）不受采样影响，应全量保留。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Dashboard</h3>
+      <p><span class="term" data-term-id="grafana-dashboard" tabindex="0">grafana dashboard</span> 建议四行：流量与错误率、<span class="term" data-term-id="latency-histogram" tabindex="0">latency histogram</span> P50/P95、Token 日累计、NS3 路由 tier 占比。</p>
+
+      <h4>PromQL 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># P95 延迟（按 model）
+histogram_quantile(0.95, sum(rate(corpassist_chat_latency_bucket[5m])) by (le, model))
+
+# 每分钟 prompt Token
+sum(rate(corpassist_chat_tokens_total{type="prompt"}[1m])) by (model)</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>面板</th><th>告警阈值（示意）</th><th>动作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>P95 latency</td><td>&gt; 3s 持续 5m</td><td>检查 reasoning 占比 / 网关</td></tr>
+          <tr><td>error rate</td><td>&gt; 5%</td><td>看熔断是否打开</td></tr>
+          <tr><td>Token 日增</td><td>&gt; 预算 120%</td><td>收紧 NS3 cost routing</td></tr>
+          <tr><td>cache hit</td><td>&lt; 20%</td><td>审查 FAQ 归一化规则</td></tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>与 Python 轨对齐</strong>
+        <ul>
+          <li>共用 Prometheus remote write 或同一 Grafana 文件夹</li>
+          <li>Trace 用同一 OTel Collector；日志用 traceId 关联</li>
+          <li>评测跑批时 tag <code>source=eval</code>，避免污染生产 SLA 面板</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>指标埋点</strong>：requests / tokens / latency 三件套，Advisor 或 Service 层统一记录。</li>
+        <li><strong>Tracing</strong>：Observation + traceparent 贯穿 Python 检索。</li>
+        <li><strong>OTel</strong>：OTLP exporter；采样与指标分离配置。</li>
+        <li><strong>Dashboard</strong>：P95 + Token + tier 占比支撑 NS3 与 SLA 复盘。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai_advanced_03_micrometer">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="metrics" /> 能写出 3 个 corpassist.chat.* 指标名</label></li>
+          <li><label><input type="checkbox" data-id="trace" /> 能说明 traceId 如何传到 Python</label></li>
+          <li><label><input type="checkbox" data-id="otel" /> 知道 OTLP endpoint 配置项</label></li>
+          <li><label><input type="checkbox" data-id="demo" /> 已阅读 metrics-list.md</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：继续 <a href="#ch-advanced-04-testing">测试与本地替身</a>，让 CI 也能验证指标 Advisor 不抛异常。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-boot/reference/actuator/metrics.html" target="_blank" rel="noopener">Spring Boot Metrics</a></li>
+      <li><a href="https://micrometer.io/docs/tracing" target="_blank" rel="noopener">Micrometer Tracing</a></li>
+      <li><a href="https://opentelemetry.io/docs/languages/java/" target="_blank" rel="noopener">OpenTelemetry Java</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">本地暴露 /actuator/prometheus 并对照 metrics-list 验收。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>添加 <code>LlmMetricsAdvisor</code> 到 NS2 ChatClient，打一次 FAQ 请求。</li>
+      <li><code>curl localhost:8080/actuator/prometheus | grep corpassist_chat</code> 确认三条指标出现。</li>
+      <li>在笔记写一条 PromQL 查询 P95 latency。</li>
+      <li>配置 <code>TraceIdFilter</code>，确认响应头含 <code>X-Request-Id</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">只打日志不打 Metrics，能否满足生产 SLA 复盘？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不能。</strong> 日志难以聚合 P95 与 Token 日趋势；Metrics + Dashboard 是 SLA 与 NS3 成本复盘的标准做法。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：LLM 指标清单</h4>
+      <p>目录：<code>demos/advanced-03-micrometer-lab/</code>。<strong>验收</strong>：对照 metrics-list.md 解释每个指标的业务含义。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-02-multimodel">多模型路由与 Fallback</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-04-testing">测试与本地替身</a></li>
+    </ul>
+  </div>
+</section>

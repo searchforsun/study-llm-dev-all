@@ -1,0 +1,333 @@
+<section id="ch-advanced-02-policy-code" class="chapter" data-chapter="advanced-02-policy-code">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>策略即代码</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-policy-code" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>合规交付</strong> · 能力：OPA 等规则引擎与策略版本化</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 的工具白名单、行业加强项、数据域访问若散落在 Java <code>if-else</code> 与 Python 脚本里，变更不可审计、金融客户无法做策略评审。把 <span class="term" data-term-id="authz-policy" tabindex="0">authz policy</span> 写成 <span class="term" data-term-id="policy-as-code" tabindex="0">policy as code</span>，进 Git、走 CI、带版本号，才能与 <a href="#ch-advanced-01-industry">行业合规差异</a> 和 <a href="#ch-practice-01-tool-authz">工具权限</a> 对齐。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 OPA + <span class="term" data-term-id="opa-rego" tabindex="0">opa rego</span> 表达 CorpAssist 工具与数据访问规则</li>
+          <li>设计 <span class="term" data-term-id="policy-version" tabindex="0">policy version</span> 与 <span class="term" data-term-id="gitops-policy" tabindex="0">gitops policy</span> 发布流程</li>
+          <li>在 CI 中跑 <span class="term" data-term-id="ci-policy" tabindex="0">ci policy</span> 单元测试，阻断危险 <span class="term" data-term-id="rego-rule" tabindex="0">rego rule</span> 合并</li>
+          <li>说明 <span class="term" data-term-id="rule-engine" tabindex="0">rule engine</span> 与业务代码的边界</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>默认拒绝</strong>：Rego 中 <code>default allow = false</code>，显式 allow 才放行。</li>
+          <li><strong>策略与代码分离</strong>：业务服务只问 OPA「这次允许吗」，不在 Controller 里堆规则。</li>
+          <li><strong>版本进审计</strong>：每条 LLM 请求日志带 <code>policy_version</code>，监管问询可复现当时规则。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OPA</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Agent 调用 <code>propose_refund</code>（45 秒）</span>
+        一线客服角色 <code>agent</code> 在处理客诉时，模型想调用退款提案工具。安全要求：仅 <code>agent</code> 且客诉工单状态为 <code>open</code> 且金额 &lt; 500 元可调用；<code>user</code> 角色永远不可。规则每月由合规部修订，需 PR 评审而非热补丁 Java 代码。
+      </aside>
+
+      <p><a href="https://www.openpolicyagent.org/" target="_blank" rel="noopener">Open Policy Agent（OPA）</a> 是 CNCF 毕业项目，用声明式策略回答：<strong>给定 input，allow 还是 deny？</strong> CorpAssist 在 Spring 网关与 Python Agent 执行器前各设 OPA sidecar 或嵌入式 SDK，统一策略源。</p>
+
+      <h4>OPA 在 CorpAssist 中的挂载点</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>挂载点</th><th>input 示例</th><th>决策</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>HTTP 网关</td>
+            <td>user_id, role, sector, route</td>
+            <td>是否允许访问 /chat、/admin</td>
+          </tr>
+          <tr>
+            <td>Tool 执行前</td>
+            <td>role, tool_name, ticket, amount</td>
+            <td>是否 allow 工具调用</td>
+          </tr>
+          <tr>
+            <td>RAG 检索</td>
+            <td>role, kb_id, doc_classification</td>
+            <td>是否允许检索该 collection</td>
+          </tr>
+          <tr>
+            <td>出站 LLM</td>
+            <td>sector, model_endpoint, pii_detected</td>
+            <td>是否允许调用外网模型</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>策略即代码：Git → CI → 运行时</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant Dev as 合规工程师
+  participant Git as policy repo
+  participant CI as CI opa test
+  participant OPA as OPA Bundle
+  participant GW as CorpAssist 网关
+  participant Agent as Tool 执行器
+  Dev->>Git: PR 修改 rego
+  Git->>CI: opa test + conftest
+  CI->>OPA: 发布 bundle v1.4.2
+  GW->>OPA: input role sector route
+  OPA-->>GW: allow deny
+  Agent->>OPA: input tool ticket amount
+  OPA-->>Agent: allow deny + policy_version</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="gitops-policy" tabindex="0">gitops policy</span> 保证生产策略与 Git tag 一致；运行时只读 bundle，不支持 SSH 改规则。</p>
+      </div>
+
+      <h4>Spring 侧调用 OPA 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># deploy/opa-sidecar.yaml（节选）
+services:
+  corpassist-gateway:
+    opa:
+      url: http://localhost:8181
+      policy_path: /v1/data/corpassist/authz/allow
+      bundle:
+        resource: corpassist-policies
+        version: "1.4.2"
+    audit:
+      include: [policy_version, decision_id, input_hash]</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不用 Spring Security 表达式替代 OPA？</summary>
+        <p>Security 表达式适合单一应用 RBAC；CorpAssist 双栈（Java + Python）、多挂载点、行业 sector 组合爆炸，且金融客户要独立审策略文件。OPA 策略可导出、可 diff、可 <span class="term" data-term-id="ci-policy" tabindex="0">ci policy</span> 测，更符合 <span class="term" data-term-id="policy-as-code" tabindex="0">policy as code</span>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>规则</h3>
+      <p>Rego 是 OPA 的策略语言。CorpAssist 工具授权包路径为 <code>corpassist.authz</code>；完整样例见 <code>demos/advanced-02-policy-code-lab/policy.sample.rego</code>，正文展开如下。</p>
+
+      <h4>CorpAssist 工具授权 Rego</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">rego</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-rego"># demos/advanced-02-policy-code-lab/policy.sample.rego（扩展版）
+package corpassist.authz
+
+import future.keywords.if
+
+default allow := false
+
+# 基线：已认证用户可调只读 FAQ 工具
+allow if {
+    input.role == "user"
+    input.tool == "faq_search"
+}
+
+# 客服可调订单查询
+allow if {
+    input.role == "agent"
+    input.tool == "query_order"
+}
+
+# 退款提案：角色 + 工单 + 金额上限
+allow if {
+    input.role == "agent"
+    input.tool == "propose_refund"
+    input.ticket.status == "open"
+    input.ticket.amount &lt; 500
+}
+
+# 金融加强：高风险工具需审批 token
+allow if {
+    input.sector == "finance"
+    input.tool == "propose_refund"
+    input.role == "agent"
+    input.approval_token != ""
+    valid_approval_token(input.approval_token)
+}
+
+# 管理员显式放行（仍需审计）
+allow if {
+    input.role == "admin"
+    input.tool in data.corpassist.admin_tools
+}
+
+valid_approval_token(tok) if {
+    data.corpassist.approval_tokens[tok].expires_at &gt; time.now_ns()
+}</code></pre>
+      </div>
+
+      <h4>策略数据与 sector 规则（YAML）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># data/corpassist/policy-data.yaml — 随 bundle 发布
+corpassist:
+  admin_tools: [force_refund, rebuild_index, export_audit]
+  approval_tokens: {}  # 运行时由工单系统注入
+  sector_rules:
+    finance:
+      block_tools: [export_all_users]
+      require_policy_version_min: "1.4.0"
+    gov:
+      block_model_hosts: [api.openai.com, api.anthropic.com]
+      allow_model_hosts: [dashscope-vpc.internal, vllm-gov.local]</code></pre>
+      </div>
+
+      <h4>CI 策略测试</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">rego</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-rego"># policy_test.rego
+package corpassist.authz_test
+
+test_user_cannot_propose_refund if {
+    not allow with input as {
+        "role": "user",
+        "tool": "propose_refund",
+        "ticket": {"status": "open", "amount": 100}
+    }
+}
+
+test_agent_small_refund_allowed if {
+    allow with input as {
+        "role": "agent",
+        "tool": "propose_refund",
+        "ticket": {"status": "open", "amount": 200}
+    }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Java / Python 各维护一份工具白名单</li>
+            <li>生产环境手工改 OPA 规则无 Git 记录</li>
+            <li>无 <code>default allow = false</code>，漏写规则即全放行</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>单 repo <code>corpassist-policies</code>；tag = <span class="term" data-term-id="policy-version" tabindex="0">policy version</span></li>
+            <li>PR 必过 <code>opa test</code> + 合规 Reviewer approve</li>
+            <li>审计日志写 <code>decision_id</code> 可关联 OPA decision log</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>OPA = 只做 RBAC</strong> — 还可表达 sector、PII 级别、模型 endpoint 等任意结构化 input。</li>
+          <li><strong>策略越细越好</strong> — 过度细粒度 Rego 难测；静态数据放 YAML bundle，Rego 只做决策逻辑。</li>
+          <li><strong>deny 不写原因</strong> — 生产应返回 <code>deny_reason</code>（内部）便于客服排障，但不暴露给终端用户。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>OPA</strong>：网关、Tool、RAG、出站模型统一策略决策点；bundle 版本化发布。</li>
+        <li><strong>Rego</strong>：default deny；角色 / 工具 / sector 组合规则；data YAML 存静态配置。</li>
+        <li><strong>CI</strong>：<code>opa test</code> 回归；<code>policy_version</code> 进审计，满足金融可追溯。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="sec_advanced02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="default-deny" /> 能解释 default allow = false 的必要性</label></li>
+          <li><label><input type="checkbox" data-id="mount-points" /> 能列举 CorpAssist 中 3 个 OPA 挂载点</label></li>
+          <li><label><input type="checkbox" data-id="rego-test" /> 能读懂 policy_test 中 with input 语法</label></li>
+          <li><label><input type="checkbox" data-id="gitops" /> 能说明 policy_version 如何进入审计日志</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist Java 网关与 Python Agent 如何共享同一套策略？冲突时以谁为准？</li>
+              <li>金融客户要求「策略变更需双人复核」，GitOps 流程如何设计？</li>
+              <li>若 OPA 不可用，fail-open 还是 fail-closed？各有什么业务影响？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成测验与 Demo；下一章 <a href="#ch-advanced-03-third-party">第三方与数据出境</a> 评估外采模型与合同条款。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.openpolicyagent.org/docs/latest/" target="_blank" rel="noopener">OPA 官方文档 — Rego 语法与 Bundle</a></li>
+      <li><a href="https://www.openpolicyagent.org/docs/latest/integration/#decision-logging" target="_blank" rel="noopener">OPA Decision Logging — 决策审计</a></li>
+      <li><a href="https://docs.spring.io/spring-security/reference/servlet/authorization/authorize-http-requests.html" target="_blank" rel="noopener">Spring Security 授权 — 与 OPA 分工</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/advanced-02-policy-code-lab/</code> 基础上，完成<strong>一条 allow 规则</strong>、<strong>一条 deny 测试</strong>与<strong>sector yaml 片段</strong>（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>policy.sample.rego</code>，为 <code>role=agent</code> 增加 <code>faq_search</code> allow 规则（若尚未覆盖）。</li>
+      <li>新增 <code>test_gov_blocks_openai</code>：sector=gov 且 model_host 为 OpenAI 时必须 deny（可用 mock package）。</li>
+      <li>在 policy-data.yaml 增加 <code>gov.block_model_hosts</code> 一条，与 <a href="#ch-advanced-01-industry">政务加强包</a> 一致。</li>
+      <li>（可选）本地安装 OPA，运行 <code>opa test .</code> 验证通过。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）开发在 Java 里加了 <code>if (role.equals("admin")) allowAllTools()</code>，未同步 Rego。会有什么问题？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>双栈策略漂移：Python Agent 仍按 Rego deny，Java 侧却放行，审计 policy_version 也对不上。应删除 Java 硬编码，统一走 OPA；admin 工具列表只维护在 Rego data。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：策略即代码</h4>
+      <p><code>demos/advanced-02-policy-code-lab/</code> — 补全 policy.sample.rego 与测试；验收：至少 2 条 allow 规则 + 2 条 opa test 通过。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-01-tool-authz">工具调用权限</a>：白名单与 OAuth scope 设计</li>
+      <li><a href="#ch-practice-03-audit">审计与留痕</a>：policy_version 字段规范</li>
+      <li><a href="#ch-advanced-01-industry">行业合规差异</a>：sector_rules 数据来源</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,408 @@
+<section id="ch-advanced-03-deepeval" class="chapter" data-chapter="advanced-03-deepeval">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>其他框架与扩展</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-deepeval" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>质量治理</strong> · 能力：理解 DeepEval 定位、封装企业 <span class="term" data-term-id="custom-metric" tabindex="0">custom metric</span>，并给出 CorpAssist 框架选型建议</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>全课以 <span class="term" data-term-id="ragas" tabindex="0">ragas</span> 为主干，但 CorpAssist 双栈团队常问：「能否用 pytest 风格断言？」「制度引用格式能否写成可复用规则？」本章介绍 <span class="term" data-term-id="deepeval" tabindex="0">deepeval</span> 与<strong>插件化指标</strong>思路，帮你在不推翻 NS1 飞轮的前提下扩展 <span class="term" data-term-id="eval-pipeline" tabindex="0">eval pipeline</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>对比 RAGAS 与 DeepEval 在 CorpAssist S1 上的适用场景与集成成本</li>
+          <li>把「答案须含 <code>[pol-</code> 引用」封装为可回归的 <span class="term" data-term-id="custom-metric" tabindex="0">custom metric</span></li>
+          <li>用 <span class="term" data-term-id="framework-compare" tabindex="0">framework compare</span> 矩阵向团队说明 <span class="term" data-term-id="tool-selection" tabindex="0">tool selection</span>，避免重复造轮子</li>
+          <li>保持 <span class="term" data-term-id="dual-stack-metrics" tabindex="0">dual stack metrics</span> 输出仍写入共用 schema，而非各框架各报一套</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>框架是手段</strong>：指标契约（<a href="#ch-basics-01-metrics">指标：准确、召回、忠实、延迟</a>）与评测集版本才是 NS1 飞轮真源。</li>
+          <li><strong>DeepEval 强项</strong>：测试用例 + assert 风格 + 内置 <span class="term" data-term-id="llm-judge" tabindex="0">llm judge</span> 指标，贴近 Python 工程师习惯。</li>
+          <li><strong>自定义优先业务规则</strong>：引用格式、拒答策略、合规禁词等用 <span class="term" data-term-id="metric-plugin" tabindex="0">metric plugin</span>，RAG 三角仍用 RAGAS/DeepEval 内置分。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>DeepEval 简介</h3>
+      <p><span class="term" data-term-id="deepeval" tabindex="0">deepeval</span>（Confident AI）是面向 LLM 应用的 Python 评测框架：把「输入 / 实际输出 / 检索上下文」组织为 <strong>Test Case</strong>，再对每条用例调用一个或多个 <span class="term" data-term-id="auto-metric" tabindex="0">auto metric</span> 打分，最后像单元测试一样 <code>assert</code> 通过与否。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 制度引用合规（30 秒）</span>
+        产品要求：凡给出天数/金额，答案必须带 <code>[pol-YYYY-NN]</code> 引用。RAGAS 的 <span class="term" data-term-id="faithfulness" tabindex="0">faithfulness</span> 能抓「是否贴上下文」，但<strong>抓不到引用格式</strong>。DeepEval 允许你叠加一条 deterministic 规则 metric，与 LLM-as-judge 并存。
+      </aside>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>RAGAS（本课主链）</th><th>DeepEval</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>核心抽象</td>
+            <td>Dataset + <span class="term" data-term-id="eval-pipeline" tabindex="0">eval pipeline</span> + RAG 指标</td>
+            <td>TestCase + Metric + assert</td>
+          </tr>
+          <tr>
+            <td>CI 体验</td>
+            <td>pytest 聚合 + JSON 报告（<a href="#ch-practice-01-python-eval">Python 服务评测流水线</a>）</td>
+            <td><code>deepeval test run</code> / pytest 插件，失败即 non-zero exit</td>
+          </tr>
+          <tr>
+            <td>内置 RAG 指标</td>
+            <td>faithfulness、context recall 等一等公民</td>
+            <td>Answer Relevancy、Faithfulness 等 + <span class="term" data-term-id="llm-evaluator" tabindex="0">llm evaluator</span></td>
+          </tr>
+          <tr>
+            <td>Spring 侧</td>
+            <td>Python 出 JSON，Spring 对齐 schema</td>
+            <td>通常 Python 专用；Spring 仍走集成测试（<a href="#ch-practice-02-spring-eval">Spring AI 服务评测</a>）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>DeepEval 最小用例（概念）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from deepeval import assert_test
+from deepeval.test_case import LLMTestCase
+from deepeval.metrics import FaithfulnessMetric
+
+def test_corpassist_faithfulness():
+    case = LLMTestCase(
+        input="年假可休几天？",
+        actual_output="依据 [pol-2024-03]，带薪年假 10 天。",
+        retrieval_context=["pol-2024-03: 带薪年假 10 天…"],
+    )
+    metric = FaithfulnessMetric(threshold=0.85)
+    assert_test(case, [metric])</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>因「听说 DeepEval 新」就替换已跑通的 RAGAS CI</li>
+            <li>DeepEval 与 RAGAS 各报一套字段名，看板无法合并</li>
+            <li>把所有指标都交给 LLM judge，忽略可 deterministic 的规则</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>RAGAS 继续负责 RAG 三角；DeepEval 补 assert 风格与 Confident AI 平台（可选）</li>
+            <li>输出映射到 <code>metrics-schema.json</code> 同一键名</li>
+            <li>规则类 metric 零 API 成本、可重复</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>RAGAS 主链 + DeepEval 扩展（CorpAssist）</h5>
+        <pre class="mermaid">flowchart TB
+  JSONL[eval JSONL] --> PY[Python CI]
+  PY --> RAGAS[RAGAS 三角]
+  PY --> DE[DeepEval 用例]
+  RAGAS --> MAP[映射 schema]
+  DE --> MAP
+  MAP --> GATE[threshold gate]</pre>
+        <p class="diagram-caption">两框架可并行；门禁只认 schema 字段，不认框架品牌。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：DeepEval 能否替代 Spring 集成测试？</summary>
+        <p>不能。DeepEval 是 Python 测试栈；Spring 侧仍需 <span class="term" data-term-id="spring-integration-test" tabindex="0">spring integration test</span> + <span class="term" data-term-id="advisor-assert" tabindex="0">advisor assert</span>。双栈对齐靠同一 JSONL 与 schema，而非同一框架。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>自定义 metric</h3>
+      <p>CorpAssist 大量质量要求<strong>可写成规则</strong>：引用前缀、拒答模板、禁词、表格字段完整度。这类逻辑适合 <span class="term" data-term-id="custom-metric" tabindex="0">custom metric</span>：输入 TestCase，输出 0～1 或 pass/fail，并可挂到 <span class="term" data-term-id="ci-gate" tabindex="0">ci gate</span>。</p>
+
+      <h4>Demo 思路：引用格式检测</h4>
+      <p>仓库 <code>demos/advanced-03-deepeval-lab/custom_metric_demo.py</code> 用极简函数演示「答案含 <code>[pol-</code> 则满分」——真实项目可升级为正则 + 白名单 policy id。</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def cite_ok(answer: str) -&gt; bool:
+    """CorpAssist S1：制度答案须含 policy 引用标记。"""
+    return "[pol-" in answer
+
+def custom_cite_metric(actual_output: str) -&gt; float:
+    return 1.0 if cite_ok(actual_output) else 0.0
+
+# DeepEval 中可 subclass BaseMetric，measure() 内调用 custom_cite_metric
+# 并与 FaithfulnessMetric 同列 assert_test(case, [faith, cite])</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>metric 类型</th><th>实现方式</th><th>示例</th><th>成本</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>规则 / 确定性</td>
+            <td>Python 函数、正则、JSON schema</td>
+            <td><code>cite_ok</code>、拒答关键词</td>
+            <td>低，适合 CI 全量跑</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="llm-judge" tabindex="0">llm judge</span></td>
+            <td>DeepEval / RAGAS 内置模板</td>
+            <td>faithfulness、relevance</td>
+            <td>按 token 计费，宜抽样+门禁子集</td>
+          </tr>
+          <tr>
+            <td>人工 rubric</td>
+            <td>导出 badcase → 标注（<a href="#ch-basics-04-human-eval">人工评测与仲裁</a>）</td>
+            <td>合规语气、表格可读性</td>
+            <td>高，用于校准自动分</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>封装为可复用 <span class="term" data-term-id="metric-plugin" tabindex="0">metric plugin</span></h4>
+      <ul>
+        <li><strong>单一职责</strong>：一个 metric 只答一个问题（引用 / 拒答 / 长度），便于坏例归因（<a href="#ch-practice-04-root-cause">坏例归因方法论</a>）。</li>
+        <li><strong>版本钉死</strong>：metric 逻辑变更视为「评测逻辑版本」，与 <span class="term" data-term-id="eval-dataset" tabindex="0">eval dataset</span> 一并 <span class="term" data-term-id="version-pin" tabindex="0">version pin</span>。</li>
+        <li><strong>映射 schema</strong>：自定义分写入 <code>extensions.cite_format_ok</code> 或合并进业务门禁，但<strong>核心 RAG 键名不变</strong>。</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "stack": "python",
+  "faithfulness": 0.91,
+  "extensions": {
+    "cite_format_score": 1.0,
+    "metric_version": "cite-v1"
+  },
+  "gate": "pass"
+}</code></pre>
+      </div>
+
+      <details class="learn-faq">
+        <summary>custom metric 与 RAGAS 指标冲突时听谁的？</summary>
+        <p>核心 RAG 阈值（faithfulness、context recall）优先；extensions 是<strong>附加 AND 条件</strong>。两者都 pass 才允许 merge，避免「格式对但内容错」。</p>
+      </details>
+
+      <details class="learn-micro-check">
+        <summary>判断：custom metric 得 1.0 但 faithfulness 0.4，能否发布？</summary>
+        <p><strong>不能</strong>。引用格式只是合规层；内容幻觉仍由 faithfulness 拦截。门禁应 AND 核心 RAG 阈值，而非用规则分替代三角。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>选择建议</h3>
+      <p>框架选型不是「谁更先进」，而是 <span class="term" data-term-id="eval-abstraction" tabindex="0">eval abstraction</span> 能否嵌入已有 NS1 飞轮：<span class="term" data-term-id="eval-dataset" tabindex="0">eval dataset</span> → 双栈执行 → schema 报告 → <span class="term" data-term-id="regression-gate" tabindex="0">regression gate</span> → 看板（<a href="#ch-advanced-04-capstone">实战：CorpAssist 质量看板</a>）。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>团队现状</th><th>建议</th><th>理由</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>已稳定 RAGAS + pytest CI</td>
+            <td>保持 RAGAS；DeepEval 仅用于新增 assert 用例或 Confident AI 云报表</td>
+            <td>迁移成本高，<span class="term" data-term-id="vendor-neutral" tabindex="0">vendor neutral</span> 靠 schema 而非框架</td>
+          </tr>
+          <tr>
+            <td>Python 团队强 pytest、缺 RAG 指标经验</td>
+            <td>DeepEval 快速起步 + 逐步对齐 RAGAS 指标定义</td>
+            <td>学习曲线低，但需补 <a href="#ch-basics-01-metrics">双栈同口径</a> 文档</td>
+          </tr>
+          <tr>
+            <td>大量企业规则指标</td>
+            <td>custom metric 独立包；RAGAS/DeepEval 二选一跑 LLM 分</td>
+            <td>规则与 judge 解耦，<span class="term" data-term-id="tool-selection" tabindex="0">tool selection</span> 聚焦「谁跑 judge」</td>
+          </tr>
+          <tr>
+            <td>ToB 要第三方评测报告</td>
+            <td>固定 dataset 版本 + 双框架交叉验证 + 人工抽检（<a href="#ch-advanced-02-governance">质量治理流程</a>）</td>
+            <td>单框架分数不足以 <span class="term" data-term-id="tob-acceptance" tabindex="0">tob acceptance</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4><span class="term" data-term-id="framework-compare" tabindex="0">framework compare</span> 决策表</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>需求</th><th>优先 RAGAS</th><th>优先 DeepEval</th><th>CorpAssist 默认</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>RAG 三角科研对齐</td>
+            <td>✓</td>
+            <td>部分对齐</td>
+            <td>RAGAS</td>
+          </tr>
+          <tr>
+            <td>pytest assert 心智</td>
+            <td>需封装</td>
+            <td>✓</td>
+            <td>DeepEval 补位</td>
+          </tr>
+          <tr>
+            <td>Spring 同口径 JSON</td>
+            <td>✓ 已落地</td>
+            <td>需额外映射层</td>
+            <td>schema 为准</td>
+          </tr>
+          <tr>
+            <td>Confident AI 托管仪表盘</td>
+            <td>—</td>
+            <td>✓ 可选</td>
+            <td>非必须</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>框架换血式迁移</strong> — 未改 schema 就换工具，<a href="#ch-advanced-04-capstone">质量看板</a> 历史趋势断裂。</li>
+          <li><strong>重复 judge</strong> — RAGAS 与 DeepEval 对同一用例各调一遍 LLM，CI 成本翻倍、结论不一致。</li>
+          <li><strong>忽视 Spring 栈</strong> — Python 选型不能代替 <span class="term" data-term-id="eval-parity" tabindex="0">eval parity</span> 验证。</li>
+        </ul>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>tool selection：以 schema 为中心的抽象层</h5>
+        <pre class="mermaid">flowchart LR
+  ADPT_R[RAGAS adapter]
+  ADPT_D[DeepEval adapter]
+  ADPT_R --> SCHEMA[metrics-schema]
+  ADPT_D --> SCHEMA
+  SCHEMA --> DASH[质量看板]
+  SCHEMA --> REG[回归门禁]</pre>
+        <p class="diagram-caption">适配器模式保证 <span class="term" data-term-id="vendor-neutral" tabindex="0">vendor neutral</span>；换框架不换契约。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>DeepEval 简介</strong>：TestCase + assert 风格，补 RAGAS 主链；Spring 仍走集成测试，双栈靠 schema 对齐。</li>
+        <li><strong>自定义 metric</strong>：企业规则（如 <code>[pol-</code> 引用）用 deterministic 函数；LLM judge 负责 RAG 三角；二者 AND 门禁。</li>
+        <li><strong>选择建议</strong>：以 <span class="term" data-term-id="eval-abstraction" tabindex="0">eval abstraction</span> / schema 选型，避免换框架导致飞轮与看板断裂。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-evaluation-quality_advanced03_deepeval">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="de-vs-ragas" /> 能说出 DeepEval 与 RAGAS 在 CI 抽象上的 1 处差异</label></li>
+          <li><label><input type="checkbox" data-id="custom-cite" /> 能解释 custom_metric_demo.py 中 cite_ok 解决什么业务问题</label></li>
+          <li><label><input type="checkbox" data-id="schema-map" /> 能说明自定义分应写入 schema 的 extensions 而非替换 faithfulness</label></li>
+          <li><label><input type="checkbox" data-id="spring-parity" /> 能解释为何 DeepEval 不能替代 Spring 集成测试</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>deepeval</td><td>Python TestCase + metric + assert，贴近 pytest</td></tr>
+                <tr><td>custom metric</td><td>企业规则函数，0/1 或 0～1，可零 token 成本</td></tr>
+                <tr><td>eval abstraction</td><td>框架适配到同一 metrics-schema</td></tr>
+                <tr><td>tool selection</td><td>看飞轮嵌入成本，非看品牌</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 CorpAssist 不把所有评测迁到 DeepEval？</li>
+              <li>自定义引用 metric 与 RAGAS faithfulness 同时失败时，你先查哪一层？</li>
+              <li>如何向架构师说明「vendor neutral」在评测里的含义？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-advanced-04-capstone">实战：CorpAssist 质量看板</a> 把双栈 schema 报告可视化。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.confident-ai.com/docs/metrics-introduction" target="_blank" rel="noopener">DeepEval — Metrics 介绍</a></li>
+      <li><a href="https://docs.confident-ai.com/docs/metrics-custom" target="_blank" rel="noopener">DeepEval — 自定义 Metric</a></li>
+      <li><a href="https://docs.ragas.io/en/stable/" target="_blank" rel="noopener">RAGAS — 与本课主链对照阅读</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 CorpAssist S1，完成<strong>框架对照表</strong>、<strong>自定义 metric 扩展</strong>与<strong>选型陈述</strong>（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读 <code>demos/advanced-03-deepeval-lab/custom_metric_demo.py</code>，为 <code>cite_ok</code> 写 2 条反例（应得 0 分）与 1 条正例。</li>
+      <li>在纸面画「RAGAS 主链 + DeepEval 扩展」数据流，标出映射到 <code>metrics-schema.json</code> 的节点。</li>
+      <li>填写 framework compare 表：对你团队现状打勾「保持 RAGAS / 引入 DeepEval / 仅 custom metric」。</li>
+      <li>写一句 <span class="term" data-term-id="ci-gate" tabindex="0">ci gate</span> 规则：faithfulness ≥ 0.85 <strong>且</strong> cite_format_score = 1.0 才 pass。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事提议「全面弃用 RAGAS，CI 只跑 DeepEval」。请指出<strong>最可能破坏</strong> NS1 飞轮哪一环？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>双栈同口径与历史回归</strong>：Spring 侧与已有 baseline、<a href="#ch-advanced-04-capstone">质量看板</a> 趋势若未做 schema 映射与 <span class="term" data-term-id="version-diff" tabindex="0">version diff</span> 对齐，会造成「分数变好但无法对比」的伪提升。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">cite_format_score=1.0 且 faithfulness=0.55，能否对客户说「质量合格」？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不能</strong>。引用格式只是形式合规；0.55 表示内容不贴证据，存在幻觉风险。应对外强调核心 RAG 阈值未达标。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：DeepEval 自定义 metric 实验室</h4>
+      <p>目录：<code>demos/advanced-03-deepeval-lab/</code>。<strong>验收</strong>：你能扩展 <code>custom_metric_demo.py</code> 增加「拒答须含『暂无依据』」规则，并说明如何写入 schema <code>extensions</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-04-capstone">实战：CorpAssist 质量看板</a> — 汇总双栈 JSON 报告</li>
+      <li><a href="#ch-basics-03-ragas">RAGAS 与自动评测</a> — 本课主链回顾</li>
+      <li><a href="#ch-practice-01-python-eval">Python 服务评测流水线</a> — pytest 门禁落地</li>
+    </ul>
+  </div>
+</section>

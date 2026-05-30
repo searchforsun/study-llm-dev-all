@@ -1,0 +1,328 @@
+<section id="ch-advanced-01-multi-kb" class="chapter" data-chapter="advanced-01-multi-kb">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多知识库联邦</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-multi-kb" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>企业级治理</strong> · 能力：设计多 KB 路由、RRF 合并与跨库去重</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 上线后，HR、财务、制度、产品文档往往各自维护独立 KB。用户只问一句「年假怎么算」，系统必须<strong>选对库、并行查、合并排序、去掉重复 chunk</strong>，否则要么漏答要么上下文膨胀。本章把「多库联邦检索」从 demo 级脚本升级为可运营的治理架构。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>按 intent / 元数据标签设计 <span class="term" data-term-id="multi-kb-route" tabindex="0">multi kb route</span>，并说明何时全库广播</li>
+          <li>用 RRF 或分数归一化实现 <span class="term" data-term-id="merge-results" tabindex="0">merge results</span>，解释为何不能简单 concat</li>
+          <li>制定 <span class="term" data-term-id="dedup-federate" tabindex="0">dedup federate</span> 策略（doc_id / chunk_hash / 语义近邻）</li>
+          <li>在双栈（Python 索引 + Spring VectorStore）下保持 ACL 与版本一致</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>路由先于检索</strong>：错库比慢库更致命；路由表与 KB 元数据是治理资产。</li>
+          <li><strong>合并要可比</strong>：各库 embedding 空间、分数尺度不同，需 <span class="term" data-term-id="unified-rank" tabindex="0">unified rank</span>。</li>
+          <li><strong>去重保上下文</strong>：同一制度 PDF 进 HR 库与通用库时，联邦检索必须 <span class="term" data-term-id="dedup-federate" tabindex="0">dedup</span> 后再送 LLM。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>路由</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 员工问「2026 病假扣薪规则」（45 秒）</span>
+        用户属于华东区销售部。系统有 <code>kb-hr-policy</code>、<code>kb-finance-payroll</code>、<code>kb-general-handbook</code> 三个 Milvus collection。若三路全查，延迟 ×3 且易混入财务敏感 chunk；若只查 general，可能漏掉 HR 最新修订。需要 <span class="term" data-term-id="router-kb" tabindex="0">router kb</span> 在 50ms 内决定查哪些库。
+      </aside>
+
+      <p><span class="term" data-term-id="kb-federation" tabindex="0">kb federation</span> 的第一层是<strong>路由</strong>：把用户 query 映射到一个或多个子 KB。常见信号：</p>
+      <ul>
+        <li><strong>显式标签</strong> — 用户在前端选了「人事政策」；或 query 带 <code>dept=hr</code>。</li>
+        <li><strong>Intent 分类</strong> — 小模型 / 规则判断「薪酬 / 制度 / 产品 FAQ」。</li>
+        <li><strong>元数据索引</strong> — 维护 KB Catalog（库名、owner、doc 类型、ACL 范围、embedding 版本）。</li>
+        <li><strong>Fallback 广播</strong> — 置信度低时并行查 Top-K 库，但须限流与 ACL 预过滤。</li>
+      </ul>
+
+      <h4>路由决策表</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>信号</th><th>路由策略</th><th>风险</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Intent 置信度 &gt; 0.85</td>
+            <td>单库检索</td>
+            <td>分类错则整题错；需监控 zero-hit</td>
+          </tr>
+          <tr>
+            <td>0.5～0.85</td>
+            <td>Top-2 库并行</td>
+            <td>延迟上升；合并层必须去重</td>
+          </tr>
+          <tr>
+            <td>&lt; 0.5 或用户选「全部」</td>
+            <td>广播 + 严格 top_k 截断</td>
+            <td>成本与 ACL 泄露面扩大</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>CorpAssist 路由配置示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">federation:
+  router: intent_classifier_v2
+  catalogs:
+    - id: kb-hr-policy
+      tags: [hr, leave, attendance]
+      acl_scope: employee_self
+    - id: kb-finance-payroll
+      tags: [payroll, tax]
+      acl_scope: finance_read
+  rules:
+    - when: intent in [leave, attendance]
+      target: [kb-hr-policy, kb-general-handbook]
+    - when: intent == payroll
+      target: [kb-finance-payroll]
+      require_groups: [finance_viewer]</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>写死 <code>if "年假" in query</code> 字符串匹配</li>
+            <li>路由不看用户 ACL，检索后再过滤</li>
+            <li>新 KB 上线要改代码发版</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>KB Catalog + 配置化 rules，运营可维护</li>
+            <li>路由阶段就剔除用户无权访问的库</li>
+            <li>记录 route_decision 便于 <a href="#ch-practice-04-obs-kb">知识库可观测</a> 排障</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何「检索后过滤 ACL」在联邦场景更危险？</summary>
+        <p>广播多库会先拉取无权 chunk 到应用内存，日志与缓存都可能泄露；且浪费向量检索配额。应在路由 + 每库 filter 双层拦截（见 <a href="#ch-practice-02-permission">权限与多租户</a>）。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>合并</h3>
+      <p>各子 KB 独立返回 top_k 后，需要 <span class="term" data-term-id="federate-search" tabindex="0">federate search</span> 的<strong>合并层</strong>。难点在于分数不可比：A 库 cosine 0.82 与 B 库 0.79 不代表 A 更相关。</p>
+
+      <h4>常见合并算法</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>方法</th><th>做法</th><th>适用</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>RRF</strong>（Reciprocal Rank Fusion）</td>
+            <td>按排名融合：<code>1/(k+rank)</code> 求和</td>
+            <td>默认首选；不依赖原始分数尺度</td>
+          </tr>
+          <tr>
+            <td>Min-Max 归一化</td>
+            <td>每库内归一化后再加权</td>
+            <td>库内分数分布稳定时</td>
+          </tr>
+          <tr>
+            <td>学习排序 LTR</td>
+            <td>用点击日志训练</td>
+            <td>有足够反馈数据后迭代</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>RRF 合并实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def rrf_merge(lists: list[list[Hit]], k: int = 60) -> list[Hit]:
+    scores: dict[str, float] = {}
+    best: dict[str, Hit] = {}
+    for hits in lists:
+        for rank, hit in enumerate(hits, start=1):
+            cid = hit.chunk_id
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+            best.setdefault(cid, hit)
+    ordered = sorted(scores.keys(), key=lambda c: scores[c], reverse=True)
+    return [best[c] for c in ordered]</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>联邦检索：路由 → 并行 → 合并</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 用户 Query
+  participant R as Router
+  participant H as kb-hr
+  participant F as kb-finance
+  participant M as Merger RRF
+  participant L as LLM
+  U->>R: 病假扣薪规则
+  R->>H: search top_k=8 ACL
+  R->>F: skip 无 finance 权限
+  H-->>M: hits rank 1..8
+  M->>M: RRF + dedup
+  M->>L: top 6 chunks</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="cross-kb" tabindex="0">cross kb</span> 并行检索后，合并层统一排序再截断上下文窗口。</p>
+      </div>
+
+      <p>合并后仍需截断：送入 LLM 的 chunk 数受 token 预算约束。CorpAssist 默认 federate top_k=8/库，合并后取 global top 6，并保留每条 hit 的 <code>kb_id</code>、<code>index_version</code> 供审计。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>去重</h3>
+      <p>大企业常见「同一份制度 PDF」被 HR 与通用库各采一遍；或 <span class="term" data-term-id="cross-kb" tabindex="0">cross kb</span> 同步导致 chunk 重复。<span class="term" data-term-id="dedup-federate" tabindex="0">dedup federate</span> 要在合并后、送 LLM 前完成。</p>
+
+      <h4>去重维度</h4>
+      <ul>
+        <li><strong>doc_id 级</strong> — 同一 <code>source_doc_id</code> 只保留 RRF 分最高的一条。</li>
+        <li><strong>chunk_hash 级</strong> — 正文 MD5 / simhash 相同则合并 metadata（保留多库 provenance）。</li>
+        <li><strong>语义近邻</strong> — 向量 cosine &gt; 0.95 且标题相同，保留较新 <code>index_version</code>。</li>
+      </ul>
+
+      <h4>去重后 metadata 保留</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def dedup_by_doc_id(hits: list[Hit]) -> list[Hit]:
+    seen: dict[str, Hit] = {}
+    for h in hits:
+        key = h.meta["source_doc_id"]
+        if key not in seen or h.rrf_score > seen[key].rrf_score:
+            seen[key] = h
+    return list(seen.values())</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只按 chunk 文本 <code>==</code> 精确匹配</li>
+            <li>去重丢弃所有 provenance，无法回溯来源库</li>
+            <li> ingestion 不去重，全靠检索层兜底</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>采集层 <code>source_doc_id</code> 全局唯一（见 <a href="#ch-basics-03-chunk-metadata">分块与元数据规范</a>）</li>
+            <li>dedup 后 <code>provenance: [kb-hr, kb-general]</code></li>
+            <li>运营台展示「重复入库」告警（见 <a href="#ch-practice-03-quality">知识质量运营</a>）</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>联邦 = 物理合库</strong> — 应保持库边界与 ACL 隔离，只在检索层联邦。</li>
+          <li><strong>合并后不再过滤 ACL</strong> — 每库检索必须带 filter；合并层不再「补过滤」。</li>
+          <li><strong>忽略 embedding 版本</strong> — 不同库模型不一致时，RRF 仍可用，但勿跨版本做语义 dedup 阈值。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>路由</strong>：KB Catalog + intent/rules 决定查哪些库；ACL 在路由与检索双层生效，避免广播泄露。</li>
+        <li><strong>合并</strong>：RRF 等 rank 融合解决分数不可比；保留 kb_id 与 index_version 便于观测与审计。</li>
+        <li><strong>去重</strong>：doc_id / chunk_hash / 语义近邻三级；采集层 source_doc_id 是治理根基。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="klg_advanced01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="route-acl" /> 能说明路由阶段为何要预过滤 ACL</label></li>
+          <li><label><input type="checkbox" data-id="rrf" /> 能口述 RRF 相比「按 raw score 排序」的优势</label></li>
+          <li><label><input type="checkbox" data-id="dedup" /> 能列举 doc_id 与 chunk_hash 去重的差异</label></li>
+          <li><label><input type="checkbox" data-id="mermaid" /> 能对照序列图讲一遍联邦检索链路</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 有 12 个子 KB，用户问模糊问题，你会单库、双库还是广播？依据是什么？</li>
+              <li>两库 embedding 模型不同，能否联邦？合并与去重要注意什么？</li>
+              <li>如何证明联邦检索没有 ACL 泄露？需要哪些日志字段？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成测验与 Demo；下一章 <a href="#ch-advanced-02-compliance">合规保留与删除</a> 处理留存与被遗忘权。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://milvus.io/docs/multi_tenancy.md" target="_blank" rel="noopener">Milvus Multi-tenancy — 多 collection 隔离</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI VectorStore — 检索 filter 表达式</a></li>
+      <li><a href="https://arxiv.org/abs/2304.02683" target="_blank" rel="noopener">RRF 论文 — Reciprocal Rank Fusion</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 CorpAssist 三库场景，完成<strong>路由规则表</strong>、<strong>RRF 手工演算</strong>与<strong>去重策略</strong>三份产出（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制正文 yaml 路由配置，为「产品 FAQ + 技术文档」新增 <code>kb-product</code> 条目，并写一条 <code>when: intent == product</code> rule。</li>
+      <li>假设 HR 库返回 chunk A/B/C（rank 1-3），General 返回 B/D（rank 1-2），用 RRF 公式（k=60）手工算 B 的融合分是否最高。</li>
+      <li>对照「去重维度」列表，为「同 PDF 双库入库」选定 doc_id 级策略，并写一句 provenance 字段设计。</li>
+      <li>（可选）完成 <code>demos/advanced-01-multi-kb-lab/</code> 中的 federate-flow 填空。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）财务库 hit 分数 0.91 排第一，HR 库 0.75 排第一，直接按分数全局排序会把 HR 结果挤掉。应改用哪种合并方式？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>使用 RRF 或 per-list 归一化后再加权，避免跨库 raw score 不可比。默认推荐 RRF；若 HR 库业务权重更高，可在 RRF 分上加库级 weight。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：多知识库联邦</h4>
+      <p><code>demos/advanced-01-multi-kb-lab/</code> — 补全 federate-flow.md 中「合并 → 去重」两步；验收：流程图四步齐全且与正文序列图一致。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-02-permission">权限与多租户</a>：联邦检索 ACL 双层过滤</li>
+      <li><a href="#ch-advanced-02-compliance">合规保留与删除</a>：跨库删除与审计</li>
+    </ul>
+  </div>
+</section>

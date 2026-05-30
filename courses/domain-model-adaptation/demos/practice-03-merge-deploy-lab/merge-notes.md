@@ -1,0 +1,3 @@
+- merge adapter
+- 可选 AWQ
+- vLLM 部署见推理课

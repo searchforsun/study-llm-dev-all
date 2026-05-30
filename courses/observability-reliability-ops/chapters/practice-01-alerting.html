@@ -1,0 +1,342 @@
+<section id="ch-practice-01-alerting" class="chapter" data-chapter="practice-01-alerting">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>告警与 oncall</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-alerting" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>可靠性运维</strong> · 能力：为 CorpAssist 设计分级告警、升级链与可执行 Runbook</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-03-dashboard-slo">Dashboard 与 SLO</a> 定义了「正常」边界，但<strong>越界时谁被叫醒、先做什么</strong>仍须工程化。<span class="term" data-term-id="alert-fatigue" tabindex="0">alert fatigue</span> 常来自「每条指标抖动都 P1 电话」或告警无 Runbook。本章把 CorpAssist 双栈（Spring BFF + Python RAG）的 oncall 流程落到可执行规则。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>编写带 <span class="term" data-term-id="severity-level" tabindex="0">severity level</span> 与 burn-rate 的 <span class="term" data-term-id="alert-rule" tabindex="0">alert rule</span></li>
+          <li>设计 <span class="term" data-term-id="oncall-escalation" tabindex="0">oncall escalation</span>：L1 群消息 → L2 电话 → 经理</li>
+          <li>为每条 P1/P2 告警绑定 <span class="term" data-term-id="runbook-link" tabindex="0">runbook link</span>，支撑 <span class="term" data-term-id="incident-triage" tabindex="0">incident triage</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>告警 = 可行动信号</strong>：须链到 Runbook，而非「图表红了」。</li>
+          <li><strong>SLO 驱动分级</strong>：<span class="term" data-term-id="slo-alert" tabindex="0">slo alert</span> 用错误预算 burn-rate，比固定阈值更抗抖动（衔接 <a href="#ch-basics-03-dashboard-slo">Dashboard 与 SLO</a>）。</li>
+          <li><strong>双栈统一 request_id</strong>：oncall 从告警跳进 Trace/日志时，<a href="#ch-basics-01-three-pillars">日志、指标、追踪</a> 的 <span class="term" data-term-id="correlation-id" tabindex="0">correlation id</span> 必须贯通。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>规则</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 智能客服 oncall（S2）</span>
+        周五 22:10，Grafana 触发「LLM P95 &gt; 3s」。oncall 工程师打开告警，需 30 秒内判断：是模型侧慢、RAG 检索慢，还是下游 ERP 超时？若 <span class="term" data-term-id="alert-rule" tabindex="0">alert rule</span> 只写 <code>latency &gt; 3</code> 而无 service/tenant 维度，会把「单租户压测」误判为全站事故。
+      </aside>
+      <p>LLM 应用告警除传统 5xx/延迟，还应覆盖：<strong>首 token 延迟</strong>、<strong>RAG 空召回率</strong>、<strong>Token 预算</strong>（见 <a href="#ch-basics-04-token-cost">Token 成本治理</a>）、<strong>工具调用失败率</strong>。规则设计原则：</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>原则</th><th>说明</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>用户面向</td>
+            <td>告警 SLI 对齐 SLO 定义</td>
+            <td>P95 端到端含 BFF + Python + LLM</td>
+          </tr>
+          <tr>
+            <td>多维分组</td>
+            <td><code>service</code>、<code>tenant_id</code>、<code>model</code></td>
+            <td>避免「finance 租户」拖垮全局阈值</td>
+          </tr>
+          <tr>
+            <td>抑制抖动</td>
+            <td><code>for: 5m</code> 或 burn-rate 窗口</td>
+            <td>短 spike 只记指标，不叫醒人</td>
+          </tr>
+          <tr>
+            <td>symptom vs cause</td>
+            <td>用户症状告警 + 组件因果告警分层</td>
+            <td>P2「P95 高」+ P3「向量库 QPS 饱和」</td>
+          </tr>
+        </tbody>
+      </table>
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>CPU &gt; 80% 即 P1 电话（与用户体验无关）</li>
+            <li>同一故障 12 条重复告警（无 grouping/inhibit）</li>
+            <li>阈值拍脑袋，与 SLO 文档不一致</li>
+            <li>告警注解只有「请看 Grafana」</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li><span class="term" data-term-id="slo-alert" tabindex="0">slo alert</span>：5m burn-rate &gt; 14× 预算消耗</li>
+            <li>父告警抑制子告警（ingress 5xx 抑制 pod restart）</li>
+            <li>每条规则带 <span class="term" data-term-id="runbook-link" tabindex="0">runbook link</span> 与 dashboard 深链</li>
+            <li>LLM 专属：TTFT、拒答率、工具超时率</li>
+          </ul>
+        </div>
+      </div>
+      <h4>Prometheus 告警规则示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">groups:
+  - name: corpassist_slo
+    rules:
+      - alert: CorpAssistChatP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_server_duration_bucket{service="corpassist-bff", route="/api/chat"}[5m])) by (le)
+          ) &gt; 3
+        for: 5m
+        labels:
+          severity: P2
+          team: llm-platform
+        annotations:
+          summary: "CorpAssist 客服 P95 &gt; 3s"
+          runbook_url: "https://wiki.internal/runbooks/llm-latency"
+          dashboard: "/d/corpassist/chat-latency?var-tenant={{ $labels.tenant_id }}"
+      - alert: TokenBudgetBurnFast
+        expr: |
+          sum(increase(llm_tokens_total[1h])) by (tenant_id)
+            / on(tenant_id) token_budget_hourly &gt; 0.9
+        for: 10m
+        labels:
+          severity: P3
+        annotations:
+          runbook_url: "https://wiki.internal/runbooks/token-budget"</code></pre>
+      </div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么 Token 预算告警设 P3 而非 P1？</summary>
+        <p>超预算通常不立即伤害可用性，但预示成本失控或遭滥用；P3 群消息 + 限流 Runbook 足够，除非连带拖垮推理集群才升级。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>升级</h3>
+      <p><span class="term" data-term-id="oncall-escalation" tabindex="0">oncall escalation</span> 回答：谁第一响应、多久未 ACK 升级、何时拉经理。<span class="term" data-term-id="severity-level" tabindex="0">severity level</span> 与通知渠道须一一映射，避免 P1 只发 Slack。</p>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>级别</th><th>定义（CorpAssist）</th><th>通知</th><th>ACK 时限</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>P1</strong></td>
+            <td>全站客服不可用 / 大面积越权风险</td>
+            <td><span class="term" data-term-id="pager-duty" tabindex="0">pager duty</span> 电话 +  war room</td>
+            <td>5 分钟</td>
+          </tr>
+          <tr>
+            <td><strong>P2</strong></td>
+            <td>SLO 显著违约、单区域降级</td>
+            <td>IM @oncall + 工单</td>
+            <td>15 分钟</td>
+          </tr>
+          <tr>
+            <td><strong>P3</strong></td>
+            <td>预算/质量分预警、非用户面向</td>
+            <td>群消息，工作时间处理</td>
+            <td>下一工作日</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist oncall 升级链</h5>
+        <pre class="mermaid">flowchart TD
+  A[告警触发] --> B{L1 oncall ACK?}
+  B -->|5min 内| C[incident triage]
+  B -->|超时| D[L2 备班电话]
+  C --> E{需变更/回滚?}
+  E -->|是| F[拉 SRE + 业务负责人]
+  E -->|否| G[Runbook 闭环]
+  D --> C</pre>
+        <p class="diagram-caption">L1 负责 <span class="term" data-term-id="incident-triage" tabindex="0">incident triage</span>：先定范围（租户/版本/模型），再选 Runbook 分支。</p>
+      </div>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">L1 oncall</span>
+          <p class="role-card-desc">ACK、开 incident 频道、按 Runbook 前 3 步采集 trace_id。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">L2 领域专家</span>
+          <p class="role-card-desc">RAG/模型/网关分工；决定是否触发灰度回滚（见 <a href="#ch-practice-02-gray-release">灰度与版本管理</a>）。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">经理 escalation</span>
+          <p class="role-card-desc">P1 超 30 分钟未缓解、或需对外公告时介入。</p>
+        </article>
+      </div>
+      <div class="notice">
+        <strong>对抗 alert fatigue</strong>
+        <ul>
+          <li><strong>合并</strong>：同一 root cause 只保留一条父告警。</li>
+          <li><strong>静默窗口</strong>：计划发布期间抑制已知噪声（须登记变更单）。</li>
+          <li><strong>定期回顾</strong>：每月统计「无行动告警」比例，删或降级规则。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Runbook</h3>
+      <p><span class="term" data-term-id="runbook-link" tabindex="0">runbook link</span> 是告警的「下一步按钮」。好的 Runbook 在 3 分钟内让 L1 完成：确认影响面 → 定位组件 → 临时缓解。</p>
+      <h4>Runbook 模板（LLM P95 高）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown"># Runbook: CorpAssist 客服 P95 过高
+
+## 0. 影响确认（2 min）
+- [ ] Dashboard: chat-latency — 是否全租户 or 单 tenant_id?
+- [ ] 最近变更: prompt / model / index 版本（version-registry）
+- [ ] 关联 Trace: 过滤 service=corpassist-bff AND span=llm.invoke
+
+## 1. 快速分流
+| 现象 | 可能根因 | 动作 |
+|------|----------|------|
+| Python RAG span 慢 | 向量库 / 重排 | 查 retrieval P95 |
+| llm.invoke 慢 | 模型 API 限流 | 切备用 model-version |
+| BFF 5xx 升 | 下游 ERP | 熔断 + 降级回复 |
+
+## 2. 缓解
+- 触发 rollback-switch（feature-flag 回滚上一 prompt-version）
+- 若单租户: 租户级限流
+
+## 3. 升级条件
+- 15 min 未恢复 → L2 + 考虑 P1
+- 怀疑越权 → 立即拉安全 oncall</code></pre>
+      </div>
+      <p>Runbook 中的 Trace/日志跳转依赖 <a href="#ch-basics-02-langsmith-mm">LangSmith 与 Micrometer</a> 统一埋点；排障细节见 <a href="#ch-practice-03-log-analytics">日志分析</a>。</p>
+      <div class="learn-faq">
+        <details>
+          <summary>Runbook 写进 Wiki 还是放在 Git？</summary>
+          <div class="learn-faq-body">Git 版本化 + Wiki 渲染均可；关键是告警 <code>annotations.runbook_url</code> 稳定可访问，且与代码变更同步 review。</div>
+        </details>
+        <details>
+          <summary>PagerDuty 与 Grafana OnCall 选哪个？</summary>
+          <div class="learn-faq-body">工具无关；<span class="term" data-term-id="pager-duty" tabindex="0">pager duty</span> 在本课指<strong>轮值排班 + 电话升级</strong>能力，须与 severity 映射文档化。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>规则</strong>：SLO 对齐、多维分组、burn-rate 抑抖；LLM 补 TTFT/Token/工具失败维度。</li>
+        <li><strong>升级</strong>：P1–P3 映射通知渠道与 ACK 时限；用合并与静默对抗 <span class="term" data-term-id="alert-fatigue" tabindex="0">alert fatigue</span>。</li>
+        <li><strong>Runbook</strong>：告警必链可执行步骤；CorpAssist 先定租户/版本范围再分流 BFF/RAG/LLM。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="observability-reliability-ops_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="rule-slo" /> 能写一条带 <code>for</code> 与 runbook_url 的 alert rule</label></li>
+          <li><label><input type="checkbox" data-id="sev-map" /> 能说明 P1/P2/P3 与通知渠道映射</label></li>
+          <li><label><input type="checkbox" data-id="escalation" /> 能画出 5 分钟未 ACK 的升级路径</label></li>
+          <li><label><input type="checkbox" data-id="runbook" /> 能列出 Runbook 前 3 步（影响确认 → 分流 → 缓解）</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>alert rule</td><td>可行动、有维度、对齐 SLO</td></tr>
+                <tr><td>slo alert</td><td>burn-rate 比固定阈值更稳</td></tr>
+                <tr><td>escalation</td><td>ACK 超时必须自动升级</td></tr>
+                <tr><td>runbook link</td><td>告警 = 入口，Runbook = 路径</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何区分「需要叫醒人」与「只需记指标」的告警？</li>
+              <li>CorpAssist 双栈故障，oncall 第一步为什么先查 tenant_id 而非直接重启 Pod？</li>
+              <li>alert fatigue 的三种工程手段是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-practice-02-gray-release">灰度与版本管理</a> 讲 prompt/模型/索引版本与回滚开关。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/" target="_blank" rel="noopener">Prometheus — Alerting rules</a></li>
+      <li><a href="https://grafana.com/docs/grafana/latest/alerting/" target="_blank" rel="noopener">Grafana Alerting</a></li>
+      <li><a href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">Google SRE — Alerting on SLOs</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 CorpAssist 客服 S2 场景，完成<strong>告警规则表</strong>、<strong>升级矩阵</strong>与<strong>Runbook 骨架</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照 <a href="#ch-basics-03-dashboard-slo">Dashboard 与 SLO</a>，为「P95 &lt; 3s、错误率 &lt; 0.1%」各写一条 <span class="term" data-term-id="alert-rule" tabindex="0">alert rule</span> 草案（含 <code>for</code>、<code>severity</code>、<code>runbook_url</code>）。</li>
+      <li>填写 P1/P2/P3 升级矩阵：通知渠道、ACK 时限、超时后升级到谁；标注哪些走 <span class="term" data-term-id="pager-duty" tabindex="0">pager duty</span> 电话。</li>
+      <li>为「LLM P95 高」Runbook 写 §0 影响确认清单（至少 3 个 checkbox），含 tenant_id 与最近 prompt/model 版本查询。</li>
+      <li>（可选）完成 <code>demos/practice-01-alerting-lab/</code>，与上述产出交叉核对。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">oncall 收到 12 条「Pod CPU &gt; 80%」同时告警，用户侧无感知。最应先做：① 全部 ACK ② 合并为一条父告警并查 ingress 5xx ③ 逐条打电话确认 ④ 删除 CPU 规则。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>②</strong>：先找用户面向症状，配置 inhibit 避免 <span class="term" data-term-id="alert-fatigue" tabindex="0">alert fatigue</span>。④ 可后续评估，但不应在 incident 中仓促删除。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">哪条<strong>违反</strong> good alert 原则？① slo alert 用 5m burn-rate ② P1 告警无 runbook_url ③ Token 超预算 P3 群消息 ④ 告警按 tenant_id 分组</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>②</strong>：P1 无 Runbook 会导致 <span class="term" data-term-id="incident-triage" tabindex="0">incident triage</span> 无从下手。①③④ 均符合本章原则。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist 告警与 oncall 实验室</h4>
+      <p>目录：<code>demos/practice-01-alerting-lab/</code>。<strong>验收</strong>：提交 2 条 YAML 规则 + 1 份 Runbook §0 清单，并通过 lab 中的 alert-checklist。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-gray-release">灰度与版本管理</a> — oncall 常需触发版本回滚</li>
+      <li><a href="#ch-basics-04-token-cost">Token 成本治理</a> — Token 预算类告警规则</li>
+      <li><a href="#ch-practice-03-log-analytics">日志分析</a> — Runbook 中的 Trace/日志跳转</li>
+    </ul>
+  </div>
+</section>

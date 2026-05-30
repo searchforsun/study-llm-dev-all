@@ -47,16 +47,14 @@ npx --yes serve .
 node scripts/sync.mjs
 ```
 
-单课正文中将课程 slug 补充为「中文名 + 链接」：
+单课生成流水线（bootstrap → 章节/demo → merge → enrich → assemble）见各课 `README.md`；常驻脚本：
 
-```powershell
-node scripts/enrich-course-refs.mjs --dir llm-application-fundamentals
-node scripts/enrich-curriculum-terms.mjs --dir llm-application-fundamentals
-```
-
-`enrich-curriculum-terms` 将正文中的 S1～S5、NS1～NS3 转为带**行业说法 hover**的术语 span；术语真源在 `outline-specs.json` → `sync.mjs` → `courses.json` 的 `curriculumGlossary`。
-
-（读取 `courses.json` 的 `courseTitleCatalog`，更新 `chapters/*.html` 与 `welcome.partial.html`，并写入 `course.json` → `courseCatalog`。）
+| 脚本 | 用途 |
+|------|------|
+| `sync.mjs` | `outline-specs.json` → `courses.json` |
+| `bootstrap-course-from-spec.mjs` | 从 spec 初始化单课目录 |
+| `merge-course-manifests.mjs` | 合并 manifest-*.json → course.json |
+| `enrich-term-prompts.mjs` | 补全术语 tip / prompt |
 
 ## 生成单课（programming-html-tutorial）
 

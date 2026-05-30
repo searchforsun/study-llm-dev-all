@@ -1,0 +1,392 @@
+<section id="ch-basics-04-eval-routing" class="chapter" data-chapter="basics-04-eval-routing">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>路由效果评测</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-eval-routing" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>多模型路由</strong> · 能力：定义路由质量/成本指标并设计 A/B 实验</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>上一章落地了 Spring + Python <span class="term" data-term-id="dual-stack-route" tabindex="0">dual stack route</span>，但若从不评测，「FAQ 改走 turbo」可能在 S5 附件场景悄悄降质。CorpAssist <strong>NS3 成本路由</strong> 要求<strong>质量与成本同时可见</strong>。本章建立 <span class="term" data-term-id="routing-eval" tabindex="0">routing eval</span> 体系：离线基准 → 回归门禁 → 线上 A/B，避免路由拍脑袋。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 S5 场景定义 <span class="term" data-term-id="router-kpi" tabindex="0">router kpi</span>：<span class="term" data-term-id="quality-metric" tabindex="0">quality metric</span> 与 <span class="term" data-term-id="cost-metric" tabindex="0">cost metric</span></li>
+          <li>搭建 <span class="term" data-term-id="offline-benchmark" tabindex="0">offline benchmark</span>（≥200 条）并检测 <span class="term" data-term-id="route-regression" tabindex="0">route regression</span></li>
+          <li>设计 <span class="term" data-term-id="ab-test-route" tabindex="0">ab test route</span>，用 <span class="term" data-term-id="win-rate" tabindex="0">win rate</span> 决策是否全量切换策略</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>先离线后线上</strong>：改 YAML 前跑 benchmark，避免生产试错。</li>
+          <li><strong>质量 ≠ 单一分数</strong>：附件问答看 grounded 率，内容创作看人工 rubric，成本看 Token/请求。</li>
+          <li><strong>A/B 要可回滚</strong>：实验组流量可控、周期固定（如 7 天），未达 win-rate 阈值则回滚。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>指标</h3>
+      <p><span class="term" data-term-id="routing-eval" tabindex="0">routing eval</span> 的核心是把「路由决策好不好」拆成可量化、可对比的 <span class="term" data-term-id="router-kpi" tabindex="0">router kpi</span>。CorpAssist S5 至少跟踪<strong>质量、成本、可靠性</strong>三类。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>KPI 类别</th><th>代表指标</th><th>S5 附件问答示例</th><th>采集点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="term" data-term-id="quality-metric" tabindex="0">quality metric</span></td>
+            <td>grounded 率、人工 rubric 均分</td>
+            <td>回答是否引用 OCR 片段</td>
+            <td>离线标注集 + 抽样人工</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="cost-metric" tabindex="0">cost metric</span></td>
+            <td>每请求 Token、每成功问答成本</td>
+            <td>vision_qa 是否滥用 VL</td>
+            <td>Gateway + Router 审计日志</td>
+          </tr>
+          <tr>
+            <td>可靠性</td>
+            <td>Fallback 触发率、P95 延迟</td>
+            <td>429 后降级成功率</td>
+            <td>Micrometer / 日志</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">offline benchmark</span>
+          <p class="role-card-desc">固定 200+ 条标注样本，每次改 routing.yaml 全量重跑，作为合并前门禁。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">route regression</span>
+          <p class="role-card-desc">对比基线策略：质量下降 &gt;2% 或成本上升 &gt;15% 则阻断发布。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">router kpi 看板</span>
+          <p class="role-card-desc">按 intent 分桶展示质量/成本，支撑 NS3 成本路由决策。</p>
+        </article>
+      </div>
+      <h4>离线评测脚本（Python 轨）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">import json
+from pathlib import Path
+from route_service import RouteService
+
+def run_offline_benchmark(
+    service: RouteService,
+    dataset: Path,
+    baseline: dict | None = None,
+) -> dict:
+    rows = [json.loads(line) for line in dataset.read_text().splitlines()]
+    total_cost = 0.0
+    grounded_hits = 0
+
+    for row in rows:
+        result = service.complete(row["intent"], row["messages"])
+        total_cost += result.get("cost_usd", 0)
+        if row.get("expected_citation") in result.get("content", ""):
+            grounded_hits += 1
+
+    metrics = {
+        "samples": len(rows),
+        "grounded_rate": grounded_hits / len(rows),
+        "avg_cost_usd": total_cost / len(rows),
+        "fallback_rate": service.stats.fallback_rate,
+    }
+    if baseline:
+        metrics["regression"] = {
+            "grounded_delta": metrics["grounded_rate"] - baseline["grounded_rate"],
+            "cost_delta_pct": (metrics["avg_cost_usd"] - baseline["avg_cost_usd"])
+                              / baseline["avg_cost_usd"],
+        }
+    return metrics</code></pre>
+      </div>
+      <h4>router-kpi 配置示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">router_kpi:
+  version: "2026.05"
+  gates:
+    offline:
+      min_samples: 200
+      max_grounded_regression: -0.02   # 质量不得降 2%
+      max_cost_increase_pct: 0.15      # 成本不得涨 15%
+    online:
+      p95_latency_ms: 3000
+      fallback_rate_max: 0.08
+  intents:
+    vision_qa:
+      quality: grounded_rate
+      cost: avg_tokens_per_request
+    faq:
+      quality: exact_match_rate
+      cost: avg_cost_usd</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>离线 benchmark → 回归门禁</h5>
+        <pre class="mermaid">flowchart LR
+  YAML[改 routing.yaml] --> DS[200条离线集]
+  DS --> RUN[Python benchmark]
+  RUN --> CMP{对比基线}
+  CMP -->|通过| MR[允许合并]
+  CMP -->|route regression| BLOCK[阻断发布]
+  MR --> AB[可选: 线上 A/B]</pre>
+        <p class="diagram-caption">Spring 轨可在 CI 调用同一 benchmark 容器，保证双栈评测口径一致。</p>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只看「用户没投诉」就当路由合格</li>
+            <li>离线样本 &lt;50 条，无法覆盖 vision_qa 长尾</li>
+            <li>质量与成本只报全局均值，不拆 intent</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li><span class="term" data-term-id="offline-benchmark" tabindex="0">offline benchmark</span> ≥200 条，含多模态附件</li>
+            <li><span class="term" data-term-id="route-regression" tabindex="0">route regression</span> 阈值写入 CI</li>
+            <li>按 intent 输出 <span class="term" data-term-id="quality-metric" tabindex="0">quality metric</span> 与 <span class="term" data-term-id="cost-metric" tabindex="0">cost metric</span> 双轴报表</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · NS3 · 成本路由评测</span>
+        拟将 <code>faq</code> 从 <code>qwen-plus</code> 降到 <code>qwen-turbo</code>：先在离线集跑 benchmark，若 exact_match_rate 降 1.5%、成本降 40%，满足 regression 门禁后再开 10% 线上 A/B。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Fallback 触发率升高一定是坏事吗？</summary>
+        <p>不一定。若主模型频繁 429，Fallback 保证可用性；需结合<strong>质量是否下降</strong>与<strong>成本是否飙升</strong>看。单独 KPI 可能误判，应纳入 router-kpi 看板联动分析。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>A/B</h3>
+      <p>离线通过后，用 <span class="term" data-term-id="ab-test-route" tabindex="0">ab test route</span> 在小流量验证真实用户行为。实验单位通常是 <code>user_id</code> 或 <code>session_id</code>，保证同一用户始终落在 A 或 B 组。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>要素</th><th>推荐做法</th><th>CorpAssist S5 注意点</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>分流键</td><td>hash(user_id) % 100</td><td>与 Gateway 鉴权后的 stable id 一致</td></tr>
+          <tr><td>周期</td><td>至少 7 天（含周末流量）</td><td>覆盖附件上传高峰</td></tr>
+          <tr><td>成功标准</td><td><span class="term" data-term-id="win-rate" tabindex="0">win rate</span> + 成本不劣化</td><td>B 组质量 ≥ A 且成本 ≤ A×0.9</td></tr>
+          <tr><td>回滚</td><td>feature flag 切回 control</td><td>保留 audit 字段对比</td></tr>
+        </tbody>
+      </table>
+      <h4>Spring 侧实验分流（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Component
+public class RouteExperimentAssigner {
+
+  public RouteVariant assign(String userId, ExperimentConfig exp) {
+    int bucket = Math.floorMod(userId.hashCode(), 100);
+    if (bucket &lt; exp.trafficPercentB()) {
+      return RouteVariant.TREATMENT;  // 新 routing.yaml 版本
+    }
+    return RouteVariant.CONTROL;
+  }
+}
+
+@Service
+public class EvaluatingRouter {
+  public ChatResponse route(RouteRequest req) {
+    RouteVariant variant = assigner.assign(req.userId(), experimentConfig);
+    RoutePolicy policy = policyLoader.load(variant);
+    ChatResponse resp = innerRouter.route(req, policy);
+    audit.log(Map.of(
+        "experiment", experimentConfig.id(),
+        "variant", variant.name(),
+        "model", resp.getMetadata().get("model")
+    ));
+    return resp;
+  }
+}</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>A/B 路由实验生命周期</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 用户
+  participant GW as Gateway
+  participant ER as EvaluatingRouter
+  participant A as Control 策略
+  participant B as Treatment 策略
+  participant KPI as router-kpi 看板
+  U->>GW: 附件问答
+  GW->>ER: userId + request
+  alt bucket in B组
+    ER->>B: 新 YAML v2
+  else bucket in A组
+    ER->>A: 基线 YAML v1
+  end
+  ER->>KPI: 写入 quality/cost 事件
+  Note over KPI: 7天后算 win-rate</pre>
+        <p class="diagram-caption">实验结束：若 treatment <span class="term" data-term-id="win-rate" tabindex="0">win rate</span> ≥55% 且成本达标，promote v2 为全量 unified policy。</p>
+      </div>
+      <h4>win-rate 计算（评测报告片段）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def compute_win_rate(paired_scores: list[tuple[float, float]]) -> float:
+    """paired_scores: (control_quality, treatment_quality) per session"""
+    wins = sum(1 for a, b in paired_scores if b > a)
+    ties = sum(1 for a, b in paired_scores if b == a)
+    return (wins + 0.5 * ties) / len(paired_scores)
+
+# 示例：200 对会话，treatment 胜 118、平 12、负 70
+# win_rate = (118 + 6) / 200 = 0.62</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>A/B 只跑 1 天就大范围全量</li>
+            <li>对照组与实验组用不同 DashScope 账号，成本不可比</li>
+            <li>未设 win-rate 阈值，凭主观「感觉更快」上线</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>固定 7 天 + 明确 promote/rollback 规则</li>
+            <li>审计日志带 <code>experiment_id</code> 与 <code>variant</code></li>
+            <li>离线 <span class="term" data-term-id="route-regression" tabindex="0">route regression</span> 通过后再开 A/B</li>
+          </ul>
+        </div>
+      </div>
+      <div class="notice">
+        <strong>关键术语速览</strong>
+        <p>
+          <span class="term" data-term-id="routing-eval" tabindex="0">routing eval</span> ·
+          <span class="term" data-term-id="ab-test-route" tabindex="0">ab test route</span> ·
+          <span class="term" data-term-id="quality-metric" tabindex="0">quality metric</span> ·
+          <span class="term" data-term-id="cost-metric" tabindex="0">cost metric</span> ·
+          <span class="term" data-term-id="route-regression" tabindex="0">route regression</span> ·
+          <span class="term" data-term-id="offline-benchmark" tabindex="0">offline benchmark</span> ·
+          <span class="term" data-term-id="win-rate" tabindex="0">win rate</span> ·
+          <span class="term" data-term-id="router-kpi" tabindex="0">router kpi</span>
+        </p>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：离线 benchmark 已通过，是否可以直接 100% 切新策略？</summary>
+        <p>不建议。离线集无法覆盖全部线上长尾（新附件格式、峰值 429）。应先用 <span class="term" data-term-id="ab-test-route" tabindex="0">ab test route</span> 小流量验证，再用 win-rate 与 cost-metric 决策全量。</p>
+      </details>
+      <div class="learn-faq">
+        <details>
+          <summary>评测数据集 200 条从哪来？</summary>
+          <div class="learn-faq-body">脱敏历史 S5 问答 + 人工构造 vision_qa 边界样例（扫描 PDF、纯图、无 OCR 文本）。每季度增补，防止过拟合旧路由。</div>
+        </details>
+        <details>
+          <summary>与 advanced NS3 成本路由章如何衔接？</summary>
+          <div class="learn-faq-body">本章建立 KPI 与 A/B 方法论；advanced 章在 KPI 达标前提下做 small-model-first、semantic cache 等策略，仍依赖同一 offline benchmark 门禁。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>指标</strong>：<span class="term" data-term-id="router-kpi" tabindex="0">router kpi</span> 分质量、成本、可靠性；<span class="term" data-term-id="offline-benchmark" tabindex="0">offline benchmark</span> ≥200 条 + <span class="term" data-term-id="route-regression" tabindex="0">route regression</span> 门禁。</li>
+        <li><strong>A/B</strong>：<span class="term" data-term-id="ab-test-route" tabindex="0">ab test route</span> 小流量验证，用 <span class="term" data-term-id="win-rate" tabindex="0">win rate</span> 与 <span class="term" data-term-id="cost-metric" tabindex="0">cost metric</span> 决策 promote 或回滚。</li>
+        <li><strong>双栈</strong>：Python 跑 benchmark，Spring 写实验分流与审计，口径统一。</li>
+        <li><strong>下一步</strong>：basics 阶段收束，进入 <a href="#ch-practice-01-vision-rag">图文 RAG 与 OCR</a> 实践多模态链路。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="multimodel-routing-multimodal_basics04_eval_routing">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="kpi" /> 能列举 2 个 quality-metric 与 2 个 cost-metric</label></li>
+          <li><label><input type="checkbox" data-id="offline" /> 能说明 offline benchmark 最低样本量与 regression 阈值</label></li>
+          <li><label><input type="checkbox" data-id="ab" /> 能口述 A/B 分流键、周期与 win-rate 含义</label></li>
+          <li><label><input type="checkbox" data-id="gate" /> 能解释「先离线后线上」的发布顺序</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>offline benchmark</td><td>改 YAML 前必跑，≥200 条</td></tr>
+                <tr><td>route regression</td><td>质量/成本越界则阻断合并</td></tr>
+                <tr><td>ab test route</td><td>小流量验证真实行为</td></tr>
+                <tr><td>win rate</td><td>treatment 优于 control 的比例</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成下方 Demo 与右侧测验；进入 practice 阶段 <a href="#ch-practice-01-vision-rag">图文 RAG 与 OCR</a>，把路由接到 DashScope VL 多模态链路上。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://help.aliyun.com/zh/model-studio/use-cases/evaluate-model-performance" target="_blank" rel="noopener">百炼 — 模型评测</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html#actuator.metrics" target="_blank" rel="noopener">Spring Boot Micrometer 指标</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">百炼 Model Studio</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 25 分钟 · 勾选 eval-checklist，完成一次离线 benchmark 报告骨架。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/basics-04-eval-routing-lab/eval-checklist.md</code>，逐项勾选。</li>
+      <li>准备或引用 200 条离线样本 JSONL（含 <code>intent</code>、<code>messages</code>、<code>expected_citation</code>）。</li>
+      <li>用上一章 Python <code>RouteService</code> 跑 benchmark，记录 grounded_rate 与 avg_cost。</li>
+      <li>模拟 route regression：将某 intent 改错模型，确认 CI 门禁失败。</li>
+      <li>设计一张 7 天 A/B 实验表（分流比例、win-rate 阈值、回滚条件），完成右侧测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">离线 benchmark 显示成本降 30%、grounded_rate 降 0.5%，门禁阈值是质量不得降 2%。能否合并 PR？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>可以合并进仓库，但<strong>不应直接全量上线</strong>。0.5% 在门禁内，可进入 A/B；若线上 vision_qa 长尾更敏感，仍可能在 A/B 中暴露问题，需盯 router-kpi 看板。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">A/B 第 3 天 treatment 组 win-rate 已达 60%，能否提前全量？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不建议。周期未覆盖完整周流量（尤其 S5 附件高峰），且样本不足。应跑满约定 7 天或达到最小样本量后再 promote。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：路由效果评测</h4>
+      <p>目录：<code>demos/basics-04-eval-routing-lab/</code>。<strong>验收</strong>：勾选 eval-checklist 三项（离线集 200 条、成本统计、A/B 7 天），并输出一页 benchmark 摘要。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-03-spring-python">双栈路由实现</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-vision-rag">图文 RAG 与 OCR</a></li>
+      <li><strong>advanced</strong>：<a href="#ch-advanced-01-cost-router">成本感知路由</a> — NS3 策略深化</li>
+    </ul>
+  </div>
+</section>

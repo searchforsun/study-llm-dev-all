@@ -1,0 +1,372 @@
+<section id="ch-basics-01-three-pillars" class="chapter" data-chapter="basics-01-three-pillars">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>日志、指标、追踪</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01-three-pillars" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>可观测基础</strong> · 能力：解释 OTel 三支柱并在 CorpAssist 双栈建立统一埋点基线</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 是 Spring AI BFF + Python Agent/RAG 双栈：用户一次客服提问会穿越网关、Java 编排、Python 检索与 LLM 调用。若只有「Java 有日志、Python 有 LangSmith」而<strong>没有</strong>统一的 <span class="term" data-term-id="correlation-id" tabindex="0">correlation id</span>，oncall 只能凭时间戳猜链路——NS3（成本/延迟）也无法按租户归因。本章用 <span class="term" data-term-id="opentelemetry" tabindex="0">OpenTelemetry</span> 把 <span class="term" data-term-id="three-pillars" tabindex="0">three pillars</span> 落到双栈工程约定，为后续 LangSmith/Micrometer 看板打地基。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>区分 Logs / Metrics / Traces 各自回答什么问题，并说明为何 LLM 系统<strong>三者都要</strong></li>
+          <li>为 CorpAssist BFF 与 Python 服务列出 <span class="term" data-term-id="obs-baseline" tabindex="0">obs baseline</span> 必含字段（含 <code>request_id</code>、<code>trace_id</code>、<code>tenant_id</code>）</li>
+          <li>配置 W3C Trace Context 传播，使一次 S2 客服请求在 Java 与 Python 侧落在同一 trace</li>
+          <li>衔接 <a href="#ch-basics-02-langsmith-mm">LangSmith 与 Micrometer</a> 的跨栈指标关联</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 2 件事</strong>
+        <ul>
+          <li><strong>三支柱分工</strong>：日志讲「发生了什么」、指标讲「有多糟/多快」、追踪讲「慢在哪一段」——单靠其中一种无法闭环排障。</li>
+          <li><strong>双栈先统一 ID</strong>：<span class="term" data-term-id="dual-stack-instrument" tabindex="0">dual stack instrument</span> 的第一优先级是 <code>request_id</code> + W3C <code>traceparent</code> 全链路贯通，再谈各自 SDK 细节。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OTel</h3>
+      <p><span class="term" data-term-id="opentelemetry" tabindex="0">OpenTelemetry</span>（OTel）是厂商中立的观测标准：定义 trace/metric/log 的数据模型、API 与 Collector 管道，避免「Java 用 APM、Python 用 B 产品、日志又在 C 系统」的三套孤岛。CorpAssist 选型 OTel 作为<strong>传播与导出层</strong>，LangSmith 仍负责 LLM 语义 span，Micrometer 负责 Spring 侧指标——二者通过同一 trace 根 ID 关联。</p>
+
+      <h4>三支柱：各回答什么问题？</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>支柱</th><th>典型信号</th><th>CorpAssist 示例</th><th>排障场景</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Logs</strong></td>
+            <td>离散事件文本/JSON</td>
+            <td>BFF 记录「转发 RAG 请求 tenant=acme」</td>
+            <td>查某次 403 是否 ACL 拦截</td>
+          </tr>
+          <tr>
+            <td><strong>Metrics</strong></td>
+            <td>聚合数值（counter/histogram）</td>
+            <td><code>llm.tokens.total{tenant=acme}</code></td>
+            <td>NS3：某租户 Token 成本突增</td>
+          </tr>
+          <tr>
+            <td><strong>Traces</strong></td>
+            <td>请求级 span 树 + 耗时</td>
+            <td>gateway → bff → rag-service → embedding</td>
+            <td>P95 从 2s 涨到 8s，定位慢在向量检索</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>三者在 OTel 里共享 <strong>Resource</strong>（<code>service.name</code>、<code>deployment.environment</code>）与 <strong>Context</strong>（trace/span id），这就是 <span class="term" data-term-id="metrics-trace" tabindex="0">metrics trace</span> 关联的基础：指标卡片上点一下能跳进 trace，trace 里又能搜到同 ID 的日志。</p>
+
+      <h4>CorpAssist 观测拓扑（预习）</h4>
+      <div class="mermaid-wrap">
+        <h5>OTel 三支柱在双栈中的落点</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph ingress [入口]
+    GW[API Gateway]
+    BFF[Spring AI BFF]
+  end
+  subgraph python [Python 能力面]
+    RAG[rag-service]
+    AGT[agent-service]
+  end
+  subgraph signals [三支柱]
+    L[Structured Logs]
+    M[Micrometer Metrics]
+    T[OTel Traces]
+  end
+  subgraph backend [后端]
+    COL[OTel Collector]
+    GRA[Grafana / Tempo]
+  end
+  GW --> BFF
+  BFF -->|HTTP + traceparent| RAG
+  BFF --> AGT
+  BFF --> L
+  BFF --> M
+  BFF --> T
+  RAG --> L
+  RAG --> T
+  L --> COL
+  M --> COL
+  T --> COL
+  COL --> GRA</pre>
+        <p class="diagram-caption">BFF 与 Python 服务各自用 <span class="term" data-term-id="otel-sdk" tabindex="0">OTel SDK</span> 导出；Collector 统一采样与路由，避免每个服务直连不同 SaaS。</p>
+      </div>
+
+      <h4>BFF 侧 OTel 配置（Spring Boot 3）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">management:
+  otlp:
+    tracing:
+      endpoint: http://otel-collector:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 0.1   # 生产可按 tenant 调高
+spring:
+  application:
+    name: corpassist-bff
+otel:
+  resource:
+    attributes:
+      service.namespace: corpassist
+      deployment.environment: prod
+  propagators: tracecontext,baggage</code></pre>
+      </div>
+
+      <h4>反例 vs 推荐：观测选型</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Java 用 Zipkin、Python 用 Jaeger 不同 trace 格式</li>
+            <li>只在 BFF 开 trace，Python 侧无 SDK</li>
+            <li>日志纯文本，无 <code>trace_id</code> 字段</li>
+            <li>100% 采样导致 Collector 与存储成本失控</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>OTel + W3C Trace Context 作为唯一传播标准</li>
+            <li>双栈均接入 <span class="term" data-term-id="otel-sdk" tabindex="0">OTel SDK</span> 或兼容 Agent</li>
+            <li><span class="term" data-term-id="structured-log" tabindex="0">structured log</span> JSON，含关联字段</li>
+            <li>按路由/租户分层采样（错误请求 100% 保留）</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：只有 Metrics 没有 Traces，能定位「RAG 慢还是 LLM 慢」吗？</summary>
+        <p>很难。聚合 P95 只能告诉你「整体变慢」；没有 span 树无法区分 embedding、向量库、重排、LLM 哪一段占时。Metrics 适合告警，Traces 适合根因分析——<span class="term" data-term-id="three-pillars" tabindex="0">three pillars</span> 互补而非替代。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈埋点</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 智能客服 S2（45 秒）</span>
+        用户问「我的订单 ORD-8842 到哪了？」请求经网关进入 Spring AI BFF：鉴权、注入 <code>request_id</code>、调用 Python <code>agent-service</code> 查 ERP 工具。Python 侧又触发 RAG 检索制度 FAQ。oncall 收到告警「P95 &gt; 5s」——若没有 <span class="term" data-term-id="correlation-id" tabindex="0">correlation id</span> 贯通，Java 日志与 Python 日志无法拼成一条故事线。
+      </aside>
+
+      <p><span class="term" data-term-id="dual-stack-instrument" tabindex="0">dual stack instrument</span> 的核心不是「两边各写一套」，而是<strong>同一套关联键 + 同一套传播头</strong>。CorpAssist <span class="term" data-term-id="obs-baseline" tabindex="0">obs baseline</span> 要求如下。</p>
+
+      <h4>结构化日志必含字段</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>字段</th><th>谁生成</th><th>用途</th><th>缺失后果</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>request_id</code></td>
+            <td>网关或 BFF（入口）</td>
+            <td>业务级关联键；写入 LangSmith metadata</td>
+            <td>无法从 Grafana 跳进 LangSmith trace</td>
+          </tr>
+          <tr>
+            <td><code>trace_id</code> / <code>span_id</code></td>
+            <td>OTel SDK</td>
+            <td>分布式追踪；日志↔trace 互跳</td>
+            <td>日志与 Tempo/Jaeger 对不上</td>
+          </tr>
+          <tr>
+            <td><code>tenant_id</code></td>
+            <td>鉴权层</td>
+            <td>NS3 成本/配额归因</td>
+            <td>Token 账单无法分租户</td>
+          </tr>
+          <tr>
+            <td><code>model_id</code></td>
+            <td>调用 LLM 前</td>
+            <td>延迟与成本分模型</td>
+            <td>换模型后回归无法对比</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>Java BFF：MDC + 出站传播</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// Filter：入口注入 request_id，写入 MDC 与 OTel Baggage
+String requestId = Optional.ofNullable(req.getHeader("X-Request-Id"))
+    .orElse(UUID.randomUUID().toString());
+MDC.put("request_id", requestId);
+MDC.put("tenant_id", auth.tenantId());
+Baggage.current().toBuilder().put("request_id", requestId).build().makeCurrent();
+
+// RestClient 调 Python：traceparent 由 OTel 自动注入
+restClient.post()
+    .uri("/v1/agent/chat")
+    .header("X-Request-Id", requestId)
+    .body(payload)
+    .retrieve();</code></pre>
+      </div>
+
+      <h4>Python 服务：接收头 + 结构化日志</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import structlog
+from opentelemetry import trace
+from opentelemetry.propagate import extract
+
+tracer = trace.get_tracer(__name__)
+
+@app.post("/v1/agent/chat")
+async def chat(request: Request, body: ChatRequest):
+    ctx = extract(request.headers)
+    request_id = request.headers.get("x-request-id", "unknown")
+    with tracer.start_as_current_span("agent.chat", context=ctx) as span:
+        span.set_attribute("request_id", request_id)
+        span.set_attribute("tenant_id", body.tenant_id)
+        log.info("agent_invoke", request_id=request_id,
+                 trace_id=format(span.get_span_context().trace_id, "032x"),
+                 model_id=body.model_id)</code></pre>
+      </div>
+
+      <h4>一次客服请求的 trace 传播</h4>
+      <div class="mermaid-wrap">
+        <h5>traceparent 穿越 Java → Python</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 用户
+  participant B as corpassist-bff
+  participant P as agent-service
+  participant L as LLM
+  U->>B: POST /chat (X-Request-Id)
+  Note over B: MDC + OTel root span
+  B->>P: HTTP traceparent + X-Request-Id
+  Note over P: child span rag + tool
+  P->>L: completion
+  L-->>P: tokens
+  P-->>B: SSE chunk
+  B-->>U: 流式回复</pre>
+        <p class="diagram-caption">同一 <code>trace_id</code> 下 BFF 的 gateway span 与 Python 的 <code>agent.chat</code> span 为父子关系；<span class="term" data-term-id="structured-log" tabindex="0">structured log</span> 行内携带相同 ID 供日志平台关联。</p>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只传 request_id 不传 trace</strong> — LangSmith 与 OTel 各一条线，无法在同一 trace 视图看全链路。</li>
+          <li><strong>日志里打完整 prompt</strong> — 违反安全课 redaction 要求；obs baseline 只记录 hash/长度/模型，不记录 PII 原文。</li>
+          <li><strong>本地 dev 关 OTel</strong> — 导致「我机器上没问题」与生产传播差异；至少 dev 也走 Collector 或 console exporter。</li>
+        </ul>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>Baggage 与 MDC 有何不同？</summary>
+        <p>MDC 通常只在本进程日志可见；OTel Baggage 会随 <code>traceparent</code> 传到下游，适合把 <code>tenant_id</code>、<code>request_id</code> 写入 Python span attribute，无需重复解析 JWT。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>OTel</strong>：三支柱分工明确——Metrics 告警、Traces 定位、Logs 补上下文；Collector 统一双栈导出，W3C 传播避免格式分裂。</li>
+        <li><strong>双栈埋点</strong>：obs baseline 四字段（<code>request_id</code>、trace/span、<code>tenant_id</code>、<code>model_id</code>）必须全链路出现；BFF 负责生成与注入，Python 负责继承与回写。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="observability-reliability-ops_basics01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pillars" /> 能各举 1 个 CorpAssist 场景说明 Logs / Metrics / Traces 用途</label></li>
+          <li><label><input type="checkbox" data-id="fields" /> 能列出 obs baseline 四个必含字段及缺失后果</label></li>
+          <li><label><input type="checkbox" data-id="propagate" /> 能解释 traceparent 如何从 BFF 传到 Python</label></li>
+          <li><label><input type="checkbox" data-id="compare" /> 能说出「只传 request_id 不传 trace」的问题</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>three pillars</td><td>日志事件、指标聚合、追踪路径——缺一不可</td></tr>
+                <tr><td>correlation id</td><td>request_id 是业务主键，trace_id 是技术主键</td></tr>
+                <tr><td>dual stack</td><td>同一传播标准，不是两套孤岛</td></tr>
+                <tr><td>obs baseline</td><td>四字段贯通才能 NS3 归因与排障</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 LLM 系统不能只做 Metrics 不做 Traces？</li>
+              <li>CorpAssist 双栈里，request_id 应在哪一层生成？为什么？</li>
+              <li>结构化日志与 span attribute 重复存 tenant_id，是否浪费？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：勾选过关清单、完成 Demo 与测验；下一章 <a href="#ch-basics-02-langsmith-mm">LangSmith 与 Micrometer</a> 讲如何把 LLM 语义 trace 与 Java 指标关联到统一看板。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://opentelemetry.io/docs/concepts/signals/" target="_blank" rel="noopener">OpenTelemetry — Logs, Metrics, Traces</a></li>
+      <li><a href="https://opentelemetry.io/docs/languages/java/" target="_blank" rel="noopener">OpenTelemetry Java SDK</a></li>
+      <li><a href="https://opentelemetry.io/docs/languages/python/" target="_blank" rel="noopener">OpenTelemetry Python SDK</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html#actuator.micrometer-tracing" target="_blank" rel="noopener">Spring Boot — Micrometer Tracing</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 CorpAssist S2 客服链路，完成<strong>三支柱对照表</strong>、<strong>obs baseline 字段清单</strong>与<strong>传播序列图口述</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制正文「三支柱」表，为「Traces」行补一列<strong>若缺失</strong>时 oncall 会遇到的典型困境（如无法区分 RAG vs LLM 耗时）。</li>
+      <li>对照「结构化日志必含字段」表，为 <code>demos/basics-01-three-pillars-lab/fields.md</code> 每字段写一句「谁写入、谁消费」。</li>
+      <li>对照 Mermaid「traceparent 穿越 Java → Python」，在纸上标出 root span 与 child span 各落在哪个服务。</li>
+      <li>写出 BFF <code>application.yaml</code> 中至少 3 个 OTel 相关键（可参考正文 yaml 块）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：P95 突增。同事提议 ① 只看 Java GC 日志 ② 100% 开 OTel 采样 ③ 先按 request_id 串 BFF 与 Python 日志 ④ 在日志里打印完整 user prompt。请指出<strong>最应先做</strong>与<strong>最应避免</strong>的步骤。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>最应先做 ③</strong>：用 correlation id 确认慢发生在哪一跳。① 偏题；② 采样 100% 可能打爆 Collector；<strong>最应避免 ④</strong>：违反脱敏与 obs baseline，引入合规风险。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：日志、指标、追踪</h4>
+      <p>目录：<code>demos/basics-01-three-pillars-lab/</code>。<strong>验收</strong>：<code>fields.md</code> 四字段各补充「写入方 / 消费方 / 缺失后果」三列说明。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-02-langsmith-mm">LangSmith 与 Micrometer</a> — Trace 关联与统一看板</li>
+      <li><a href="https://www.w3.org/TR/trace-context/" target="_blank" rel="noopener">W3C Trace Context</a></li>
+      <li><a href="../security-compliance-engineering/index.html" target="_blank" rel="noopener">安全合规工程</a> — 日志脱敏与 obs 边界</li>
+    </ul>
+  </div>
+</section>

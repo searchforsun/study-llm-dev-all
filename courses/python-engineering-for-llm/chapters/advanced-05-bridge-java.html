@@ -1,0 +1,314 @@
+<section id="ch-advanced-05-bridge-java" class="chapter" data-chapter="advanced-05-bridge-java">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>双栈协作规范</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-05-bridge-java" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产级 Python AI 服务</strong> · 能力：统一错误码、DTO 映射、联调清单与 Spring 模块对照</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 不是「Python 写完丢给 Java」——双栈长期共存需要<strong>可执行的协作规范</strong>：<span class="term" data-term-id="error-code-unify" tabindex="0">error code unify</span>、<span class="term" data-term-id="dto-mapping" tabindex="0">DTO mapping</span>、<span class="term" data-term-id="joint-debug" tabindex="0">joint debug</span> 流程，以及清晰的 <span class="term" data-term-id="spring-module-map" tabindex="0">Spring module map</span>。本章是 advanced 阶段收官，把 Python AI 快迭代与 Spring 企业治理接在同一套 <span class="term" data-term-id="shared-contract" tabindex="0">shared contract</span> 上。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>维护 CorpAssist 双栈错误码表，映射 HTTP 状态与 <span class="term" data-term-id="app-error" tabindex="0">AppError</span></li>
+          <li>处理 <span class="term" data-term-id="snake-camel" tabindex="0">snake_case ↔ camelCase</span> 与 <span class="term" data-term-id="pydantic" tabindex="0">Pydantic</span> / Jackson 差异</li>
+          <li>执行联调清单：request_id 贯穿、日志互查、契约 diff</li>
+          <li>画出 Python 包与 <span class="term" data-term-id="maven-module" tabindex="0">Maven 子模块</span> 职责对照表</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>错误码稳定</strong>：业务码字符串不变，HTTP 状态可映射，便于 BFF 统一处理。</li>
+          <li><strong>契约优先</strong>：OpenAPI 字段命名以 snake_case 为真源，Java 生成配置跟随。</li>
+          <li><strong>联调可复现</strong>：compose 起 Python + Mock BFF，固定 request_id 查两边日志。</li>
+          <li><strong>边界清晰</strong>：Python 不做账号体系；Spring 不做 Embedding 批处理。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>错误码统一</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 前端同一 toast</span>
+        用户搜索知识库无结果时，BFF 与直连 Python 应返回相同 <code>code: RAG_NOT_FOUND</code>，前端一套 i18n 映射。若 Python 返回 <code>not_found</code>、Java 返回 <code>RAG_NOT_FOUND</code>，联调会陷入 endless 对齐会议。
+      </aside>
+      <p><span class="term" data-term-id="error-code-unify" tabindex="0">Error code unify</span> 维护单一表格（Markdown 或 YAML），Python <span class="term" data-term-id="exception-hierarchy" tabindex="0">异常层次</span> 与 Spring <code>ErrorCodes</code> 枚举同源生成（可选代码生成）。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>code</th><th>HTTP</th><th>Python 异常</th><th>Spring 枚举</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>LLM_RATE_LIMIT</code></td>
+            <td>429</td>
+            <td><code>LlmRateLimitError</code></td>
+            <td><code>LLM_RATE_LIMIT</code></td>
+          </tr>
+          <tr>
+            <td><code>RAG_NOT_FOUND</code></td>
+            <td>404</td>
+            <td><code>RagNotFoundError</code></td>
+            <td><code>RAG_NOT_FOUND</code></td>
+          </tr>
+          <tr>
+            <td><code>VALIDATION_ERROR</code></td>
+            <td>422</td>
+            <td><code>ValidationError</code> / FastAPI 默认</td>
+            <td><code>VALIDATION_ERROR</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>FastAPI exception_handler</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError) -&gt; JSONResponse:
+    rid = request.state.request_id
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"code": exc.code, "message": exc.message, "request_id": rid},
+    )</code></pre>
+      </div>
+      <p>日志侧：<span class="term" data-term-id="structlog" tabindex="0">structlog</span> 记录 <code>code</code>、<code>request_id</code>；Java Logback MDC 同键，便于 ELK <code>request_id:"uuid"</code> 联查（<span class="term" data-term-id="mdc-trace" tabindex="0">MDC trace</span>）。</p>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>错误码变更流程</summary>
+          <div class="learn-cheat-body">
+            <ol>
+              <li>在共享 error_codes 表新增一行并 PR 双栈评审</li>
+              <li>Python 增加 AppError 子类 + handler 映射</li>
+              <li>Java common 模块增加枚举 + i18n 文案</li>
+              <li>补充 contract test 样例 JSON</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>DTO 映射</h3>
+      <p><span class="term" data-term-id="dto-mapping" tabindex="0">DTO mapping</span> 解决三类差异：命名（<span class="term" data-term-id="snake-camel" tabindex="0">snake/camel</span>）、可选字段默认值、枚举与日期格式。原则：<strong>OpenAPI schema 为真源</strong>，避免手写两套模型漂移。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="DTO 策略">
+        <input type="radio" name="adv05-dto-tab" id="adv05-dto-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="adv05-dto-tab" id="adv05-dto-tab-b" class="learn-tab-input" />
+        <label for="adv05-dto-tab-a">Python Pydantic</label>
+        <label for="adv05-dto-tab-b">Java Record + Jackson</label>
+        <div class="learn-tab-panel" id="adv05-dto-panel-a" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">python</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-python">class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(min_length=1, max_length=2000)
+    top_k: int = Field(default=5, ge=1, le=50)
+    # JSON 输出 snake_case（默认）</code></pre>
+          </div>
+        </div>
+        <div class="learn-tab-panel" id="adv05-dto-panel-b" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+public record SearchRequest(
+    @NotBlank String query,
+    @Min(1) @Max(50) int topK  // Java 字段 camel，JSON snake
+) {}</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">双份手写</span>
+          <ul>
+            <li>Python 改字段未通知 Java</li>
+            <li>BFF 层手动 Map 漏字段</li>
+            <li>枚举 int vs string 不一致</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">契约驱动</span>
+          <ul>
+            <li>openapi.json → Java generator</li>
+            <li>共享 <code>corpassist-schemas</code> 包（advanced-03）</li>
+            <li>contract test 固定样例 JSON</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>联调清单</h3>
+      <p><span class="term" data-term-id="joint-debug" tabindex="0">Joint debug</span> 标准流程减少「在我机器上能跑」。CorpAssist 推荐每次 MINOR 发版前走一遍：</p>
+
+      <ol class="steps">
+        <li><strong>环境</strong> — compose 起 Python + redis + mock-llm；BFF 指向 <code>http://corpassist-python:8000</code>。</li>
+        <li><strong>契约</strong> — 拉取同 tag 的 <code>openapi.json</code>，oasdiff 与 BFF 依赖版本一致。</li>
+        <li><strong>冒烟</strong> — <code>GET /health</code>；带 <code>X-Request-Id</code> 调 <code>POST /api/v1/rag/search</code>。</li>
+        <li><strong>日志</strong> — 用同一 request_id 在 Python JSON 日志与 Java MDC 日志各查到一条。</li>
+        <li><strong>异常</strong> — 触发 <code>RAG_NOT_FOUND</code> 与 <code>LLM_RATE_LIMIT</code>（Mock），核对 body.code。</li>
+        <li><strong>长任务</strong> — BFF 提交 index job，轮询至 succeeded（advanced-02）。</li>
+      </ol>
+
+      <div class="mermaid-wrap">
+        <h5>联调 request_id 贯穿</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant FE as 前端
+  participant BFF as Spring BFF
+  participant PY as CorpAssist-python
+  FE-&gt;&gt;BFF: X-Request-Id: abc
+  BFF-&gt;&gt;PY: X-Request-Id: abc
+  PY--&gt;&gt;BFF: JSON + request_id abc
+  Note over BFF,PY: ELK 用 abc 关联两侧日志</pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：BFF 未转发 X-Request-Id 时，Python 应生成新 id 还是拒绝请求？</summary>
+        <p>内网联调应配置中间件：缺 header 则生成并回传；生产 BFF 必须转发，便于 <span class="term" data-term-id="bff-pattern" tabindex="0">BFF pattern</span> 统一入口追踪。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>对照 Spring Boot 模块</h3>
+      <p>CorpAssist Java 仓常见模块与 Python 包职责对照——双栈分工可视化，避免「这块该谁做」争议。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>Spring Boot 模块</th><th>Python 包 / 服务</th><th>协作接口</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>corpassist-gateway</code></td>
+            <td>—（不实现）</td>
+            <td>路由、限流、TLS 终结</td>
+          </tr>
+          <tr>
+            <td><code>corpassist-bff</code></td>
+            <td><code>corpassist.api</code></td>
+            <td>OpenAPI HTTP；JWT 转 API Key</td>
+          </tr>
+          <tr>
+            <td><code>corpassist-rag-api</code>（jar 契约）</td>
+            <td><code>corpassist.rag</code> + openapi.json</td>
+            <td>DTO 同源；Java 生成 Client</td>
+          </tr>
+          <tr>
+            <td><code>corpassist-worker</code>（Java 定时）</td>
+            <td><code>corpassist-worker</code>（ARQ）</td>
+            <td>Spring 触发索引；Python 执行</td>
+          </tr>
+          <tr>
+            <td><code>corpassist-common</code></td>
+            <td><code>corpassist.core</code></td>
+            <td>错误码、配置、日志格式</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>课程收官</strong>
+        <p>完成本章与全课测验后，你应能独立交付 CorpAssist-python 服务并与 Spring 团队联调。回顾路径：<a href="#ch-basics-01-env-tooling">工程基座</a> → <a href="#ch-practice-01-fastapi-intro">FastAPI</a> → <a href="#ch-advanced-04-corpassist-api">API 交付</a> → 本章协作规范。</p>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩题：为何 Python 服务不并入 Maven 父工程？</summary>
+          <p>工具链（uv/Docker）、发布节奏与运行时不同；集成靠 <span class="term" data-term-id="shared-contract" tabindex="0">shared contract</span> 而非编译耦合。Python 专注 RAG/LLM；Spring 专注网关、账号与 <span class="term" data-term-id="spring-mvc" tabindex="0">Spring MVC</span> 生态。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>错误码统一</strong>：单表维护；AppError → JSON；日志 code + request_id 双栈一致。</li>
+        <li><strong>DTO 映射</strong>：OpenAPI 真源；snake JSON；Java SnakeCaseStrategy / 代码生成。</li>
+        <li><strong>联调清单</strong>：compose 环境 → 契约 diff → 冒烟 → 日志互查 → 异常与长任务。</li>
+        <li><strong>Spring 模块对照</strong>：gateway/bff/rag-api/worker/common 与 Python 包一一映射。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_adv05">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="err" /> 能写出 RAG_NOT_FOUND 的 HTTP 与 body 字段</label></li>
+          <li><label><input type="checkbox" data-id="dto" /> 能说明 snake_case JSON 在 Java 的配置方式</label></li>
+          <li><label><input type="checkbox" data-id="debug" /> 能描述用 request_id 联查日志的步骤</label></li>
+          <li><label><input type="checkbox" data-id="map" /> 能说出 bff 与 corpassist.api 的对应关系</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成全课 advanced 测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">恭喜完成 advanced 阶段！可回到 <a href="#ch-advanced-04-corpassist-api">API 交付章</a> 核对检查单，或在真实 CorpAssist 仓库实践联调清单。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/handling-errors/" target="_blank" rel="noopener">FastAPI — Handling Errors</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc.html" target="_blank" rel="noopener">Spring Web MVC</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc7807" target="_blank" rel="noopener">RFC 7807 Problem Details</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">阅读 Demo 错误码表，并完成「联调清单」6 步中的纸面演练（标注每步预期证据）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/advanced-05-bridge-java-lab/error_codes.md</code>，为 <code>VALIDATION_ERROR</code> 补充一列「前端 toast 文案要点」。</li>
+      <li>对照「错误码统一」表，说明 Python <code>exception_handler</code> 返回体与 Spring <code>ProblemDetail</code> 应对齐的 3 个字段。</li>
+      <li>在「DTO 映射」Java 代码块中，JSON 字段 <code>top_k</code> 对应 Java record 哪个参数名？</li>
+      <li>按「联调清单」第 4 步，写出 ELK 查询 <code>request_id</code> 的示例 KQL 片段（纸面即可）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（权衡）BFF 坚持 JSON 用 camelCase，Python 坚持 snake_case。列出各 1 条支持与反对 argument，并给出 CorpAssist 推荐裁决。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>支持 camel：Java 前端生态默认。支持 snake：Python/OpenAPI 默认、少 alias 出错。推荐：HTTP JSON 以 OpenAPI snake 为真源，Java 用 @JsonNaming；内部 Java 变量仍 camel。单一契约仓库 + contract test 强制执行。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：错误码对照表</h4>
+      <p>目录：<code>demos/advanced-05-bridge-java-lab/</code>。<strong>验收</strong>：阅读 <code>error_codes.md</code> 至少 3 行；能口头映射 <code>LLM_RATE_LIMIT</code> 到 HTTP 429 与 Python/Java 枚举名。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-04-corpassist-api">实战：CorpAssist Python 服务 API</a></li>
+      <li><a href="../llm-application-fundamentals/index.html" target="_blank" rel="noopener">大模型应用基础</a> — RAG 业务语境</li>
+      <li><a href="https://12factor.net/" target="_blank" rel="noopener">The Twelve-Factor App</a></li>
+    </ul>
+  </div>
+</section>

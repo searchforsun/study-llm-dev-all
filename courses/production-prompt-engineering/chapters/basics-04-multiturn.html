@@ -1,0 +1,446 @@
+<section id="ch-basics-04-multiturn" class="chapter" data-chapter="basics-04-multiturn">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多轮对话与状态</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-multiturn" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Prompt 结构与模板</strong> · 能力：设计历史裁剪策略、衔接上下文记忆课、预览 Spring Advisor 与 LangChain Memory 并做对照实验</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-03-variables">变量、版本与配置管理</a> 解决了「模板怎么发版」；CorpAssist <strong>智能客服</strong> 还要解决「上一轮说了什么」。<span class="term" data-term-id="multiturn" tabindex="0">多轮对话</span> 不是无限堆 <code>messages</code>——必须在 Token 预算内做 <span class="term" data-term-id="history-trim" tabindex="0">历史裁剪</span>，并把结构化事实写入 <span class="term" data-term-id="session-state" tabindex="0">会话状态</span>。本章是 <a href="../context-memory-engineering/index.html">《上下文与记忆工程》</a> 的 Prompt 侧入门。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为客服场景配置 <span class="term" data-term-id="window-slice" tabindex="0">滑动窗口</span> 与 <span class="term" data-term-id="turn-summary" tabindex="0">轮次摘要</span> 策略</li>
+          <li>说明本课与《上下文与记忆》课的分工，知道何时深化记忆架构</li>
+          <li>对比 Spring <code>MessageChatMemoryAdvisor</code> 与 LangChain Memory 的职责边界</li>
+          <li>设计 <span class="term" data-term-id="compare-exp" tabindex="0">对照实验</span> 验证裁剪后关键槽位（工号、工单号）是否保留</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>历史有预算</strong>：system + RAG + 本轮优先；历史按 <span class="term" data-term-id="window-slice" tabindex="0">window-slice</span> 从新到旧填充至预算。</li>
+          <li><strong>事实要外置</strong>：工号、审批状态写入 <span class="term" data-term-id="session-state" tabindex="0">session-state</span>，不要只靠模型「记住」被裁掉的对话。</li>
+          <li><strong>框架是钩子</strong>：<span class="term" data-term-id="advisor-vs-langchain" tabindex="0">Advisor vs LangChain</span> 负责注入/裁剪消息，策略仍由你定义。</li>
+          <li><strong>用实验验收</strong>：<span class="term" data-term-id="compare-exp" tabindex="0">对照实验</span> 对比裁剪前后拒答率、槽位召回与 Token 成本。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>历史裁剪入门</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 智能客服第 8 轮</span>
+        用户前 3 轮已提供工号与请假类型，第 8 轮问「审批到哪了」。若把 8 轮全文塞进 prompt，输入 Token 暴涨且可能挤掉 system 里的合规指令。编排层必须在 POST 前执行 <span class="term" data-term-id="history-trim" tabindex="0">history-trim</span>。
+      </aside>
+      <p>API 无状态：每次调用都要重新发送 <code>messages</code>。<span class="term" data-term-id="multiturn" tabindex="0">多轮对话</span> 的「记忆」= 你组装进 prompt 的内容 + DB 里的 <span class="term" data-term-id="session-state" tabindex="0">session-state</span>。<span class="term" data-term-id="history-trim" tabindex="0">历史裁剪</span> 在 Token 预算内决定保留哪些轮次，而非假设模型持久记住被裁掉的内容。</p>
+
+      <h4>流程：多轮消息裁剪（CorpAssist 客服）</h4>
+      <div class="mermaid-wrap">
+        <h5>多轮对话 · 历史裁剪决策</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph input [会话输入]
+    SYS[system 模板\n始终保留]
+    STATE[session-state 槽位\n工号 / 工单号]
+    HIST[DB 全量历史]
+    CUR[user 本轮]
+  end
+  subgraph trim [history-trim]
+    SLICE[window-slice\n最近 max_turns 轮]
+    SUM[turn-summary\n旧对话压一条摘要]
+    TOK[Token 计数至预算 70%]
+  end
+  subgraph out [发往 LLM]
+    MSG[messages 数组]
+  end
+  SYS --> MSG
+  STATE --> MSG
+  HIST --> SLICE
+  SLICE --> TOK
+  TOK -->|仍超限| SUM
+  SUM --> MSG
+  SLICE --> MSG
+  TOK --> MSG
+  CUR --> MSG</pre>
+        <p class="diagram-caption">原则：<strong>system 与槽位注入优先</strong>；历史从新到旧填充；超限先缩 <span class="term" data-term-id="window-slice" tabindex="0">window-slice</span>，再 <span class="term" data-term-id="turn-summary" tabindex="0">turn-summary</span>。</p>
+      </div>
+
+      <h4>策略对照表</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>策略</th><th>做法</th><th>CorpAssist 适用</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>window-slice</strong></td>
+              <td>只保留最近 N 轮 user/assistant</td>
+              <td>默认；<code>max_turns: 6</code>（见 Demo）</td>
+            </tr>
+            <tr>
+              <td><strong>turn-summary</strong></td>
+              <td>第 10 轮后用小模型把更早对话压成一条 system 摘要</td>
+              <td>长会话需保留「已提交材料清单」</td>
+            </tr>
+            <tr>
+              <td><strong>session-state 注入</strong></td>
+              <td>结构化槽位写入 system 或 tool 上下文</td>
+              <td>工号、审批单号——防裁剪丢失</td>
+            </tr>
+            <tr>
+              <td><strong>Token 硬预算</strong></td>
+              <td>从新到旧累加至 70% 输入预算</td>
+              <td>与费用控制、输出 <code>max_tokens</code> 预留联动</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>代码：裁剪策略配置（YAML 示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># 与 demos/basics-04-multiturn-lab/trim-policy.md 对齐
+multiturn:
+  max_turns: 6              # window-slice：最近 6 轮 user/assistant
+  summarize_after: 10       # 超过 10 轮触发 turn-summary
+  reserve_system_tokens: 1200
+  history_token_budget_ratio: 0.70
+  slot_inject:              # session-state → system 前缀
+    - employee_id
+    - ticket_id
+    - leave_type</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐 · 无界堆历史</span>
+          <ul>
+            <li>每轮发送 30 轮完整对话</li>
+            <li>触顶后厂商静默截断头部，system 或工号被挤掉</li>
+            <li>费用随轮次线性增长</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐 · 裁剪 + 槽位</span>
+          <ul>
+            <li><code>max_turns: 6</code> + Token 预算双保险</li>
+            <li>工号写入 session-state 再注入 system</li>
+            <li>旧轮次用 turn-summary 保留事实而非全文</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：把 max_turns 从 6 调到 20，模型一定更「记得住」吗？</summary>
+        <p>不一定。更长历史带来噪声与费用，且仍受窗口限制；关键事实应进 <span class="term" data-term-id="session-state" tabindex="0">session-state</span>。是否调参应用 <span class="term" data-term-id="compare-exp" tabindex="0">对照实验</span> 看槽位召回率。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>与《上下文与记忆》课衔接</h3>
+      <p>本课站在 <strong>Prompt 编排</strong> 视角：如何把历史与状态<strong>组装进 messages</strong>。系统化的记忆分层、向量记忆、长期画像等，在姊妹课 <a href="../context-memory-engineering/index.html">《上下文与记忆工程》</a> 展开——建议学完本章后按需跳转。</p>
+
+      <h4>课程分工（memory-bridge）</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>主题</th><th>本课（生产 Prompt）</th><th><a href="../context-memory-engineering/index.html">上下文与记忆工程</a></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>历史裁剪</td>
+              <td><span class="term" data-term-id="window-slice" tabindex="0">window-slice</span>、<span class="term" data-term-id="turn-summary" tabindex="0">turn-summary</span> 策略与 Prompt 注入格式</td>
+              <td>裁剪算法、Token 计数、与 RAG 预算协同</td>
+            </tr>
+            <tr>
+              <td>会话状态</td>
+              <td>槽位写入 system 的 Prompt 句式</td>
+              <td>状态机、DB  schema、一致性</td>
+            </tr>
+            <tr>
+              <td>长期记忆</td>
+              <td>预告：摘要进 system 的入门做法</td>
+              <td>向量记忆、用户画像、过期策略</td>
+            </tr>
+            <tr>
+              <td>评测</td>
+              <td><span class="term" data-term-id="compare-exp" tabindex="0">对照实验</span> 看槽位是否丢失</td>
+              <td>记忆命中率、长期任务成功率</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><span class="term" data-term-id="memory-bridge" tabindex="0">memory-bridge</span>：把本课的 <code>trim-policy.md</code> 当作下游记忆课的「输入契约」——记忆课改存储，不应 silently 改变 max_turns 语义而不更新 Prompt 评测。</p>
+
+      <div class="notice">
+        <strong>衔接建议</strong>
+        <ul>
+          <li>先在本课 Demo 固定 <code>max_turns: 6</code> 并完成对照实验。</li>
+          <li>若 CorpAssist 需要「跨天记住用户偏好」，再学姊妹课长期记忆章节。</li>
+          <li>制度问答（RAG）主路径仍以检索片段为主，历史裁剪为辅——见 <a href="#ch-practice-01-rag-prompt">RAG 专用 Prompt</a>。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring Advisor vs LangChain 预览</h3>
+      <p>双栈都提供「在调用模型前改写 messages」的扩展点；策略（保留几轮、是否摘要）仍由应用配置。对比 <span class="term" data-term-id="advisor-vs-langchain" tabindex="0">advisor-vs-langchain</span> 时，关注<strong>谁负责持久化</strong>与<strong>谁负责裁剪</strong>。</p>
+
+      <h4>对照表</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>能力</th><th>Spring AI</th><th>LangChain (Python)</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>会话存储</td>
+              <td><code>ChatMemory</code> / JDBC / Redis 实现</td>
+              <td><code>ChatMessageHistory</code> + 自定义 backend</td>
+            </tr>
+            <tr>
+              <td>调用链注入</td>
+              <td><code>MessageChatMemoryAdvisor</code> 等 Advisor</td>
+              <td><code>RunnableWithMessageHistory</code>、Memory 中间件</td>
+            </tr>
+            <tr>
+              <td>裁剪钩子</td>
+              <td>Advisor 或自定义 <code>ChatMemory</code> 实现</td>
+              <td><code>ConversationBufferWindowMemory</code>（k 轮）</td>
+            </tr>
+            <tr>
+              <td>与 Prompt 模板</td>
+              <td><code>PromptTemplate</code> 渲染 system，Advisor 追加历史</td>
+              <td>Jinja system + memory 变量</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>代码：Spring ChatClient + Memory Advisor</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// CorpAssist 客服 — Spring AI 预览（策略在 memory 实现中配置 maxMessages）
+ChatMemory memory = MessageWindowChatMemory.builder()
+    .maxMessages(12)  // 约 6 轮 user+assistant，按消息条数计
+    .build();
+
+ChatClient client = ChatClient.builder(chatModel)
+    .defaultAdvisors(new MessageChatMemoryAdvisor(memory))
+    .build();
+
+String reply = client.prompt()
+    .system(systemFromPromptTemplate)  // 含 session-state 槽位
+    .user(userUtterance)
+    .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
+    .call()
+    .content();</code></pre>
+      </div>
+
+      <h4>代码：LangChain 滑动窗口 Memory</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from langchain.memory import ConversationBufferWindowMemory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+# k=6 与 trim-policy max_turns 对齐
+memory = ConversationBufferWindowMemory(k=6, return_messages=True)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "{system_with_slots}"),
+    MessagesPlaceholder("history"),
+    ("human", "{input}"),
+])
+
+# 编排层：先把 employee_id 写入 system_with_slots，再 chain.invoke</code></pre>
+      </div>
+
+      <p>无论哪栈，上线前用同一套 <code>trim-policy.md</code> 与 golden 多轮对话用例回归，避免「Java 保留 12 条、Python 保留 6 轮」的隐性 <span class="term" data-term-id="env-diff" tabindex="0">环境差异</span>。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>对照实验</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 裁剪 A/B</span>
+        团队争论 max_turns 用 4 还是 10。用固定 50 条多轮脚本（含第 3 轮报工号、第 9 轮追问审批）做 <span class="term" data-term-id="compare-exp" tabindex="0">compare-exp</span>，对比槽位召回、平均输入 Token、拒答率。
+      </aside>
+
+      <h4>实验设计模板</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>组</th><th>配置</th><th>观测指标</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>A（基线）</strong></td>
+              <td><code>max_turns: 6</code>，无 summary</td>
+              <td>slot_recall、avg_prompt_tokens、合规拒答率</td>
+            </tr>
+            <tr>
+              <td><strong>B</strong></td>
+              <td><code>max_turns: 10</code></td>
+              <td>同上 + 费用增幅</td>
+            </tr>
+            <tr>
+              <td><strong>C</strong></td>
+              <td><code>max_turns: 6</code> + <code>summarize_after: 10</code></td>
+              <td>长会话第 12 轮槽位是否仍正确</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>序列图：对照实验流水线</h4>
+      <div class="mermaid-wrap">
+        <h5>multiturn · compare-exp 流水线</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant DS as 固定多轮脚本
+  participant OR as 编排层
+  participant LLM as 模型 API
+  participant R as 评测报表
+  DS->>OR: 组 A/B/C trim-policy
+  OR->>LLM: 逐轮 messages
+  LLM-->>OR: assistant
+  OR->>R: slot_recall / tokens
+  R-->>DS: 选优策略写回 trim-policy.md</pre>
+        <p class="diagram-caption">实验结论应回写 Git（<a href="#ch-basics-03-variables">版本管理</a>），而非只留在表格里。</p>
+      </div>
+
+      <p>验收标准示例：<strong>slot_recall ≥ 98%</strong> 且 <strong>avg_prompt_tokens 不高于基线 15%</strong>。若 B 组槽位略升但 Token +40%，产品需明确是否值得买单。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">多轮 Prompt 工程 = 裁剪策略 + 状态外置 + 双栈一致 + 实验验收。验收时能解释 CorpAssist 第 9 轮为何仍知道工号。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>历史裁剪入门</strong>：<span class="term" data-term-id="history-trim" tabindex="0">history-trim</span> 用 <span class="term" data-term-id="window-slice" tabindex="0">window-slice</span> 与 <span class="term" data-term-id="turn-summary" tabindex="0">turn-summary</span>；system 与槽位优先，禁止无界堆历史。</li>
+        <li><strong>与《上下文与记忆》课衔接</strong>：<span class="term" data-term-id="memory-bridge" tabindex="0">memory-bridge</span> 划分 Prompt 组装 vs 记忆架构；深化见 <a href="../context-memory-engineering/index.html">姊妹课</a>。</li>
+        <li><strong>Spring Advisor vs LangChain 预览</strong>：<span class="term" data-term-id="advisor-vs-langchain" tabindex="0">advisor-vs-langchain</span> 提供注入钩子，max_turns 语义应对齐 <code>trim-policy.md</code>。</li>
+        <li><strong>对照实验</strong>：<span class="term" data-term-id="compare-exp" tabindex="0">compare-exp</span> 用 slot_recall 与 Token 成本选优，结论回写版本库。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="production-prompt-engineering_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="trim-order" /> 能画出 system → 槽位 → window-slice 的组装顺序</label></li>
+          <li><label><input type="checkbox" data-id="memory-bridge" /> 能说明本课与《上下文与记忆》课各解决什么</label></li>
+          <li><label><input type="checkbox" data-id="dual-stack" /> 能写出 Spring 与 LangChain 各一条裁剪配置</label></li>
+          <li><label><input type="checkbox" data-id="compare-exp" /> 能设计 A/B/C 三组 compare-exp 指标</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>术语</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>history-trim</td><td>POST 前裁剪 messages</td></tr>
+                <tr><td>window-slice</td><td>最近 N 轮</td></tr>
+                <tr><td>session-state</td><td>槽位外置，防裁丢失</td></tr>
+                <tr><td>turn-summary</td><td>旧对话压摘要</td></tr>
+                <tr><td>compare-exp</td><td>多策略槽位+Token 对比</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>用户抱怨「刚说的工号忘了」，可能是 history-trim 哪一步出问题？如何改？</li>
+              <li>Spring Advisor 与 LangChain Memory 都配置了不同的 k，你如何保证双栈行为一致？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；继续 <a href="#ch-practice-01-rag-prompt">RAG 专用 Prompt</a>，或深化 <a href="../context-memory-engineering/index.html">《上下文与记忆工程》</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html#_chat_memory" target="_blank" rel="noopener">Spring AI — Chat Memory &amp; Advisors</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/chatbots_memory/" target="_blank" rel="noopener">LangChain — Memory in chatbots</a></li>
+      <li><a href="https://platform.openai.com/docs/guides/chat-completions" target="_blank" rel="noopener">OpenAI — Chat Completions (messages)</a></li>
+      <li><strong>姊妹课</strong>：<a href="../context-memory-engineering/index.html">上下文与记忆工程</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 客服编写 <strong>trim-policy</strong> 并完成一组<strong>对照实验</strong>设计（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>编辑 <code>demos/basics-04-multiturn-lab/trim-policy.md</code>：确认 <code>max_turns: 6</code>、<code>summarize_after: 10</code>，并补充 2 个 <code>slot_inject</code> 字段名。</li>
+      <li>画出 Mermaid 流程图中 system → session-state → window-slice 的顺序，标出 Token 超限后触发 turn-summary 的分支。</li>
+      <li>填写对照实验表：A/B/C 三组配置与 3 个观测指标（slot_recall、avg_prompt_tokens、拒答率）。</li>
+      <li>用一段话说明本课与 <a href="../context-memory-engineering/index.html">《上下文与记忆工程》</a> 的分工（memory-bridge）。</li>
+      <li>完成右侧章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">为「记住工号」，团队把 max_turns 从 6 提到 30，未写 session-state。第 15 轮仍可能丢失工号的最可能原因是？A Token/窗口仍裁掉早期轮次 B temperature 太低 C 模型不支持中文</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>选 <strong>A</strong>。轮次增多仍受 <span class="term" data-term-id="window-slice" tabindex="0">window-slice</span> 与 Token 预算约束；工号应写入 <span class="term" data-term-id="session-state" tabindex="0">session-state</span> 并注入 system，而非指望堆历史。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Python 用 k=10、Java 用 maxMessages=12，评测脚本用最近 6 轮。上线后双栈行为不一致。首要修复是？A 统一 trim-policy 语义并回归 golden B 换更大模型 C 关闭 Advisor</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>选 <strong>A</strong>。对齐 <code>trim-policy.md</code> 与 <span class="term" data-term-id="compare-exp" tabindex="0">compare-exp</span> golden，避免隐性 <span class="term" data-term-id="advisor-vs-langchain" tabindex="0">advisor-vs-langchain</span> 差异。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：多轮对话与状态</h4>
+      <p>目录：<code>demos/basics-04-multiturn-lab/</code>（<code>trim-policy.md</code> + 可选对照实验记录）。<strong>验收</strong>：<code>trim-policy.md</code> 含 <code>max_turns</code> 与槽位列表；能口述 A/B/C 实验指标与 memory-bridge 分工。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-rag-prompt">RAG 专用 Prompt</a></li>
+      <li><strong>姊妹课</strong>：<a href="../context-memory-engineering/index.html">上下文与记忆工程</a> — 记忆分层与长期状态</li>
+      <li><a href="#ch-basics-03-variables">变量、版本与配置管理</a> — 将 trim-policy 纳入 Git 与基线</li>
+    </ul>
+  </div>
+</section>

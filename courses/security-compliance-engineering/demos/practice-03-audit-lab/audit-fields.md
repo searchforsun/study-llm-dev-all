@@ -1,0 +1,4 @@
+- user_id
+- chunks cited
+- tools called
+- timestamp

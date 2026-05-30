@@ -1,0 +1,382 @@
+<section id="ch-basics-01-rag-pattern" class="chapter" data-chapter="basics-01-rag-pattern">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>RAG 模式与架构</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01-rag-pattern" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30 分钟</strong> · 阶段：<strong>RAG 架构与数据管线</strong> · 能力：区分 Naive/Advanced RAG 并画出 CorpAssist 组件图</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>这是 CorpAssist <span class="term" data-term-id="corpassist-s1" tabindex="0">corpassist s1</span> 知识库课的架构起点。面试里常被问「你们的 RAG 长什么样」——若只能画「问题→向量→LLM」，后面的接入、分块、权限与评测都会显得零散。本章用统一语言把 <span class="term" data-term-id="rag-pipeline" tabindex="0">rag pipeline</span> 与 <span class="term" data-term-id="dual-stack-rag" tabindex="0">dual stack rag</span> 分工讲清楚。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>口述 <span class="term" data-term-id="naive-rag" tabindex="0">naive rag</span> 与 <span class="term" data-term-id="advanced-rag" tabindex="0">advanced rag</span> 各适合什么阶段、各缺什么</li>
+          <li>画出 CorpAssist S1 的 <span class="term" data-term-id="component-diagram" tabindex="0">component diagram</span>：索引侧 Python、查询侧 Spring、共用向量库</li>
+          <li>说明 <span class="term" data-term-id="retriever" tabindex="0">retriever</span> 与 <span class="term" data-term-id="generator" tabindex="0">generator</span> 的边界，并衔接 <a href="#ch-basics-02-ingestion">文档接入与解析</a></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>RAG 解决什么</strong>：用外部知识补全 LLM 上下文，降低幻觉并支持文档更新，而不是靠微调背制度。</li>
+          <li><strong>Naive → Advanced</strong>：先跑通「检索+生成」，再按需加改写、重排、混合检索与拒答（详见 <a href="#ch-basics-05-retrieval-gen">检索、重排与生成</a>）。</li>
+          <li><strong>双栈分工</strong>：Python 负责离线 <strong>索引管线</strong>；Spring AI 负责在线 <strong>查询与引用</strong>，共用同一 collection 与 ACL 元数据。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Naive vs Advanced RAG</h3>
+
+      <p><strong>检索增强生成（RAG）</strong> 的核心动作：把用户问题变成检索请求，从知识库取回相关片段，拼进 Prompt 再交给 LLM 生成。工程上常分两层理解：</p>
+      <ul>
+        <li><strong><span class="term" data-term-id="naive-rag" tabindex="0">Naive RAG</span></strong> — 问题直接向量化 → TopK 相似块 → 一次生成。实现快、适合 PoC，但对口语化问题、表格 PDF、权限过滤往往不够。</li>
+        <li><strong><span class="term" data-term-id="advanced-rag" tabindex="0">Advanced RAG</span></strong> — 在检索前后加「预处理与后处理」：查询改写、混合检索、Rerank、引用约束、拒答与评测闭环。CorpAssist S1 上线目标通常落在此层。</li>
+      </ul>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 制度问答（45 秒）</span>
+        HR 同事问：「试用期考核不过，补偿怎么算？」知识库里有 2024 版《员工手册》PDF 与 2023 年旧版 Word。Naive 只取向量最近的一块，可能命中旧版或半句话；Advanced 会结合元数据过滤、重排与「必须带引用」的生成策略。
+      </aside>
+
+      <h4>模式对比：何时停在 Naive，何时必须 Advanced</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>Naive RAG</th><th>Advanced RAG</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>典型链路</strong></td>
+            <td>Embed 问题 → 向量 TopK → LLM</td>
+            <td>改写/路由 → 混合检索 → Rerank → 打包上下文 → 带引用生成</td>
+          </tr>
+          <tr>
+            <td><strong>CorpAssist 阶段</strong></td>
+            <td>Demo、内部试点</td>
+            <td>S1 生产、需 ACL 与评测门禁</td>
+          </tr>
+          <tr>
+            <td><strong>主要风险</strong></td>
+            <td>检索不到、答非所问、幻觉</td>
+            <td>复杂度高、延迟与成本上升（需度量）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Naive 常见踩坑</span>
+          <ul>
+            <li>脏 PDF 不清洗就入库，检索全是页眉页脚</li>
+            <li>检索层不做 ACL，越权片段进入 Prompt</li>
+            <li>纯向量忽略制度编号等关键词</li>
+            <li>无引用，用户无法核对来源</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Advanced 最小增量</span>
+          <ul>
+            <li>接入与分块质量先行（<a href="#ch-basics-02-ingestion">文档接入与解析</a>、<a href="#ch-basics-03-chunking">分块策略</a>）</li>
+            <li>检索带 <code>dept</code> / <code>doc_version</code> 过滤</li>
+            <li>TopK 扩大 + Rerank 收窄（<a href="#ch-basics-05-retrieval-gen">检索、重排与生成</a>）</li>
+            <li>生成 Prompt 要求「仅依据上下文 + 列出引用」</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：CorpAssist 只有 2 周做 MVP，你会先 Naive 还是直接 Advanced？</summary>
+        <p>合理路径：<strong>Naive 跑通双栈与评测集</strong>，同时把接入/分块/ACL 设计按 Advanced 预留；别在 Naive 里堆 Rerank+GraphRAG，否则排障困难。2 周后用基准集决定加哪一环。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>组件图</h3>
+
+      <p>把 RAG 拆成可替换组件，便于双栈对齐与面试白板。CorpAssist S1 常用划分如下：</p>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">Ingestion / Indexer</span>
+          <p class="role-card-desc">离线：Reader → 清洗 → 分块 → Embedding → 写入向量库（Python 为主）。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title"><span class="term" data-term-id="retriever" tabindex="0">Retriever</span></span>
+          <p class="role-card-desc">在线：把问题（及改写结果）映射为检索请求，带 ACL 与 TopK 策略。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title"><span class="term" data-term-id="generator" tabindex="0">Generator</span></span>
+          <p class="role-card-desc">在线：组装 Prompt、调用 LLM、流式输出与引用格式化（Spring ChatClient + Advisor）。</p>
+        </article>
+      </div>
+
+      <h4>逻辑组件关系（索引 vs 查询）</h4>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist S1 · RAG 组件图</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph offline["离线 · Python 索引"]
+    SRC[制度 PDF / Word / HTML]
+    RD[Document Reader]
+    CH[Chunker]
+    EM[Embedding]
+    SRC --> RD --> CH --> EM
+    EM --> VS[(Vector Store)]
+  end
+  subgraph online["在线 · Spring 查询"]
+    U[用户问题]
+    RT[Retriever + ACL]
+    GEN[Generator + Citation]
+    U --> RT
+    VS --> RT
+    RT --> GEN
+    GEN --> ANS[带引用回答]
+  end</pre>
+        <p class="diagram-caption">实线数据流：<span class="term" data-term-id="rag-pipeline" tabindex="0">rag pipeline</span> 离线写库、在线读库；ACL 元数据在入库与检索两侧必须一致。</p>
+      </div>
+
+      <h4>组件职责速查</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>组件</th><th>输入</th><th>输出</th><th>双栈落点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Reader</td>
+            <td>原始文件</td>
+            <td>结构化文本 + meta</td>
+            <td>LangChain / Unstructured（Python）</td>
+          </tr>
+          <tr>
+            <td>Chunker</td>
+            <td>长文本</td>
+            <td>带 page/heading 的块</td>
+            <td>Python 索引任务</td>
+          </tr>
+          <tr>
+            <td>VectorStore</td>
+            <td>向量 + payload</td>
+            <td>相似度检索</td>
+            <td>共用 Milvus / PGVector 等</td>
+          </tr>
+          <tr>
+            <td>Advisor / Retriever</td>
+            <td>用户 query</td>
+            <td>Context 文档列表</td>
+            <td>Spring AI QuestionAnswerAdvisor</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>把 Retriever 当 Generator</strong> — 检索只负责「找材料」，不能代替 Prompt 约束与引用格式。</li>
+          <li><strong>组件图画成单进程</strong> — 生产上索引与查询往往不同服务、不同发布节奏。</li>
+          <li><strong>忽略 meta 契约</strong> — Python 写入的 <code>dept</code>、<code>source</code> 字段，Spring 侧 filter 必须同名。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 管线</h3>
+
+      <p><span class="term" data-term-id="corpassist-s1" tabindex="0">CorpAssist S1</span> 企业知识库的主线：<strong>制度与手册可检索、可引用、可审计</strong>。<span class="term" data-term-id="dual-stack-rag" tabindex="0">Dual stack rag</span> 在此的具体含义：</p>
+      <ul>
+        <li><strong>Python 索引栈</strong> — 定时/事件触发：扫描对象存储 → Reader → 清洗 → 分块 → Embedding → upsert 向量库，写入 <code>model_version</code> 与 ACL 字段。</li>
+        <li><strong>Spring 查询栈</strong> — BFF 或 RAG API：鉴权 → 注入用户租户/部门 → Retriever 带 filter → Generator 流式输出 + SSE 引用。</li>
+        <li><strong>共用索引</strong> — 两边读同一 collection；索引变更走 alias 切换（详见 <a href="#ch-basics-04-embedding">Embedding 与索引</a>）。</li>
+      </ul>
+
+      <h4>端到端管线（五段）</h4>
+      <div class="mermaid-wrap">
+        <h5>S1 知识库 · 从文档到回答</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant HR as HR 上传制度
+  participant PY as Python Indexer
+  participant VS as 向量库
+  participant SP as Spring RAG API
+  participant U as 员工提问
+  HR->>PY: 新 PDF + ACL meta
+  PY->>VS: 分块 + Embedding
+  U->>SP: 「试用期补偿怎么算？」
+  SP->>VS: 向量检索 + dept 过滤
+  VS-->>SP: TopK 块 + source/page
+  SP->>U: 流式回答 + 引用 [hr.pdf p.12]</pre>
+        <p class="diagram-caption">与 Demo <code>pipeline.md</code> 一致：<strong>接入 → 分块 → 索引 → 检索 → 生成+引用</strong>。</p>
+      </div>
+
+      <h4>双栈分工：标签页对照</h4>
+      <div class="learn-tabs" role="tablist" aria-label="Python 索引 vs Spring 查询">
+        <input type="radio" name="rag01stack" id="rag01-tab-py" class="learn-tab-input" checked />
+        <input type="radio" name="rag01stack" id="rag01-tab-sp" class="learn-tab-input" />
+        <label for="rag01-tab-py">Python · 索引</label>
+        <label for="rag01-tab-sp">Spring · 查询</label>
+        <div class="learn-tab-panel" id="rag01-panel-py" role="tabpanel">
+          <p><strong>职责</strong>：批处理、重跑、re-embed；适合 LangChain LCEL 编排。</p>
+          <p><strong>产出</strong>：向量 + <code>{source, page, dept, doc_version}</code> payload。</p>
+          <p><strong>注意</strong>：Embedding 模型变更必须全量或增量 re-embed，并 bump <code>model_version</code>。</p>
+        </div>
+        <div class="learn-tab-panel" id="rag01-panel-sp" role="tabpanel">
+          <p><strong>职责</strong>：低延迟问答、会话、流式 SSE；QuestionAnswerAdvisor 注入检索结果。</p>
+          <p><strong>输入</strong>：用户 JWT 中的 tenant/dept，转成 VectorStore metadata filter。</p>
+          <p><strong>注意</strong>：不在 Spring 里做重 OCR；脏数据应回退到索引任务修复。</p>
+        </div>
+      </div>
+
+      <h4>索引 meta 契约（示意）</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-good">Python 写入 payload</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">json</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-json">{
+  "text": "试用期考核不合格，依法无需支付经济补偿…",
+  "meta": {
+    "source": "hr-handbook-2024.pdf",
+    "page": 12,
+    "dept": "HR",
+    "doc_version": "2024.06",
+    "acl": ["all-staff"]
+  }
+}</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">Spring 检索 filter（概念）</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">// 伪代码：用户部门 + 文档版本策略
+SearchRequest.builder()
+  .query(userQuestion)
+  .topK(8)
+  .filterExpression("dept in ['HR','all'] && doc_version >= '2024'")
+  .build();</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>为什么不把索引也写在 Spring 里，少维护一套 Python？</summary>
+          <div class="learn-faq-body">
+            企业制度批量入库、OCR、大文件解析在 Python 生态工具更成熟；Spring 侧聚焦低延迟 API 与权限。双栈增加对齐成本，但换来<strong>离线吞吐</strong>与<strong>在线 SLA</strong>的分工清晰。practice 阶段会做 parity 对照。
+          </div>
+        </details>
+        <details>
+          <summary>Advanced RAG 是否等于一定要上 GraphRAG？</summary>
+          <div class="learn-faq-body">
+            否。S1 多数场景「混合检索 + Rerank + 引用 + 拒答」已足够；GraphRAG 在 advanced 阶段单独讲边界与成本。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Naive vs Advanced</strong>：Naive 适合 PoC；S1 生产需在检索前后加 ACL、重排、引用与评测，而不是一次性堆复杂模块。</li>
+        <li><strong>组件图</strong>：离线 Indexer（Reader→Chunk→Embed）与在线 Retriever+Generator 分离；向量库是双栈唯一共享锚点。</li>
+        <li><strong>CorpAssist 管线</strong>：Python 写索引、Spring 答问题；meta 契约（source/page/dept/version）两端一致，才能安全引用。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_basics01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="naive-adv" /> 能各用一句话说明 Naive 与 Advanced 的差异</label></li>
+          <li><label><input type="checkbox" data-id="components" /> 能画出 Retriever / Generator / VectorStore 三者的数据流</label></li>
+          <li><label><input type="checkbox" data-id="dual-stack" /> 能说明 Python 索引与 Spring 查询各负责什么</label></li>
+          <li><label><input type="checkbox" data-id="meta" /> 能列举至少 3 个应写入向量 payload 的 meta 字段</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Naive RAG</td><td>一次向量检索 + 一次生成</td></tr>
+                <tr><td>Advanced RAG</td><td>检索前后可加改写、混合、Rerank、引用、拒答</td></tr>
+                <tr><td>Dual stack</td><td>Python 索引，Spring 查询，共用向量库</td></tr>
+                <tr><td>Retriever</td><td>找材料，不代替生成策略</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-basics-02-ingestion">文档接入与解析</a> 从管线第一段「接入」展开 PDF/Word/HTML 与双栈 Reader。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI — Retrieval Augmentation</a></li>
+      <li><a href="https://python.langchain.com/docs/concepts/rag/" target="_blank" rel="noopener">LangChain — RAG 概念</a></li>
+      <li><a href="https://www.anthropic.com/research/rag" target="_blank" rel="noopener">Anthropic — 检索增强实践讨论</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 CorpAssist S1 场景，完成<strong>模式对照</strong>、<strong>组件图</strong>与<strong>双栈分工</strong>三份纸面产出（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照正文 Naive/Advanced 表，为「制度版本冲突」场景写 2 条 Advanced 最小增量（如 meta 过滤 + 引用），说明为何不继续 Naive。</li>
+      <li>在白板或纸上重画 Mermaid「CorpAssist S1 · RAG 组件图」，标出 Python 与 Spring 的边界及 VectorStore 位置。</li>
+      <li>打开 <code>demos/basics-01-rag-pattern-lab/pipeline.md</code>，补写第 6 步「ACL 校验」属于索引侧还是查询侧，并一句话说明理由。</li>
+      <li>（可选）用 JSON 示例中的 meta 字段，设计一条 Spring filter 表达式（部门 + 文档版本）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事说：「我们把 OCR、分块、Embedding、问答全放进 Spring Boot，就不用 Python 了。」请判断<strong>主要问题</strong>是什么。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>问题在于<strong>混淆离线吞吐与在线 SLA</strong>。批量 OCR、大 PDF 解析、全量 re-embed 适合异步索引任务；全塞进 Spring 会导致发布耦合、内存与超时风险，且工具链不如 Python 成熟。双栈是为分工，不是为「多一门语言而多一门」。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：哪条<strong>违反</strong>组件边界？① Retriever 返回 TopK 文本 ② Generator 要求仅依据上下文并附引用 ③ Generator 内部再次 OCR PDF</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>答：③</strong>。OCR 属于接入/索引阶段（Reader），不应在在线生成路径重复做；①② 是正确分工。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：RAG 模式与架构实验室</h4>
+      <p>目录：<code>demos/basics-01-rag-pattern-lab/</code>。<strong>验收</strong>：在 <code>pipeline.md</code> 补全双栈分工与 ACL 步骤，并能口述 Naive→Advanced 的演进路径。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-02-ingestion">文档接入与解析</a> — 管线第一段：PDF/Word/HTML 与 OCR</li>
+      <li><a href="https://arxiv.org/abs/2312.10997" target="_blank" rel="noopener">Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors — 检索注入生成</a></li>
+    </ul>
+  </div>
+</section>

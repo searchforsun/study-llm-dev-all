@@ -1,0 +1,306 @@
+<section id="ch-practice-07-code-rag" class="chapter" data-chapter="practice-07-code-rag">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>代码库 RAG 与研发助手（面试场景）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-07-code-rag" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈实现 CorpAssist 知识库</strong> · 能力：S4 代码库 RAG、符号检索与双栈对照</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist <span class="term" data-term-id="s4-scenario" tabindex="0">s4 scenario</span> 面向研发：「这个接口在哪实现的？」「如何加单元测试？」需要<strong>按函数/类切片</strong>而非 PDF 段落。文档 RAG 的固定 chunk 会把方法拦腰截断；必须结合 <span class="term" data-term-id="ast-split" tabindex="0">ast split</span> 与 <span class="term" data-term-id="symbol-index" tabindex="0">symbol index</span>，并在 <span class="term" data-term-id="dual-stack-rag" tabindex="0">dual stack rag</span> 下对齐 Python 索引与 Spring 查询。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 AST 做 <span class="term" data-term-id="code-chunk" tabindex="0">code chunk</span>，并维护符号表索引</li>
+          <li>配置 <span class="term" data-term-id="repo-rag" tabindex="0">repo rag</span>：限定 repo + branch + path 前缀</li>
+          <li>编写补全与问答 <span class="term" data-term-id="fim-prompt" tabindex="0">fim prompt</span>，控制上下文窗口</li>
+          <li>设定 <span class="term" data-term-id="latency-budget" tabindex="0">latency budget</span> 与 <span class="term" data-term-id="secret-scan" tabindex="0">secret scan</span> 流水线</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 5 件事</strong>
+        <ul>
+          <li><strong>勿整库塞 Prompt</strong>：检索范围必须 repo+branch 限定（见 Demo 笔记）。</li>
+          <li><strong>符号优先</strong>：问「类 X 在哪」先查 symbol index，再向量补全。</li>
+          <li><strong>双模式</strong>：FIM 补全 vs 问答 RAG 的 Prompt 结构不同。</li>
+          <li><strong>延迟预算</strong>：IDE 内补全 P95 &lt; 800ms，问答可放宽至 3s。</li>
+          <li><strong>索引前扫描</strong>：密钥、token 不得入向量库。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>代码切片与符号索引</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S4 · monorepo</span>
+        研发问：「<code>OrderService#createOrder</code> 的幂等逻辑在哪？」需要定位 Java 方法级片段，而非 512 token 随意切块。
+      </aside>
+      <p><span class="term" data-term-id="ast-split" tabindex="0">ast split</span> 按语法树切分：每个 chunk 对应一个 function / class / interface，metadata 含 <code>symbol</code>、<code>file_path</code>、<code>start_line</code>、<code>language</code>。</p>
+
+      <h4>Python：tree-sitter 切片示意</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def chunk_java_file(path: str, source: str) -> list[dict]:
+    tree = parser.parse(bytes(source, "utf8"))
+    chunks = []
+    for node in tree.root_node.children:
+        if node.type in ("class_declaration", "method_declaration"):
+            chunks.append({
+                "text": source[node.start_byte:node.end_byte],
+                "symbol": extract_symbol(node),
+                "file_path": path,
+                "start_line": node.start_point[0] + 1,
+            })
+    return chunks</code></pre>
+      </div>
+
+      <h4>符号索引（并行于向量库）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "symbol": "com.corp.OrderService#createOrder",
+  "file": "src/main/java/.../OrderService.java",
+  "line": 42,
+  "vector_id": "chunk-8f3a2b"
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">固定 token 切块</span>
+          <ul>
+            <li>方法被截断，缺 import 上下文</li>
+            <li>「类名」问法 recall 低</li>
+            <li>符号无法精确跳转</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">AST + 符号索引</span>
+          <ul>
+            <li>一 chunk 一符号，边界清晰</li>
+            <li>精确 lookup + 向量语义兜底</li>
+            <li>IDE 可跳转行号</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>仓库级检索</h3>
+      <p><span class="term" data-term-id="repo-rag" tabindex="0">repo rag</span> 检索必须在 metadata 上过滤：<code>repo_id</code>、<code>branch</code>、<code>path_prefix</code>。多 monorepo 时禁止跨 repo 混检。</p>
+
+      <h4>混合检索：符号 lookup + 向量</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def retrieve_code(query: str, ctx: RepoContext) -> list[Document]:
+    if looks_like_symbol(query):  # e.g. FooBar#baz
+        hit = symbol_index.lookup(query, repo=ctx.repo, branch=ctx.branch)
+        if hit:
+            return [load_chunk(hit.vector_id)]
+    return vector_store.similarity_search(
+        query,
+        filter={"repo": ctx.repo, "branch": ctx.branch},
+        k=8,
+    )</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>S4 仓库级检索</h5>
+        <pre class="mermaid">flowchart TD
+  Q[用户问句] --> S{像符号名?}
+  S -->|是| SI[symbol index]
+  S -->|否| VS[向量 TopK]
+  SI --> M[metadata: repo+branch]
+  VS --> M
+  M --> C[context pack]</pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 branch 必须进 filter？</summary>
+        <p>同一文件在不同分支内容不同；不过滤会把已合并/已删除分支的 stale chunk 检入，导致错误答案。索引 job 应随 push webhook 增量更新。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>补全/问答 Prompt</h3>
+      <p>两种场景 Prompt 不可混用：</p>
+      <ul>
+        <li><strong>FIM 补全</strong>：<code>&lt;prefix&gt;…&lt;suffix&gt;…</code>，检索片段作 <code>&lt;middle&gt;</code> 参考，强调语法正确与短输出</li>
+        <li><strong>问答 RAG</strong>：System 要求引用 <code>file:line</code>，User 含问句 + 检索块</li>
+      </ul>
+
+      <h4>问答 Prompt 模板</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown">你是 CorpAssist 代码助手。仅根据下列代码片段回答；无法确定时说「未在库中找到」。
+每个结论后标注 [file:line]。
+
+## 检索片段
+{context_blocks}
+
+## 问题
+{question}</code></pre>
+      </div>
+
+      <h4>Spring AI：Advisor 注入代码上下文</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">var advisor = QuestionAnswerAdvisor.builder(vectorStore)
+    .searchRequest(SearchRequest.builder()
+        .topK(6)
+        .filterExpression("repo == 'corp-backend' && branch == 'main'")
+        .build())
+    .build();</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>延迟与安全扫描</h3>
+      <p><span class="term" data-term-id="latency-budget" tabindex="0">latency budget</span> 按场景拆分：</p>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>场景</th><th>P95 目标</th><th>策略</th></tr></thead>
+          <tbody>
+            <tr><td>IDE 内联补全</td><td>&lt; 800ms</td><td>符号优先、小 TopK、缓存热文件</td></tr>
+            <tr><td>侧边栏问答</td><td>&lt; 3s</td><td>可 rerank、可流式</td></tr>
+            <tr><td>CI 代码审查 Bot</td><td>&lt; 30s</td><td>异步、批量索引</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>索引流水线入口必须跑 <span class="term" data-term-id="secret-scan" tabindex="0">secret scan</span>（gitleaks / trufflehog）；命中则阻断 chunk 写入。</p>
+
+      <h4>扫描配置片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">ingestion:
+  pre_hooks:
+    - secret_scan:
+        block_on_match: true
+        patterns: [AWS_KEY, PRIVATE_KEY, BEARER_TOKEN]
+  on_match: skip_file_and_alert</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈对照</h3>
+      <p>Python 负责 AST 切片、embedding、符号表构建；Spring 暴露 <code>/api/code-rag/ask</code> 与 IDE 插件调用。对照要点：</p>
+      <ul>
+        <li>filter 表达式语义一致（repo、branch、ACL）</li>
+        <li>TopK、score threshold 与 Python 批测对齐</li>
+        <li>引用格式统一为 <code>path:line</code></li>
+      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist S4 双栈</h5>
+        <pre class="mermaid">flowchart LR
+  GH[Git webhook] --> PY[Python 索引]
+  PY --> VS[(向量+符号)]
+  IDE[IDE 插件] --> SP[Spring Code RAG]
+  SP --> VS
+  SP --> LLM[模型网关]</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">面试雷区</span>
+          <ul>
+            <li>「把整个 repo 塞进 Prompt」</li>
+            <li>不做密钥扫描</li>
+            <li>文档 RAG 方案直接套代码</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">S4 标准答法</span>
+          <ul>
+            <li>AST 切片 + 符号索引 + repo 过滤</li>
+            <li>延迟预算 + secret scan</li>
+            <li>Python 索引 / Spring 查询分工</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>代码切片与符号索引</strong>：AST 保边界；symbol index 支撑精确跳转。</li>
+        <li><strong>仓库级检索</strong>：repo+branch 硬过滤；符号问法走 lookup。</li>
+        <li><strong>补全/问答 Prompt</strong>：FIM 与 RAG 分离；答案必须 file:line 引用。</li>
+        <li><strong>延迟与安全扫描</strong>：分场景 latency budget；索引前 secret scan。</li>
+        <li><strong>双栈对照</strong>：Python 建索引，Spring 对外 API；filter 与 TopK 对齐。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_practice07">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="ast" /> 能说明 AST 切块优于固定 token 的两点理由</label></li>
+          <li><label><input type="checkbox" data-id="repo" /> 能写出 repo+branch filter 的必要性</label></li>
+          <li><label><input type="checkbox" data-id="prompt" /> 能区分 FIM 与问答 Prompt 结构</label></li>
+          <li><label><input type="checkbox" data-id="scan" /> 能描述 secret scan 在流水线中的位置</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；进入进阶阶段 <a href="#ch-advanced-01-query-transform">查询改写与 HyDE</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://tree-sitter.github.io/tree-sitter/" target="_blank" rel="noopener">Tree-sitter · 多语言 AST</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI RAG · FilterExpression</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/contextual_compression/" target="_blank" rel="noopener">LangChain · 代码上下文压缩</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">阅读 <code>demos/practice-07-code-rag-lab/code-rag-notes.md</code>，完成 S4 面试答题框架草稿。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>为一个 Java 类手写 AST 级 chunk metadata（symbol、line、file_path）。</li>
+      <li>写 symbol lookup 伪代码：问「OrderService」时如何 fallback 到向量检索。</li>
+      <li>设计 IDE 补全场景的 latency budget 分解（检索 / LLM / 网络各占多少 ms）。</li>
+      <li>列出 secret scan 应拦截的 3 类 pattern 示例（勿用真实密钥）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">用户问「这个项目怎么跑起来？」应走 symbol index 还是语义向量？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>语义向量为主</strong>。问法不含明确符号名，README / build.gradle 等文档型 chunk 靠 embedding；可对 <code>README.md</code> 提权而非 symbol lookup。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Spring filter 漏写 branch，Python 索引已按 branch 分 collection。会出现什么现象？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>可能检索到其他 branch 的 stale chunk，或空结果（若 collection 按 branch 隔离且 filter 不匹配）。双栈 parity 失败；应在 Spring SearchRequest 与 Python filter 对齐 branch 字段。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：代码库 RAG</h4>
+      <p>目录：<code>demos/practice-07-code-rag-lab/</code>。<strong>验收</strong>：能口述 S4 五要素（切片、检索、Prompt、延迟、安全）及双栈分工。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>：S4 同样需黄金集</li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-01-query-transform">查询改写与 HyDE</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,451 @@
+<section id="ch-basics-03-ragas" class="chapter" data-chapter="basics-03-ragas">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>RAGAS 与自动评测</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-ragas" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>评测体系设计</strong> · 能力：用 RAGAS pipeline 自动打分并接入 CI 门禁</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist <span class="term glossary-term" data-term-id="s1" tabindex="0"><span class="term-label">企业知识库 RAG</span><span class="term-code">S1</span></span> 已在 <a href="#ch-basics-01-metrics">指标：准确、召回、忠实、延迟</a> 定义了 <span class="term" data-term-id="faithfulness" tabindex="0">faithfulness</span> 等契约，在 <a href="#ch-basics-02-dataset">评测集构建</a> 准备了 JSONL。若仍靠人工逐条打分，MR 合并前无法做回归。<span class="term" data-term-id="ragas" tabindex="0">ragas</span> 把「检索→生成→指标」串成可重复的 <span class="term" data-term-id="eval-pipeline" tabindex="0">eval pipeline</span>，是 <span class="term" data-term-id="ns1-flywheel" tabindex="0">NS1 飞轮</span> 中<strong>自动评测</strong>一环。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>画出 S1 RAG 的 RAGAS 输入输出（question / contexts / answer / ground_truth）与指标映射</li>
+          <li>用 Python 脚本或 pytest 对 <span class="term" data-term-id="corpassist-eval" tabindex="0">corpassist eval</span> JSONL 做 <span class="term" data-term-id="batch-eval" tabindex="0">batch eval</span></li>
+          <li>在 CI 配置 <span class="term" data-term-id="ci-gate" tabindex="0">ci gate</span> 与 <span class="term" data-term-id="threshold-gate" tabindex="0">threshold gate</span>，低于阈值阻塞合并</li>
+          <li>解读自动分与人工 rubrics 的偏差，避免「分数好看、客户不买账」</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>Pipeline 四元组</strong>：question、contexts、answer、（可选）ground_truth → RAGAS <span class="term" data-term-id="auto-metric" tabindex="0">auto metric</span>。</li>
+          <li><strong>Judge 成本</strong>：多数指标依赖 <span class="term" data-term-id="llm-judge" tabindex="0">llm judge</span>，CI 应固定模型与 prompt 版本。</li>
+          <li><strong>双栈同集</strong>：Python RAGAS 与 Spring 集成测试读同一 JSONL hash，输出映射到 <span class="term" data-term-id="dual-stack-metrics" tabindex="0">dual stack metrics</span> schema。</li>
+          <li><strong>分≠放行</strong>：自动分是门禁必要条件，不是充分条件；上线仍要人工抽检与 A/B。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>pipeline</h3>
+      <p><span class="term" data-term-id="ragas" tabindex="0">ragas</span> 的 <span class="term" data-term-id="eval-pipeline" tabindex="0">eval pipeline</span> 把 CorpAssist S1「问→检→答」产物标准化为评测行，再批量调用指标函数。核心不是「调一个 API」，而是<strong>数据契约 + 执行顺序 + 结果落盘</strong>。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · MR 前回归（45 秒）</span>
+        工程师改了检索 top-k。CI 拉取 <code>eval-sample.jsonl</code>（与 Spring 侧同 hash），对每条样例：① 跑 S1 RAG 得到 answer 与 contexts ② 调用 RAGAS 算 faithfulness / context_recall ③ 汇总均值并与 <code>metrics-schema.json</code> 阈值比 ④ 任一项低于 <span class="term" data-term-id="threshold-gate" tabindex="0">threshold gate</span> 则 block merge。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist S1 · RAGAS eval pipeline</h5>
+        <pre class="mermaid">flowchart LR
+  DS[(eval JSONL)] --> RUN[S1 RAG 推理]
+  RUN --> ROW[行: q / ctx / ans / gold]
+  ROW --> RAGAS[RAGAS metrics]
+  RAGAS --> MAP[映射 metrics-schema]
+  MAP --> GATE{threshold gate}
+  GATE -->|pass| ART[json artifact]
+  GATE -->|fail| BLOCK[CI block]</pre>
+        <p class="diagram-caption">与 NS1 飞轮：自动评测输出进入「门禁发布」，坏例进入后续人工/A/B 环节。</p>
+      </div>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>阶段</th><th>输入</th><th>输出</th><th>常见失败</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>加载评测集</td>
+              <td>JSONL：<code>query</code>、<code>gold</code>、<code>tags</code></td>
+              <td>内存 Dataset / 迭代器</td>
+              <td>评测集 <span class="term" data-term-id="version-pin" tabindex="0">version pin</span> 与 MR 不一致</td>
+            </tr>
+            <tr>
+              <td>推理</td>
+              <td>query</td>
+              <td>answer + retrieved contexts</td>
+              <td>环境变量指向错误索引/模型</td>
+            </tr>
+            <tr>
+              <td>打分</td>
+              <td>四元组</td>
+              <td>faithfulness、context_recall 等</td>
+              <td>Judge 模型漂移导致分不可比</td>
+            </tr>
+            <tr>
+              <td>门禁</td>
+              <td>聚合分 + schema 阈值</td>
+              <td>pass/fail + 报告</td>
+              <td>只报均值不看 <span class="term" data-term-id="hard-case" tabindex="0">hard case</span> 分位</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>反例 vs 推荐：Pipeline 设计</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Notebook 手点跑分，无版本、无 CI</li>
+            <li>只存 answer，不存 contexts，无法算 faithfulness</li>
+            <li>换评测集仍用旧阈值，误杀/误放</li>
+            <li>Python 与 Spring 各跑各的 CSV 字段名</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>脚本化 <span class="term" data-term-id="batch-eval" tabindex="0">batch eval</span> + JSON 报告 artifact</li>
+            <li>每行保留 contexts 快照便于归因</li>
+            <li>阈值与 schema、评测集 tag 同 PR 审查</li>
+            <li>输出映射 <span class="term" data-term-id="dual-stack-metrics" tabindex="0">dual stack metrics</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：没有 ground_truth 还能跑 RAGAS 吗？</summary>
+        <p>可以。<span class="term" data-term-id="faithfulness" tabindex="0">faithfulness</span>、<span class="term" data-term-id="answer-relevance" tabindex="0">answer relevance</span> 等可不依赖 gold；<span class="term" data-term-id="context-recall" tabindex="0">context recall</span> 通常需要 gold 或人工标注的参考证据。S1 评测集应尽可能带 gold。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Python 脚本</h3>
+      <p>工程上常用两种方式：<strong>独立 runner 脚本</strong>（本地/CI 一条命令）或 <strong>pytest 用例</strong>（与单元测试同仓库）。CorpAssist Python 栈以前者做 nightly、后者做 MR 快路径。</p>
+
+      <h4>最小 mock runner（与 Demo 对齐）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># demos/basics-03-ragas-lab/mock_ragas.py — 示意，不调用真实 API
+def faithfulness_score(answer: str, contexts: list[str]) -&gt; float:
+    """S1：答案含 doc_id 引用则高分"""
+    cited = any(c.split("-")[0] in answer for c in contexts if "-" in c)
+    has_ref = "pol-" in answer or "doc_id" in answer
+    return 0.91 if (cited or has_ref) else 0.42
+
+def run_row(query: str, answer: str, contexts: list[str]) -&gt; dict:
+    return {
+        "query": query,
+        "faithfulness": faithfulness_score(answer, contexts),
+        "answer_relevance": 0.88 if len(answer) &gt; 20 else 0.55,
+        "context_recall": 0.85 if contexts else 0.0,
+    }
+
+if __name__ == "__main__":
+    row = run_row("年假几天？", "依据 pol-001…", ["pol-001 text"])
+    print(row)  # 期望 faithfulness &gt;= 0.9</code></pre>
+      </div>
+
+      <h4>pytest 门禁片段（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import json
+from pathlib import Path
+
+THRESHOLDS = json.loads(Path("metrics-schema.json").read_text(encoding="utf-8"))
+
+def test_s1_faithfulness_regression():
+    from mock_ragas import run_row
+    bad = run_row("报销上限？", "随便说说", ["fin-002"])
+    assert bad["faithfulness"] &gt;= THRESHOLDS["faithfulness_min"], bad</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="Python 脚本形态">
+        <input type="radio" name="ragas-script-tab" id="ragas-tab-runner" class="learn-tab-input" checked />
+        <input type="radio" name="ragas-script-tab" id="ragas-tab-pytest" class="learn-tab-input" />
+        <label for="ragas-tab-runner">独立 runner</label>
+        <label for="ragas-tab-pytest">pytest 集成</label>
+        <div class="learn-tab-panel" id="ragas-panel-runner" role="tabpanel">
+          <p><strong>适用</strong>：全量 JSONL、生成 HTML/JSON 报告、上传 artifact。<strong>命令</strong>：<code>python -m ragas_runner --dataset eval-v3.jsonl</code>（命名见 <span class="term" data-term-id="ragas-runner" tabindex="0">ragas runner</span>）。</p>
+        </div>
+        <div class="learn-tab-panel" id="ragas-panel-pytest" role="tabpanel">
+          <p><strong>适用</strong>：MR 快反馈、与现有 <span class="term" data-term-id="pytest-eval" tabindex="0">pytest eval</span> 同 job。<strong>注意</strong>：抽样 20 条 hard tag + 全量 smoke，避免 CI 超时。</p>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>双栈提示</strong>
+        <p>Spring 侧不直接跑 RAGAS Python 包时，应对同一 JSONL 做集成测试，断言后写入相同 schema 字段——详见 <a href="#ch-practice-02-spring-eval">Spring AI 服务评测</a>。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CI 集成</h3>
+      <p>自动评测的价值在「<strong>每次变更可重复、可阻塞</strong>」。<span class="term" data-term-id="ci-gate" tabindex="0">ci gate</span> 把 RAGAS 报告挂到 PR：失败即不可合并，避免 NS1 飞轮在发布环节失守。</p>
+
+      <h4>GitHub Actions 示意</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">jobs:
+  rag-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin eval dataset
+        run: echo "EVAL_SHA=$(sha256sum eval/corpassist-s1.jsonl | cut -d' ' -f1)" &gt;&gt; $GITHUB_ENV
+      - name: Run RAGAS batch
+        run: python scripts/run_ragas.py --out reports/ragas.json
+      - name: Threshold gate
+        run: python scripts/check_thresholds.py reports/ragas.json metrics-schema.json</code></pre>
+      </div>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>场景</th><th>门禁策略</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>日常 MR</td>
+              <td>hard 子集 + 核心指标均值</td>
+              <td>平衡成本与信号；&lt; 10 min</td>
+            </tr>
+            <tr>
+              <td>Release candidate</td>
+              <td>全量 JSONL + SLA 分位</td>
+              <td>与 <span class="term" data-term-id="regression-set" tabindex="0">regression set</span> 对齐</td>
+            </tr>
+            <tr>
+              <td>仅 Prompt 微调</td>
+              <td>faithfulness + answer_relevance</td>
+              <td>检索未动时可跳过 recall 全量</td>
+            </tr>
+            <tr>
+              <td>索引/embedding 变更</td>
+              <td>context_recall 必跑</td>
+              <td>生成再好也救不了漏检索</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>CI 集成 FAQ</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>Judge 调用太慢，CI 超时怎么办？</summary>
+          <div class="learn-faq-body">
+            ① 分层：smoke 子集每 MR，全量 nightly；② 缓存相同 query 的推理结果；③ 固定 judge 模型与 batch size；④ 极端情况用本章 mock 做结构测试，真实 judge 放 release 流水线。
+          </div>
+        </details>
+        <details>
+          <summary>阈值设多少「合理」？</summary>
+          <div class="learn-faq-body">
+            从当前 baseline 减 0.02～0.05 作 MR 门禁，全量发布用 baseline 本身。阈值必须与 <code>metrics-schema.json</code> 和评测集版本同 PR 修改，避免偷换集合作弊。
+          </div>
+        </details>
+        <details>
+          <summary>Python CI 绿了，Spring 还需要跑吗？</summary>
+          <div class="learn-faq-body">
+            需要。双栈客户可能走不同部署路径；Spring 集成测试验证 Advisor 链与 HTTP 契约，见 <a href="#ch-practice-02-spring-eval">Spring AI 服务评测</a> 的 <span class="term" data-term-id="eval-parity" tabindex="0">eval parity</span>。
+          </div>
+        </details>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：MR 只改文档，还要跑全量 RAGAS 吗？</summary>
+        <p>文档-only 可配置 skip 规则，但需团队显式约定。默认仍跑 smoke 子集，防止「顺手改了一行 Prompt 配置」被漏检。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>结果解读</h3>
+      <p>自动分是 <span class="term" data-term-id="llm-judge" tabindex="0">llm judge</span> 或启发式函数的输出，不是用户满意度。<span class="term" data-term-id="metric-interpret" tabindex="0">metric interpret</span> 要求你看<strong>分布、坏例、与人工 rubrics 的对照</strong>，而不是只报一个均值。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>现象</th><th>可能含义</th><th>建议动作</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>faithfulness 高、客户仍投诉</td>
+              <td>Judge 与业务 rubrics 不一致；引用格式「骗过」指标</td>
+              <td>抽 20 条做 <a href="#ch-basics-04-human-eval">人工评测与仲裁</a></td>
+            </tr>
+            <tr>
+              <td>recall 跌、faithfulness 升</td>
+              <td>检索变保守，生成「安全但漏答」</td>
+              <td>查索引与 top-k；勿单看忠实</td>
+            </tr>
+            <tr>
+              <td>双栈分差 &gt; 0.05</td>
+              <td>推理配置或 schema 映射不一致</td>
+              <td><span class="term" data-term-id="cross-stack-compare" tabindex="0">cross stack compare</span> 对齐 trace</td>
+            </tr>
+            <tr>
+              <td>hard tag 均值远低于 easy</td>
+              <td>回归集未覆盖真实难例</td>
+              <td>坏例回流 <span class="term" data-term-id="badcase-reflow" tabindex="0">badcase reflow</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>自动分 vs 人工 rubrics（示意）</h4>
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-json">{
+  "id": "s1-042",
+  "ragas_faithfulness": 0.88,
+  "human_rubric_faithfulness": 2,
+  "note": "有引用但曲解制度年限"
+}</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-markdown">解读：RAGAS 看到 doc_id 给高分；人工 2 分（1-5）
+→ 纳入 calibration 集，调整 judge prompt 或加规则 metric</code></pre>
+        </div>
+      </div>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">研发</span>
+          <p class="role-card-desc">看分项与 badcase id，定位检索/Prompt/模型。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">QA / 标注</span>
+          <p class="role-card-desc">维护 calibration 集，对齐 auto 与 human。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">发布负责人</span>
+          <p class="role-card-desc">门禁 pass + 人工抽检 pass 才进 RC。</p>
+        </article>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>NS1 飞轮：自动评测之后是什么？</summary>
+        <p>门禁发布 → 线上 A/B / 灰度 → 用户反馈 → 坏例回流评测集。只停在离线高分，飞轮不会转。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>pipeline</strong>：JSONL → 推理 → RAGAS 四元组 → 映射 schema → threshold gate；须 version pin 与 contexts 快照。</li>
+        <li><strong>Python 脚本</strong>：runner 全量 + pytest MR 快路径；Demo <code>mock_ragas.py</code> 展示引用与分数关系。</li>
+        <li><strong>CI 集成</strong>：<span class="term" data-term-id="ci-gate" tabindex="0">ci gate</span> 阻塞 merge；分层 smoke / nightly 控制 judge 成本。</li>
+        <li><strong>结果解读</strong>：看分布与 hard 子集；自动分与人工 rubrics 偏差要进 calibration，支撑 dual stack metrics 与 NS1 飞轮。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-evaluation-quality_basics03_ragas">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pipeline-io" /> 能列出 RAGAS 行级输入字段与 S1 两个核心输出指标</label></li>
+          <li><label><input type="checkbox" data-id="script-modes" /> 能说明 runner 与 pytest 两种脚本各自适用场景</label></li>
+          <li><label><input type="checkbox" data-id="ci-gate" /> 能写出 CI 中 threshold gate 失败时的阻塞行为</label></li>
+          <li><label><input type="checkbox" data-id="interpret" /> 能解释「faithfulness 高但人工低分」的一种原因</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>eval pipeline</td><td>评测集→推理→RAGAS→schema→门禁</td></tr>
+                <tr><td>batch eval</td><td>整集可重复跑，输出 json artifact</td></tr>
+                <tr><td>ci gate</td><td>指标不达标则 MR 不可合并</td></tr>
+                <tr><td>metric interpret</td><td>看坏例与人工偏差，不只报均值</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何在 CI 里平衡 RAGAS judge 成本与回归信号？</li>
+              <li>Python RAGAS 0.91、Spring 集成测试 0.84，你会先查什么？</li>
+              <li>为什么自动评测 pass 仍要做人工抽检？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-basics-04-human-eval">人工评测与仲裁</a> 补齐自动指标盲区（语气、合规、体验）。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.ragas.io/en/stable/getstarted/rag_evaluation/" target="_blank" rel="noopener">RAGAS — RAG Evaluation Quickstart</a></li>
+      <li><a href="https://docs.ragas.io/en/stable/concepts/metrics/" target="_blank" rel="noopener">RAGAS Metrics Reference</a></li>
+      <li><a href="https://docs.ragas.io/en/stable/howtos/customizations/" target="_blank" rel="noopener">RAGAS — Customizations &amp; CI</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 CorpAssist S1，完成 <strong>pipeline</strong> 序列标注、<strong>Python 脚本</strong> mock 实验、<strong>CI 集成</strong> 决策表与 <strong>结果解读</strong> 排查表（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照「pipeline」小节 Mermaid「RAGAS eval pipeline」，标出 NS1 飞轮中自动评测的前后继环节（各写 1 个环节名）。</li>
+      <li>按「Python 脚本」小节 mock 代码，修改 <code>demos/basics-03-ragas-lab/mock_ragas.py</code>：分别用「含 pol- 引用」与「无引用胡答」两行输入，记录 faithfulness 差异。</li>
+      <li>根据「CI 集成」决策表，为「仅改 Prompt」与「改 embedding 索引」各选一行门禁策略并写一句理由。</li>
+      <li>从「结果解读」现象表选一行，写 2 条排查动作（检索 / 人工 / 双栈之一）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）MR 只改了 UI 颜色，同事提议跳过 RAGAS CI 以节省时间。你是否同意？若不同意，最小应跑什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不同意跳过</strong>：UI 变更不应影响 RAG，但 CI 存在是为了证明「无回归」。<strong>最小</strong>：smoke 子集（5～10 条）+ faithfulness 均值 gate，或标记为 docs-only 跳过（需团队规则）。全 skip 违反 NS1 飞轮门禁习惯。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：下列 yaml 哪条<strong>最危险</strong>？① 固定 EVAL_SHA ② <code>check_thresholds.py</code> 失败 exit 1 ③ Judge 模型随 <code>latest</code> 漂移 ④ 上传 reports/ragas.json</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>③ 最危险</strong>：Judge 漂移导致分数不可比，假阳性/假阴性。①②④ 是推荐实践。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：RAGAS mock 实验室</h4>
+      <p>目录：<code>demos/basics-03-ragas-lab/</code>。<strong>验收</strong>：在目录执行 <code>python mock_ragas.py</code>，输出含 <code>faithfulness</code>、<code>answer_relevance</code>、<code>context_recall</code> 三个键；无引用答案 faithfulness &lt; 0.5。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-human-eval">人工评测与仲裁</a> — 校准自动分、覆盖合规与语气</li>
+      <li><a href="#ch-practice-01-python-eval">Python 服务评测流水线</a> — pytest + RAGAS 完整落地</li>
+      <li><a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener">RAGAS 论文</a></li>
+    </ul>
+  </div>
+</section>

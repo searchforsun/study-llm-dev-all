@@ -1,0 +1,221 @@
+<section id="ch-practice-04-gray" class="chapter" data-chapter="practice-04-gray">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>灰度与版本</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-gray" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：推理模型 <span class="term" data-term-id="model-version-route" tabindex="0">model version route</span> 与 <span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span></p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S4 将 <code>qwen-7b-awq</code> 升级到 v2 时，不能一次性切流。<span class="term" data-term-id="infer-gray" tabindex="0">infer gray</span> 让 Python 补全服务与 Spring BFF 共用<strong>稳定</strong>的 <span class="term" data-term-id="model-alias" tabindex="0">model alias</span>，由网关按 <span class="term" data-term-id="route-weight" tabindex="0">route weight</span> 把少量流量打到新 vLLM 实例，指标劣化再 <span class="term" data-term-id="version-switch" tabindex="0">version switch</span> 回滚。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 header / 比例两种 <span class="term" data-term-id="canary-infer" tabindex="0">canary infer</span> 路由</li>
+          <li>列出 TTFT、错误率、补全采纳率三类回滚触发条件</li>
+          <li>说明 <span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span> 与生产灰度的边界</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>客户端不动 model 名</strong>：双栈只认 <code>corp-coder-7b</code> alias，版本差异在路由层。</li>
+          <li><strong>灰度在网关或 sidecar</strong>：勿在业务代码里 if random 切 URL（难观测、难回滚）。</li>
+          <li><strong>回滚要快</strong>：配置改 <code>canary_percent: 0</code> 优于重新发版应用。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>路由</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S4 · AWQ v2 上线</span>
+        平台组发布 <code>vllm-v2</code>（新量化权重），研发侧仍调用 <code>model: corp-coder-7b</code>。网关 5% 流量走 v2，其余走 v1；内部评测用 <code>X-Infer-Canary: 1</code> 强制金丝雀。
+      </aside>
+      <p><span class="term" data-term-id="model-version-route" tabindex="0">Model version route</span> 在<strong>推理入口</strong>完成：Spring <a href="#ch-practice-02-spring-remote">远程 ChatModel</a> 与 Python <a href="#ch-practice-01-python-client">OpenAI client</a> 的 <code>base_url</code> 指向<strong>统一网关</strong>，由网关解析后端 <code>vllm-v1:8000</code> / <code>vllm-v2:8000</code>。</p>
+
+      <h4>灰度路由配置（Lab 草案）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># demos/practice-04-gray-lab/gray-route.yaml
+model_alias: corp-coder-7b
+default_backend: vllm-v1:8000
+canary_backend: vllm-v2:8000
+canary_percent: 5
+
+routing:
+  default: vllm-v1:8000
+  canary: vllm-v2:8000
+  canary_percent: 5
+header_canary: X-Infer-Canary</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>策略</th><th>适用</th><th>CorpAssist 注意</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="term" data-term-id="route-weight" tabindex="0">route weight</span>（比例）</td>
+            <td>生产默认</td>
+            <td>从 5% → 20% → 50% 阶梯；每步观察 24h</td>
+          </tr>
+          <tr>
+            <td>Header 强制金丝雀</td>
+            <td>内测 / 自动化对比</td>
+            <td>勿对普通用户默认带 header</td>
+          </tr>
+          <tr>
+            <td>租户 / 部门路由</td>
+            <td>大客单独版本</td>
+            <td>与 <span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span> 实验区分：AB 要固定 cohort</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>Spring 配置两套 <code>base-url</code>，业务 if 切换</li>
+            <li>灰度直接改 <code>served-model-name</code>，客户端跟着改</li>
+            <li>无 trace：无法区分 v1/v2 延迟</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>单 alias + 网关路由</li>
+            <li>日志带 <code>backend_version=v2</code> 标签</li>
+            <li>与 <a href="#ch-practice-03-stream">流式监控</a> 的 TTFT 联动</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · 推理灰度路径</h5>
+        <pre class="mermaid">flowchart LR
+  Py[Python 补全] --> GW[推理网关]
+  Sp[Spring BFF] --> GW
+  GW -->|95%| V1[vLLM v1]
+  GW -->|5%| V2[vLLM v2 AWQ]
+  V1 --> GPU1[GPU Pool A]
+  V2 --> GPU2[GPU Pool B]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="infer-gray" tabindex="0">infer gray</span> 发生在网关；vLLM 实例各自独立，共享 OpenAI API 契约。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何坚持 model alias 而不是让前端传 v2 模型名？</summary>
+        <p>双栈与 IDE 插件只配置一次；版本切换对应用透明，回滚只改路由百分比，避免全量改配置发版。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>回滚</h3>
+      <p><span class="term" data-term-id="rollback-model" tabindex="0">Rollback model</span> 是<strong>运维动作</strong>：当 <span class="term" data-term-id="canary-infer" tabindex="0">canary infer</span> 指标越过阈值，将 <code>canary_percent</code> 置 0 或切默认 backend，必要时配合 <span class="term" data-term-id="version-switch" tabindex="0">version switch</span> 冻结发布。</p>
+
+      <h4>回滚触发（gray-route.yaml）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">rollback:
+  triggers:
+    - metric: p95_latency_ms
+      threshold: 3000
+      window: 5m
+    - metric: error_rate
+      threshold: 0.02
+      window: 5m
+  action: set_canary_percent_to_0</code></pre>
+      </div>
+
+      <p>S4 代码补全额外关注：<strong>空补全率</strong>、<strong>FIM 截断错误</strong>（常与 <a href="#ch-basics-04-quant">量化精度</a> 或 <code>max-model-len</code> 有关）。回滚前用 <span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span> 对比脚本固定 200 条 prompt，避免凭体感。</p>
+
+      <details class="learn-faq">
+        <summary>FAQ：回滚 vLLM 版本要不要重启 Spring？</summary>
+        <p>若客户端始终连网关且 alias 不变，<strong>不必</strong>重启应用；仅当 Spring 缓存了错误 endpoint 或本地 fallback 指向 v2 时才需刷新配置。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>路由</strong>：model alias + 网关比例/header 灰度，双栈零改 model 字段。</li>
+        <li><strong>回滚</strong>：延迟/错误率/业务指标触发，优先 <code>canary_percent: 0</code>。</li>
+        <li><strong>观测</strong>：请求必须带 backend 版本标签，才能做 ab infer 与复盘。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一章 <a href="#ch-practice-05-corpassist-deploy">实战：CorpAssist 推理部署</a> — 把 v1/v2 与网关写进 compose 验收清单。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM</a></li>
+      <li><a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html" target="_blank" rel="noopener">Nginx Upstream（路由参考）</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/" target="_blank" rel="noopener">Kubernetes Ingress（K8s 灰度见 advanced-02）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-04-gray-lab/gray-route.yaml</code> 上补全回滚条件，并画一张你司网关灰度拓扑。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>为 <code>rollback.triggers</code> 增加一条 S4 业务指标（如空补全率 &gt; 5%）。</li>
+      <li>写清 <code>canary_percent</code> 从 5 → 20 → 50 的三步放量计划与每步观察窗口。</li>
+      <li>说明 Spring 与 Python 的 <code>base_url</code> 应指向网关还是直连 vLLM（结合 <a href="#ch-practice-02-spring-remote">Spring 远程</a>）。</li>
+      <li>完成右侧章节测验（lsfa-p04）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">灰度第二天 P95 延迟升 40%，错误率正常。是否应立即 rollback？列出你的决策依据（至少 2 条）。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>不一定立即全量回滚：先确认是否仅 v2 cohort、是否 TTFT 与 <a href="#ch-practice-03-stream">流式</a> 配置变化；若超 SLA 且影响用户则降 canary_percent 或回滚；保留 ab 样本对比 v1/v2。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">团队在 Spring 里新增 <code>vllmV2BaseUrl</code> 字段按用户 ID 切换。这种 <span class="term" data-term-id="model-version-route" tabindex="0">model version route</span> 有何风险？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>逻辑散落、难统一回滚、观测标签不一致；应上移到网关并保留 model alias。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：灰度与版本</h4>
+      <p>目录：<code>demos/practice-04-gray-lab/</code>（<code>gray-route.yaml</code>）。<strong>验收</strong>：补全至少 2 条 rollback 触发；写明 header 与比例两种路由的使用场景。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-03-stream">流式与批处理</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-corpassist-deploy">实战：CorpAssist 推理部署</a></li>
+      <li><a href="#ch-advanced-02-k8s-serve">K8s 部署清单</a>（Ingress 金丝雀）</li>
+    </ul>
+  </div>
+</section>

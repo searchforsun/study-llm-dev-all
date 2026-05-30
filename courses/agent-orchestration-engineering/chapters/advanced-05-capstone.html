@@ -1,0 +1,326 @@
+<section id="ch-advanced-05-capstone" class="chapter" data-chapter="advanced-05-capstone">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>实战：CorpAssist Python Agent</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-05-capstone" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>生产 Agent</strong> · 能力：S2/S3 端到端交付、指标看板与 runbook 文档</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>前序章节拆解决了 graph、tool、安全、观测；<span class="term" data-term-id="capstone-agent" tabindex="0">capstone agent</span> 要求你把 CorpAssist Python Agent 作为<strong>可上线产品</strong>交付：FastAPI 服务、Spring 调用、LangSmith eval gate、on-call runbook。这是 <span class="term" data-term-id="s2-s3-delivery" tabindex="0">s2 s3 delivery</span> 的汇总验收。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>按 checklist 完成 <span class="term" data-term-id="e2e-delivery" tabindex="0">e2e delivery</span>：图 + 工具 + MCP + interrupt + obs</li>
+          <li>定义 <span class="term" data-term-id="agent-metrics" tabindex="0">agent metrics</span> 看板（CSAT、转人工、成本、工具失败率）</li>
+          <li>编写 <span class="term" data-term-id="runbook" tabindex="0">runbook</span> 与 <span class="term" data-term-id="api-doc" tabindex="0">api doc</span> 供双栈联调</li>
+          <li>通过 <span class="term" data-term-id="eval-gate" tabindex="0">eval gate</span> 后再灰度 <span class="term" data-term-id="production-agent" tabindex="0">production agent</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>交付 = 代码 + 指标 + 文档</strong>：缺 runbook 的 Agent 不算生产就绪。</li>
+          <li><strong>S2 与 S3 同架构、不同 SLA</strong>：共用 FastAPI 壳，分 graph 与路由配置。</li>
+          <li><strong>灰度顺序</strong>：eval gate → 5% 流量 → 看板 24h → 全量。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>端到端</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist 上线前最后一关</span>
+        架构师问：「Spring 网关调 Python Agent，thread 能续聊吗？退款能 interrupt 吗？MCP 挂了会降级吗？」——本章 checklist 逐条应答。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist Python Agent 端到端架构</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph clients [Clients]
+    WEB[Web/App]
+    SPR[Spring Boot Gateway]
+  end
+  subgraph py [Python Agent Service]
+    API[FastAPI agent api]
+    G2[S2 Customer Graph]
+    G3[S3 Office Graph]
+    CP[Redis checkpoint]
+  end
+  subgraph deps [Dependencies]
+    MCP[MCP Tools]
+    LS[LangSmith]
+    HITL[Approval UI]
+  end
+  WEB --> SPR
+  SPR -->|dual stack api| API
+  API --> G2
+  API --> G3
+  G2 --> MCP
+  G3 --> MCP
+  G2 --> CP
+  G3 --> CP
+  G2 --> HITL
+  API --> LS</pre>
+        <p class="diagram-caption">S2/S3 分 graph，共享 <span class="term" data-term-id="fastapi-agent" tabindex="0">fastapi agent</span> 与观测；详见 <a href="#ch-practice-06-api">Agent 服务化</a>。</p>
+      </div>
+
+      <h4>delivery-checklist 解读</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown"># demos/advanced-05-capstone-lab/delivery-checklist.md
+- [ ] 图 + 工具 + MCP（allowlist + timeout）
+- [ ] 人工审批 interrupt + audit trail
+- [ ] 观测 LangSmith + usage meter
+- [ ] 步数/Token 预算 + loop detection
+- [ ] eval gate 数据集 regression pass
+- [ ] FastAPI OpenAPI + Spring 调用样例
+- [ ] runbook：P0 工具失败 / 死循环 / 成本告警</code></pre>
+      </div>
+
+      <h4>FastAPI 入口（双场景）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">@app.post("/v1/agent/{scene}/chat")
+async def chat(scene: Literal["s2", "s3"], req: ChatReq, user=Depends(auth)):
+    graph = GRAPHS[scene]
+    config = {
+        "configurable": {
+            "thread_id": req.thread_id,
+            "role": user.role,
+            "user_id": user.id,
+        }
+    }
+    if req.stream:
+        return EventSourceResponse(stream_graph(graph, req.message, config))
+    return await graph.ainvoke({"messages": [("user", req.message)]}, config)</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>检查项</th><th>S2 验收</th><th>S3 验收</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>意图路由</td>
+            <td>turbo/plus 分流</td>
+            <td>长链路 plus</td>
+          </tr>
+          <tr>
+            <td>interrupt</td>
+            <td>refund_propose</td>
+            <td>approval_submit</td>
+          </tr>
+          <tr>
+            <td>降级</td>
+            <td>转人工</td>
+            <td>checkpoint 续办</td>
+          </tr>
+          <tr>
+            <td>MCP 超时</td>
+            <td>3s 重试 1 次 → 话术</td>
+            <td>5s → 通知用户</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>指标</h3>
+      <p><span class="term" data-term-id="agent-metrics" tabindex="0">agent metrics</span> 分<strong>体验</strong>、<strong>可靠</strong>、<strong>成本</strong>三类；与 LangSmith experiment 与 Prometheus 双写。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>指标</th><th>定义</th><th>S2 目标示例</th><th>告警</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="term" data-term-id="csat-metric" tabindex="0">csat metric</span></td>
+            <td>会话结束 1～5 分</td>
+            <td>≥ 4.2</td>
+            <td>周环比 -0.2</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="transfer-rate" tabindex="0">transfer rate</span></td>
+            <td>转人工 / 总会话</td>
+            <td>≤ 18%</td>
+            <td>&gt; 25% 1h</td>
+          </tr>
+          <tr>
+            <td>tool_failure_rate</td>
+            <td>tool 错误 / 调用</td>
+            <td>&lt; 2%</td>
+            <td>MCP 宕机</td>
+          </tr>
+          <tr>
+            <td>avg_steps / cost</td>
+            <td>每会话步数与 Token</td>
+            <td>steps ≤ 8</td>
+            <td>成本 +30%</td>
+          </tr>
+          <tr>
+            <td>eval_pass_rate</td>
+            <td>regression dataset</td>
+            <td>≥ 92%</td>
+            <td>gate fail</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># Grafana 面板分组示意
+panels:
+  - title: S2 CSAT / Transfer
+    metrics: [csat_avg, transfer_rate]
+  - title: Agent Cost
+    metrics: [token_per_session, model_route_ratio]
+  - title: Reliability
+    metrics: [tool_failure_rate, p95_latency]</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：eval_pass_rate 92% 但 CSAT 跌，先查什么？</summary>
+        <p>查 dataset 是否覆盖最新促销话术/新 SKU；trace replay CSAT 低分会话，看是回复语气、步数过早终止还是 tool 误调。指标冲突时<strong>用户体验 KPI 优先</strong>，但须排除评测集过时。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>文档</h3>
+      <p>交付物：<span class="term" data-term-id="openapi-agent" tabindex="0">openapi agent</span> spec、Spring 集成指南、on-call <span class="term" data-term-id="runbook" tabindex="0">runbook</span>。文档与代码同 PR，避免「代码上了 runbook 下周补」。</p>
+
+      <h4>runbook 结构（扩展 demo）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown"># demos/advanced-05-capstone-lab/runbook.md
+## 1. 服务概览
+- FastAPI :8080, graphs: s2, s3
+- 依赖: Redis checkpoint, MCP order-service
+
+## 2. 告警 playbook
+| 告警 | 首步 | 升级 |
+| transfer_rate high | 查 LangSmith intent 分布 | on-call TL |
+| tool_failure_rate | 查 MCP 健康 | 切 fallback 话术 |
+
+## 3. 灰度与回滚
+- 5% → 24h → 100%; 回滚 helm revision N-1
+
+## 4. 联调
+- Spring: X-Session-Id, POST /v1/agent/s2/chat</code></pre>
+      </div>
+
+      <h4>API 文档要点</h4>
+      <ul>
+        <li><code>thread_id</code>：续聊与 checkpoint 键；Spring 须持久化。</li>
+        <li><code>stream=true</code>：<span class="term" data-term-id="sse-stream" tabindex="0">sse stream</span> 事件含 tool_start/tool_end。</li>
+        <li>错误码：429 步数耗尽、403 tool denied、503 MCP 不可用。</li>
+      </ul>
+
+      <div class="notice">
+        <strong>生产陷阱</strong>
+        <ul>
+          <li><strong>只交付 Docker 镜像</strong>：无 OpenAPI、无 runbook，Spring 联调反复 3 天。</li>
+          <li><strong>指标未接告警</strong>：CSAT 跌一周才发现。</li>
+          <li><strong>跳过 eval gate</strong>：灰度直接 50% 流量——违反 <span class="term" data-term-id="eval-gate" tabindex="0">eval gate</span> 纪律。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>端到端</strong>：S2/S3 分 graph，共享 FastAPI；checklist 覆盖 MCP、interrupt、预算、obs。</li>
+        <li><strong>指标</strong>：CSAT、转人工、tool 失败、成本、eval pass；看板 + 告警绑定灰度。</li>
+        <li><strong>文档</strong>：OpenAPI、Spring 联调、runbook 与代码同发布；eval gate 先于放量。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="aoe_advanced05_capstone">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 6 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="e2e" /> 能勾选 delivery-checklist 全部 7 项含义</label></li>
+          <li><label><input type="checkbox" data-id="metrics" /> 能列举 4 个 agent metrics</label></li>
+          <li><label><input type="checkbox" data-id="gray" /> 能复述灰度 5%→24h→100%</label></li>
+          <li><label><input type="checkbox" data-id="runbook" /> 能写出 transfer_rate 告警首步</label></li>
+          <li><label><input type="checkbox" data-id="api" /> 能说明 thread_id 用途</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Capstone Demo；学习 <a href="#ch-advanced-06-interview">面试排障</a>，把交付经验转化为口述案例。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://fastapi.tiangolo.com/advanced/openapi-customization/" target="_blank" rel="noopener">FastAPI OpenAPI</a></li>
+      <li><a href="https://langchain-ai.github.io/langgraph/cloud/deployment/standalone/" target="_blank" rel="noopener">LangGraph 部署</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI 调用外部 Agent</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">补全 delivery-checklist、指标阈值与 runbook 告警首步（约 45 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/advanced-05-capstone-lab/delivery-checklist.md</code>，为未勾选项各写一句验收标准。</li>
+      <li>在指标表中为 S3 填一列「目标示例」（如 approval 完成率）。</li>
+      <li>扩展 <code>runbook.md</code>：增加「tool_failure_rate &gt;5%」playbook 3 步。</li>
+      <li>列出 FastAPI OpenAPI 必须文档化的 3 个字段/参数。</li>
+      <li>设计 eval gate：handoff_rate 不得较 baseline +2%，写在 PR 模板一句。</li>
+      <li>可选：对照 <code>demos/practice-06-api-lab/openapi-snippet.yaml</code> 合并到 capstone。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（发布）eval 90% pass，PM 要求今晚全量。你如何决策？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>拒绝直接全量：未达 92% 门槛或需书面豁免；最低 5% 灰度 + 看板 24h。强调 <span class="term" data-term-id="production-agent" tabindex="0">production agent</span> 纪律与回滚预案。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（双栈）Spring 调通 chat，但未传 thread_id。会有什么问题？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>无法续聊与 interrupt resume；每次新会话，checkpoint 失效；S3 长任务中断后不能恢复。须在 <span class="term" data-term-id="api-doc" tabindex="0">api doc</span> 标必填并集成测试。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist Capstone 实验室</h4>
+      <p>目录：<code>demos/advanced-05-capstone-lab/</code>。<strong>验收</strong>：提交勾选的 checklist + 扩展 runbook；指标表含 S2/S3 各 2 项；口述灰度与回滚步骤。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>汇总</strong>：<a href="#ch-practice-01-single-agent">单 Agent 完整实现</a> · <a href="#ch-practice-06-api">Agent 服务化</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-06-interview">面试：Agent 排障</a></li>
+    </ul>
+  </div>
+</section>

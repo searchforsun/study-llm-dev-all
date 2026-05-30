@@ -1,0 +1,297 @@
+<section id="ch-practice-01-incremental" class="chapter" data-chapter="practice-01-incremental">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>增量更新与重建</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-incremental" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>治理实战</strong> · 能力：设计 CorpAssist 增量管道、全量重建窗口与 Python/Spring 双栈同步</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-04-index-versions">索引版本与回滚</a> 解决了「如何安全切换索引」；生产环境还要回答「日常怎么更新」。CorpAssist S1 KB 每天接收 Confluence/Git 变更，若每次全量 <span class="term" data-term-id="re-embed" tabindex="0">re-embed</span> 成本不可接受；若只做增量不做对账，又会在 ACL 元数据漂移、删除文档残留向量时埋雷。本章把<strong>增量管道、季度全量、双栈触发</strong>串成可运维方案。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="delta-ingest" tabindex="0">delta ingest</span> 只处理变更文档，并写 upsert/delete 契约</li>
+          <li>在 <span class="term" data-term-id="rebuild-window" tabindex="0">rebuild window</span> 内完成 <span class="term" data-term-id="full-rebuild" tabindex="0">full rebuild</span> + <span class="term" data-term-id="blue-green-index" tabindex="0">blue green index</span> 切换</li>
+          <li>配置 Python 索引完成后通知 Spring <span class="term" data-term-id="stack-sync" tabindex="0">stack sync</span> 刷新 VectorStore</li>
+          <li>判断何时必须全量重建（Embedding 模型、分块策略、schema 变更）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>增量默认</strong>：按 <code>doc_id + content_hash</code> 识别变更；删除走 tombstone，勿留 orphan 向量。</li>
+          <li><strong>全量兜底</strong>：Embedding/分块/schema 变更必须新 index + alias；增量无法修复历史脏数据。</li>
+          <li><strong>双栈一致</strong>：Python Milvus 写入与 Spring VectorStore 读 alias 必须同一 <code>index_version</code>。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>增量管道</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · nightly 同步</span>
+        每晚 02:00 从 Confluence 空间 <code>HR-POLICY</code> 拉取变更；法务文件夹平均 120 篇/天改动 3～8 篇。增量管道须在 30 分钟内完成 embed + upsert，并在 morning peak 前完成 Spring 侧 cache 刷新。
+      </aside>
+      <p><span class="term" data-term-id="incremental-pipe" tabindex="0">incremental pipe</span> 由调度器、变更检测、分块/embed、向量 upsert 四段组成。与 basics 采集不同，practice 强调<strong>与当前 index_version 绑定</strong>的幂等写入。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 增量管道四步</h5>
+        <pre class="mermaid">flowchart LR
+  CDC[变更检测] --> Split[分块+元数据]
+  Split --> Embed[embed incremental]
+  Embed --> Upsert[Milvus upsert]
+  Upsert --> Notify[stack sync 事件]</pre>
+        <p class="diagram-caption">删除文档走 delete by doc_id；更新走 upsert 同 chunk_id。</p>
+      </div>
+
+      <h4>变更检测：CDC 与 content_hash</h4>
+      <p>CorpAssist 使用 <span class="term" data-term-id="cdc-sync" tabindex="0">cdc sync</span> 表记录上次同步水位。对比源站 <code>updated_at</code> 与本地 <code>content_hash</code>，输出 <code>changed</code> / <code>deleted</code> 两集合。</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># corpassist/ingest/incremental_runner.py
+def run_incremental(source: str, index_version: str, since: datetime) -&gt; IngestReport:
+    changed, deleted = cdc_sync.diff(source, since)
+    for doc_id in deleted:
+        vector_store.delete(filter=f'doc_id == "{doc_id}" and index_version == "{index_version}"')
+    for doc in changed:
+        chunks = split_with_schema(doc, schema=CORPASSIST_SCHEMA)
+        vectors = embed_incremental(chunks)  # 仅变更块 re-embed
+        upsert(vectors, metadata={"index_version": index_version, "acl_tags": doc.acl})
+    return IngestReport(changed=len(changed), deleted=len(deleted))</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>全库扫描 re-embed，无 hash 短路</li>
+            <li>删除源文档但不删 Milvus 向量</li>
+            <li>增量写入未带 <code>index_version</code></li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li><code>content_hash</code> 不变则跳过 embed</li>
+            <li>delete filter 带 <code>doc_id</code> + version</li>
+            <li>upsert 携带 <code>acl_tags</code> 供检索层过滤</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-micro-check">
+        <p><strong>先想 10 秒：</strong>某篇政策标题未变、正文改了一个字，<code>content_hash</code> 会变吗？对应应触发 embed 还是跳过？</p>
+        <details><summary>参考思路</summary><p>hash 会变 → 进入 changed 集合 → 对该 doc 的 chunks 做 embed incremental；若只改元数据 ACL 则可能只 upsert metadata 不重算向量（视实现而定）。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>全量重建</h3>
+      <p>当 Embedding 模型从 <code>bge-m3</code> 升级到 <code>text-embedding-3-large</code>，或 <a href="#ch-basics-03-chunk-metadata">分块与元数据规范</a> 调整 overlap 从 128→256，<strong>增量无法修复历史向量</strong>，必须 <span class="term" data-term-id="full-rebuild" tabindex="0">full rebuild</span>：在新 collection 全量 embed，对账通过后 alias 切换。</p>
+
+      <h4>重建窗口与对账门禁</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>触发条件</th><th>策略</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Embedding 模型变更</td>
+            <td>新 index + 全量 re-embed</td>
+            <td><code>index_version=v20260601_emb_v2</code></td>
+          </tr>
+          <tr>
+            <td>分块/schema 变更</td>
+            <td>新 index + 全量重建</td>
+            <td>chunk_size 512→768</td>
+          </tr>
+          <tr>
+            <td>增量漂移超阈值</td>
+            <td>scheduled full rebuild</td>
+            <td>季度对账 diff &gt; 0.5%</td>
+          </tr>
+          <tr>
+            <td>仅文档内容变更</td>
+            <td>增量即可</td>
+            <td>日常 Confluence 更新</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>蓝绿切换配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist/config/rebuild.yaml
+rebuild:
+  window_cron: "0 3 * * 0"          # 周日 03:00 低峰
+  index_version: v20260530_full
+  alias: corpassist_kb_prod
+  blue_green: true
+  keep_versions: 3
+  reconcile:
+    - source_doc_count
+    - chunk_count
+    - vector_count
+  gate:
+    max_diff_ratio: 0.005           # 对账 diff &gt; 0.5% 禁止 alias switch</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="全量 vs 增量">
+        <input type="radio" name="incr-tab" id="incr-tab-inc" class="learn-tab-input" checked />
+        <input type="radio" name="incr-tab" id="incr-tab-full" class="learn-tab-input" />
+        <label for="incr-tab-inc">日常增量</label>
+        <label for="incr-tab-full">季度全量</label>
+        <div class="learn-tab-panel" id="incr-panel-inc" role="tabpanel">
+          <ul>
+            <li>耗时：分钟级（变更集小）</li>
+            <li>风险：delete 遗漏、hash 碰撞（极低）</li>
+            <li>适用：正文/元数据小改</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="incr-panel-full" role="tabpanel">
+          <ul>
+            <li>耗时：小时级（万级文档）</li>
+            <li>风险：切换窗口内查询一致性</li>
+            <li>适用：模型/schema 变更、对账修复</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈触发</h3>
+      <p>CorpAssist 采用 Python 索引管线写 Milvus，Spring AI <code>VectorStore</code> 负责在线检索。<span class="term" data-term-id="dual-trigger" tabindex="0">dual trigger</span> 指：索引任务完成后发布事件，Spring 侧刷新 alias 绑定或本地 cache，避免读到 stale index。</p>
+
+      <h4>事件契约（Python → Spring）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "event": "INDEX_PUBLISHED",
+  "kb_id": "corpassist_s1_hr",
+  "index_version": "v20260530",
+  "alias": "corpassist_kb_prod",
+  "mode": "incremental",
+  "stats": { "upserted": 42, "deleted": 3 },
+  "published_at": "2026-05-30T02:28:00Z"
+}</code></pre>
+      </div>
+
+      <h4>Spring 侧监听刷新</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@EventListener
+public void onIndexPublished(IndexPublishedEvent evt) {
+    if (!evt.kbId().equals("corpassist_s1_hr")) return;
+    vectorStoreRegistry.switchAlias(evt.alias(), evt.indexVersion());
+    meterRegistry.counter("kb.index.sync", "mode", evt.mode()).increment();
+}</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>排障提示</strong>
+        <p>用户反馈「昨晚更新了政策仍搜到旧版」：先查 Python ingest 日志是否 SUCCESS → 事件是否投递 → Spring <code>index_version</code> 是否与 Milvus alias 一致；<strong>勿</strong>只重启 Spring 而不核对 alias。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>增量管道</strong>：CDC + hash 识别变更；delete/upsert 带 <code>doc_id</code> 与 <code>index_version</code>；ACL 元数据随块写入。</li>
+        <li><strong>全量重建</strong>：模型/schema 变更必须新 index；对账 diff 超阈值禁止 alias switch。</li>
+        <li><strong>双栈触发</strong>：Python 发布 INDEX_PUBLISHED；Spring 切换 alias 并打点，保证读写同一版本。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="klg_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cdc" /> 能说明 CDC diff 输出 changed/deleted 两集合</label></li>
+          <li><label><input type="checkbox" data-id="delete" /> 能写出 delete filter 含 doc_id + index_version</label></li>
+          <li><label><input type="checkbox" data-id="rebuild" /> 能列举 2 条必须全量重建的触发条件</label></li>
+          <li><label><input type="checkbox" data-id="event" /> 能复述 INDEX_PUBLISHED 事件关键字段</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-02-permission">权限与多租户</a>，在检索层落实 ACL 行级过滤。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://milvus.io/docs/delete_entities.md" target="_blank" rel="noopener">Milvus Delete Entities</a></li>
+      <li><a href="https://milvus.io/docs/manage-collections.md" target="_blank" rel="noopener">Milvus Collection Alias</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI VectorStore</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 Demo 目录模拟一次增量 run + 全量 rebuild 决策表填写，并对照 JSON 事件验收双栈字段。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读正文「增量管道四步」Mermaid，在 <code>incremental-flow.md</code> 标注 delete 与 upsert 分支。</li>
+      <li>对照 Python <code>incremental_runner.py</code> 片段，写出 <code>deleted</code> 集合对应的 Milvus filter 表达式。</li>
+      <li>在「重建窗口与对账门禁」表中，为「Embedding 模型变更」行补充 CorpAssist 的 <code>index_version</code> 命名示例。</li>
+      <li>填写 <code>rebuild.yaml</code> 中 <code>max_diff_ratio</code> 含义，并说明超阈值时运维应做什么（禁止 alias switch）。</li>
+      <li>可选：运行 <code>demos/practice-01-incremental-lab/</code> 脚本，验证 INDEX_PUBLISHED JSON 字段齐全。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障）运营称「源站已删文档，RAG 仍能引用」。请按优先级列出 3 个检查点（从 ingest 到检索）。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>1) CDC 是否把 doc 放进 deleted 集合；2) Milvus delete filter 是否执行成功（doc_id + index_version）；3) Spring alias 是否指向仍含旧向量的 index_version。常见根因：增量漏删或 Spring 未 sync alias。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（找错）Embedding 刚从 v1 换 v2，运维选择「仅跑 incremental_runner」且 <code>blue_green: false</code>。违反哪条本章契约？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>违反「Embedding 变更必须 full rebuild + blue_green」。仅 incremental 会导致同一 alias 下混用两种 embedding 空间，检索质量不可控；应新建 index 全量 re-embed 再 alias switch。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：增量更新与重建</h4>
+      <p>目录：<code>demos/practice-01-incremental-lab/</code>。<strong>验收</strong>：<code>python validate_incremental.py</code> 输出 <code>PASS: cdc diff ok, event schema ok</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-04-index-versions">索引版本与回滚</a>：蓝绿 alias 与对账基础</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-permission">权限与多租户</a>：检索层 ACL 过滤</li>
+      <li><a href="https://milvus.io/docs/upsert_entities.md" target="_blank" rel="noopener">Milvus Upsert</a></li>
+    </ul>
+  </div>
+</section>

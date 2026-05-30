@@ -1,0 +1,409 @@
+<section id="ch-practice-05-docker" class="chapter" data-chapter="practice-05-docker">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>容器化与本地 compose</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-docker" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>FastAPI 与异步服务</strong> · 能力：构建可复现 Docker 镜像并用 compose 与 Java 侧联调</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>「在我机器上能跑」无法交付给 Spring 团队。CorpAssist-python 需与 Java 服务一样可容器化：<span class="term" data-term-id="dockerfile" tabindex="0">Dockerfile</span> 可复现、镜像精简、<span class="term" data-term-id="compose" tabindex="0">compose</span> 一键起 Python + 依赖中间件，供 BFF <span class="term" data-term-id="java-consumer" tabindex="0">Java 消费</span> 联调。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>编写符合 <span class="term" data-term-id="twelve-factor" tabindex="0">12-factor</span> 的 Dockerfile（非 root、分层缓存）</li>
+          <li>用 <span class="term" data-term-id="multi-stage" tabindex="0">多阶段构建</span> 缩小运行时镜像</li>
+          <li>编写 compose 栈：Python + <span class="term" data-term-id="healthcheck" tabindex="0">healthcheck</span> + 环境变量</li>
+          <li>从 Spring Boot 侧 curl Python <code>/health</code> 与 RAG 占位 API</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>锁文件进镜像</strong>：<code>uv sync --frozen</code> 保证与 CI 相同依赖树。</li>
+          <li><strong>配置走环境</strong>：密钥与 URL 用 <code>environment</code> / <code>.env</code>，不写进镜像层。</li>
+          <li><strong>探活再联调</strong>：compose <code>healthcheck</code> 通过后再启 Java 集成测试。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Dockerfile 最佳实践</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 交付镜像</span>
+        DevOps 要求 Python 服务镜像 &lt;200MB、以非 root 运行、启动 10s 内 health 为 healthy，以便与现有 Spring 微服务同一 K8s 集群部署。
+      </aside>
+      <p>基础镜像选 <code>python:3.12-slim</code>；依赖安装用 <span class="term" data-term-id="uv-sync" tabindex="0">uv sync</span> 或 pip + lock。遵循：少层、多缓存、无密钥、<span class="term" data-term-id="non-root" tabindex="0">非 root 用户</span>。</p>
+
+      <h4>单阶段精简 Dockerfile（Demo 级）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">dockerfile</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-dockerfile">FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir fastapi uvicorn pydantic
+COPY demos/practice-01-fastapi-intro-lab/main.py ./main.py
+USER nobody
+EXPOSE 8000
+HEALTHCHECK CMD curl -f http://localhost:8000/health || exit 1
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>实践</th><th>原因</th><th>反例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>--no-cache-dir</code></td><td>减小 <span class="term" data-term-id="image-layer" tabindex="0">镜像层</span></td><td>缓存 wheel 进镜像</td></tr>
+          <tr><td><code>USER nobody</code></td><td>降低容器逃逸风险</td><td>root 跑 uvicorn</td></tr>
+          <tr><td><code>HEALTHCHECK</code></td><td>编排器等待就绪</td><td>仅依赖端口映射</td></tr>
+          <tr><td><code>.dockerignore</code></td><td>排除 <code>.venv</code>、<code>__pycache__</code></td><td>整仓 COPY . .</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">镜像内写死配置</span>
+          <ul>
+            <li><code>ENV LLM_API_KEY=sk-xxx</code> 进镜像</li>
+            <li>换环境需重 build</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">运行时注入</span>
+          <ul>
+            <li>compose / K8s Secret 挂载</li>
+            <li>同一镜像 dev/staging/prod</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>.dockerignore 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">gitignore</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+tests/
+.pytest_cache/
+htmlcov/</code></pre>
+      </div>
+      <p>排除测试与虚拟环境可显著加快 <code>docker build</code> 上下文上传，并避免把本地密钥 COPY 进镜像。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="Dockerfile 阶段选择">
+        <input type="radio" name="prac05-docker-tab" id="prac05-docker-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac05-docker-tab" id="prac05-docker-tab-b" class="learn-tab-input" />
+        <label for="prac05-docker-tab-a">单阶段（Demo）</label>
+        <label for="prac05-docker-tab-b">多阶段（生产）</label>
+        <div class="learn-tab-panel" id="prac05-docker-panel-a" role="tabpanel">
+          <ul>
+            <li>适合课程 Demo、快速验证 <code>/health</code></li>
+            <li>单 <code>COPY main.py</code> + pip install 三件套</li>
+            <li>镜像略大，但 build 逻辑简单</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac05-docker-panel-b" role="tabpanel">
+          <ul>
+            <li>builder 装 <code>uv sync --frozen</code>，runtime 只带 <code>.venv</code></li>
+            <li>与 CI 同一 lock，生产推荐</li>
+            <li>无 gcc/uv 于 runtime，攻击面更小</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多阶段构建</h3>
+      <p>构建阶段安装编译依赖与 <code>uv</code>，运行阶段只复制 venv 与源码，显著缩小最终镜像。生产 CorpAssist 推荐此模式。</p>
+
+      <h4>builder + runtime 两阶段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">dockerfile</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-dockerfile"># --- builder ---
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN pip install uv &amp;&amp; uv sync --frozen --no-dev
+
+# --- runtime ---
+FROM python:3.12-slim AS runtime
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+COPY src ./src
+ENV PATH="/app/.venv/bin:$PATH" \
+    CORPASSIST_ENV=production
+RUN useradd -m appuser
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "corpassist.main:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+      </div>
+
+      <p>构建缓存：先 COPY lock 文件再 <code>uv sync</code>，源码变更时不重装依赖。与 Maven「先 pom 后源码」分层同理。</p>
+
+      <div class="mermaid-wrap">
+        <h5>多阶段构建产物流向</h5>
+        <pre class="mermaid">flowchart LR
+  src["pyproject + uv.lock"]
+  builder["builder: uv sync"]
+  venv[".venv"]
+  runtime["runtime 镜像"]
+  src --> builder --> venv
+  venv -->|COPY --from=builder| runtime
+  code["src/"] --> runtime</pre>
+        <p class="diagram-caption">runtime 不含 gcc、uv 源码；仅解释器 + venv + 应用包。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 runtime 阶段不再装 gcc？</summary>
+        <p>编译已在 builder 完成；runtime 只需解释器与 wheel。去掉 build-essential 可减数百 MB，并缩小攻击面。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>compose 联调</h3>
+      <p>本地双栈：compose 起 Python 服务（+ 可选 Redis/Postgres），Spring Boot 在 IDE 或 compose 另一 service 中运行，通过服务名 <code>http://corpassist-python:8000</code> 访问。</p>
+
+      <h4>docker-compose.yml</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">services:
+  corpassist-python:
+    build:
+      context: ../..
+      dockerfile: demos/practice-05-docker-lab/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      CORPASSIST_ENV: local
+      CORPASSIST_INTERNAL_API_KEY: dev-key-change-me
+      CORPASSIST_LOG_LEVEL: debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>compose 本地双栈</h5>
+        <pre class="mermaid">flowchart LR
+  dev["开发者"]
+  compose["docker compose"]
+  py["corpassist-python:8000"]
+  spring["Spring Boot IDE :8080"]
+  dev --> compose --> py
+  spring -->|X-API-Key| py
+  py -->|health OK| compose</pre>
+        <p class="diagram-caption"><code>depends_on: condition: service_healthy</code> 可避免 BFF 启动时连接拒绝。</p>
+      </div>
+
+      <h4>常用命令</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">cd demos/practice-05-docker-lab
+docker compose up --build -d
+docker compose ps          # 等待 healthy
+curl -s localhost:8000/health
+docker compose logs -f corpassist-python</code></pre>
+      </div>
+      <details class="learn-faq">
+        <summary>FAQ：slim 镜像缺 curl，HEALTHCHECK 失败怎么办？</summary>
+        <p>安装 <code>curl</code> 或改用 Python 一行脚本：<code>python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"</code>。Demo Dockerfile 若未装 curl，compose healthcheck 需与镜像能力一致。</p>
+      </details>
+
+      <h4>compose 网络与服务发现</h4>
+      <p>同一 compose 项目内，服务名即 DNS 主机名。Spring 在<strong>宿主机 IDE</strong> 运行时用 <code>localhost:8000</code>；Spring 在<strong>compose 另一 service</strong> 内时用 <code>http://corpassist-python:8000</code>。勿混用，否则出现 Connection refused。</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># Spring 也在 compose 时（示意）
+services:
+  corpassist-bff:
+    image: corpassist-bff:local
+    depends_on:
+      corpassist-python:
+        condition: service_healthy
+    environment:
+      CORPASSIST_PYTHON_BASE_URL: http://corpassist-python:8000</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>章末 Java 消费</h3>
+      <p>Spring BFF 作为 <span class="term" data-term-id="java-consumer" tabindex="0">Java 消费方</span>，通过 WebClient 调 Python 服务。联调验收：health 200、带 API Key 的 RAG 请求、响应头 <code>X-Request-Id</code> 回传。</p>
+
+      <h4>Spring WebClient 调用 Python</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// application-local.yml: corpassist.python.base-url=http://localhost:8000
+@Service
+public class PythonRagClient {
+    private final WebClient client;
+
+    public PythonRagClient(WebClient.Builder builder,
+                           @Value("${corpassist.python.base-url}") String baseUrl) {
+        this.client = builder.baseUrl(baseUrl).build();
+    }
+
+    public Mono&lt;RagQueryResponse&gt; query(RagQueryRequest req, String requestId) {
+        return client.post()
+            .uri("/v1/rag/query")
+            .header("X-API-Key", "${corpassist.internal-api-key}")
+            .header("X-Request-Id", requestId)
+            .bodyValue(req)
+            .retrieve()
+            .bodyToMono(RagQueryResponse.class);
+    }
+}</code></pre>
+      </div>
+
+      <h4>application-local.yml（Spring 侧）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">corpassist:
+  python:
+    base-url: http://localhost:8000   # IDE 联调
+  internal-api-key: ${CORPASSIST_INTERNAL_API_KEY:dev-key-change-me}</code></pre>
+      </div>
+
+      <ul>
+        <li>DTO 字段 snake_case 与 Python Pydantic 一致，或在 BFF 统一转换（<a href="#ch-advanced-05-bridge-java">双栈协作规范</a>）。</li>
+        <li>先 <code>curl /health</code>，再在 Spring 写 @SpringBootTest 集成测试。</li>
+        <li>practice 阶段完成「Compose Python + IDE Spring」；full compose 见 <a href="#ch-advanced-04-corpassist-api">实战：CorpAssist Python 服务 API</a> 交付章。</li>
+      </ul>
+
+      <div class="learn-interview">
+        <p><strong>答辩题</strong>：为何 Java 联调前必须先等 compose health 为 healthy？</p>
+        <p><code>depends_on</code> 只保证容器启动顺序，不保证 uvicorn 已监听。healthcheck 通过才表示 <code>/health</code> 可达，避免 BFF 集成测试因 Connection refused 误报失败。</p>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>联调验收清单</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>步骤</th><th>命令/操作</th><th>期望</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td><code>docker compose ps</code></td><td>healthy</td></tr>
+                <tr><td>2</td><td><code>curl localhost:8000/health</code></td><td><code>status: ok</code></td></tr>
+                <tr><td>3</td><td>Spring 调 RAG</td><td>200 + answer 字段</td></tr>
+                <tr><td>4</td><td>查 Python 日志</td><td>含 request_id</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，容器交付与双栈联调复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Dockerfile 最佳实践</strong>：slim 基础镜像、非 root、HEALTHCHECK、无密钥进层。</li>
+        <li><strong>多阶段构建</strong>：builder 装依赖，runtime 只带 venv + 源码。</li>
+        <li><strong>compose 联调</strong>：healthcheck + 环境变量；<code>compose up --build</code> 可复现。</li>
+        <li><strong>Java 消费</strong>：WebClient + X-API-Key + X-Request-Id；先 health 后业务。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_practice05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="build" /> <code>docker compose up --build</code> 成功</label></li>
+          <li><label><input type="checkbox" data-id="healthy" /> <code>docker compose ps</code> 显示 healthy</label></li>
+          <li><label><input type="checkbox" data-id="multistage" /> 能解释 builder/runtime 各 COPY 什么</label></li>
+          <li><label><input type="checkbox" data-id="java" /> Spring WebClient 能调通 /health</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">practice 阶段收官：进入 <a href="#ch-advanced-01-performance">性能与资源</a>，优化 httpx 连接池与 Embedding 批处理。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.docker.com/develop/develop-images/dockerfile_best-practices/" target="_blank" rel="noopener">Dockerfile best practices</a></li>
+      <li><a href="https://docs.docker.com/compose/" target="_blank" rel="noopener">Docker Compose</a></li>
+      <li><a href="https://docs.astral.sh/uv/guides/integration/docker/" target="_blank" rel="noopener">uv · Docker integration</a></li>
+      <li><a href="https://12factor.net/" target="_blank" rel="noopener">The Twelve-Factor App</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-05-docker-lab/</code> 构建 compose 栈，完成 healthcheck 与 Java/WebClient 或 curl 联调验收清单。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照「单阶段精简 Dockerfile」与 Demo 文件，列出 3 处你已满足的最佳实践（如 USER、HEALTHCHECK）。</li>
+      <li>阅读「builder + runtime 两阶段」片段，说明 runtime 镜像不包含 <code>uv</code> 二进制的原因。</li>
+      <li>执行 <code>docker compose up --build -d</code>，<code>docker compose ps</code> 直到 <code>healthy</code>，<code>curl -s localhost:8000/health</code>。</li>
+      <li>（可选）在 Spring 本地配置 <code>corpassist.python.base-url</code>，用 WebClient 或 RestClient 调 <code>/health</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">镜像 build 时 <code>COPY .env .</code> 把 LLM 密钥打进镜像。应如何改为符合 <span class="term" data-term-id="config-env" tabindex="0">配置与环境分离</span>？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>删除 Dockerfile 中 COPY .env；在 compose <code>environment</code> 或 K8s Secret 注入 <code>CORPASSIST_LLM_API_KEY</code>。重建镜像不应包含任何环境密钥，同一镜像可用于多环境。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Spring 启动报 Connection refused，但 <code>curl localhost:8000/health</code> 正常。常见配置错误是什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>Spring 在容器内仍用 <code>localhost:8000</code>（指向 Java 容器自身）。应改为 compose 服务名 <code>http://corpassist-python:8000</code>，或 Spring 在 host 网络时用 host.docker.internal。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Compose 联调</h4>
+      <p>目录：<code>demos/practice-05-docker-lab/</code>。<strong>验收</strong>：<code>docker compose up --build -d</code> 后 <code>docker compose ps</code> 为 <code>healthy</code>；<code>curl -s localhost:8000/health</code> 含 <code>ok</code>；日志无 traceback。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-04-middleware">中间件、鉴权与 CORS</a> · API Key 经 compose 注入</li>
+      <li><strong>下一阶段</strong>：<a href="#ch-advanced-01-performance">性能与资源</a> · 连接池与 profiling</li>
+      <li><a href="#ch-basics-01-env-tooling">环境、uv/poetry 与项目结构</a> · lock 文件与 uv sync</li>
+    </ul>
+  </div>
+</section>

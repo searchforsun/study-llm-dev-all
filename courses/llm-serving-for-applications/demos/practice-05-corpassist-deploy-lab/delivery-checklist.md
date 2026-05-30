@@ -1,0 +1,3 @@
+- [ ] vLLM healthy
+- [ ] 双栈 client
+- [ ] 流式补全

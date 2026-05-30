@@ -1,0 +1,389 @@
+<section id="ch-basics-03-core-libs" class="chapter" data-chapter="basics-03-core-libs">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>常用库与 HTTP 客户端</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-core-libs" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>32 分钟</strong> · 阶段：<strong>Python 工程基座</strong> · 能力：用 httpx + Pydantic 调用 OpenAI 兼容 LLM 网关并加载结构化配置</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist RAG 服务的核心外向依赖是<strong>模型网关 HTTP API</strong> 与<strong>可校验配置</strong>。Java 侧你可能用 RestTemplate/WebClient + <code>@ConfigurationProperties</code>；Python 侧事实标准是 <span class="term" data-term-id="httpx" tabindex="0">httpx</span> + <span class="term" data-term-id="pydantic" tabindex="0">Pydantic v2</span> + <span class="term" data-term-id="pydantic-settings" tabindex="0">pydantic-settings</span>。本章打通「读配置 → 发请求 → 解析 DTO」闭环。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 httpx 同步客户端调用 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> <code>/v1/chat/completions</code></li>
+          <li>定义 <span class="term" data-term-id="base-model" tabindex="0">BaseModel</span> 请求/响应并在边界 <code>model_validate</code></li>
+          <li>编写 <span class="term" data-term-id="settings-model" tabindex="0">Settings 模型</span> 从 <code>CORPASSIST_*</code> 环境变量加载网关 URL 与 API Key</li>
+          <li>用 <span class="term" data-term-id="mock-transport" tabindex="0">MockTransport</span> 做无网络单测，衔接 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>HTTP 客户端选 httpx</strong>：API 与 requests 相近，原生支持 async 与 MockTransport。</li>
+          <li><strong>边界数据用 Pydantic</strong>：入参/outbound JSON 一律 BaseModel，内部可再转 TypedDict。</li>
+          <li><strong>配置是 typed Settings</strong>：禁止在代码里硬编码网关 URL；12-factor 环境注入。</li>
+          <li><strong>LLM 调用要可测</strong>：MockTransport + fixture，CI 禁止直连真实模型。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>httpx</h3>
+
+      <p><span class="term" data-term-id="httpx" tabindex="0">httpx</span> 是 CorpAssist Python 调 Spring 网关或直连 DashScope/OpenAI 兼容端点的默认客户端。对比 Java WebClient：同样需显式超时、headers 与连接复用。</p>
+
+      <h4>同步客户端最小示例</h4>
+      <div class="code-block"><pre><code class="language-python">import httpx
+
+def fetch_health(base_url: str) -> dict[str, object]:
+    with httpx.Client(base_url=base_url, timeout=5.0) as client:
+        resp = client.get("/health")
+        resp.raise_for_status()
+        return resp.json()</code></pre></div>
+
+      <h4>生产级 Client 参数</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>参数</th><th>建议</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>timeout</code></td><td><code>httpx.Timeout(connect=5, read=60, write=10, pool=5)</code></td><td>Chat 读超时通常 &gt; 普通 REST</td></tr>
+          <tr><td><code>base_url</code></td><td>Settings 注入</td><td>避免 URL 拼接错误</td></tr>
+          <tr><td><code>headers</code></td><td><code>Authorization: Bearer …</code></td><td>与 Spring AI 相同 Bearer 约定</td></tr>
+          <tr><td><code>limits</code></td><td><code>httpx.Limits(max_connections=100)</code></td><td>类比连接池（advanced 章展开）</td></tr>
+        </tbody>
+      </table>
+
+      <h4>异步预告</h4>
+      <p><span class="term" data-term-id="async-client" tabindex="0">异步客户端</span> <code>httpx.AsyncClient</code> 将在 <a href="#ch-practice-02-async-io">asyncio 与并发</a> 与 FastAPI 路由配合；本章先用同步 Client 理解请求/响应模型。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>每次请求 <code>httpx.post(url)</code> 无 Client 复用</li>
+            <li>无 timeout，LLM 挂死占满 worker</li>
+            <li>裸 <code>requests</code> 且无 mock 策略</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>应用 lifespan 创建/关闭单例 Client</li>
+            <li>区分 connect/read 超时</li>
+            <li>测试用 <span class="term" data-term-id="mock-transport" tabindex="0">MockTransport</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 LLM 读超时要比普通 REST 长？</summary>
+        <p>Token 生成是流式/长耗时计算；过短 read timeout 会在模型仍正常生成时误杀。应对：合理 read 超时 + 可观测 latency + <span class="term" data-term-id="retry-policy" tabindex="0">重试策略</span> 仅用于幂等/可恢复错误。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>pydantic v2</h3>
+
+      <p><span class="term" data-term-id="pydantic" tabindex="0">Pydantic v2</span> 负责 CorpAssist 所有 HTTP JSON 边界的解析与校验，对齐 Java <span class="term" data-term-id="validation" tabindex="0">Bean Validation</span> + Jackson。</p>
+
+      <h4>Chat 请求/响应模型</h4>
+      <div class="code-block"><pre><code class="language-python">from pydantic import BaseModel, Field
+
+class ChatRequest(BaseModel):
+    model: str
+    messages: list[dict[str, str]]
+    temperature: float = 0.3
+    max_tokens: int = Field(default=512, ge=1)
+
+class ChatChoice(BaseModel):
+    index: int
+    message: dict[str, str]
+    finish_reason: str | None = None
+
+class ChatResponse(BaseModel):
+    id: str
+    choices: list[ChatChoice]
+    usage: dict[str, int] | None = None</code></pre></div>
+
+      <h4>model_validate 与 model_dump</h4>
+      <div class="code-block"><pre><code class="language-python">raw = resp.json()
+parsed = ChatResponse.model_validate(raw)
+outbound = ChatRequest(model="qwen-plus", messages=[...]).model_dump()</code></pre></div>
+      <p>入站：<code>model_validate</code> 抛 ValidationError → 映射 400（practice 章 exception_handler）。出站：<code>model_dump</code> 给 httpx JSON body。</p>
+
+      <h4>v2 常用配置</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>能力</th><th>写法</th><th>场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>字段约束</td><td><code>Field(ge=1, le=8192)</code></td><td>max_tokens 上限</td></tr>
+          <tr><td>别名</td><td><code>Field(alias="messageId")</code></td><td>对齐 Java camelCase JSON</td></tr>
+          <tr><td>忽略多余字段</td><td><code>model_config = ConfigDict(extra="ignore")</code></td><td>网关返回扩展字段</td></tr>
+        </tbody>
+      </table>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">入站</span>
+          <p class="role-card-desc"><code>model_validate</code> 解析网关 JSON，失败即 400。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">出站</span>
+          <p class="role-card-desc"><code>model_dump</code> 生成 httpx body，字段名与 OpenAPI 一致。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">与 TypedDict</span>
+          <p class="role-card-desc">内部仍可用 TypedDict；HTTP 边界统一 BaseModel。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>结构化配置</h3>
+
+      <p>CorpAssist 网关 URL、模型名、日志级别不应写死在源码。使用 <span class="term" data-term-id="pydantic-settings" tabindex="0">pydantic-settings</span> 定义 <span class="term" data-term-id="settings-model" tabindex="0">Settings 模型</span>，类比 Spring <code>@ConfigurationProperties(prefix="corpassist")</code>。</p>
+
+      <h4>Settings 示例</h4>
+      <div class="code-block"><pre><code class="language-python">from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class CorpAssistSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="CORPASSIST_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    llm_base_url: str = Field(default="http://localhost:8080/v1")
+    llm_api_key: SecretStr = Field(default=SecretStr("dev-key"))
+    default_model: str = "qwen-plus"
+    log_level: str = "INFO"</code></pre></div>
+
+      <h4>环境变量映射</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>环境变量</th><th>字段</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>CORPASSIST_LLM_BASE_URL</code></td><td><code>llm_base_url</code></td><td>Spring 网关或 DashScope 兼容 base</td></tr>
+          <tr><td><code>CORPASSIST_LLM_API_KEY</code></td><td><code>llm_api_key</code></td><td>SecretStr 日志脱敏</td></tr>
+          <tr><td><code>CORPASSIST_DEFAULT_MODEL</code></td><td><code>default_model</code></td><td>默认 chat 模型</td></tr>
+          <tr><td><code>CORPASSIST_LOG_LEVEL</code></td><td><code>log_level</code></td><td>与 Logback 级别对齐</td></tr>
+        </tbody>
+      </table>
+
+      <p>本地开发可复制 <code>.env.example</code>；真实密钥仅经 K8s Secret / CI 变量注入 — 见 <a href="#ch-basics-04-errors-logging">12-factor 配置</a>。</p>
+
+      <div class="mermaid-wrap">
+        <h5>配置加载到 LLM 调用</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant Env as 环境变量
+  participant S as CorpAssistSettings
+  participant C as httpx.Client
+  participant GW as LLM 网关
+  Env->>S: CORPASSIST_LLM_*
+  S->>C: base_url + api_key
+  C->>GW: POST /chat/completions</pre>
+        <p class="diagram-caption">Settings 在进程启动时解析一次，通过依赖注入传给 Client（FastAPI 章展开）。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>调用 LLM API</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 制度问答（45 秒）</span>
+        用户经 Java BFF 提问 → BFF 转发 Python RAG 服务 → Python 组装 prompt 后调用 <span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI 兼容</span> 网关 <code>POST /v1/chat/completions</code>。Python 需解析 <code>choices[0].message.content</code> 与 <code>usage</code> 供成本统计。
+      </aside>
+
+      <h4>完整调用函数</h4>
+      <div class="code-block"><pre><code class="language-python">def chat_completion(
+    client: httpx.Client,
+    base_url: str,
+    api_key: str,
+    req: ChatRequest,
+) -> ChatResponse:
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = client.post(url, json=req.model_dump(), headers=headers, timeout=30.0)
+    resp.raise_for_status()
+    return ChatResponse.model_validate(resp.json())</code></pre></div>
+
+      <h4>MockTransport 测试</h4>
+      <div class="code-block"><pre><code class="language-python">def mock_transport(request: httpx.Request) -> httpx.Response:
+    body = {
+        "id": "mock-1",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "（mock）答复"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 156, "completion_tokens": 42, "total_tokens": 198},
+    }
+    return httpx.Response(200, json=body)
+
+transport = httpx.MockTransport(mock_transport)
+with httpx.Client(transport=transport, base_url="http://mock/v1") as client:
+    result = chat_completion(client, "http://mock/v1", "demo-key", req)</code></pre></div>
+
+      <h4>错误与重试（概要）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>HTTP</th><th>含义</th><th>CorpAssist 策略</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>401/403</td><td>密钥/权限</td><td>不重试；告警配置</td></tr>
+          <tr><td>429</td><td>限流</td><td>有限退避重试（<span class="term" data-term-id="retry-policy" tabindex="0">重试策略</span>）</td></tr>
+          <tr><td>502/503</td><td>上游不可用</td><td>短重试 + 映射 LlmUpstreamError</td></tr>
+          <tr><td>超时</td><td>read timeout</td><td>记录 latency；是否重试看幂等性</td></tr>
+        </tbody>
+      </table>
+
+      <p>结构化日志与异常映射在 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a> 实现；FastAPI 路由暴露在 <a href="#ch-practice-01-fastapi-intro">FastAPI 路由与依赖注入</a>。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串讲后做练习与测验。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>httpx</strong>：Client 复用、显式 timeout、Bearer 头 — CorpAssist 外向 HTTP 标准姿势。</li>
+        <li><strong>pydantic v2</strong>：ChatRequest/ChatResponse 在边界 model_validate，对齐 OpenAPI 与 Java DTO。</li>
+        <li><strong>结构化配置</strong>：CorpAssistSettings + CORPASSIST_ 前缀，SecretStr 保护密钥。</li>
+        <li><strong>调用 LLM API</strong>：/chat/completions + MockTransport 可测；429/502 有明确重试语义。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_basics03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="httpx-timeout" /> 能写出 httpx Timeout 四段含义</label></li>
+          <li><label><input type="checkbox" data-id="pydantic-validate" /> 能解释 model_validate 与 model_dump 使用场景</label></li>
+          <li><label><input type="checkbox" data-id="settings-env" /> 能列出 3 个 CORPASSIST_ 环境变量</label></li>
+          <li><label><input type="checkbox" data-id="mock" /> 能说明 MockTransport 如何替代真实 LLM</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>步骤</th><th>API</th></tr></thead>
+              <tbody>
+                <tr><td>读配置</td><td>CorpAssistSettings()</td></tr>
+                <tr><td>发请求</td><td>client.post + model_dump()</td></tr>
+                <tr><td>解析响应</td><td>ChatResponse.model_validate</td></tr>
+                <tr><td>单测</td><td>httpx.MockTransport</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>组件</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>httpx.Client</td><td>复用连接 + 显式 Timeout</td></tr>
+                <tr><td>model_validate</td><td>入站 JSON → 类型安全 DTO</td></tr>
+                <tr><td>CorpAssistSettings</td><td>CORPASSIST_* 环境变量</td></tr>
+                <tr><td>MockTransport</td><td>CI 禁止直连真实 LLM</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>为何不用 requests？</summary>
+          <div class="learn-faq-body"><span class="term" data-term-id="httpx" tabindex="0">httpx</span> 支持 async、HTTP/2 与 MockTransport，与 FastAPI 异步栈一致；requests 无官方 async，测试 mock 也更繁琐。</div>
+        </details>
+        <details>
+          <summary>SecretStr 日志会泄露吗？</summary>
+          <div class="learn-faq-body">Pydantic <code>SecretStr</code> 默认不在 <code>repr</code> 中暴露；仍禁止把 API Key 打进 info 日志，只记录「已配置」类元数据。</div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Chat 调用的 connect 与 read 超时为何应分开配置？</li>
+              <li>model_validate 失败时，应对外返回什么 HTTP 状态与 code？</li>
+              <li>MockTransport 与集成测试的边界如何划分？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a> 为 LLM 调用加上 structlog 与 AppError。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.python-httpx.org/" target="_blank" rel="noopener">httpx — 用户指南</a></li>
+      <li><a href="https://docs.pydantic.dev/latest/" target="_blank" rel="noopener">Pydantic v2 文档</a></li>
+      <li><a href="https://docs.pydantic.dev/latest/concepts/pydantic_settings/" target="_blank" rel="noopener">pydantic-settings</a></li>
+      <li><a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener">OpenAI Chat Completions API（兼容参考）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照正文 httpx 超时表、Settings 环境变量映射与 MockTransport 代码，完成配置补全与联调排障纸面练习（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「生产级 Client 参数」表中 <code>timeout</code> 一行，写出 connect 与 read 超时各自保护哪类失败。</li>
+      <li>对照「环境变量映射」表，写出 <code>CORPASSIST_LLM_BASE_URL</code> 在本地指向 Spring 网关时的示例值。</li>
+      <li>阅读「Chat 请求/响应模型」代码块，说明 <code>Field(ge=1)</code> 校验失败在 HTTP 层应对应什么状态码（概念上 400）。</li>
+      <li>打开 demo <code>mock_llm_client.py</code>，核对 <code>mock_transport</code> 返回的 <code>usage.total_tokens</code> 是否等于 prompt + completion；可选运行 <code>python mock_llm_client.py</code> 验证无真实网络。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障顺序：联调 Chat 502。同事计划 ① 加大 read timeout 到 300s ② 在代码写死生产 API Key ③ 用 curl 打网关 ④ 检查 CORPASSIST_LLM_BASE_URL。请排序最优排查步骤。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>推荐顺序：④ → ③ → ①</strong>。先确认 Settings 注入的 base URL 是否正确，再用 curl 验证网关本身；最后再调 timeout。② 写死密钥违反 12-factor，应拒绝。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：下列哪条违反「调用 LLM API」规范？① 每次请求新建 Client 无 timeout ② 用 MockTransport 做单元测试 ③ 在源码写死生产 API Key ④ 对 429 做有限退避重试</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>违反：① 和 ③</strong>。应复用 Client 并配置 Timeout；密钥走 Settings/环境变量。②④ 是推荐做法。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Mock LLM 客户端</h4>
+      <p>目录：<code>demos/basics-03-core-libs-lab/</code>。<strong>验收</strong>：<code>python mock_llm_client.py</code> 输出 mock 回复与 usage，进程无外向网络连接。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-errors-logging">异常、日志与配置</a>：structlog JSON 与 AppError</li>
+      <li><a href="https://www.python-httpx.org/advanced/transports/#mock-transports" target="_blank" rel="noopener">httpx Mock Transports</a></li>
+    </ul>
+  </div>
+</section>

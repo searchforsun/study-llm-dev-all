@@ -1,0 +1,448 @@
+<section id="ch-basics-01-gateway" class="chapter" data-chapter="basics-01-gateway">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Spring Cloud Gateway 与 LLM</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01-gateway" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>LLM 网关与流式</strong> · 能力：为 CorpAssist S2 配置 LLM 路由、JWT 鉴权与租户级限流</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 企业助手在 <strong>S2 智能客服</strong> 场景下面向 ToC 高 QPS：流式对话、订单查询工具、RAG 检索不能各自为政。若鉴权、限流散落在 BFF 与 FastAPI 里各写一套，会出现密钥泄漏、配额穿透与排障盲区。统一 <span class="term" data-term-id="spring-gateway" tabindex="0">Spring Cloud Gateway</span> 作为 <span class="term" data-term-id="api-entry" tabindex="0">api entry</span>，才能在<strong>对模型计费之前</strong>挡住刷量、越权与异常路由——这是治理面（Spring）与能力面（Python）分工的第一道关。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>按路径把 <code>/v1/chat</code>、<code>/v1/tools/order</code>、<code>/v1/rag</code>、<code>/v1/stream</code> 路由到 BFF 与 Python，并解释 SSE 路由的超时差异</li>
+          <li>在 <span class="term" data-term-id="filter-chain" tabindex="0">filter chain</span> 中接入 <span class="term" data-term-id="gateway-auth" tabindex="0">gateway auth</span>，将 <code>tenantId</code> 注入内网 Header</li>
+          <li>用 Redis 令牌桶实现按租户的 <span class="term" data-term-id="gateway-rate-limit" tabindex="0">gateway rate limit</span>，并说明与 BFF Token 预算、模型 RPM 的分层关系（NS3 成本）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>网关是治理面入口</strong>：路由、鉴权、限流在 Gateway 完成；Python 只做 AI 能力，不重复鉴权逻辑（NS2 确定性桥接在 BFF/工具层）。</li>
+          <li><strong>LLM 路由按场景分</strong>：同步 JSON 与 <span class="term" data-term-id="llm-route" tabindex="0">llm route</span> 的 SSE 流式须不同 <span class="term" data-term-id="route-predicate" tabindex="0">route predicate</span> 与超时策略。</li>
+          <li><strong>限流要分层</strong>：Gateway 挡 QPS/连接；BFF 管 Token 预算；模型侧还有厂商 RPM/TPM（见 <a href="#ch-practice-02-rate-limit">限流与配额</a>）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>路由</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · 查订单 + 流式回复（30 秒）</span>
+        用户问「订单 SO-1024 到哪了？」App 经 Gateway 到 BFF：<code>POST /v1/chat</code> 触发 NS2 确定性工具 <code>lookup_order</code>；模型解释物流时走 <code>GET /v1/stream/chat</code> SSE。RAG 知识库问答走 <code>/v1/rag/**</code> 到 Python。Gateway 只做转发与治理，不执行业务逻辑。
+      </aside>
+
+      <p>Spring Cloud Gateway 基于 <strong>Predicate + Filter</strong> 组合。CorpAssist 双栈拓扑中，Gateway 是面向公网的唯一 <span class="term" data-term-id="upstream-bff" tabindex="0">upstream bff</span> 入口；BFF 再按契约调用 Python 能力面。</p>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">治理面 · Gateway</span>
+          <p class="role-card-desc">路由、JWT、QPS 限流、Trace 注入、SSE 透传配置。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">编排面 · Spring BFF</span>
+          <p class="role-card-desc">多轮会话、工具编排、Spring AI、对内调用 Python。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">能力面 · FastAPI</span>
+          <p class="role-card-desc">RAG、评测、流式生成器；仅内网 + 信任 Gateway 头。</p>
+        </article>
+      </div>
+
+      <h4>CorpAssist 典型路由表</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>路径前缀</th><th>上游</th><th>典型场景</th><th>超时提示</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/v1/chat/**</code></td><td><code>lb://corpassist-bff</code></td><td>多轮对话、工具触发（查订单）</td><td>120s（含工具链）</td></tr>
+          <tr><td><code>/v1/stream/**</code></td><td><code>lb://corpassist-bff</code></td><td>SSE 流式 token</td><td>0（长连接）</td></tr>
+          <tr><td><code>/v1/rag/**</code></td><td><code>lb://corpassist-ai-py</code></td><td>检索增强、批量评测</td><td>300s</td></tr>
+          <tr><td><code>/v1/admin/**</code></td><td><code>lb://corpassist-admin</code></td><td>租户配额、路由配置</td><td>30s + mTLS</td></tr>
+        </tbody>
+      </table>
+
+      <h4>双栈路由配置（YAML）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  cloud:
+    gateway:
+      routes:
+        - id: corpassist-bff-chat
+          uri: lb://corpassist-bff
+          predicates:
+            - Path=/v1/chat/**
+          metadata:
+            response-timeout: 120000
+        - id: corpassist-sse-stream
+          uri: lb://corpassist-bff
+          predicates:
+            - Path=/v1/stream/**
+          metadata:
+            response-timeout: 0
+        - id: corpassist-py-rag
+          uri: lb://corpassist-ai-py
+          predicates:
+            - Path=/v1/rag/**
+          metadata:
+            response-timeout: 300000</code></pre>
+      </div>
+
+      <h4>按 Header 分流（灰度 / 租户专属模型）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">        - id: corpassist-chat-canary
+          uri: lb://corpassist-bff-canary
+          predicates:
+            - Path=/v1/chat/**
+            - Header=X-Canary, true</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist API 入口拓扑</h5>
+        <pre class="mermaid">flowchart LR
+  Client[App / Web]
+  GW[Spring Cloud Gateway]
+  BFF[corpassist-bff]
+  Py[corpassist-ai-py]
+  ERP[存量订单服务]
+  Client --> GW
+  GW -->|/v1/chat /v1/stream| BFF
+  GW -->|/v1/rag| Py
+  BFF -->|工具 Feign| ERP
+  BFF -->|OpenAPI 流式| Py</pre>
+        <p class="diagram-caption">查订单工具走 BFF→ERP（NS2 确定性）；生成解释走 BFF→Python 流式。Gateway 不直连 ERP。</p>
+      </div>
+
+      <h4>路由设计：反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>所有路径 <code>/**</code> 打到单一服务</li>
+            <li>SSE 与 JSON 共用 30s 读超时</li>
+            <li>公网暴露 Python <code>:8000</code> 绕过 Gateway</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>chat / stream / rag 分 route id，可独立扩缩与限流</li>
+            <li>stream 路由 <code>response-timeout: 0</code> + 关闭缓冲（见 <a href="#ch-basics-02-sse">SSE 流式端到端</a>）</li>
+            <li>Python 仅 ClusterIP，Ingress 只指向 Gateway</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么「查订单」不宜把 ERP 直接配在 Gateway 路由里？</summary>
+        <p>工具编排、会话上下文、幂等与审计在 BFF；Gateway 应保持薄。ERP 调用属于 NS2 确定性桥接，由 BFF 的 <code>lookup_order</code> 统一封装（见 <a href="#ch-basics-04-idempotency">幂等与重试</a> 对写操作的要求）。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>鉴权</h3>
+      <p>LLM 接口不能「内网裸奔」。Gateway 层做 <span class="term" data-term-id="gateway-auth" tabindex="0">gateway auth</span>：校验 JWT、解析 <code>tenantId</code> / <code>userId</code>，经 <span class="term" data-term-id="filter-chain" tabindex="0">filter chain</span> 注入 Header 传递给下游。下游在 mTLS 内网中<strong>信任 Gateway 已验签</strong>，不再各自持 JWT 公钥副本。</p>
+
+      <h4>Filter 执行顺序（概念）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>顺序</th><th>Filter</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>TraceId / RequestId</td><td>全链路关联 S2 客诉与账单</td></tr>
+          <tr><td>2</td><td>JWT 验签 + 租户解析</td><td>拒绝过期/错 aud；注入 <code>X-Tenant-Id</code></td></tr>
+          <tr><td>3</td><td>RequestRateLimiter</td><td>按租户 QPS（见下节）</td></tr>
+          <tr><td>4</td><td>RouteToRequestUrl</td><td>转发到 BFF / Python</td></tr>
+        </tbody>
+      </table>
+
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Python 服务各自解析 JWT，密钥多份拷贝</li>
+            <li>仅校验 Token 存在，不校验 <code>aud</code> / 租户范围</li>
+            <li>把模型 API Key 写在 URL Query 里转发</li>
+            <li>信任客户端 Body 里的 <code>tenantId</code></li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Gateway GlobalFilter 统一验签 + 注入 <code>X-Tenant-Id</code>、<code>X-User-Id</code></li>
+            <li>内网 mTLS；Python 只信 Gateway 注入的租户头</li>
+            <li>模型 Key 只在 BFF/Vault，不下发到 App</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>GlobalFilter 示意（Java）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class TenantAuthFilter implements GlobalFilter, Ordered {
+  @Override
+  public Mono&lt;Void&gt; filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+    String auth = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+    if (auth == null) {
+      exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+      return exchange.getResponse().setComplete();
+    }
+    Claims claims = jwtParser.parse(auth);
+    ServerHttpRequest req = exchange.getRequest().mutate()
+        .header("X-Tenant-Id", claims.get("tenantId", String.class))
+        .header("X-User-Id", claims.getSubject())
+        .header("X-Trace-Id", traceId(exchange))
+        .build();
+    return chain.filter(exchange.mutate().request(req).build());
+  }
+  @Override public int getOrder() { return -100; }
+}</code></pre>
+      </div>
+
+      <h4>鉴权与工具调用：代码层对比</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">不推荐 · 信任 Body 租户</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">// BFF 直接使用客户端传来的 tenantId 查订单
+String tenantId = body.getTenantId();
+orderClient.lookup(tenantId, orderId);</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">推荐 · 仅用 Gateway 头</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">String tenantId = exchange.getRequest().getHeaders().getFirst("X-Tenant-Id");
+// 与 JWT 一致，再调 lookup_order
+orderClient.lookup(tenantId, orderId);</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>Gateway 只转发不过滤</strong> — 恶意用户可直接打 Python 绕过配额（若网络可达）。</li>
+          <li><strong>鉴权下放给 LLM</strong> — 模型无法可靠执行安全策略；必须在 Gateway/BFF 硬编码。</li>
+          <li><strong>SSE 不做鉴权</strong> — 长连接更需建立前验签，避免「半开流式」占满连接。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>限流</h3>
+      <p>Gateway 限流保护全站：按 IP、用户或租户限制 QPS。S2 ToC 大促下，<strong>未做 Gateway 限流就扩容模型</strong>是典型 NS3 成本坑——重复请求还会放大 Token 账单（配合 <a href="#ch-basics-04-idempotency">幂等与重试</a>）。</p>
+
+      <h4>Redis 令牌桶（RequestRateLimiter）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">filters:
+  - name: RequestRateLimiter
+    args:
+      redis-rate-limiter.replenishRate: 10
+      redis-rate-limiter.burstCapacity: 20
+      redis-rate-limiter.requestedTokens: 1
+      key-resolver: "#{@tenantKeyResolver}"</code></pre>
+      </div>
+
+      <h4>限流维度决策表</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>限流维度</th><th>适用场景</th><th>主要实施层</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>QPS / 并发连接</td><td>防刷、防 SSE 占满</td><td>Gateway</td><td>租户 A 客服入口 50 QPS</td></tr>
+          <tr><td>Token 预算 / 费用</td><td>月度额度、成本归因</td><td>BFF + 计量存储</td><td>见 <a href="#ch-practice-02-rate-limit">限流与配额</a></td></tr>
+          <tr><td>工具调用频率</td><td>保护 ERP 订单接口</td><td>BFF Resilience4j</td><td><code>lookup_order</code> 每用户 5/min</td></tr>
+          <tr><td>模型 RPM/TPM</td><td>厂商 API 配额</td><td>路由 + 模型代理</td><td>多模型 fallback 0.5</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-tabs" role="tablist" aria-label="限流响应策略">
+        <input type="radio" name="gw-limit-tab" id="gw-limit-sync" class="learn-tab-input" checked />
+        <input type="radio" name="gw-limit-tab" id="gw-limit-sse" class="learn-tab-input" />
+        <label for="gw-limit-sync">同步 JSON</label>
+        <label for="gw-limit-sse">SSE 流式</label>
+        <div class="learn-tab-panel" id="gw-limit-panel-sync" role="tabpanel">
+          <p>超限返回 <code>429 Too Many Requests</code> + <code>Retry-After</code>。客户端退避重试<strong>必须</strong>带 <code>Idempotency-Key</code>（写操作）或只重试 GET。</p>
+        </div>
+        <div class="learn-tab-panel" id="gw-limit-panel-sse" role="tabpanel">
+          <p>尽量在<strong>建立 SSE 连接前</strong>限流；已建立连接中途超限应发送 <code>event: error</code> 并关闭，避免半开连接泄漏。</p>
+        </div>
+      </div>
+
+      <h4>租户 QPS 示意（教学滑块）</h4>
+      <div class="learn-param-slider" data-storage-key="llm-application-backend_basics01_qps">
+        <label for="basics01-qps-range">Gateway replenishRate（次/秒，示意）</label>
+        <input type="range" id="basics01-qps-range" min="1" max="100" step="1" value="10" />
+        <output for="basics01-qps-range">10 /s</output>
+        <p class="learn-param-hint">S2 峰值需结合压测调整；burst 通常设为 replenish 的 2 倍。</p>
+      </div>
+
+      <h4>常见问题（FAQ）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>Gateway 限流了，还要在 BFF 限流吗？</summary>
+          <div class="learn-faq-body">
+            <p>要。Gateway 挡「入口洪水」；BFF 对 ERP 工具、单用户对话频率做细粒度保护。两层职责不同，不是重复建设。</p>
+          </div>
+        </details>
+        <details>
+          <summary>流式路由为何不能和 chat 共用同一限流 key？</summary>
+          <div class="learn-faq-body">
+            <p>SSE 长连接占用的不是「每秒请求数」而是「并发连接数」。可为 <code>/v1/stream/**</code> 单独配置连接数上限或更长窗口的配额。</p>
+          </div>
+        </details>
+        <details>
+          <summary>Python 服务还需要 API Key 吗？</summary>
+          <div class="learn-faq-body">
+            <p>对内可用 mTLS + 网络策略；若仍有服务间 Key，应通过 Vault 轮换，且不暴露给移动端。公网鉴权只在 Gateway/JWT 完成。</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">放在正文与复习之间，便于串起全章再做题。每条对应上文一个小节标题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>路由</strong>：chat/stream/rag/admin 分上游与超时；查订单工具经 BFF 编排，Gateway 保持薄；SSE 须 <code>response-timeout: 0</code>。</li>
+        <li><strong>鉴权</strong>：Gateway 统一 JWT 验签并注入租户/用户/Trace 头；禁止信任 Body 租户；Python 仅内网信任 Gateway。</li>
+        <li><strong>限流</strong>：Gateway 挡入口 QPS 与连接；Token 预算与 ERP 工具限流在 BFF；429 重试须配合幂等键。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_basics01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="routes" /> 能说出 chat/stream/rag 三条路由各自上游与超时差异</label></li>
+          <li><label><input type="checkbox" data-id="auth" /> 能解释为何 tenantId 必须来自 JWT 而非 Body</label></li>
+          <li><label><input type="checkbox" data-id="filter-order" /> 能列出鉴权前 Trace、鉴权后限流的大致 Filter 顺序</label></li>
+          <li><label><input type="checkbox" data-id="limit-layer" /> 能区分 Gateway QPS、BFF Token 预算、ERP 工具限流</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>api entry</td><td>公网只进 Gateway，Python 不直连</td></tr>
+                <tr><td>llm route</td><td>JSON 与 SSE 分路由、分超时</td></tr>
+                <tr><td>gateway auth</td><td>JWT 一次验签，头传递租户</td></tr>
+                <tr><td>gateway rate limit</td><td>入口 QPS；Token 费用在 BFF 计</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 为何用 Spring Gateway + FastAPI 双栈，而不是单一 Python 网关？</li>
+              <li>SSE 路由在 Gateway 层需要哪些特殊配置？</li>
+              <li>租户 A 被刷流量时，你会先调 Gateway 还是模型配额？为什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-basics-02-sse">SSE 流式端到端</a> 讲解 Gateway 如何透传 Python 生成器流与断线重连。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank" rel="noopener">Spring Cloud Gateway Reference</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-server-webflux/filters/request-rate-limiter-filters.html" target="_blank" rel="noopener">RequestRateLimiter Filter</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-server-webflux/http-client.html" target="_blank" rel="noopener">Gateway HttpClient — 超时与连接池</a></li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/custom-request-and-route/" target="_blank" rel="noopener">FastAPI — Custom Routes（下游对照）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/basics-01-gateway-lab/gateway-routes.yaml</code> 上补全 CorpAssist 路由，并写「鉴权 + 限流 + 查订单工具」分工说明（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照正文路由表，为 <code>/v1/stream/**</code> 增加 route，<code>uri</code> 指向 <code>lb://corpassist-bff</code>，设置 <code>response-timeout: 0</code> 并注释原因。</li>
+      <li>为 <code>/v1/chat/**</code> 添加 <code>RequestRateLimiter</code>，<code>replenishRate: 5</code>，注明 <code>tenantKeyResolver</code> 应读取 JWT 的哪个 claim。</li>
+      <li>在 lab 文档中画一张简图：用户查订单时 Gateway、BFF、ERP、Python 四条边各走什么协议。</li>
+      <li>填写「限流维度决策表」中 Token 预算一行：说明 Gateway 不能单独完成的原因及配合层。</li>
+      <li>（可选）完成 <code>demos/basics-01-gateway-lab/README</code> 中的验收 curl。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">找错：同事配置「Python RAG 自行校验 JWT，Gateway 只做 Path 转发；移动端可配置 Python 直连地址做评测」。指出<strong>两条</strong>违反本章原则的做法。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>① 鉴权未在 Gateway 统一，密钥与策略分裂，且可能绕过配额；② 公网/客户端直连 Python，审计与 <span class="term" data-term-id="gateway-rate-limit" tabindex="0">gateway rate limit</span> 失效。应 Gateway 验签 + 内网 mTLS + 租户头传递。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">大促预案：① 只把模型副本数 ×3 ② Gateway 租户 QPS 减半 ③ BFF 对 <code>lookup_order</code> 加熔断 ④ 取消 JWT 校验提速。请选出<strong>应优先</strong>与<strong>最危险</strong>的一项。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>应优先：③</strong>，保护 ERP 与确定性工具链。<strong>最危险：④</strong>，入口失控且无法归因租户。仅 ① 不限入口，NS3 成本仍可能失控。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Spring Cloud Gateway 与 LLM</h4>
+      <p>目录：<code>demos/basics-01-gateway-lab/</code>。<strong>验收</strong>：<code>gateway-routes.yaml</code> 含 chat/rag/stream 三条 route；能口头说明 RequestRateLimiter 的 key 来源及查订单为何不直连 ERP。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-02-sse">SSE 流式端到端</a>：Gateway 透传流式响应与 Last-Event-ID</li>
+      <li><a href="#ch-practice-02-rate-limit">限流与配额</a>：租户 Token 预算与告警</li>
+      <li><a href="#ch-basics-04-idempotency">幂等与重试</a>：429 重试与写操作幂等键</li>
+      <li><a href="../llm-composite-integration-workshop/index.html">双栈对照集成实战</a>：治理面与能力面分工</li>
+    </ul>
+  </div>
+</section>

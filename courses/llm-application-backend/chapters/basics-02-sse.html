@@ -1,0 +1,470 @@
+<section id="ch-basics-02-sse" class="chapter" data-chapter="basics-02-sse">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>SSE 流式端到端</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-sse" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>LLM 网关与流式</strong> · 能力：贯通 Gateway → BFF → Python 的 SSE 流式与断线重连</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>智能客服首字延迟（TTFT）直接影响 S2 体验。LLM 回复必须经 <span class="term" data-term-id="sse-stream" tabindex="0">SSE stream</span> 逐 token 推送；若 Gateway 缓冲整包、BFF 聚合 JSON、或断线无 <span class="term" data-term-id="reconnect-sse" tabindex="0">reconnect sse</span>，用户会看到「卡住再一次性弹出」——这是 CorpAssist 生产高频坑，也是 NS2/NS3 联调时最容易被忽略的链路问题。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>在 Spring BFF 用 <span class="term" data-term-id="spring-sse" tabindex="0">spring sse</span> 转发 Python <span class="term" data-term-id="python-generator" tabindex="0">python generator</span> 输出，并为每个 chunk 分配 event id</li>
+          <li>配置 Gateway <span class="term" data-term-id="stream-proxy" tabindex="0">stream proxy</span> 不缓冲 <span class="term" data-term-id="event-stream" tabindex="0">event stream</span>，实现逐跳 <span class="term" data-term-id="chunk-forward" tabindex="0">chunk forward</span></li>
+          <li>设计 <span class="term" data-term-id="last-event-id" tabindex="0">last event id</span>、心跳与 Redis 短时缓冲，支持移动端断线续传</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>SSE 是单向 HTTP 长连接</strong>：格式为 <code>data:</code> 行 + 双换行；比 WebSocket 更简单，适合 LLM 文本流（前提：客户端只收不发）。</li>
+          <li><strong>每一跳都要「流式不缓冲」</strong>：Gateway、BFF、Nginx/Ingress 都要关闭 response buffering 并设置合理读超时（见 <a href="#ch-basics-01-gateway">Spring Cloud Gateway 与 LLM</a>）。</li>
+          <li><strong>断线重连要有 id</strong>：服务端为每个 chunk 分配单调递增 id，客户端带 <code>Last-Event-ID</code> 重连；会话上下文仍靠 <a href="#ch-basics-03-session">会话与状态</a>。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring SSE</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · 客服流式回复（30 秒）</span>
+        用户问「订单 SO-1024 物流到哪了？」App 经 Gateway 到 BFF：<code>GET /v1/stream/chat?sessionId=c-8f2a</code>。BFF 从 Redis 加载会话摘要，调用 Python 流式接口，将 token 逐段写入 WebFlux <code>Flux&lt;ServerSentEvent&gt;</code>；客户端 EventSource 实时渲染，首 token 须在 500ms 内可见（SLO 示意）。
+      </aside>
+
+      <p>BFF 层职责：鉴权后的会话上下文、调用 Python、统一 traceId、对前端暴露 <code>text/event-stream</code>。Gateway 只做 <span class="term" data-term-id="stream-proxy" tabindex="0">stream proxy</span>，不在此层解析 SSE 帧内容。</p>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">Gateway</span>
+          <p class="role-card-desc"><code>response-timeout: 0</code>、透传 <code>Last-Event-ID</code>、关闭缓冲。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Spring BFF</span>
+          <p class="role-card-desc">WebFlux SSE 出口；httpx/WebClient 流式读 Python。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">FastAPI</span>
+          <p class="role-card-desc">async generator 产出 SSE 帧；内网 only。</p>
+        </article>
+      </div>
+
+      <h4>SSE 帧格式（HTTP 层）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>示例</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>id:</code></td><td><code>id: 42</code></td><td>断线续传锚点（<span class="term" data-term-id="last-event-id" tabindex="0">last event id</span>）</td></tr>
+          <tr><td><code>event:</code></td><td><code>event: token</code></td><td>前端按类型分发（token / error / done）</td></tr>
+          <tr><td><code>data:</code></td><td><code>data: {"text":"您好"}</code></td><td>payload；多行 data 用 <code>\n</code> 拼接</td></tr>
+          <tr><td>注释行</td><td><code>: ping</code></td><td>心跳，防止代理空闲断开</td></tr>
+        </tbody>
+      </table>
+
+      <h4>WebFlux SSE 控制器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@GetMapping(value = "/v1/stream/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;ServerSentEvent&lt;String&gt;&gt; streamChat(
+    @RequestHeader("X-Tenant-Id") String tenantId,
+    @RequestParam String sessionId,
+    @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
+
+  long resumeFrom = lastEventId == null ? 0 : Long.parseLong(lastEventId);
+  return pythonStreamClient.streamTokens(tenantId, sessionId, resumeFrom)
+      .map(chunk -&gt; ServerSentEvent.&lt;String&gt;builder()
+          .id(String.valueOf(chunk.eventId()))
+          .event(chunk.type())
+          .data(chunk.payloadJson())
+          .build())
+      .concatWith(Flux.just(ServerSentEvent.builder().event("done").data("{}").build()));
+}</code></pre>
+      </div>
+
+      <h4>BFF 流式读 Python（WebClient）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">return webClient.get()
+    .uri("/internal/v1/generate/stream?sessionId={id}&amp;after={after}", sessionId, resumeFrom)
+    .accept(MediaType.TEXT_EVENT_STREAM)
+    .retrieve()
+    .bodyToFlux(String.class)   // 按行或按帧解析，勿 .bodyToMono
+    .map(this::parseSseLine);</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>SSE 端到端序列</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant GW as Gateway
+  participant BFF as Spring BFF
+  participant Py as FastAPI
+  C->>GW: GET /v1/stream/chat + JWT
+  GW->>BFF: 透传 SSE + X-Tenant-Id
+  BFF->>Py: httpx stream (内网)
+  loop 每个 token
+    Py-->>BFF: id/data chunk
+    BFF-->>GW: SSE frame
+    GW-->>C: SSE frame (无缓冲)
+  end
+  BFF-->>C: event: done</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="chunk-forward" tabindex="0">chunk forward</span> 要求每一跳禁止聚合为单 JSON 响应；任一中间层缓冲都会导致「假流式」。</p>
+      </div>
+
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>BFF 用 <code>RestTemplate</code> 同步等待完整 body</li>
+            <li>Gateway 对 <code>/v1/stream/**</code> 设 30s 读超时</li>
+            <li>SseEmitter 线程阻塞等待 Python 整段返回</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>WebFlux <code>Flux</code> 或 reactive WebClient 边读边写</li>
+            <li>Gateway <code>response-timeout: 0</code> + <code>X-Accel-Buffering: no</code></li>
+            <li>每个 chunk 带递增 <code>id</code>，便于续传与排障</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么 BFF 不直接把 Python URL 暴露给浏览器？</summary>
+        <p>鉴权、租户隔离、Trace、内容安全与模型 Key 保护都应在 BFF/Gateway；Python 仅内网可达。直连会绕过 <a href="#ch-basics-01-gateway">gateway auth</a> 与 <a href="#ch-practice-02-rate-limit">租户配额</a>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Python 生成器</h3>
+      <p>FastAPI 用 <code>StreamingResponse</code> 包装 async generator 产出 SSE 帧；与 OpenAI 兼容 API 的 <code>stream=True</code> 模式对接。CorpAssist 能力面只信任 Gateway 注入的 <code>X-Tenant-Id</code>，不对外暴露。</p>
+
+      <h4>FastAPI 流式生成器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def token_stream(session_id: str, after: int = 0):
+    event_id = after
+    async for chunk in llm.astream(session_id):
+        event_id += 1
+        payload = json.dumps({"text": chunk}, ensure_ascii=False)
+        yield f"id: {event_id}\nevent: token\ndata: {payload}\n\n"
+        if event_id % 20 == 0:
+            yield ": ping\n\n"  # 心跳，防代理 60s 空闲断开
+
+@app.get("/internal/v1/generate/stream")
+async def stream(
+    session_id: str,
+    after: int = 0,
+    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+):
+    return StreamingResponse(
+        token_stream(session_id, after),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )</code></pre>
+      </div>
+
+      <h4>与 OpenAI SDK 对接（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def llm_astream(session_id: str):
+    messages = await session_store.build_prompt(session_id)
+    stream = await client.chat.completions.create(
+        model="gpt-4o-mini", messages=messages, stream=True
+    )
+    async for part in stream:
+        delta = part.choices[0].delta.content
+        if delta:
+            yield delta</code></pre>
+      </div>
+
+      <h4>同步阻塞 vs 异步生成：代码对比</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">不推荐 · 阻塞读满</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">python</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-python">resp = requests.post(url, json=body, stream=True)
+text = resp.text  # 仍等整包
+return {"answer": text}</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">推荐 · async generator</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">python</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-python">async def gen():
+    async with httpx.AsyncClient() as client:
+        async with client.stream("POST", url, json=body) as r:
+            async for line in r.aiter_lines():
+                if line.startswith("data:"):
+                    yield parse_sse(line)</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="SSE 与 WebSocket 选型">
+        <input type="radio" name="basics02proto" id="basics02-tab-sse" class="learn-tab-input" checked />
+        <input type="radio" name="basics02proto" id="basics02-tab-ws" class="learn-tab-input" />
+        <label for="basics02-tab-sse">SSE</label>
+        <label for="basics02-tab-ws">WebSocket</label>
+        <div class="learn-tab-panel" id="basics02-panel-sse" role="tabpanel">
+          <p><strong>适用</strong>：LLM 单向 token 推送、HTTP 生态友好、自动重连（EventSource）。</p>
+          <p><strong>CorpAssist S2</strong>：客服 App 默认 SSE；Gateway 配置成熟。</p>
+        </div>
+        <div class="learn-tab-panel" id="basics02-panel-ws" role="tabpanel">
+          <p><strong>适用</strong>：双向高频交互、二进制帧、游戏/协作编辑。</p>
+          <p><strong>本课</strong>：可选 gRPC stream（见 <a href="#ch-practice-05-grpc">gRPC 可选集成</a>）；S2 主路径仍 SSE。</p>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>Python 是 generator 就够了</strong> — BFF/Gateway/Nginx 任一环节缓冲仍会「批量弹出」。</li>
+          <li><strong>无 heartbeat</strong> — 中间代理 60s 空闲断开，用户以为模型卡住。</li>
+          <li><strong>event id 随机 UUID</strong> — 无法单调续传；应用递增整数或雪花序。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>断线重连</h3>
+      <p>移动网络切换、笔记本休眠、K8s 滚动发布会导致 SSE 断开。客户端应使用 <code>EventSource</code>（自带重连）或 fetch 流式库，携带 <code>Last-Event-ID</code> 请求头；服务端从 Redis 补发遗漏帧或告知「请重新提问」。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>策略</th><th>做法</th><th>注意</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>服务端缓冲</td><td>Redis List <code>sse:buf:{sessionId}</code> 存最近 N 帧</td><td>TTL 5–10min；上限防 OOM</td></tr>
+          <tr><td>重连参数</td><td><code>Last-Event-ID: 42</code></td><td>只补发 id &gt; 42 的事件</td></tr>
+          <tr><td>会话一致性</td><td>同一 <code>sessionId</code> 绑定生成状态</td><td>见 <a href="#ch-basics-03-session">会话与状态</a></td></tr>
+          <tr><td>生成已结束</td><td>返回 <code>event: replay_done</code></td><td>避免重复计 Token（配合 <a href="#ch-basics-04-idempotency">幂等</a>）</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>断线重连时序</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant BFF as BFF
+  participant R as Redis
+  C->>BFF: SSE id=1..40
+  Note over C: 网络断开
+  C->>BFF: GET stream Last-Event-ID: 40
+  BFF->>R: LRANGE buf 41..
+  alt 缓冲命中
+    BFF-->>C: 补发 41..N
+  else 生成已结束
+    BFF-->>C: event: replay_done
+  end</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="reconnect-sse" tabindex="0">reconnect sse</span> 不是重新 POST chat；续传用 GET + Last-Event-ID，写操作仍须 Idempotency-Key。</p>
+      </div>
+
+      <h4>Gateway 透传与缓冲关闭</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  cloud:
+    gateway:
+      httpclient:
+        response-timeout: 0
+        pool:
+          max-idle-time: 300s
+      routes:
+        - id: corpassist-sse-stream
+          uri: lb://corpassist-bff
+          predicates:
+            - Path=/v1/stream/**
+          filters:
+            - name: SetResponseHeader
+              args:
+                name: X-Accel-Buffering
+                value: "no"</code></pre>
+      </div>
+
+      <h4>BFF 重连处理（Java 示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">Flux&lt;ServerSentEvent&lt;String&gt;&gt; replayThenLive(long after, String sessionId) {
+  Flux&lt;ServerSentEvent&lt;String&gt;&gt; replay = sseBufferRepo.replayAfter(sessionId, after);
+  Flux&lt;ServerSentEvent&lt;String&gt;&gt; live = pythonStreamClient.streamFrom(sessionId, after);
+  return replay.concatWith(live);
+}</code></pre>
+      </div>
+
+      <h4>断线策略决策表</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>场景</th><th>推荐</th><th>避免</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Wi-Fi → 4G 切换</td><td>EventSource 自动重连 + Last-Event-ID</td><td>立即新 POST 触发第二次 LLM 调用</td></tr>
+          <tr><td>Pod 滚动发布</td><td>Redis 缓冲 + 无状态 BFF</td><td>强依赖 Gateway 粘性（见 session 章）</td></tr>
+          <tr><td>用户主动停止</td><td>客户端 abort + 服务端 cancel generator</td><td>后台继续生成浪费 Token</td></tr>
+        </tbody>
+      </table>
+
+      <h4>常见问题（FAQ）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>SSE 断线后为什么要带 Last-Event-ID 而不是重新 POST？</summary>
+          <div class="learn-faq-body">
+            <p>重新 POST 可能触发第二次 LLM 推理，双倍 Token 费用且回复可能不一致。续传只补发未送达帧；若生成已结束则返回 <code>replay_done</code> 或缓存全文。</p>
+          </div>
+        </details>
+        <details>
+          <summary>Gateway 限流应放在建立 SSE 之前还是之后？</summary>
+          <div class="learn-faq-body">
+            <p>尽量在<strong>建立连接前</strong>限流（见 <a href="#ch-basics-01-gateway">gateway rate limit</a>）；已建立的长连接中途超限应发 <code>event: error</code> 并关闭。</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">放在正文与复习之间，便于串起全章再做题。每条对应上文一个小节标题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Spring SSE</strong>：BFF 用 WebFlux 暴露 <code>text/event-stream</code>，WebClient 流式读 Python；禁止 RestTemplate 整包等待。</li>
+        <li><strong>Python 生成器</strong>：<code>async generator</code> + <code>StreamingResponse</code>；heartbeat 与递增 event id 是生产必备。</li>
+        <li><strong>断线重连</strong>：Last-Event-ID + Redis 短时缓冲；Gateway 关闭读超时与响应缓冲；续传≠重新 POST。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_basics02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="flow" /> 能画出 Client→GW→BFF→Py 四跳 SSE 序列</label></li>
+          <li><label><input type="checkbox" data-id="buffer" /> 能说出两处必须关闭 buffering 的组件（Gateway + Nginx/BFF）</label></li>
+          <li><label><input type="checkbox" data-id="reconnect" /> 能解释 Last-Event-ID 如何用于续传且避免重复计费</label></li>
+          <li><label><input type="checkbox" data-id="heartbeat" /> 能说明 <code>: ping</code> 注释行的作用</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>sse stream</td><td>单向 HTTP 长连接，<code>data:</code> + 双换行</td></tr>
+                <tr><td>chunk forward</td><td>每一跳边读边写，禁止整包缓冲</td></tr>
+                <tr><td>last event id</td><td>续传锚点；单调递增</td></tr>
+                <tr><td>stream proxy</td><td>Gateway 透传，不解析 token 内容</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>用户反馈「流式变批量」，你的排查顺序是什么？</li>
+              <li>SSE 与 WebSocket 在 LLM 客服场景各适合什么？CorpAssist 为何默认 SSE？</li>
+              <li>K8s 滚动发布时 SSE 连接断开，架构上如何让用户无感续传？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-basics-03-session">会话与状态</a> 讲解 Redis 多轮对话与 TTL 策略。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events" target="_blank" rel="noopener">MDN — Server-Sent Events</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webflux/reactive-spring.html#webflux-streaming" target="_blank" rel="noopener">Spring WebFlux Streaming</a></li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse" target="_blank" rel="noopener">FastAPI StreamingResponse</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-server-webflux/http-client.html" target="_blank" rel="noopener">Gateway HttpClient — 长连接与超时</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照 <code>demos/basics-02-sse-lab/sse-flow.md</code>，补全「断线重连」时序说明与 Gateway 缓冲关闭项（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 sse-flow.md 的 Mermaid 序列图中，为 Gateway、BFF、Nginx 三处标注「是否必须 stream 透传」及一句理由。</li>
+      <li>为 Python <code>token_stream</code> 伪代码补一行 heartbeat（<code>: ping</code>）应插入的位置与间隔建议（15–30s）。</li>
+      <li>填写正文「断线重连策略表」中 Redis 缓冲行的 TTL 建议值（如 10min）及内存上限思路。</li>
+      <li>在 lab 文档中写清：Last-Event-ID 续传与重新 POST chat 在 Token 计费上的差异。</li>
+      <li>（可选）用 <code>curl -N -H "Accept: text/event-stream"</code> 请求本地 BFF，确认逐行输出。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：用户反馈「流式变批量」。已确认 Python 是 async generator，下一步最应检查什么？① BFF 是否 json 聚合 ② Gateway <code>response-timeout</code> ③ Nginx <code>X-Accel-Buffering</code> ④ 前端是否 EventSource</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>优先 ① 和 ③</strong>。BFF 聚合或反向代理缓冲是最常见根因。② 过长会导致断连而非「批量弹出」；④ 错误通常表现为完全不更新。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：方案写「SSE 断线后客户端立即重新 POST /v1/chat，不带 Last-Event-ID」。违反哪条原则？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反断线续传与 NS3 成本控制：可能触发第二次 LLM 调用、双倍 Token。应 GET stream + <code>Last-Event-ID</code> 补发，或返回 <code>replay_done</code>。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：SSE 流式端到端</h4>
+      <p>目录：<code>demos/basics-02-sse-lab/</code>。<strong>验收</strong>：sse-flow.md 含完整四跳序列 + Last-Event-ID 重连说明 + Gateway 缓冲关闭项清单。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-session">会话与状态</a>：Redis 会话与 SSE 断线时的 sessionId 绑定</li>
+      <li><a href="#ch-basics-01-gateway">Spring Cloud Gateway 与 LLM</a>：SSE 路由 <code>response-timeout: 0</code></li>
+      <li><a href="#ch-basics-04-idempotency">幂等与重试</a>：避免重连/重试导致重复计费</li>
+      <li><a href="../llm-composite-integration-workshop/index.html">双栈集成实战</a>：BFF 调用 Python 流式契约</li>
+    </ul>
+  </div>
+</section>

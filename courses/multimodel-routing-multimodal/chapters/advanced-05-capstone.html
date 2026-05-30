@@ -1,0 +1,304 @@
+<section id="ch-advanced-05-capstone" class="chapter" data-chapter="advanced-05-capstone">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>与网关课集成</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-05-capstone" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产路由</strong> · 能力：统一 API 入口、路由中间层与 LLM 应用后端课程衔接</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>前四章把成本、降级、治理、面试架构讲清了，但<strong>请求从哪进、路由在哪一层执行</strong>决定能否上线。CorpAssist <strong>NS3 · S5</strong> 的生产路径是：<span class="term" data-term-id="api-gateway" tabindex="0">api gateway</span> 鉴权限流 → BFF 聚合 → <span class="term" data-term-id="route-middleware" tabindex="0">route middleware</span> 选模型 → DashScope。本章作为 <span class="term" data-term-id="gateway-capstone" tabindex="0">gateway capstone</span>，与 <a href="../llm-application-backend/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">LLM 应用后端</span><code class="course-ref-slug">llm-application-backend</code></a> 网关章对接，完成 Spring + Python 双栈的 <span class="term" data-term-id="unified-entry" tabindex="0">unified entry</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>画出 Gateway → BFF → route-service → LLM 全路径，并说明 <span class="term" data-term-id="auth-then-route" tabindex="0">auth then route</span> 顺序</li>
+          <li>配置 <span class="term" data-term-id="rate-limit-route" tabindex="0">rate limit route</span> 与路由上下文透传（tenant、request_id、campaign_id）</li>
+          <li>完成 Demo 集成图，并列出与 llm-application-backend 的 <span class="term" data-term-id="composite-next" tabindex="0">composite next</span> 学习路径</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>统一入口</strong>：外部只认 Gateway URL，不暴露各模型厂商 endpoint。</li>
+          <li><strong>先鉴权后路由</strong>：无 tenant 上下文，budget 与 compliance 无法执行。</li>
+          <li><strong>中间层可 Sidecar</strong>：route-service 可嵌 BFF 或独立 Python 服务，策略仍单源。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>统一入口</h3>
+      <p><span class="term" data-term-id="unified-entry" tabindex="0">unified entry</span> 对外暴露 <code>/v1/mm/chat</code>、<code>/v1/mm/vision</code> 等路径，内部由 Spring Cloud Gateway 按 predicate 转发到 BFF 或 Python route-service。S5 编辑器、企业门户、开放 API 共用同一入口，便于 <span class="term" data-term-id="rate-limit-route" tabindex="0">rate limit route</span> 与 WAF。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>路径</th><th>上游</th><th>路由层职责</th><th>S5 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/v1/mm/chat</code></td><td>corpassist-bff</td><td>文本意图 + 成本路由</td><td>文案草稿、FAQ</td></tr>
+          <tr><td><code>/v1/mm/vision</code></td><td>corpassist-bff</td><td>附件元数据 + VL 路由</td><td>海报、PDF 表格</td></tr>
+          <tr><td><code>/v1/mm/batch</code></td><td>python-route-svc</td><td>批处理、离线评测</td><td>活动期批量改写</td></tr>
+          <tr><td><code>/actuator/health</code></td><td>各服务</td><td>探活，不参与 LLM 路由</td><td>K8s readiness</td></tr>
+        </tbody>
+      </table>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">api gateway</span>
+          <p class="role-card-desc">JWT 校验、租户解析、全局限流；注入 <code>X-Tenant-Id</code>、<code>X-Request-Id</code> 头。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">bff integration</span>
+          <p class="role-card-desc">聚合会话、附件 URL 预签名；调用 Route Middleware 而非直连 ChatModel。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">auth then route</span>
+          <p class="role-card-desc">Gateway Filter 顺序：Auth → RateLimit → RoutePredicate → 上游 BFF。</p>
+        </article>
+      </div>
+      <h4>Gateway 路由配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">spring:
+  cloud:
+    gateway:
+      routes:
+        - id: mm-chat
+          uri: lb://corpassist-bff
+          predicates:
+            - Path=/v1/mm/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+            - name: JwtAuth
+            - AddRequestHeader=X-Route-Layer, gateway</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>NS3/S5 · unified entry 全路径</h5>
+        <pre class="mermaid">flowchart TB
+  Client[S5 编辑器 / 门户]
+  GW[API Gateway 鉴权限流]
+  BFF[corpassist-bff]
+  RM[route middleware]
+  Py[python route-service 批处理]
+  DS[DashScope 兼容网关]
+  Audit[(audit log)]
+  Client --> GW
+  GW -->|/v1/mm/chat| BFF
+  GW -->|/v1/mm/batch| Py
+  BFF --> RM
+  RM --> DS
+  Py --> DS
+  RM --> Audit
+  BFF --> Audit</pre>
+        <p class="diagram-caption">与 <a href="../llm-application-backend/chapters/basics-01-gateway.html" class="course-ref" target="_blank" rel="noopener">LLM 应用后端 · Gateway</a> 同构；本课补上 Route Middleware 盒。</p>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>前端直连 DashScope API Key</li>
+            <li>Gateway 内嵌 model 选择 if-else</li>
+            <li>批处理与在线 API 不同域名且无统一 audit</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Gateway 只做入口治理，路由在 Middleware</li>
+            <li>统一 trace_id 贯穿 GW → BFF → Router → LLM</li>
+            <li>策略 YAML 与 llm-application-backend 配置中心同源</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S5 开放 API · 租户限流</span>
+        品牌 A 日配额 1 万次；Gateway <span class="term" data-term-id="rate-limit-route" tabindex="0">rate limit route</span> 按 <code>X-Tenant-Id</code> 令牌桶；触顶返回 429，BFF 不再进入 Router，保护 spend cap 与模型配额。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Route Middleware 放在 BFF 内还是独立服务？</summary>
+        <p>在线路径可 BFF 内嵌 Spring Router（低延迟）；Python 批处理走独立 route-service。两者读同一 policy Git 仓库，通过 config sync 保持一致 — 见 basics-03。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>中间层与课程衔接</h3>
+      <p><span class="term" data-term-id="route-middleware" tabindex="0">route middleware</span> 是本课 advanced 01–03 的<strong>落地容器</strong>：Advisor 链执行 cache / classify / budget / degrade / audit。与 <span class="term" data-term-id="bff-integration" tabindex="0">bff integration</span> 的边界：BFF 管会话与 DTO，Middleware 管 model 决策。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>本课模块</th><th>llm-application-backend 对应</th><th>集成点</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>unified entry</td><td>basics-01-gateway</td><td>Gateway routes / JWT / 限流</td></tr>
+          <tr><td>rate-limit-route</td><td>practice-02-rate-limit</td><td>租户配额表</td></tr>
+          <tr><td>auth then route</td><td>practice-03-multi-tenant</td><td>tenant 上下文</td></tr>
+          <tr><td>degrade + circuit</td><td>practice-01-circuit</td><td>Resilience4j 配置</td></tr>
+          <tr><td>gateway-capstone 交付</td><td>practice-06-corpassist-gw</td><td>端到端 checklist</td></tr>
+        </tbody>
+      </table>
+      <h4>BFF 调用 Route Middleware（Spring）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@RestController
+@RequestMapping("/v1/mm")
+public class MultimodalChatController {
+
+  private final ChatClientRouter router;
+
+  @PostMapping("/chat")
+  public ChatResponse chat(
+      @RequestHeader("X-Tenant-Id") String tenantId,
+      @RequestHeader("X-Request-Id") String requestId,
+      @RequestBody ChatRequest body) {
+    RouteContext ctx = RouteContext.builder()
+        .tenantId(tenantId)
+        .requestId(requestId)
+        .campaignId(body.campaignId())
+        .build();
+    return router.route(body.toRouteRequest(ctx));
+  }
+}</code></pre>
+      </div>
+      <h4>composite next：推荐学习顺序</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown">1. multimodel-routing-multimodal（本课 advanced）— 路由策略与多模态
+2. llm-application-backend basics-01-gateway — Gateway 路由与鉴权
+3. llm-application-backend practice-06-corpassist-gw — CorpAssist 网关交付
+4. llm-composite-integration-workshop — 全栈合成集成（可选）</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>route middleware 内部 Advisor 链</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant BFF as corpassist-bff
+  participant CC as ChatClient + Advisors
+  participant C as Semantic Cache
+  participant L as LLM DashScope
+  BFF->>CC: route(ctx, prompt)
+  Note over CC: AuditAdvisor 包装全程
+  CC->>C: cache lookup
+  alt miss
+    CC->>L: classify + generate
+    L-->>CC: response
+    CC->>C: store
+  end
+  CC-->>BFF: ChatResponse + audit fields</pre>
+      </div>
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>Gateway 做路由</strong> — Gateway 不应懂 qwen-turbo vs vl-plus；职责混淆难维护。</li>
+          <li><strong>BFF 直连厂商 SDK</strong> — 绕过 Middleware，成本/降级/审计全丢。</li>
+          <li><strong>忽略 batch 路径</strong> — S5 批量活动走 Python，须同 audit schema。</li>
+        </ul>
+      </div>
+      <p>完整集成清单见 <code>demos/advanced-05-capstone-lab/integration-map.md</code>。完成本课后，建议在 <a href="../llm-application-backend/index.html" class="course-ref" target="_blank" rel="noopener">LLM 应用后端</a> 完成 Gateway 实验，把 <span class="term" data-term-id="gateway-capstone" tabindex="0">gateway capstone</span> 跑通。</p>
+      <details class="learn-micro-check">
+        <summary>自检：composite next 为何先本课再 llm-application-backend？</summary>
+        <p>先理解<strong>路由策略</strong>（本课），再学<strong>入口治理</strong>（后端课），最后<strong>交付集成</strong>（practice-06）。顺序反了容易「网关很好但不知道模型怎么选」。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">capstone = unified entry + route middleware + 与 llm-application-backend 衔接。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>统一入口</strong>：<span class="term" data-term-id="api-gateway" tabindex="0">api gateway</span> 对外唯一；<span class="term" data-term-id="auth-then-route" tabindex="0">auth then route</span>。</li>
+        <li><strong>中间层</strong>：<span class="term" data-term-id="route-middleware" tabindex="0">route middleware</span> 承载 advanced 01–03 能力；<span class="term" data-term-id="bff-integration" tabindex="0">bff integration</span> 管会话。</li>
+        <li><strong>限流</strong>：<span class="term" data-term-id="rate-limit-route" tabindex="0">rate limit route</span> 在 Gateway，保护 Router 与 LLM。</li>
+        <li><strong>下一步</strong>：<span class="term" data-term-id="composite-next" tabindex="0">composite next</span> → llm-application-backend 网关与 CorpAssist 交付。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="multimodel-routing-multimodal_advanced05_capstone">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="path" /> 能画出 Gateway → BFF → Middleware → LLM 路径</label></li>
+          <li><label><input type="checkbox" data-id="auth" /> 能解释 auth then route 为何不可颠倒</label></li>
+          <li><label><input type="checkbox" data-id="limit" /> 能说明 Gateway 限流与 spend cap 分工</label></li>
+          <li><label><input type="checkbox" data-id="next" /> 能列出 composite next 至少 3 门课</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>术语</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>unified entry</td><td>对外只暴露 Gateway /v1/mm/*</td></tr>
+                <tr><td>route middleware</td><td>路由决策容器，非 Gateway 职责</td></tr>
+                <tr><td>auth then route</td><td>先 tenant 上下文，再 budget/路由</td></tr>
+                <tr><td>composite next</td><td>本课 → llm-application-backend → 交付</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成下方 Demo 与右侧测验；继续 <a href="#ch-practice-04-corpassist-mm">CorpAssist 多模态交付</a> 或 <a href="../llm-application-backend/index.html" class="course-ref" target="_blank" rel="noopener">LLM 应用后端</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank" rel="noopener">Spring Cloud Gateway 参考</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient · Advisor</a></li>
+      <li><a href="../llm-application-backend/index.html" class="course-ref" target="_blank" rel="noopener">LLM 应用后端 — 网关与 CorpAssist 实践</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 35 分钟 · 绘制 S5 全链路集成图，并对照 llm-application-backend 标注 5 个集成点。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/advanced-05-capstone-lab/integration-map.md</code>，阅读验收项。</li>
+      <li>画 Gateway → BFF → route middleware → DashScope 序列图，标 auth / rate limit / audit。</li>
+      <li>写 Gateway <code>routes</code> 片段：至少 <code>/v1/mm/chat</code> 与 <code>/v1/mm/batch</code>。</li>
+      <li>打开 <a href="../llm-application-backend/chapters/basics-01-gateway.html" class="course-ref" target="_blank" rel="noopener">LLM 应用后端 Gateway 章</a>，对比差异列 3 条。</li>
+      <li>完成右侧「与网关课集成 · 测验」。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">团队在 Gateway GlobalFilter 里写「若 prompt 含图片则 model=vl-max」。请指出<strong>架构问题</strong>与推荐分层。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>Gateway 不应承担 <span class="term" data-term-id="route-middleware" tabindex="0">route middleware</span> 业务路由；且无法复用 Python 批处理。应：Gateway 鉴权限流 → BFF → Middleware 读 routing.yaml 决策。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Gateway 429 与 Router spend cap 触顶，用户看到的体验应如何区分？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>Gateway 429：请求未进 BFF，提示「调用过于频繁」。spend cap：已进入 Router，返回 degrade text「今日生成额度已满，草稿已保存」。HTTP 码与文案应不同，audit 字段分别 <code>rate_limited</code> / <code>budget_exceeded</code>。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：与网关课集成</h4>
+      <p>目录：<code>demos/advanced-05-capstone-lab/</code>。<strong>验收</strong>：提交全路径集成图 + 与 llm-application-backend 对照表（≥5 行）。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>推荐下一步</strong>：<a href="../llm-application-backend/index.html" class="course-ref" target="_blank" rel="noopener">LLM 应用后端</a> — Gateway、限流、CorpAssist 网关交付</li>
+      <li><a href="#ch-practice-04-corpassist-mm">CorpAssist 多模态交付</a></li>
+      <li><a href="../llm-composite-integration-workshop/index.html" class="course-ref" target="_blank" rel="noopener">大模型合成集成工坊</a></li>
+    </ul>
+  </div>
+</section>

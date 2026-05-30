@@ -1,0 +1,304 @@
+<section id="ch-practice-02-spring-rag" class="chapter" data-chapter="practice-02-spring-rag">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Spring AI：RAG 实现</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-spring-rag" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈实现 CorpAssist 知识库</strong> · 能力：<span class="term" data-term-id="question-answer-advisor" tabindex="0">QuestionAnswerAdvisor</span> + <span class="term" data-term-id="spring-vectorstore" tabindex="0">VectorStore</span>，与 Python 链对照</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 对外 API 落在 Spring Boot BFF：<strong>统一鉴权、审计、SLA</strong>。Python 链（上一章）证明检索契约可行；本章用 Spring AI 在<strong>同一向量库</strong>上实现等价 <span class="term" data-term-id="java-rag" tabindex="0">Java RAG</span>，并做 <span class="term" data-term-id="parity-test" tabindex="0">parity test</span>，避免双栈各说各话。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>配置 <span class="term" data-term-id="spring-vectorstore" tabindex="0">VectorStore</span> 连接与 collection 元数据</li>
+          <li>用 <span class="term" data-term-id="question-answer-advisor" tabindex="0">QuestionAnswerAdvisor</span> 挂载到 <code>ChatClient</code></li>
+          <li>对照 <a href="#ch-practice-01-python-rag">Python LCEL 链</a> 的字段与 TopK</li>
+          <li>用 <code>mvn test</code> / curl 跑通 <span class="term" data-term-id="corpassist-java-rag" tabindex="0">CorpAssist Java RAG</span> 端点</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Advisor 即检索增强切面</strong>：在调用 LLM 前注入检索到的 context。</li>
+          <li><strong>VectorStore 只读查询</strong>：索引仍由 Python 批处理写入（basics-04）。</li>
+          <li><strong>DTO 对齐</strong>：<span class="term" data-term-id="dto-align" tabindex="0">dto align</span> 的 <code>sources</code> 与 Python <code>AskResponse</code> 同形。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>VectorStore：连接共用索引</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 同一 PGVector collection</span>
+        Python 夜间 job 写入 <code>corpassist-hr-v2</code>；白天 Spring 只读查询。禁止 Spring 侧换 embedding 模型或 collection 名不自知。
+      </aside>
+      <p><span class="term" data-term-id="spring-vectorstore" tabindex="0">Spring AI VectorStore</span> 抽象 PGVector、Redis、Elasticsearch 等后端。CorpAssist 选用与 Python 相同的 JDBC URL 与表/ collection。</p>
+
+      <h4>application.yml（向量库 + 模型网关）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    vectorstore:
+      pgvector:
+        index-type: HNSW
+        distance-type: COSINE_DISTANCE
+        dimensions: 1536
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      embedding:
+        options:
+          model: text-embedding-3-small
+      chat:
+        options:
+          model: gpt-4o-mini
+
+corpassist:
+  rag:
+    collection: corpassist-hr-v2
+    default-top-k: 4</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>双栈共用索引（practice-02 视角）</h5>
+        <pre class="mermaid">flowchart TB
+  PY[Python 离线索引] --> VS[(PGVector corpassist-hr-v2)]
+  SP[Spring ChatClient + Advisor] --> VS
+  SP --> GW[模型网关]
+  PY -.->|同 embedding 模型| VS</pre>
+        <p class="diagram-caption">变更 embedding 须双栈 re-embed + <span class="term" data-term-id="parity-test" tabindex="0">parity test</span> 回归。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>QuestionAnswerAdvisor：挂载 RAG 到 ChatClient</h3>
+      <p><span class="term" data-term-id="question-answer-advisor" tabindex="0">QuestionAnswerAdvisor</span> 是 Spring AI 1.x 推荐的 <span class="term" data-term-id="advisor-rag" tabindex="0">Advisor RAG</span> 方式：在 <code>ChatClient</code> 上注册后，自动完成「检索 → 填入 Prompt → 调用 ChatModel」。</p>
+
+      <h4>Java 配置与 Controller 片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// demos/practice-02-spring-rag-lab/SpringRagDemo.java 思路
+@Configuration
+class RagConfig {
+  @Bean
+  ChatClient chatClient(ChatClient.Builder builder, VectorStore vectorStore) {
+    var advisor = QuestionAnswerAdvisor.builder(vectorStore)
+        .searchRequest(SearchRequest.builder()
+            .topK(4)
+            .filterExpression("tenant_id == 'corp-a' &amp;&amp; kb == 'hr'")
+            .build())
+        .build();
+    return builder.defaultAdvisors(advisor).build();
+  }
+}
+
+@RestController
+@RequestMapping("/v1/rag")
+class RagController {
+  private final ChatClient chatClient;
+
+  @PostMapping("/ask")
+  AskResponse ask(@RequestBody AskRequest req) {
+    String answer = chatClient.prompt()
+        .user(req.question())
+        .call()
+        .content();
+    // 从 Advisor 上下文或 Document 列表映射 sources — 与 Python 同 DTO
+    return new AskResponse(answer, mapSources(...));
+  }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Java 侧反模式</span>
+          <ul>
+            <li>Controller 内手写 JDBC 查向量</li>
+            <li>TopK=20 且无 rerank</li>
+            <li>返回字段 <code>citations</code> 与 Python <code>sources</code> 不一致</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Advisor 推荐</span>
+          <ul>
+            <li>filter 与 Python <code>search_kwargs.filter</code> 同语义</li>
+            <li><span class="term" data-term-id="spring-retrieval" tabindex="0">spring retrieval</span> 参数集中配置</li>
+            <li>集成测试对比 golden answer 的 doc_id 集合</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>对照 Python：管线映射表</h3>
+      <p>面试与联调时常问「Spring 这段等价 LangChain 哪一段」。下表用于 <span class="term" data-term-id="dto-align" tabindex="0">双栈对照</span> 文档（建议写入团队 Wiki）。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>Python（practice-01）</th><th>Spring AI（本章）</th><th>契约</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>vectorstore.as_retriever(k=4)</code></td>
+            <td><code>SearchRequest.topK(4)</code></td>
+            <td>TopK 一致</td>
+          </tr>
+          <tr>
+            <td><code>filter: {tenant_id, kb}</code></td>
+            <td><code>filterExpression</code></td>
+            <td>检索层 ACL</td>
+          </tr>
+          <tr>
+            <td><code>ChatPromptTemplate</code></td>
+            <td>Advisor 内置 QA 模板（可自定义）</td>
+            <td>「仅根据 context」</td>
+          </tr>
+          <tr>
+            <td><code>AskResponse</code></td>
+            <td><code>record AskResponse</code></td>
+            <td><code>answer</code> + <code>sources[]</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：能否 Spring 也做离线索引？</summary>
+        <p>可以但不推荐双写。CorpAssist 约定 Python 批处理索引 + Spring 查询，减少两套 ingest 逻辑漂移。若必须 Java ingest，需与 Python 共用同一 pipeline 版本号。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>本地启动与 curl 验收</h3>
+      <p>与 <a href="#ch-practice-01-python-rag">Python API</a> 对照时，保持<strong>相同测试问题</strong>与 tenant filter，比较 <code>sources[].doc_id</code> 集合（允许顺序不同）。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">cd demos/practice-02-spring-rag-lab
+mvn -q spring-boot:run -Dspring-boot.run.profiles=local
+
+curl -s -X POST http://localhost:8080/v1/rag/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假几天","tenantId":"corp-a"}' | jq .
+
+mvn -q test -Dtest=RagParityTest</code></pre>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>Spring AI RAG 速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>组件</th><th>作用</th></tr></thead>
+              <tbody>
+                <tr><td><code>VectorStore</code></td><td>相似度检索 Document</td></tr>
+                <tr><td><code>QuestionAnswerAdvisor</code></td><td>检索 + 注入 Prompt</td></tr>
+                <tr><td><code>ChatClient</code></td><td>统一调用入口，可挂多个 Advisor</td></tr>
+                <tr><td><code>SearchRequest</code></td><td>topK、filter、similarityThreshold</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>VectorStore</strong>：与 Python 同 collection、同 embedding 维度，Spring 只读查询。</li>
+        <li><strong>Advisor</strong>：<code>QuestionAnswerAdvisor</code> 承载检索增强，避免 Controller 拼 SQL。</li>
+        <li><strong>对照</strong>：TopK、filter、DTO 与 LCEL 链一一映射，parity 测 doc_id 集合。</li>
+        <li><strong>验收</strong>：<code>mvn spring-boot:run</code> + curl <code>/v1/rag/ask</code> 与 Python 同源。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_practice02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="vs" /> 能说明 Spring VectorStore 与 Python 索引分工</label></li>
+          <li><label><input type="checkbox" data-id="advisor" /> 能写出 Advisor + topK + filter 配置思路</label></li>
+          <li><label><input type="checkbox" data-id="map" /> 能填一张 Python→Spring 管线对照表</label></li>
+          <li><label><input type="checkbox" data-id="curl" /> curl 与 Python 返回 doc_id 集合一致</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-03-hybrid">混合检索接入</a>，在共用索引上叠加 BM25 与向量融合。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI Retrieval Augmentation</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI Vector Databases</a></li>
+      <li><a href="https://python.langchain.com/docs/concepts/rag/" target="_blank" rel="noopener">LangChain RAG（对照）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">改 yaml 中 topK 与 filter，用 mvn 启动后 curl 对照 Python 同一问题的 sources。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 <code>application-local.yml</code> 设置 <code>corpassist.rag.collection</code> 与 Python 一致。</li>
+      <li>将 <code>default-top-k</code> 从 4 改为 8，curl 对比 sources 条数变化。</li>
+      <li>故意写错 <code>filterExpression</code> 的 <code>kb</code>，确认 sources 为空（与 Python 实验对照）。</li>
+      <li>运行 <code>mvn test -Dtest=RagParityTest</code>（或 lab 中占位测试），记录 doc_id 差异。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）同事在 Controller 里先 <code>chatClient.call()</code> 再手动 <code>vectorStore.similaritySearch</code> 拼 context。错在哪？应如何改？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>顺序反了：未检索就生成，必然胡编。应使用 <code>QuestionAnswerAdvisor</code> 或先检索再带 context 调用；检索 filter 与 TopK 进 <code>SearchRequest</code>，勿散落 Controller。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（找错）parity 测试失败：Python 有 <code>pol-102</code>，Java 只有 <code>pol-99</code>。yaml 与代码中最常见的 2 处不一致？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>embedding 模型/维度或 collection 名不一致；或 filterExpression / topK 与 Python <code>search_kwargs</code> 不同。先对齐配置再比 LLM 输出。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Spring AI RAG</h4>
+      <p>目录：<code>demos/practice-02-spring-rag-lab/</code>（<code>SpringRagDemo.java</code>）。<strong>验收</strong>：curl 返回 sources；与 Python 同题 doc_id 集合一致。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-01-python-rag">Python：LangChain RAG 实现</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-hybrid">混合检索接入</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient</a></li>
+    </ul>
+  </div>
+</section>

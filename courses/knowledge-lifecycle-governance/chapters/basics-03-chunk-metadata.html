@@ -1,0 +1,113 @@
+<section id="ch-basics-03-chunk-metadata" class="chapter" data-chapter="basics-03-chunk-metadata">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>分块与元数据规范</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-chunk-metadata" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生命周期模型</strong> · 能力：定义 CorpAssist chunk schema、标签体系与 ACL 元数据（C7）</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>ACL 泄露、检索无法按部门过滤，根因常是<strong>入库时没写 metadata</strong>。统一 <span class="term" data-term-id="chunk-spec" tabindex="0">chunk spec</span> 是双栈共用契约。</p></div>
+      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
+        <li>设计 <span class="term" data-term-id="corpassist-schema" tabindex="0">corpassist schema</span> 必填字段</li>
+        <li>配置 <span class="term" data-term-id="acl-tags" tabindex="0">acl tags</span> 与 <span class="term" data-term-id="doc-type-tag" tabindex="0">doc type tag</span></li>
+        <li>保证 Python 写入与 Spring filter 表达式字段一致</li>
+      </ul></div>
+      <div class="notice"><strong>本章先记住 3 件事</strong><ul>
+        <li><strong>chunk_id</strong> 稳定可复现，便于增量 upsert。</li>
+        <li><strong>acl_tags</strong> 在入库时写入，检索层 filter，非事后过滤。</li>
+        <li><strong>metadata norm</strong> 版本化，变更需 re-embed 或迁移计划。</li>
+      </ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>规范</h3>
+      <p><span class="term" data-term-id="metadata-norm" tabindex="0">metadata norm</span> 规定字段类型、枚举与必填项：</p>
+      <table class="outline-table">
+        <thead><tr><th>字段</th><th>类型</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><span class="term" data-term-id="chunk-id" tabindex="0">chunk id</span></td><td>string</td><td>主键；格式 <code>{doc_id}#{page}#{seq}</code></td></tr>
+          <tr><td>index_version</td><td>string</td><td>蓝绿发布（<a href="#ch-basics-04-index-versions">索引版本与回滚</a>）</td></tr>
+          <tr><td>tenant_id</td><td>string</td><td>多租户隔离</td></tr>
+          <tr><td>updated_at</td><td>ISO8601</td><td>stale 检测</td></tr>
+        </tbody>
+      </table>
+      <h4>分块策略对比</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不推荐</span><ul><li>固定 512 token 切标题中间</li><li>无 overlap 丢上下文</li><li>表格转纯文本丢结构</li></ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐</span><ul><li>按标题/段落语义切</li><li>10–15% overlap</li><li>表格保留 markdown/HTML 结构</li></ul></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>标签体系</h3>
+      <p><span class="term" data-term-id="tag-system" tabindex="0">tag system</span> 支持检索过滤与运营统计：</p>
+      <ul>
+        <li><strong>业务域</strong>：<code>domain:hr</code>、<code>domain:finance</code></li>
+        <li><strong>密级</strong>：<code>classification:internal</code></li>
+        <li><strong>ACL</strong>：<code>acl:dept-hr</code>、<code>acl:mgmt-only</code></li>
+      </ul>
+      <div class="mermaid-wrap"><h5>标签 → Milvus filter</h5>
+      <pre class="mermaid">flowchart LR
+  META[chunk metadata] --> FILTER["filter: acl in user.acl"]
+  FILTER --> HITS[合法 hits]
+  META --> STATS[运营聚合 by domain]</pre></div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 acl_tags 必须在入库时写入，而不是检索后打标？</summary>
+        <p>检索后打标意味着无权限 chunk 已进入候选集，存在日志与缓存泄露风险；filter 依赖入库时的标量字段索引。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist schema</h3>
+      <p><span class="term" data-term-id="c7-metadata" tabindex="0">c7 metadata</span> 双栈共享 JSON Schema：</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-json">{
+  "$schema": "https://corpassist/schema/chunk/v1.2",
+  "required": ["chunk_id", "tenant_id", "acl_tags", "source_uri", "index_version"],
+  "properties": {
+    "chunk_id": { "type": "string" },
+    "acl_tags": { "type": "array", "items": { "type": "string" } },
+    "doc_type": { "enum": ["policy", "faq", "procedure"] },
+    "embedding_model": { "type": "string" }
+  }
+}</code></pre></div>
+      <h4>Spring VectorStore filter 示例</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 检索层注入 ACL — 非 LLM 事后过滤
+SearchRequest request = SearchRequest.query(userQuery)
+  .withTopK(8)
+  .withFilterExpression(
+    "tenant_id == '" + tenantId + "' && acl_tags IN " + userAclJson);</code></pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>规范</strong>：chunk_id、index_version、tenant_id 等必填，分块保语义与结构。</li>
+        <li><strong>标签体系</strong>：domain/密级/ACL 标签支撑 filter 与运营统计。</li>
+        <li><strong>CorpAssist schema</strong>：JSON Schema 版本化，Python 写、Spring 读同一契约。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block"><h3>复习与自检</h3>
+      <p class="chapter-review-next">下一章 <a href="#ch-basics-04-index-versions">索引版本与回滚</a>：蓝绿 alias 与 re-embed 策略。</p>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方文档</h3><ul>
+    <li><a href="https://milvus.io/docs/scalar_index.md" target="_blank" rel="noopener">Milvus — 标量字段与过滤</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/milvus.html" target="_blank" rel="noopener">Spring AI Milvus</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <p class="steps-intro">扩展 CorpAssist chunk schema 并写 Spring filter 表达式（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>为 schema 增加 <code>effective_date</code> 字段并说明 stale 检测用途。</li>
+      <li>设计 3 个 <code>acl_tags</code> 枚举值对应 HR/Finance/全员。</li>
+      <li>写出用户 ACL 为 <code>["acl:dept-hr"]</code> 时的 Milvus filter 字符串。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list"><li><p class="judgment-stem">（场景）LLM 回答后 Java 代码再删无权限句子，是否满足 C7？</p>
+      <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p><strong>不满足</strong>。chunk 可能已被 LLM 内化进上下文；必须在 VectorStore 检索层 filter，否则 <span class="term" data-term-id="permission-leak" tabindex="0">permission leak</span>。</p></div></details></div>
+    </li></ol>
+    <div class="demo-box"><h4 class="demo-box-title">Demo：分块与元数据规范</h4><p><code>demos/basics-03-chunk-metadata-lab/schema-fields.md</code> — 填完必填字段表。</p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸学习</h3><ul><li><a href="#ch-practice-02-permission">权限与多租户</a></li></ul></div>
+</section>

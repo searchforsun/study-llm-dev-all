@@ -1,0 +1,447 @@
+<section id="ch-advanced-02-background-jobs" class="chapter" data-chapter="advanced-02-background-jobs">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>后台任务与队列</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-background-jobs" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产级 Python AI 服务</strong> · 能力：选型任务队列、对接 MQ、实现 RAG 长任务并由 Spring 触发</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>全量 RAG 索引、大文件解析与批量 Embedding 动辄数十分钟，不能占用 FastAPI 请求线程。CorpAssist 双栈里，Spring BFF 负责鉴权与编排，Python 侧需要可靠的 <span class="term" data-term-id="task-queue" tabindex="0">task queue</span> 执行 <span class="term" data-term-id="rag-indexing" tabindex="0">RAG indexing</span>。本章对比 <span class="term" data-term-id="celery" tabindex="0">Celery</span> 与 <span class="term" data-term-id="arq" tabindex="0">ARQ</span>，说明与 Java MQ 的 <span class="term" data-term-id="mq-bridge" tabindex="0">桥接</span>，以及 <span class="term" data-term-id="spring-trigger" tabindex="0">Spring 触发</span> 模式。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 CorpAssist 选型 Celery（成熟生态）或 ARQ（async 原生）</li>
+          <li>设计 <span class="term" data-term-id="idempotent" tabindex="0">幂等</span> 索引任务与 <span class="term" data-term-id="retry-backoff" tabindex="0">retry backoff</span></li>
+          <li>描述 Spring 经 HTTP/MQ 投递任务到 Python Worker 的序列</li>
+          <li>把任务状态（pending/running/done）通过 API 或 Webhook 回传 BFF</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>HTTP 只提交</strong>：POST 返回 <code>job_id</code>，不在路由里 await 全量索引。</li>
+          <li><strong>幂等键</strong>：同一 <code>doc_set_version</code> 重复投递不应双写向量。</li>
+          <li><strong>可见性</strong>：任务日志带 <span class="term" data-term-id="correlation-id" tabindex="0">request_id</span>，与 Spring 触发请求一致。</li>
+          <li><strong>失败可恢复</strong>：DLQ + 人工重放，类比 Java @Retryable。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Celery/ARQ 简介</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 知识库 nightly rebuild</span>
+        每晚 02:00 从对象存储拉取增量文档，重建向量索引。API 服务 3 副本常驻；索引 Worker 1–2 副本按需扩容。需要队列解耦「提交」与「执行」。
+      </aside>
+      <p>Python 生态常见两类 Worker 框架。选型时对照团队已有中间件与 async 栈深度——CorpAssist 默认 API 全 async，Worker 侧 IO 密集，ARQ 往往更贴手；若运维已标准化 Celery + RabbitMQ，沿用 Celery 亦可。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>框架</th><th>Broker 常见选型</th><th>CorpAssist 适用场景</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Celery</strong></td>
+            <td>Redis / RabbitMQ</td>
+            <td>团队已有 RabbitMQ、需复杂路由与 Flower 监控</td>
+          </tr>
+          <tr>
+            <td><strong>ARQ</strong></td>
+            <td>Redis</td>
+            <td>全 async 栈、任务以 await httpx 为主、部署要轻</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>ARQ 任务定义（async 友好）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from arq.connections import RedisSettings
+
+async def index_documents(ctx, job_id: str, doc_ids: list[str]) -&gt; dict:
+    # ctx["http"] 可在 worker startup 注入 AsyncClient
+    indexed = 0
+    for doc_id in doc_ids:
+        await index_one(ctx, doc_id)
+        indexed += 1
+    return {"job_id": job_id, "indexed": indexed, "status": "done"}
+
+class WorkerSettings:
+    redis_settings = RedisSettings(host="redis", port=6379)
+    functions = [index_documents]
+    on_startup = startup
+    on_shutdown = shutdown</code></pre>
+      </div>
+
+      <h4>Celery 任务定义（sync 包装 async 时慎用）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from celery import Celery
+
+app = Celery("corpassist", broker="amqp://guest@rabbitmq//")
+
+@app.task(bind=True, max_retries=3, default_retry_delay=60)
+def index_documents_celery(self, job_id: str, doc_ids: list[str]) -&gt; dict:
+    try:
+        return run_async(index_documents_impl(job_id, doc_ids))
+    except TransientError as exc:
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries)</code></pre>
+      </div>
+      <p>Celery 任务默认同步；若内部跑 asyncio 事件循环，需单独进程并避免与 uvicorn 共进程。CorpAssist 新 Worker 优先 ARQ，减少「sync 包 async」的嵌套复杂度。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>FastAPI 路由 <code>BackgroundTasks</code> 跑 30 分钟索引</li>
+            <li>无 broker 的 while True 线程（进程崩溃任务丢失）</li>
+            <li>Worker 与 API 共进程抢 CPU</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>独立 Deployment：<code>corpassist-worker</code></li>
+            <li>Redis/RabbitMQ 持久化队列</li>
+            <li>任务函数纯 async IO + 批处理（见 <a href="#ch-advanced-01-performance">性能章</a>）</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：BackgroundTasks 适合 CorpAssist 的哪些场景？</summary>
+        <p>仅适合请求返回后几秒内可完成的副作用，如写审计日志、发 Webhook 通知。超过 30 秒或需重试的任务必须进 <span class="term" data-term-id="task-queue" tabindex="0">task queue</span>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>与 MQ 集成</h3>
+      <p>企业内常已有 RabbitMQ / Kafka（Spring <code>@RabbitListener</code>）。Python 侧可通过 <span class="term" data-term-id="mq-bridge" tabindex="0">MQ bridge</span> 消费同一 Topic/Queue，或 Spring 转发为 Redis 任务——关键是<strong>契约统一</strong>：消息体 JSON Schema 与 OpenAPI DTO 同源。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Spring → MQ → Python Worker</h5>
+        <pre class="mermaid">flowchart LR
+  BFF["corpassist-bff\nSpring"]
+  MQ["RabbitMQ\nindex.jobs"]
+  PY["corpassist-worker\nARQ/Celery"]
+  VDB["向量库"]
+  BFF -->|"发布 IndexJobMessage"| MQ
+  MQ --> PY
+  PY --> VDB
+  PY -->|"状态回调 HTTP"| BFF</pre>
+        <p class="diagram-caption">BFF 不写 Python 实现细节，只发 <code>job_id</code>、<code>doc_ids</code>、<code>request_id</code>。</p>
+      </div>
+
+      <h4>消息体契约（Pydantic）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pydantic import BaseModel, Field
+
+class IndexJobMessage(BaseModel):
+    job_id: str
+    doc_ids: list[str] = Field(max_length=500)
+    request_id: str
+    doc_set_version: str  # 幂等键组成部分
+
+    model_config = {"extra": "forbid"}</code></pre>
+      </div>
+      <p>Java 侧用同名 DTO（Jackson <code>@JsonProperty</code> snake_case）序列化；CI 可做 <span class="term" data-term-id="contract-test" tabindex="0">contract test</span> 比对样例 JSON。</p>
+
+      <h4>RabbitMQ 消费桥接（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def on_index_message(body: bytes, arq_pool: ArqRedis) -&gt; None:
+    msg = IndexJobMessage.model_validate_json(body)
+    await arq_pool.enqueue_job(
+        "index_documents",
+        msg.job_id,
+        msg.doc_ids,
+        msg.doc_set_version,
+        _job_id=msg.job_id,
+    )</code></pre>
+      </div>
+      <p>桥接层职责单一：校验 JSON → 入 ARQ 队列。复杂索引逻辑仍在 Worker 函数内，便于单测与 <span class="term" data-term-id="structlog" tabindex="0">structlog</span> 打 <code>request_id</code>。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>集成模式</th><th>优点</th><th>CorpAssist 注意点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Spring 直发 RabbitMQ，Python 消费</td>
+            <td>与 Java 定时任务同 broker</td>
+            <td>队列名、DLQ、消息 TTL 与运维文档一致</td>
+          </tr>
+          <tr>
+            <td>Spring HTTP 202 → Python 入 Redis</td>
+            <td>联调简单，契约即 OpenAPI</td>
+            <td>需 API Key；高吞吐时 HTTP 成瓶颈</td>
+          </tr>
+          <tr>
+            <td>Outbox 模式（Java 写 DB 再发 MQ）</td>
+            <td>事务与消息一致</td>
+            <td>Python 只消费，不参与 Java 事务</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：Kafka 还是 RabbitMQ？</summary>
+        <p>CorpAssist 教程默认 RabbitMQ + Redis（ARQ）；若平台已标准化 Kafka，Celery 4.x+ 或独立 consumer 均可，但需团队统一运维。双栈联调优先「消息体 Schema 一致」而非 broker 品牌。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>长任务 RAG 索引</h3>
+      <p><span class="term" data-term-id="rag-indexing" tabindex="0">RAG indexing</span> 典型阶段：拉文档 → 分块 → Embedding 批处理 → upsert 向量 → 更新元数据索引状态。长任务要支持<strong>进度查询</strong>、<strong>可取消</strong>与<strong>失败重试</strong>。</p>
+
+      <h4>状态机与存储</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>状态</th><th>含义</th><th>对外 API</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>queued</code></td><td>已入队未执行</td><td>GET /jobs/{id} → progress 0</td></tr>
+          <tr><td><code>running</code></td><td>Worker 执行中</td><td>progress 1–99</td></tr>
+          <tr><td><code>succeeded</code></td><td>完成</td><td>progress 100 + stats</td></tr>
+          <tr><td><code>failed</code></td><td>可重试错误</td><td>error_code + request_id</td></tr>
+          <tr><td><code>cancelled</code></td><td>用户或 BFF 取消</td><td>Worker 协作式检查 cancel flag</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def index_documents(ctx, job_id: str, doc_ids: list[str], doc_set_version: str) -&gt; dict:
+    redis = ctx["redis"]
+    key = f"index:idem:{doc_set_version}"
+    if await redis.setnx(key, job_id):
+        await redis.expire(key, 86400)
+    else:
+        existing = await redis.get(key)
+        return {"job_id": existing.decode(), "status": "duplicate"}
+
+    total = len(doc_ids)
+    for i, doc_id in enumerate(doc_ids, start=1):
+        if await redis.get(f"job:{job_id}:cancel"):
+            return {"job_id": job_id, "status": "cancelled"}
+        await index_one(ctx, doc_id)
+        await redis.hset(f"job:{job_id}", mapping={"progress": int(i / total * 100)})
+    return {"job_id": job_id, "status": "succeeded"}</code></pre>
+      </div>
+
+      <h4>重试与 DLQ</h4>
+      <p>对 Embedding 429/503 使用 <span class="term" data-term-id="retry-backoff" tabindex="0">retry backoff</span>；超过 <code>max_retries</code> 写入 DLQ 队列 <code>index.jobs.dlq</code>，运维控制台可重放。日志必须保留 <code>job_id</code> 与 <code>request_id</code>，便于与 Spring 触发记录对齐。</p>
+
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python"># 反例：失败静默吞掉
+try:
+    await embed_batch(batch)
+except Exception:
+    pass  # 向量缺失，检索静默降级</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python"># 推荐：可观测失败 + 有限重试
+for attempt in range(3):
+    try:
+        return await embed_batch(batch)
+    except RateLimitError:
+        await asyncio.sleep(2 ** attempt)
+raise IndexFailedError(code="LLM_RATE_LIMIT", job_id=job_id)</code></pre>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何用 doc_set_version 而不是 job_id 做幂等键？</summary>
+        <p>同一批文档重复触发应合并为一次索引；job_id 每次新建无法去重。version 通常来自 Git commit、ETag 或业务批次号。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring 触发</h3>
+      <p><span class="term" data-term-id="spring-trigger" tabindex="0">Spring trigger</span> 指 BFF 在管理端操作或定时任务（<code>@Scheduled</code>）中调用 Python「提交索引」API，或直接发 MQ。Python 不反向调用 Spring 启动任务，保持依赖方向清晰。</p>
+
+      <h4>HTTP 提交 + 轮询（入门联调）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// corpassist-bff — 伪代码
+var body = Map.of(
+    "doc_ids", docIds,
+    "doc_set_version", version,
+    "request_id", MDC.get("requestId")
+);
+var resp = webClient.post()
+    .uri(pythonBaseUrl + "/api/v1/index/jobs")
+    .bodyValue(body)
+    .retrieve()
+    .bodyToMono(IndexJobResponse.class)
+    .block();
+// 前端轮询 GET /api/v1/index/jobs/{job_id}</code></pre>
+      </div>
+
+      <h4>@Scheduled 定时触发</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Scheduled(cron = "0 0 2 * * *")
+public void nightlyIndexTrigger() {
+    var version = docCatalogService.currentVersion();
+    indexJobClient.submit(new IndexJobCreate(docIds, version, traceId()));
+}</code></pre>
+      </div>
+      <p>定时任务在 Java 侧调度；Python 只负责执行。若需「仅 Python 侧 cron」，用 ARQ <code>cron</code> 作业，但仍应通过 BFF 暴露管理 API 供人工重跑。</p>
+
+      <h4>FastAPI 提交端点</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">@router.post("/index/jobs", status_code=202)
+async def create_index_job(
+    body: IndexJobCreate,
+    arq: ArqRedis = Depends(get_arq),
+) -&gt; IndexJobAccepted:
+    job = await arq.enqueue_job(
+        "index_documents",
+        body.job_id,
+        body.doc_ids,
+        body.doc_set_version,
+    )
+    return IndexJobAccepted(job_id=body.job_id, arq_job_id=job.job_id)</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>鉴权</strong>
+        <p>触发接口应校验 <span class="term" data-term-id="api-key" tabindex="0">API Key</span> 或 <span class="term" data-term-id="jwt-bridge" tabindex="0">JWT</span>（见 <a href="#ch-practice-04-middleware">中间件章</a>），仅允许内网 BFF 调用；返回 202 Accepted 而非 200 OK 表示异步受理。</p>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩题：为何不让 Python Worker 直接读 Spring 的数据库？</summary>
+          <p>跨栈共享 DB 耦合 schema 迁移节奏，且 Worker 需 DB 凭证。推荐 BFF 发消息或 HTTP 提交 <code>doc_ids</code>；元数据状态回写经 API 或 MQ 事件，保持 <span class="term" data-term-id="shared-contract" tabindex="0">shared contract</span> 在 HTTP/MQ 层。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Celery/ARQ</strong>：长任务独立 Worker；async 栈优先 ARQ + Redis。</li>
+        <li><strong>与 MQ 集成</strong>：消息体 Pydantic 与 Java DTO 同源；Spring 发布、Python 消费。</li>
+        <li><strong>长任务 RAG 索引</strong>：状态机 + 进度 + doc_set_version 幂等 + DLQ。</li>
+        <li><strong>Spring 触发</strong>：BFF POST 202 或发 MQ；Python 回调状态，不反向编排 Spring。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_adv02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pick" /> 能说明 Celery vs ARQ 选型一条理由</label></li>
+          <li><label><input type="checkbox" data-id="mq" /> 能画出 Spring → MQ → Worker 数据流</label></li>
+          <li><label><input type="checkbox" data-id="idem" /> 能解释 doc_set_version 幂等作用</label></li>
+          <li><label><input type="checkbox" data-id="http202" /> 能说明为何提交任务返回 202</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-advanced-03-packaging">打包、版本与发布</a>，让 Worker 镜像与 API 镜像版本可追踪。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.celeryq.dev/" target="_blank" rel="noopener">Celery 文档</a></li>
+      <li><a href="https://arq-docs.helpmanual.io/" target="_blank" rel="noopener">ARQ 文档</a></li>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/background-tasks/" target="_blank" rel="noopener">FastAPI BackgroundTasks（短任务）</a></li>
+      <li><a href="https://docs.spring.io/spring-amqp/reference/" target="_blank" rel="noopener">Spring AMQP — RabbitMQ</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照正文「消息体契约」与「状态机表」，设计一条 IndexJob 从 Spring 提交到 Python succeeded 的字段流转笔记，并运行 Demo 占位任务。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在「Celery/ARQ 简介」决策表中，为「团队已有 RabbitMQ + 需要 Flower」勾选推荐框架并写一句理由。</li>
+      <li>列出 <code>IndexJobMessage</code> 代码块中 4 个字段，并说明 Java 侧 JSON 应使用 snake_case 与 Python 对齐。</li>
+      <li>根据「状态机表」，写出 <code>running</code> 状态时前端应展示的 UI 字段（至少 progress 与 job_id）。</li>
+      <li>对照「MQ 集成模式」表，说明 CorpAssist 入门联调优先 HTTP 202 还是直发 RabbitMQ，并写一句原因。</li>
+      <li>阅读「重试与 DLQ」对比代码，说明反例会导致何种线上症状。</li>
+      <li>运行 <code>demos/advanced-02-background-jobs-lab/task_stub.py</code>，确认输出含 <code>indexed</code> 与 <code>status</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）某同事在 FastAPI 路由里 <code>await index_all_docs()</code> 并设置 timeout=600s。违反本章哪 2 条原则？应如何改？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>违反「HTTP 只提交」与「Worker 与 API 分离」。应改为 POST 返回 job_id + 202，索引在 ARQ/Celery Worker 执行；API 路由 timeout 保持短（如 30s）。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（排障）BFF 显示 job 一直 queued，Redis 无消费。请按优先级列出 3 个检查点（Worker 进程、队列名、消息 Schema）。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>① Worker Deployment 是否运行且连同一 Redis/RabbitMQ；② 入队函数名与 Worker 注册名是否一致；③ 消息 JSON 校验失败是否被桥接层丢弃（查 structlog 与 DLQ）。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：后台任务占位</h4>
+      <p>目录：<code>demos/advanced-02-background-jobs-lab/</code>。<strong>验收</strong>：<code>python task_stub.py</code> 输出含 <code>status': 'done'</code> 且 <code>indexed': 2</code>；你能对照 Mermaid 图说明真实部署时 Redis 所在位置。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-01-performance">性能与资源</a> — 索引批处理与内存</li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-03-packaging">打包、版本与发布</a> — Worker 镜像 semver</li>
+      <li><a href="#ch-practice-05-docker">容器化与本地 compose</a> — 多服务 compose 联调</li>
+    </ul>
+  </div>
+</section>

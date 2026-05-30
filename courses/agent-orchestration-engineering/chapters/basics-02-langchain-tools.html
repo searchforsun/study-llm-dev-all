@@ -1,0 +1,204 @@
+<section id="ch-basics-02-langchain-tools" class="chapter" data-chapter="basics-02-langchain-tools">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>LangChain Tools</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-langchain-tools" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Agent 基础</strong> · 能力：用 Pydantic 定义工具 schema、处理错误返回并接入 LangGraph</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 的「行动」层就是工具。schema 模糊会导致模型传错参；错误返回过长会淹没上下文；未校验的返回值会被模型误读为成功。本章是 NS2 的落地接口。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="pydantic-tool" tabindex="0">Pydantic</span> 定义 <span class="term" data-term-id="structured-tool" tabindex="0">structured tool</span> 并写清 <span class="term" data-term-id="tool-description" tabindex="0">description</span></li>
+          <li>设计 <span class="term" data-term-id="tool-error" tabindex="0">tool error</span> 返回格式，避免 Agent 死循环重试</li>
+          <li>对照 SAA ToolCallback 说明双栈工具契约一致性的要点</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Description 即文档</strong>：模型靠描述选工具；写「何时用/何时不用」。</li>
+          <li><strong>Args 先校验</strong>：<span class="term" data-term-id="arg-validation" tabindex="0">arg validation</span> 在 Pydantic 层失败，不要把脏参数打到业务 API。</li>
+          <li><strong>Return 要短</strong>：<span class="term" data-term-id="tool-return" tabindex="0">tool return</span> 截断 + 结构化，便于 Observation 进 state。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>定义</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · 订单工具集</span>
+        客服 Agent 仅允许：<code>get_order</code>、<code>create_ticket</code>、<code>handoff_human</code>。每个工具一个文件/模块，禁止「万能 search_db」。
+      </aside>
+
+      <p><span class="term" data-term-id="langchain-tool" tabindex="0">LangChain tool</span> 把 Python 函数包装成模型可调的 Action。生产上工具是<strong>白名单</strong>，不是「模型想到什么写什么」。</p>
+
+      <h4>最小工具示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+
+class GetOrderInput(BaseModel):
+    order_id: str = Field(..., description="纯数字订单号，不含 # 前缀")
+
+@tool("get_order", args_schema=GetOrderInput)
+def get_order(order_id: str) -&gt; str:
+    """查询订单物流与状态。用户问「到哪了/进度」时使用；不用于改地址或退款。"""
+    data = order_api.fetch(order_id)  # 真实 HTTP
+    return truncate_json(data, max_chars=1200)</code></pre>
+      </div>
+
+      <h4>工具设计清单</h4>
+      <table class="outline-table">
+        <thead><tr><th>项</th><th>要求</th><th>反例</th></tr></thead>
+        <tbody>
+          <tr><td>命名</td><td>动词+宾语，与 OpenAPI operationId 对齐</td><td><code>do_stuff</code></td></tr>
+          <tr><td>粒度</td><td>一工具一业务动作</td><td>一个工具里 if/else 干五件事</td></tr>
+          <tr><td>副作用</td><td>写操作单独工具 + 审批</td><td>读工具里偷偷改库</td></tr>
+          <tr><td>权限</td><td>注入 caller 身份校验 ACL</td><td>工具内不验用户</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：能否用一个「execute_sql」工具让 Agent 更灵活？</summary>
+        <p>生产禁止。等价于把数据库写权限交给概率模型；应提供<strong>窄接口</strong>工具，SQL 留在服务内。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>schema</h3>
+      <p><span class="term" data-term-id="tool-schema" tabindex="0">tool schema</span> 来自 Pydantic/JSON Schema，决定模型如何填参。schema 与业务 API 契约<strong>同源</strong>（可从 OpenAPI 生成）。</p>
+
+      <h4>反例 vs 推荐：参数描述</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">不推荐</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-python">class BadInput(BaseModel):
+    id: str  # 无 description，模型常传「#8821」含符号</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">推荐</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-python">class GoodInput(BaseModel):
+    order_id: str = Field(
+        pattern=r"^\d{6,12}$",
+        description="6-12 位数字订单号；去掉用户输入的 # 前缀",
+    )</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <h4>注册到 LangGraph 节点</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">TOOLS = [get_order, create_ticket, handoff_human]
+tool_node = ToolNode(TOOLS)  # 预绑定，运行时不可动态增删</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>错误</h3>
+      <p>工具失败是常态：超时、4xx、下游维护。Observation 里必须让模型<strong>知道失败原因</strong>且<strong>可行动</strong>（重试/换工具/转人工），而不是抛未捕获栈追踪。</p>
+
+      <h4>推荐错误 envelope</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "ok": false,
+  "error_code": "ORDER_NOT_FOUND",
+  "message": "订单 8821 不存在",
+  "retryable": false,
+  "suggested_action": "ask_user_confirm_order_id"
+}</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead><tr><th>错误类型</th><th>retryable</th><th>Agent 行为</th></tr></thead>
+        <tbody>
+          <tr><td>超时 / 503</td><td>true</td><td>有限重试 → 仍失败则降级</td></tr>
+          <tr><td>404 订单不存在</td><td>false</td><td>澄清 order_id，禁止盲重试</td></tr>
+          <tr><td>403 无权限</td><td>false</td><td>拒答或转人工</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>工具失败 → Agent 分支</h5>
+        <pre class="mermaid">flowchart TD
+  T[Tool 调用] --> OK{ok?}
+  OK -->|是| OBS[写入 Observation]
+  OK -->|否| R{retryable?}
+  R -->|是| RET[重试计数+1]
+  R -->|否| ASK[澄清/转人工]
+  RET --> LIM{超限?}
+  LIM -->|是| HO[handoff_human]</pre>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>定义</strong>：工具窄接口 + 白名单；description 写清使用边界。</li>
+        <li><strong>schema</strong>：Pydantic 校验与 OpenAPI 对齐，减少脏参数。</li>
+        <li><strong>错误</strong>：结构化 error envelope，区分可重试与应澄清/降级。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：<a href="#ch-basics-03-memory">记忆：短期与长期</a> 把多轮 tool 结果放进 checkpoint。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://python.langchain.com/docs/concepts/tools/" target="_blank" rel="noopener">LangChain Tools</a></li>
+      <li><a href="https://docs.pydantic.dev/latest/concepts/models/" target="_blank" rel="noopener">Pydantic Models</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 S2 设计 <code>refund_apply</code> 工具的 schema 与错误返回（纸面 + 可选代码）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按正文清单写 <code>refund_apply</code> 的 Field description（含「何时不用」）。</li>
+      <li>设计 404/403/503 三种 error envelope 行（对照决策表）。</li>
+      <li>对照 Mermaid 失败分支，写当 <code>retryable=false</code> 时 Agent 应对话术要点。</li>
+      <li>（可选）编辑 <code>demos/basics-02-langchain-tools-lab/tool_sample.py</code> 并本地运行 pydantic 校验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">找错：工具返回 2000 行 JSON 原始堆栈给模型 — 违反本章哪条原则？应如何改？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反「Return 要短」与错误处理规范。应截断/摘要，错误用 envelope；栈追踪进日志与 trace，不进 Observation。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：LangChain Tools</h4>
+      <p>目录：<code>demos/basics-02-langchain-tools-lab/</code>。<strong>验收</strong>：<code>python tool_sample.py</code> 对非法 order_id 抛出 ValidationError，合法参数打印 mock JSON。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-03-memory">记忆：短期与长期</a></li>
+      <li><a href="#ch-practice-04-mcp-tools">MCP 与外部工具</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,394 @@
+<section id="ch-practice-02-async-io" class="chapter" data-chapter="practice-02-async-io">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>asyncio 与并发</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-async-io" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>FastAPI 与异步服务</strong> · 能力：用 async/await 实现 LLM 流式响应与并发限制</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-practice-01-fastapi-intro">FastAPI 路由与依赖注入</a> 搭好占位 API 后，真实 RAG 与 Chat 全是 I/O 等待。在 async 路由里误用阻塞调用会拖垮整个 <span class="term" data-term-id="event-loop" tabindex="0">event loop</span>，表现为延迟飙升、健康检查超时。本章建立 CorpAssist-python 的异步调用与流式输出基线。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="async-await" tabindex="0">async/await</span> 配合 <span class="term" data-term-id="httpx-async" tabindex="0">httpx.AsyncClient</span> 调用模型网关</li>
+          <li>用 <span class="term" data-term-id="semaphore" tabindex="0">Semaphore</span> 限制并发，保护上游配额</li>
+          <li>用 <span class="term" data-term-id="stream-response" tabindex="0">StreamingResponse</span> 推送 <span class="term" data-term-id="sse" tabindex="0">SSE</span> token 流</li>
+          <li>识别 <span class="term" data-term-id="blocking-io" tabindex="0">blocking IO</span> 陷阱并用 <code>run_in_executor</code> 隔离</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>async 路由不阻塞</strong>：禁止在 async def 内直接 <code>time.sleep</code> 或同步 httpx。</li>
+          <li><strong>并发需上限</strong>：<code>asyncio.Semaphore</code> 防止打爆模型网关 QPS。</li>
+          <li><strong>流式用 SSE</strong>：Chat 体验依赖 <code>text/event-stream</code>，BFF 可原样转发。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>async/await</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Chat 代理</span>
+        用户提问后，Python 服务需并行检索向量库并调用 LLM。单线程阻塞模型下每个请求占一个线程；asyncio 在 I/O 等待时切换协程，单机可承载更多并发连接。
+      </aside>
+      <p>FastAPI 的 <code>async def</code> 路由跑在 asyncio 事件循环上，类比 Spring WebFlux 非阻塞栈（非 Servlet 阻塞模型）。CorpAssist 约定：对外 HTTP 用 async 路由，对内 LLM 用 <code>httpx.AsyncClient</code>。</p>
+
+      <h4>async 路由 + AsyncClient</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import httpx
+from fastapi import Depends, FastAPI
+
+app = FastAPI()
+
+async def get_http_client() -> httpx.AsyncClient:
+    # 生产环境在 lifespan 中创建并挂载 app.state
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        yield client
+
+@app.get("/v1/rag/query")
+async def rag_query(
+    q: str,
+    client: httpx.AsyncClient = Depends(get_http_client),
+) -> dict:
+    # await 让出控制权，等待网关响应
+    resp = await client.get("https://httpbin.org/get", params={"q": q})
+    resp.raise_for_status()
+    return {"status": "ok", "upstream": resp.status_code}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">同步 httpx 于 async 路由</span>
+          <ul>
+            <li><code>client.get(...)</code> 阻塞 event loop</li>
+            <li>并发上升时 P99 延迟飙升</li>
+            <li>health 探活偶发超时</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">AsyncClient + await</span>
+          <ul>
+            <li><code>await client.get(...)</code> 让出控制权</li>
+            <li>lifespan 复用连接池</li>
+            <li>与 <a href="#ch-basics-03-core-libs">常用库与 HTTP 客户端</a> httpx 约定一致</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>async 请求在时间线上的调度</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant Loop as event loop
+  participant R1 as 请求 A
+  participant GW as 模型网关
+  participant R2 as 请求 B
+  R1->>GW: await client.post (I/O)
+  Note over Loop: A 等待时切换
+  Loop->>R2: 处理 B 的逻辑
+  GW-->>R1: 响应到达
+  Loop->>R1: 恢复 A 的协程</pre>
+        <p class="diagram-caption">仅在 <code>await</code> 点才会切换；CPU 密集代码仍会阻塞循环。</p>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>Spring 栈</th><th>Python 栈</th><th>CorpAssist 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>WebFlux + WebClient</td><td>FastAPI + httpx.AsyncClient</td><td>Chat 代理</td></tr>
+          <tr><td>Servlet 阻塞 Tomcat 线程</td><td>sync def 路由 + 线程池</td><td>仅 legacy 端点</td></tr>
+          <tr><td><code>Mono.flatMap</code></td><td><code>await</code> 链式调用</td><td>检索后生成</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>async 路由自检清单</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>检查项</th><th>通过标准</th></tr></thead>
+              <tbody>
+                <tr><td>HTTP 出站</td><td>使用 <code>httpx.AsyncClient</code> + <code>await</code></td></tr>
+                <tr><td>睡眠/等待</td><td><code>await asyncio.sleep</code>，非 <code>time.sleep</code></td></tr>
+                <tr><td>客户端生命周期</td><td>lifespan 单例，非每请求 new</td></tr>
+                <tr><td>CPU 密集</td><td><code>run_in_executor</code> 或独立 worker</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>并发限制</h3>
+      <p>模型网关与向量库都有 QPS/并发上限。无节制 <code>asyncio.gather</code> 可能触发 429 或拖垮本进程内存。<span class="term" data-term-id="concurrency-limit" tabindex="0">Semaphore</span> 限制同时 in-flight 的请求数。</p>
+
+      <h4>Semaphore 包装 LLM 调用</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+
+# 进程级单例，数值来自 CORPASSIST_LLM_MAX_CONCURRENT
+_LLM_SEM = asyncio.Semaphore(10)
+
+async def call_llm(client: httpx.AsyncClient, payload: dict) -> dict:
+    async with _LLM_SEM:
+        resp = await client.post("/v1/chat/completions", json=payload)
+        resp.raise_for_status()
+        return resp.json()</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">无限制 gather</span>
+          <ul>
+            <li>100 个用户同时触发 100 路 LLM</li>
+            <li>网关返回 429，客户端重试雪崩</li>
+            <li>内存中堆积未完成的 response body</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Semaphore + 队列</span>
+          <ul>
+            <li>最多 10 路并发，其余 await 槽位</li>
+            <li>配合 <span class="term" data-term-id="retry-policy" tabindex="0">重试策略</span> 处理 429</li>
+            <li>指标可暴露「排队长度」</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Semaphore(10) 与线程池 max=10 有何不同？</summary>
+        <p>Semaphore 限制的是<strong>协程同时 await 的数量</strong>，线程开销极小；线程池限制 OS 线程数，适合阻塞 IO。LLM HTTP 调用用 Semaphore + AsyncClient 即可。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>流式响应</h3>
+      <p>Chat 场景需逐 token 推送。HTTP 使用 <code>text/event-stream</code>（SSE）：每行 <code>data: ...\n\n</code>。FastAPI 用 <code>StreamingResponse</code> 包装异步生成器。</p>
+
+      <h4>SSE 流式端点</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+SEM = asyncio.Semaphore(5)
+
+async def token_generator():
+    for chunk in ["你好", "，", "CorpAssist"]:
+        yield f"data: {chunk}\n\n"
+        await asyncio.sleep(0.05)
+
+@app.get("/v1/chat/stream")
+async def chat_stream():
+    async with SEM:
+        return StreamingResponse(
+            token_generator(),
+            media_type="text/event-stream",
+        )</code></pre>
+      </div>
+
+      <p>Spring BFF 可用 <code>WebClient</code> 订阅 SSE 并转发给前端；注意设置 <code>Cache-Control: no-cache</code> 与连接超时（见 <a href="#ch-practice-04-middleware">中间件、鉴权与 CORS</a>）。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="流式协议对比">
+        <input type="radio" name="prac02-stream-tab" id="prac02-stream-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac02-stream-tab" id="prac02-stream-tab-b" class="learn-tab-input" />
+        <label for="prac02-stream-tab-a">SSE</label>
+        <label for="prac02-stream-tab-b">WebSocket</label>
+        <div class="learn-tab-panel" id="prac02-stream-panel-a" role="tabpanel">
+          <ul>
+            <li>单向 server → client，HTTP 友好</li>
+            <li>CorpAssist Chat 默认选型</li>
+            <li>网关与 Nginx 需关闭缓冲</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac02-stream-panel-b" role="tabpanel">
+          <ul>
+            <li>双向，适合协作编辑</li>
+            <li>LLM Chat 通常不需要 client 持续上行</li>
+            <li>运维与鉴权复杂度更高</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>阻塞陷阱</h3>
+      <p>async 路由中最常见的生产事故：在 <code>async def</code> 内调用同步阻塞 API（<code>requests.get</code>、<code>time.sleep</code>、CPU 密集 numpy、同步数据库驱动），导致<strong>整个事件循环停滞</strong>。</p>
+
+      <h4>反例与修复</h4>
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-python"># 反例：阻塞整个 loop
+@app.get("/bad")
+async def bad():
+    time.sleep(5)  # 或 requests.get(...)
+    return {"ok": True}</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-python">import asyncio
+
+@app.get("/good")
+async def good():
+    await asyncio.sleep(5)  # 异步等待
+
+# 必须阻塞时：
+@app.get("/legacy")
+async def legacy():
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, sync_heavy_fn)</code></pre>
+        </div>
+      </div>
+
+      <ul>
+        <li><strong>优先</strong>：换 async 库（httpx 而非 requests，asyncpg 而非 psycopg2 同步）。</li>
+        <li><strong>次选</strong>：<code>run_in_executor</code> 把阻塞代码丢进线程池。</li>
+        <li><strong>兜底</strong>：路由改为 <code>def</code>（非 async），FastAPI 自动放线程池——但高并发下线程数仍有限。</li>
+      </ul>
+
+      <details class="learn-faq">
+        <summary>FAQ：向量检索库只有同步 SDK 怎么办？</summary>
+        <p>用 <code>run_in_executor</code> 包装，或在本章之后的 <a href="#ch-advanced-01-performance">性能与资源</a> 中评估批处理与连接池。切忌在 hot path 上长时间阻塞 loop。</p>
+      </details>
+
+      <h4>lifespan 中挂载 AsyncClient（推荐）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from contextlib import asynccontextmanager
+import httpx
+from fastapi import FastAPI, Request
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=30.0)
+    yield
+    await app.state.http.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+def get_http(request: Request) -> httpx.AsyncClient:
+    return request.app.state.http</code></pre>
+      </div>
+      <p>与 <a href="#ch-practice-01-fastapi-intro">FastAPI 路由与依赖注入</a> 中的 <span class="term" data-term-id="lifespan" tabindex="0">lifespan</span> 衔接：进程级单例客户端，避免每请求创建 TCP 连接。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>阻塞调用</th><th>症状</th><th>修复</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>requests.get</code></td><td>全站 P99 飙升</td><td>换 <code>await client.get</code></td></tr>
+          <tr><td><code>time.sleep</code></td><td>health 探活超时</td><td><code>await asyncio.sleep</code></td></tr>
+          <tr><td>同步 DB 驱动</td><td>并发连接数低</td><td>async 驱动或 executor</td></tr>
+          <tr><td>大 JSON <code>json.loads</code> 循环</td><td>CPU 占满 loop</td><td>批处理或 executor</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，practice 阶段异步 I/O 复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>async/await</strong>：FastAPI async 路由 + httpx.AsyncClient；<code>await</code> 是协作式调度点。</li>
+        <li><strong>并发限制</strong>：<code>asyncio.Semaphore</code> 保护 LLM 网关；数值可配置化。</li>
+        <li><strong>流式响应</strong>：<code>StreamingResponse</code> + SSE 推送 token；与 BFF WebClient 对接。</li>
+        <li><strong>阻塞陷阱</strong>：禁止 async 路由内同步 sleep/HTTP；必要时 executor 或换 async 驱动。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_practice02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="await" /> 能解释 await 与 event loop 的关系</label></li>
+          <li><label><input type="checkbox" data-id="sem" /> 能写出 Semaphore 包装 LLM 调用的 3 行核心代码</label></li>
+          <li><label><input type="checkbox" data-id="sse" /> 能描述 SSE 帧格式 <code>data:\n\n</code></label></li>
+          <li><label><input type="checkbox" data-id="block" /> 能列举 2 种阻塞 loop 的写法与修复</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-03-testing">测试策略</a>，为 async 路由编写 pytest 与 mock LLM。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.python.org/3/library/asyncio.html" target="_blank" rel="noopener">asyncio 标准库</a></li>
+      <li><a href="https://www.python-httpx.org/async/" target="_blank" rel="noopener">httpx AsyncClient</a></li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse" target="_blank" rel="noopener">FastAPI StreamingResponse</a></li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events" target="_blank" rel="noopener">MDN · Server-Sent Events</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 Demo <code>stream_demo.py</code> 与正文「SSE 流式端点」代码，启动服务并用 curl 观察流式输出；对照「阻塞陷阱」反例说明为何不能 <code>time.sleep</code>。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「async 请求在时间线上的调度」Mermaid，用三句话向 Java 同事对比 WebFlux 与 asyncio。</li>
+      <li>在 Demo 中将 <code>SEM = asyncio.Semaphore(5)</code> 改为 1，并发发起 3 个 <code>curl /stream</code>，观察串行化效果。</li>
+      <li>对照「SSE 流式端点」代码，用 <code>curl -N localhost:8000/stream</code> 验收是否逐段输出 <code>data:</code> 行。</li>
+      <li>在笔记中写一条「阻塞陷阱」修复：把 <code>time.sleep(1)</code> 改为 <code>await asyncio.sleep(1)</code> 的位置说明。</li>
+      <li>（可选）进入 <code>demos/practice-02-async-io-lab/</code>，<code>uvicorn stream_demo:app --reload</code> 完成上述 curl 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）生产环境 <code>/v1/chat/stream</code> 偶发整站卡顿，APM 显示 event loop blocked 5s。代码在 async 路由里用 <code>requests.post</code> 调 LLM。排障第一步应改什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>将 <code>requests</code> 换为 <code>httpx.AsyncClient</code> 并 <code>await client.post</code>；临时可改 <code>run_in_executor</code>。根因是同步 HTTP 阻塞了整个 asyncio loop，导致所有 async 路由排队。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（找错）同事把 <code>SEM = asyncio.Semaphore(5)</code> 写在路由函数内部，每次请求新建 Semaphore。并发限制还有效吗？应放哪？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>无效——每个请求拿到独立 Semaphore(5)，等于无全局上限。应放在模块级或 <code>app.state</code> / lifespan 中作为进程单例，与 Demo <code>stream_demo.py</code> 顶部 <code>SEM = asyncio.Semaphore(5)</code> 一致。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：SSE 与 Semaphore</h4>
+      <p>目录：<code>demos/practice-02-async-io-lab/</code>。<strong>验收</strong>：<code>pip install fastapi uvicorn &amp;&amp; uvicorn stream_demo:app --reload</code>；<code>curl -N localhost:8000/stream</code> 依次出现 <code>data: token1</code> 等三帧；HTTP 200，<code>Content-Type</code> 含 <code>text/event-stream</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-01-fastapi-intro">FastAPI 路由与依赖注入</a> · lifespan 与 AsyncClient 挂载</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-testing">测试策略</a> · 异步路由测试与 mock</li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webflux.html" target="_blank" rel="noopener">Spring WebFlux 文档 — 对照</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,398 @@
+<section id="ch-practice-02-rate-limit" class="chapter" data-chapter="practice-02-rate-limit">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>限流与配额</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-rate-limit" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>弹性与多租户</strong> · 能力：设计租户 QPS、Token 预算、超限告警与可行动 429 响应</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-01-gateway">Gateway 入口限流</a> 只挡连接级 QPS。CorpAssist S2 下，单租户内部测试脚本、超长 RAG 或恶意刷接口仍可能<strong>穿透 Gateway</strong> 耗尽模型账单——缺少 <span class="term" data-term-id="tenant-quota" tabindex="0">tenant quota</span> 与 <span class="term" data-term-id="token-budget" tabindex="0">token budget</span> 是 NS3 成本失控与「租户配额未隔离」生产坑。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 Redis <span class="term" data-term-id="sliding-window" tabindex="0">sliding window</span> 实现 <span class="term" data-term-id="usage-meter" tabindex="0">usage meter</span>，区分 QPS 与 Token 两维配额</li>
+          <li>按 tier 配置 <span class="term" data-term-id="qps-cap" tabindex="0">qps cap</span> 与月度 Token 上限，落实 <span class="term" data-term-id="fair-usage" tabindex="0">fair usage</span> 策略</li>
+          <li>在 <span class="term" data-term-id="quota-exceeded" tabindex="0">quota exceeded</span> 时返回可行动 429，并触发 <span class="term" data-term-id="rate-limit-alert" tabindex="0">rate limit alert</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>QPS 与 Token 分开计</strong>：高频短问与长 RAG 消耗模型成本完全不同。</li>
+          <li><strong>配额实时扣减 + 异步对账</strong>：Redis 热路径；日批落库与厂商账单核对。</li>
+          <li><strong>超限响应要可行动</strong>：429 + 剩余额度 + 升级入口，而非裸拒绝。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>租户配额</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · 三租户同一集群（40 秒）</span>
+        租户 A（标准企业）大促客服；租户 B（免费试用）被误配同一 Gateway 路由；租户 C（内部压测）脚本未停。若无 per-tenant <span class="term" data-term-id="tenant-quota" tabindex="0">tenant quota</span>，B 的 2 QPS  cap 无法阻止 C 占满模型 RPM，A 的真实用户反而被厂商 429——须<strong>全链路按 tenantId 计量</strong>。
+      </aside>
+
+      <p>配额是<strong>商业契约 + 稳定性</strong>的双重边界。CorpAssist 推荐三维度：</p>
+      <ul>
+        <li><strong>入口 QPS</strong> — Gateway <code>RequestRateLimiter</code>，按 <code>tenantId</code> 令牌桶（见 basics-01）。</li>
+        <li><strong>业务 QPS</strong> — BFF 对 <code>/v1/chat</code>、<code>/v1/rag</code> 二次限流，防单连接 SSE 多路复用穿透。</li>
+        <li><strong>并发 SSE</strong> — 长连接占 Tomcat 线程与网关连接表；须单独 cap。</li>
+      </ul>
+
+      <h4>租户 tier 配额表（CorpAssist 缺省）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>租户 tier</th><th>QPS cap</th><th>月 Token 预算</th><th>并发 SSE</th><th>备注</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>免费试用</td><td>2</td><td>100k</td><td>2</td><td>超限引导升级</td></tr>
+          <tr><td>标准企业</td><td>20</td><td>5M</td><td>50</td><td>S2 主力 tier</td></tr>
+          <tr><td>大客专属</td><td>协商</td><td>协商</td><td>协商</td><td>独立模型路由可选</td></tr>
+        </tbody>
+      </table>
+      <p>配额维度写入 Nacos <code>corpassist-quota-{tenantId}.yaml</code>，支持热更新（见 <a href="#ch-advanced-02-config">配置中心与密钥</a>）。</p>
+
+      <h4>Gateway 租户限流（YAML）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  cloud:
+    gateway:
+      routes:
+        - id: corpassist-bff-chat
+          uri: lb://corpassist-bff
+          predicates:
+            - Path=/v1/chat/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 20    # 稳态 QPS（按 tier 动态覆盖）
+                redis-rate-limiter.burstCapacity: 40
+                key-resolver: "#{@tenantKeyResolver}"   # 从 JWT 解析 tenantId
+                deny-empty-key: true</code></pre>
+      </div>
+
+      <h4>sliding window 计数（Redis Lua 示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># Key: ratelimit:{tenantId}:chat:window
+# ZSET score=毫秒时间戳 member=requestId
+# 每次请求：ZREMRANGEBYSCORE 删除窗口外 → ZCARD 计数 → 与 qps cap 比较</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>全集群共用一个全局 QPS，不区分 tenantId</li>
+            <li>仅限制 Gateway，BFF 直连模型绕过计量</li>
+            <li>固定窗口计数，边界时刻双倍流量（burst 漏洞）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li><span class="term" data-term-id="sliding-window" tabindex="0">sliding window</span> 或令牌桶，按 tenant 独立 key</li>
+            <li>Gateway + BFF 双层；模型厂商 RPM 作为第三层硬顶</li>
+            <li><span class="term" data-term-id="fair-usage" tabindex="0">fair usage</span>：大租户 burst 不得挤占小租户 steady 配额</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何「全局限 1000 QPS」不够？</summary>
+        <p>1000 QPS 可能被单一压测租户占满，其他企业租户 SLA 归零。配额必须<strong>按 tenantId 隔离</strong>，与 <a href="#ch-practice-03-multi-tenant">多租户边界</a> 一致。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Token 预算</h3>
+      <p><span class="term" data-term-id="token-budget" tabindex="0">Token budget</span> 反映<strong>模型成本</strong>，与 QPS 正交：一次 RAG 问答可能消耗 8k tokens，但只计 1 QPS。CorpAssist 在每次 LLM 调用后异步累加 usage，并在请求前做<strong>预检</strong>（soft）与调用后<strong>扣减</strong>（hard）。</p>
+
+      <h4>计量点与 Redis 结构</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>计量点</th><th>记录内容</th><th>Redis Key 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>BFF chat 完成</td><td>input + output tokens</td><td><code>quota:{tenantId}:202605</code> Hash</td></tr>
+          <tr><td>Python RAG embed</td><td>embed tokens（若单独计费）</td><td><code>quota:{tenantId}:embed:202605</code></td></tr>
+          <tr><td>流式 SSE 结束</td><td>累计 output tokens</td><td>同上，field <code>tokens</code></td></tr>
+        </tbody>
+      </table>
+
+      <h4>Python usage meter（FastAPI 回调）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def record_usage(tenant_id: str, usage: TokenUsage) -&gt; None:
+    key = f"quota:{tenant_id}:{month_key()}"  # 如 quota:acme-corp:202605
+    pipe = redis.pipeline()
+    pipe.hincrby(key, "tokens", usage.total)
+    pipe.hincrby(key, "requests", 1)
+    pipe.expire(key, 60 * 60 * 24 * 40)  # 跨月保留 40 天供对账
+    await pipe.execute()
+
+async def pre_check_budget(tenant_id: str, estimated: int, cap: int) -&gt; bool:
+    current = int(await redis.hget(f"quota:{tenant_id}:{month_key()}", "tokens") or 0)
+    return current + estimated &lt;= cap</code></pre>
+      </div>
+
+      <h4>BFF 预检 + 超限拦截（Java）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public void assertTokenBudget(String tenantId, int estimatedTokens) {
+  QuotaTier tier = quotaService.getTier(tenantId);
+  long used = usageMeter.getMonthlyTokens(tenantId);
+  if (used + estimatedTokens &gt; tier.getMonthlyTokenCap()) {
+    throw new QuotaExceededException(tenantId, used, tier.getMonthlyTokenCap());
+  }
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>Token 预算：预检 → 调用 → 扣减</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant App
+  participant BFF
+  participant Redis
+  participant LLM
+  App->>BFF: POST /v1/chat
+  BFF->>Redis: pre_check_budget
+  alt 超限
+    BFF-->>App: 429 quota exceeded
+  else 通过
+    BFF->>LLM: 流式生成
+    LLM-->>BFF: usage tokens
+    BFF->>Redis: record_usage (async)
+    BFF-->>App: SSE stream
+  end</pre>
+        <p class="diagram-caption">预检可保守估计（如 4k）；实际 usage 在流结束后异步写入 <span class="term" data-term-id="usage-meter" tabindex="0">usage meter</span>。</p>
+      </div>
+
+      <h4>quota exceeded 响应契约</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">HTTP/1.1 429 Too Many Requests
+Retry-After: 3600
+Content-Type: application/json
+
+{
+  "error": "quota_exceeded",
+  "dimension": "monthly_tokens",
+  "used": 5120000,
+  "limit": 5000000,
+  "resetAt": "2026-06-01T00:00:00+08:00",
+  "upgradeUrl": "https://admin.corpassist.example/billing/upgrade",
+  "message": "本月 Token 配额已用尽，请联系管理员升级或等待下月重置。"
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>告警</h3>
+      <p>限流与配额不是「配完即忘」。须通过 <span class="term" data-term-id="rate-limit-alert" tabindex="0">rate limit alert</span> 在<strong>用户投诉之前</strong>发现异常消耗或配置错误。</p>
+
+      <h4>分级阈值与动作</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>用量占配额</th><th>级别</th><th>告警渠道</th><th>建议动作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>≥ 80%</td><td>预警</td><td>邮件 + 租户管理员 Dashboard</td><td>通知客户续费/升级；检查是否有异常脚本</td></tr>
+          <tr><td>≥ 100%</td><td>硬限</td><td>企业微信 on-call + 租户 webhook</td><td>新请求 429；存量 SSE 允许收尾</td></tr>
+          <tr><td>≥ 120%</td><td>异常</td><td>P2 告警</td><td>可能存在 meter 漏计或 bypass；紧急对账</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>配额告警流水线</h5>
+        <pre class="mermaid">flowchart LR
+  Meter[usage meter Redis]
+  Exp[Exporter / 定时任务]
+  Prom[Prometheus]
+  AM[Alertmanager]
+  Wx[企业微信]
+  Tenant[租户管理员]
+  Meter --> Exp --> Prom
+  Prom -->|tenant_token_usage_ratio &gt; 0.8| AM
+  AM --> Wx
+  AM --> Tenant</pre>
+        <p class="diagram-caption">指标示例：<code>corpassist_tenant_tokens_used / corpassist_tenant_tokens_limit</code>，label 含 <code>tenant_id</code>、<code>tier</code>。</p>
+      </div>
+
+      <h4>Prometheus 规则片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">groups:
+  - name: corpassist-quota
+    rules:
+      - alert: TenantTokenBudgetWarning
+        expr: corpassist_tenant_token_ratio &gt; 0.8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "租户 {{ $labels.tenant_id }} Token 已达 80%"
+      - alert: TenantQpsSaturated
+        expr: rate(corpassist_ratelimit_denied_total[5m]) &gt; 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "租户 {{ $labels.tenant_id }} 频繁触发 QPS 限流"</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只告警不阻断</strong> — 100% 后仍放行会导致 NS3 账单失控；须 hard limit。</li>
+          <li><strong>429 无 Retry-After</strong> — 客户端无法退避，形成 retry 风暴加剧限流。</li>
+          <li><strong>内部压测账号无独立 tenantId</strong> — 与生产租户共用配额，误伤 SLA。</li>
+        </ul>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>QPS 未超限但月账单爆掉，最先查哪？</summary>
+          <div class="learn-faq-body">
+            查 <span class="term" data-term-id="token-budget" tabindex="0">token budget</span> meter 是否覆盖全部模型调用路径（含 Python 直连、批处理 embed、重试重复计费）。低频超长 RAG 是典型漏计场景。
+          </div>
+        </details>
+        <details>
+          <summary>fair usage 与大客 burst 如何平衡？</summary>
+          <div class="learn-faq-body">
+            大客可协商更高 <span class="term" data-term-id="qps-cap" tabindex="0">qps cap</span> 与 burstCapacity，但<strong>不得</strong>占用共享模型 RPM 的全局上限；必要时专属模型 endpoint（见 advanced 配置）。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">配额是 Gateway 限流的延伸；做题前对照下表。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>租户配额</strong>：QPS / 月 Token / SSE 并发分 tier；Gateway + BFF 双层 + sliding window 按 tenantId 隔离。</li>
+        <li><strong>Token 预算</strong>：预检 + 调用后 meter 累加；Redis 热路径，日批对账厂商账单。</li>
+        <li><strong>告警</strong>：80/100/120 分级；<span class="term" data-term-id="quota-exceeded" tabindex="0">quota exceeded</span> 返回可行动 429 + upgradeUrl。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_practice02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="qps-token" /> 能解释 QPS 与 Token 为何要分开限</label></li>
+          <li><label><input type="checkbox" data-id="sliding" /> 能说明 sliding window 相对固定窗口的优势</label></li>
+          <li><label><input type="checkbox" data-id="429" /> 能列举 quota exceeded 429 响应必备字段</label></li>
+          <li><label><input type="checkbox" data-id="alert-tier" /> 能说出 80%/100% 告警动作差异</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>tenant quota</td><td>按 tenantId 隔离 QPS / Token / 并发</td></tr>
+                <tr><td>token budget</td><td>模型成本维度，与 QPS 正交</td></tr>
+                <tr><td>usage meter</td><td>调用后异步累加，Redis + 对账</td></tr>
+                <tr><td>fair usage</td><td>防止单租户挤占共享资源</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：测验与 Demo；下一章 <a href="#ch-practice-03-multi-tenant">多租户隔离</a> 保证配额计量所依赖的 tenantId 在数据与检索层不可伪造、不可穿透。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/docs/current/reference/html/#the-requestratelimiter-gatewayfilter-factory" target="_blank" rel="noopener">Spring Cloud Gateway RequestRateLimiter</a></li>
+      <li><a href="https://redis.io/docs/latest/develop/use/patterns/rate-limiting/" target="_blank" rel="noopener">Redis — Rate limiting patterns</a></li>
+      <li><a href="https://prometheus.io/docs/alerting/latest/overview/" target="_blank" rel="noopener">Prometheus Alerting</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照正文「租户 tier 配额表」与 Gateway YAML，填写 <code>demos/practice-02-rate-limit-lab/quota-table.md</code> 并设计 429 响应（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 quota-table.md 补全「免费试用 / 标准企业 / 大客专属」三行：QPS、月 Token、并发 SSE（数值与正文 tier 表一致）。</li>
+      <li>写 Redis key 命名规范：<code>quota:{tenantId}:{yyyyMM}</code> 与 <code>ratelimit:{tenantId}:chat:window</code>，并说明过期策略（对照 Python <code>record_usage</code>）。</li>
+      <li>设计 quota exceeded 时 JSON 响应字段（至少 error、dimension、used、limit、resetAt、upgradeUrl、message），与正文示例对齐。</li>
+      <li>为 80% 预警写一条 Prometheus alert 名称与 <code>for</code> 持续时间（参考正文规则片段）。</li>
+      <li>（可选）画出「QPS 未超限但 Token 爆账单」的排查顺序 3 步。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：某租户 Gateway QPS 未超限，但月 DashScope 账单为预期的 12 倍。最可能漏了哪层计量？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>Token meter</strong>（或 embed 子计量）：低频但超长 RAG / 批处理 embed 不触发 QPS 限流。须检查 BFF 与 Python 所有模型调用是否都调用 <code>record_usage</code>，以及重试是否重复计费。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：429 响应仅 <code>{"error":"too many requests"}</code>，无 Retry-After 与 upgradeUrl。违反本章哪条？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反「超限响应要可行动」：客户端无法退避（缺 Retry-After）且租户无法升级（缺 upgradeUrl / used / limit）。S2 体验与商务转化都会受损。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">权衡：把标准企业月 Token 从 5M 提到 50M 且不告警，短期客诉下降，长期风险是什么？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>NS3 成本不可控；异常脚本或 prompt 注入导致<strong>静默超支</strong>；失去 80% 预警窗口。应提 tier 价格或专属模型，而非取消 meter 与告警。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：限流与配额</h4>
+      <p>目录：<code>demos/practice-02-rate-limit-lab/</code>。<strong>验收</strong>：quota-table.md 三 tier 完整、Redis key 规范、429 JSON 字段说明、一条 Prometheus 告警名。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-multi-tenant">多租户隔离</a></li>
+      <li><a href="#ch-basics-01-gateway">Spring Cloud Gateway 与 LLM</a>：入口 QPS 与 tenantKeyResolver</li>
+      <li><a href="#ch-practice-01-circuit">熔断、舱壁与降级</a>：配额耗尽后的降级策略</li>
+    </ul>
+  </div>
+</section>

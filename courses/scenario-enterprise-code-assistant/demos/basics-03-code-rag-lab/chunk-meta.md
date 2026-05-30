@@ -1,0 +1,4 @@
+- path
+- start_line
+- language
+- symbol_name

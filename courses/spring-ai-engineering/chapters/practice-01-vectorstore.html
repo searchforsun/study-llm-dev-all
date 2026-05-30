@@ -1,0 +1,367 @@
+<section id="ch-practice-01-vectorstore" class="chapter" data-chapter="practice-01-vectorstore">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>VectorStore 与 Embedding</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-vectorstore" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>RAG、工具与记忆</strong> · 能力：配置 VectorStore、EmbeddingModel 与元数据过滤，并与 Python 索引对齐</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>basics 阶段掌握了 <a href="#ch-basics-02-chatclient">ChatClient 与 ChatModel</a>；practice 从<strong>可检索的知识底座</strong>开始。CorpAssist S2 智能客服要回答「年假制度」「差旅报销」等问题，必须先有向量索引。VectorStore 抽象让你能在本地 Simple 存储与生产 <span class="term" data-term-id="pgvector" tabindex="0">pgvector</span> 之间切换，而不改业务代码。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>说明 <span class="term" data-term-id="vector-store" tabindex="0">vector store</span> 接口的 add / similaritySearch 契约</li>
+          <li>在 SimpleVectorStore 与 PgVectorStore 之间做环境选型</li>
+          <li>用 <span class="term" data-term-id="metadata-filter" tabindex="0">metadata filter</span> 实现部门级检索隔离</li>
+          <li>与 Python 侧 <span class="term" data-term-id="python-index" tabindex="0">python index</span> 共用 chunk 元数据约定</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Embedding 与存储分离</strong>：<span class="term" data-term-id="embedding-model" tabindex="0">embedding model</span> 负责向量化，VectorStore 负责持久化与检索。</li>
+          <li><strong>元数据是护栏</strong>：检索时必须带 dept / tenant 过滤，避免跨部门泄露制度片段。</li>
+          <li><strong>双栈同源</strong>：chunk id、overlap、embedding 模型名写入契约，Python 建索引、Java 消费检索。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>接口模型：Document、Embedding 与 VectorStore</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 制度问答</span>
+        HR 上传《员工手册》片段后，客服 Bot 需根据员工所属部门检索相关制度。Spring AI 用 <code>Document</code> 承载文本 + metadata，<code>EmbeddingModel</code> 转向量，<code>VectorStore</code> 负责写入与 <span class="term" data-term-id="similarity-search" tabindex="0">similarity search</span>。
+      </aside>
+      <p>Spring AI 1.0 的 <span class="term" data-term-id="vector-store" tabindex="0">vector store</span> 是统一 SPI：业务只依赖接口，具体实现由 Starter 或 <code>@Bean</code> 注入。核心方法：</p>
+      <ul>
+        <li><code>add(List&lt;Document&gt;)</code>：批量写入；Document 含 id、text、metadata Map。</li>
+        <li><code>similaritySearch(SearchRequest)</code>：按 query 向量 + topK + filter 返回最相似 Document。</li>
+        <li><code>delete(filter)</code>：按 metadata 或 id 清理过期索引（制度版本升级时用）。</li>
+      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>VectorStore 写入与检索</h5>
+        <pre class="mermaid">flowchart LR
+  Doc["Document + metadata"]
+  Emb["EmbeddingModel.embed()"]
+  VS["VectorStore.add()"]
+  Q["用户问题"]
+  SR["similaritySearch(topK, filter)"]
+  Doc --> Emb --> VS
+  Q --> Emb --> SR
+  VS --> SR</pre>
+        <p class="diagram-caption">检索时 query 与入库文档走同一 EmbeddingModel，模型不一致会导致相似度失真。</p>
+      </div>
+
+      <h4>CorpAssist 最小配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Configuration
+public class VectorStoreConfig {
+
+  @Bean
+  VectorStore vectorStore(EmbeddingModel embeddingModel) {
+    return SimpleVectorStore.builder(embeddingModel).build();
+  }
+
+  @Bean
+  EmbeddingModel embeddingModel(OpenAiEmbeddingModel openAi) {
+    return openAi; // 与 Python 侧共用 text-embedding-3-small
+  }
+}</code></pre>
+      </div>
+
+      <p>每个 Document 的 <span class="term" data-term-id="document-id" tabindex="0">document id</span> 建议稳定可追踪，例如 <code>pol-001</code>，便于 RAG 引用溯源（见 <a href="#ch-practice-02-rag-pipeline">RAG Pipeline 实现</a>）。</p>
+
+      <details class="learn-faq">
+        <summary>FAQ：VectorStore 与 ChatModel 能否用不同厂商？</summary>
+        <p>可以，但生产环境建议统一网关与计费账户；Embedding 与 Chat 模型维度、tokenizer 不同不影响存储，只要入库与检索使用同一 EmbeddingModel。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Simple vs 外部向量库</h3>
+      <p>本地开发用内存型 SimpleVectorStore；联调与生产切换到 PgVector、Redis、Milvus 等，仅改依赖与配置，业务 Service 不变。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>实现</th><th>适用场景</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>SimpleVectorStore</strong></td>
+            <td>单元测试、Demo、离线 PoC</td>
+            <td><code>practice-01-vectorstore-lab</code> 默认</td>
+          </tr>
+          <tr>
+            <td><strong>PgVectorStore</strong></td>
+            <td>已有 PostgreSQL、需要事务与备份</td>
+            <td>S2 预发 / 生产首选</td>
+          </tr>
+          <tr>
+            <td><strong>Redis / Milvus</strong></td>
+            <td>超大规模、专用向量团队运维</td>
+            <td>与 Python 实验栈对齐后再引入</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">绑定具体 SDK</span>
+          <ul>
+            <li>业务直接调用 Milvus gRPC</li>
+            <li>换库需重写 Service</li>
+            <li>测试无法 mock</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">依赖 VectorStore SPI</span>
+          <ul>
+            <li><code>@Profile("local")</code> Simple，<code>prod</code> PgVector</li>
+            <li>检索逻辑单测注入内存实现</li>
+            <li>与 Spring AI Advisor 无缝配合</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>PgVector 生产 Bean（片段）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    vectorstore:
+      pgvector:
+        index-type: HNSW
+        distance-type: COSINE_DISTANCE
+        dimensions: 1536
+  datasource:
+    url: jdbc:postgresql://localhost:5432/corpassist</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 Demo 用 JSON 文件而非直连 DB？</summary>
+        <p>降低环境门槛，聚焦 metadata 过滤与 topK 语义；生产再换 PgVector，检索 API 不变。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>元数据过滤：部门隔离与 topK</h3>
+      <p>S2 场景中，FIN 员工问报销不应检索到 HR 专用制度。Spring AI 的 <code>SearchRequest</code> 支持 FilterExpression，与 <span class="term" data-term-id="chunk-meta" tabindex="0">chunk meta</span> 字段对齐。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class PolicySearchService {
+  private final VectorStore vectorStore;
+
+  public List&lt;Document&gt; searchForDept(String question, String dept, int topK) {
+    SearchRequest request = SearchRequest.builder()
+        .query(question)
+        .topK(topK)
+        .filterExpression("dept == '" + dept + "'")
+        .build();
+    return vectorStore.similaritySearch(request);
+  }
+
+  public void ingestPolicy(Document doc) {
+    vectorStore.add(List.of(doc));
+  }
+}</code></pre>
+      </div>
+
+      <p>Demo 中 <code>sample-documents.json</code> 两条制度分别带 <code>dept: HR</code> 与 <code>dept: FIN</code>。验收：对「年假」提问且 filter <code>dept == 'HR'</code> 应命中 pol-001，filter FIN 时不应返回 HR 片段。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">检索后内存过滤</span>
+          <ul>
+            <li>topK=10 再 Java stream filter</li>
+            <li>相似条目被其他部门占满 topK</li>
+            <li>latency 与 token 浪费</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">存储层 filter</span>
+          <ul>
+            <li>filter 下推至 VectorStore</li>
+            <li>topK 在目标集合内有效</li>
+            <li>审计日志记录 filter 表达式</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>常用 metadata 字段（CorpAssist 约定）</h4>
+      <table class="outline-table">
+        <thead><tr><th>键</th><th>示例</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><code>dept</code></td><td>HR / FIN</td><td>部门过滤</td></tr>
+          <tr><td><code>tenantId</code></td><td>t-acme</td><td>多租户隔离</td></tr>
+          <tr><td><code>docVersion</code></td><td>2026-Q2</td><td>制度版本切换</td></tr>
+          <tr><td><code>source</code></td><td>handbook.pdf</td><td>引用溯源</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>Python 索引同源：双栈契约</h3>
+      <p>CorpAssist 双栈分工：Python 轨批量解析 PDF、切块、调用 Embedding API 写入向量库；Java 轨在运行时检索并注入 RAG Advisor。两边必须共享<strong>索引契约</strong>，避免「Python 建了索引、Java 查不到」。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Python 建索引 · Java 消费检索</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant Py as Python ingest
+  participant VS as PgVector
+  participant Java as Spring RAG
+  Py->>VS: add(chunks, embedding_model=v3-small)
+  Java->>VS: similaritySearch(filter=dept)
+  VS-->>Java: Document + metadata
+  Java->>Java: QuestionAnswerAdvisor</pre>
+      </div>
+
+      <ul>
+        <li><strong>embedding 模型名</strong>：写入配置中心，Python/Java 读同一 key。</li>
+        <li><strong>chunk 参数</strong>：size 500、overlap 50（与 <a href="#ch-practice-02-rag-pipeline">RAG Pipeline 实现</a> Splitter 一致）。</li>
+        <li><strong>id 规则</strong>：<code>{docId}-{chunkIndex}</code>，删除旧版时 Python 脚本按 <code>docVersion</code> 批量 delete。</li>
+        <li><strong>验收</strong>：Python 写入后，Java 集成测试对固定 query 断言 top1 id 与 Python eval 一致。</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "indexContractVersion": "1.0",
+  "embeddingModel": "text-embedding-3-small",
+  "chunkSize": 500,
+  "chunkOverlap": 50,
+  "requiredMetadata": ["dept", "tenantId", "source", "docVersion"]
+}</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 联调检查点</span>
+        发布前跑「同源冒烟」：Python 导入 2 条 sample-documents → Java <code>PolicySearchService</code> 对 HR 过滤检索 → 断言 text 含「年假不少于5天」。
+      </aside>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>VectorStore 选型速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>环境</th><th>实现</th><th>切换方式</th></tr></thead>
+              <tbody>
+                <tr><td>local / CI</td><td>SimpleVectorStore</td><td>@Profile("local")</td></tr>
+                <tr><td>staging / prod</td><td>PgVectorStore</td><td>@Profile("prod") + datasource</td></tr>
+                <tr><td>实验</td><td>与 Python 共用 PG</td><td>同一 indexContractVersion</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：similaritySearch 的 topK 设多少？</summary>
+        <p>S2 制度问答默认 topK=4～6；过多 chunk 会撑爆 prompt token。与 RAG Advisor 的 SearchRequest 保持一致，并在 Micrometer 记录「检索条数 vs 实际注入条数」（advanced 章）。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，practice 向量底座复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>接口模型</strong>：Document + EmbeddingModel + VectorStore；similaritySearch 带 topK 与 filter。</li>
+        <li><strong>环境选型</strong>：Simple 开发测试，PgVector 生产；勿在业务层绑定厂商 SDK。</li>
+        <li><strong>元数据过滤</strong>：dept/tenant 下推至 VectorStore，避免检索后内存过滤。</li>
+        <li><strong>双栈同源</strong>：embedding 模型、chunk 参数、document id 写入共享契约，Python 写、Java 读。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai_practice01_vectorstore">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="spi" /> 能画出 Document → Embedding → VectorStore 流程</label></li>
+          <li><label><input type="checkbox" data-id="simple-pg" /> 能说明 Simple 与 PgVector 切换方式</label></li>
+          <li><label><input type="checkbox" data-id="filter" /> 能写出 dept 过滤的 SearchRequest 片段</label></li>
+          <li><label><input type="checkbox" data-id="demo" /> 完成 sample-documents.json 过滤验收</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-02-rag-pipeline">RAG Pipeline 实现</a>，把检索结果注入 ChatClient。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI — Vector Databases</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/embeddings.html" target="_blank" rel="noopener">Spring AI — Embeddings API</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/pgvector.html" target="_blank" rel="noopener">Spring AI — PgVector Store</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/simple.html" target="_blank" rel="noopener">Spring AI — SimpleVectorStore</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">阅读 Demo 样本数据，设计部门过滤下的 topK 期望，并对照 Java 检索片段。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-01-vectorstore-lab/sample-documents.json</code>，记录 pol-001 / pol-002 的 metadata。</li>
+      <li>假设 topK=1、query=「年假制度」，分别写 HR 与 FIN filter 下期望返回的 id。</li>
+      <li>在笔记中补全 <code>PolicySearchService.searchForDept</code> 调用示例（dept=HR）。</li>
+      <li>列出 indexContract 中 4 个 requiredMetadata 字段及用途。</li>
+      <li>完成右侧章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事在 similaritySearch 后 Java 里 <code>.filter(d -&gt; "HR".equals(d.getMetadata().get("dept")))</code>。应如何改？风险是什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>改为 SearchRequest 的 filterExpression 下推。风险：topK 被其他部门占满导致 HR 条目漏检，且无法利用向量库索引。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Python 用 text-embedding-ada-002 建库，Java 用 text-embedding-3-small 检索。现象与根因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>检索结果随机或相似度极低。根因：入库与查询 EmbeddingModel 不一致，违反 indexContract 的 embeddingModel 字段。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：VectorStore 与 Embedding</h4>
+      <p>目录：<code>demos/practice-01-vectorstore-lab/</code>。<strong>验收</strong>：对 HR 过滤 query「年假」期望 top1 为 pol-001；FIN 过滤不应返回 HR 文本。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-04-structured-output">结构化输出</a> — JSON 与校验模式</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-rag-pipeline">RAG Pipeline 实现</a> — DocumentReader 到引用溯源</li>
+      <li><a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 工程轨</span><code class="course-ref-slug">python-engineering-for-llm</code></a> — 批量 ingest 脚本</li>
+    </ul>
+  </div>
+</section>

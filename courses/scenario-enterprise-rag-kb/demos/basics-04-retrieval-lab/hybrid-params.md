@@ -1,0 +1,3 @@
+- vector_weight: 0.6
+- bm25_weight: 0.4
+- rerank_top: 10

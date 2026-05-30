@@ -1,0 +1,442 @@
+<section id="ch-practice-04-middleware" class="chapter" data-chapter="practice-04-middleware">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>中间件、鉴权与 CORS</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-middleware" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>FastAPI 与异步服务</strong> · 能力：实现 API Key、JWT 透传、request_id 与请求超时</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>对外 API 不能裸奔。CorpAssist Python 服务位于 Spring BFF 之后，需校验 <span class="term" data-term-id="api-key" tabindex="0">API Key</span>、解析 BFF 转发的 JWT，并在全链路写入 <span class="term" data-term-id="request-id" tabindex="0">request_id</span>。中间件集中处理横切关注点，避免每个 handler 重复鉴权与日志代码。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 Starlette <span class="term" data-term-id="middleware" tabindex="0">middleware</span> 注入 <span class="term" data-term-id="correlation-id" tabindex="0">request_id</span> 到日志与响应头</li>
+          <li>实现内部 <span class="term" data-term-id="api-key" tabindex="0">X-API-Key</span> 校验与 401 映射</li>
+          <li>解析 Spring 签发的 JWT _claims（<span class="term" data-term-id="jwt-bridge" tabindex="0">JWT 桥接</span>）</li>
+          <li>配置路由级 <span class="term" data-term-id="timeout" tabindex="0">timeout</span> 与 <span class="term" data-term-id="cors" tabindex="0">CORS</span> 供本地联调</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>中间件顺序</strong>：request_id → 鉴权 → 业务；超时在最外层或网关。</li>
+          <li><strong>与 Spring 对齐</strong>：头名称 <code>X-Request-Id</code>、JWT issuer 与 Java 一致。</li>
+          <li><strong>失败要可观测</strong>：<span class="term" data-term-id="exception-handler" tabindex="0">exception_handler</span> 返回统一 JSON 错误体。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>API Key</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 服务间调用</span>
+        BFF 调 Python RAG 时携带共享密钥 <code>X-API-Key</code>，防止内网其他服务误调用。密钥来自环境变量，不进 Git。
+      </aside>
+      <p>API Key 适合 machine-to-machine；比 JWT 简单，适合 BFF → Python 固定信任链。校验失败返回 401，body 与 Java <code>AppError</code> 格式对齐（见 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a>）。</p>
+
+      <h4>Depends 校验 API Key</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from fastapi import Depends, HTTPException, Security
+from fastapi.security import APIKeyHeader
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(
+    key: str | None = Security(_api_key_header),
+    settings: CorpAssistSettings = Depends(get_settings),
+) -> None:
+    if not key or key != settings.internal_api_key:
+        raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "Invalid API key"})</code></pre>
+      </div>
+
+      <h4>路由挂载</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">@router.post("/v1/rag/query", dependencies=[Depends(verify_api_key)])
+async def rag_query(body: RagQueryRequest) -> RagQueryResponse:
+    ...</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">handler 内手写 if</span>
+          <ul>
+            <li>每个路由复制 key 比较</li>
+            <li>漏改一处即安全洞</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">router 级 Depends</span>
+          <ul>
+            <li><code>dependencies=[Depends(verify_api_key)]</code></li>
+            <li>健康检查 router 不挂载</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>环境变量注入（12-factor）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 本地 .env（不进 Git）
+CORPASSIST_INTERNAL_API_KEY=dev-key-change-me
+
+# 验证
+curl -s -o /dev/null -w "%{http_code}" \
+  -H "X-API-Key: dev-key-change-me" \
+  -X POST localhost:8000/v1/rag/query \
+  -H "Content-Type: application/json" \
+  -d '{"query":"ping"}'
+# 期望 200；无头或错误 key 期望 401</code></pre>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：API Key 与 OAuth2 用户登录冲突吗？</summary>
+        <p>不冲突。API Key 标识<strong>服务</strong>（BFF→Python）；用户 OAuth2 在 Spring 完成。Python 可同时校验 Key（服务信任）与 JWT（用户身份），见下一节。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>JWT 对接 Spring</h3>
+      <p>用户身份由 Spring 鉴权后，BFF 将 JWT 转发给 Python（或换发内部 token）。Python 侧验证签名、issuer、exp，提取 <code>sub</code> / <code>tenant_id</code> 供审计。</p>
+
+      <h4>解析 JWT claims（HS256 示例）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import jwt
+from fastapi import Header, HTTPException
+
+async def get_current_user(authorization: str | None = Header(default=None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=["HS256"],
+            issuer="corpassist-spring",
+        )
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
+    return {"user_id": payload["sub"], "tenant": payload.get("tenant_id")}</code></pre>
+      </div>
+
+      <p>生产可用 RS256 + JWK 集；issuer / audience 必须与 Spring Security 配置一致。双栈联调清单见 <a href="#ch-advanced-05-bridge-java">双栈协作规范</a>。</p>
+
+      <h4>Spring 与 Python JWT 字段对照</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>Claim</th><th>Spring 侧</th><th>Python 使用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>iss</code></td><td><code>corpassist-spring</code></td><td><code>jwt.decode(..., issuer=...)</code> 必校验</td></tr>
+          <tr><td><code>sub</code></td><td>用户 UUID</td><td>审计日志 <code>user_id</code></td></tr>
+          <tr><td><code>tenant_id</code></td><td>多租户扩展</td><td>RAG 命名空间隔离</td></tr>
+          <tr><td><code>exp</code></td><td>短 TTL（如 15m）</td><td>过期返回 401，BFF 刷新 token</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：Python 还要再登录吗？</summary>
+        <p>通常不。BFF 已完成 OAuth2/Session，Python 信任内网 mTLS + API Key + 短 JWT。勿在 Python 重复实现完整 OIDC，除非服务直接对公网。</p>
+      </details>
+
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-python"># 反例：只 decode 不验 issuer
+payload = jwt.decode(token, secret, algorithms=["HS256"])</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code class="language-python"># 推荐：与 Spring Security 对齐
+payload = jwt.decode(
+    token, secret, algorithms=["HS256"],
+    issuer="corpassist-spring",
+    audience="corpassist-python",
+)</code></pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>请求 ID</h3>
+      <p><span class="term" data-term-id="correlation-id" tabindex="0">request_id</span> 贯穿 Spring MDC、Python structlog 与 ELK。中间件：读入 <code>X-Request-Id</code>，无则生成 UUID，写回响应头并绑定日志上下文。</p>
+
+      <h4>RequestIdMiddleware</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import uuid
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+        # structlog.contextvars.bind_contextvars(request_id=rid)
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = rid
+        return response
+
+app.add_middleware(RequestIdMiddleware)</code></pre>
+      </div>
+
+      <h4>structlog 绑定 request_id</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import structlog
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(request_id=rid)
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = rid
+        return response</code></pre>
+      </div>
+      <p>与 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a> 中 <span class="term" data-term-id="structlog" tabindex="0">structlog</span> JSON 字段一致，便于 ELK 与 Java <span class="term" data-term-id="mdc-trace" tabindex="0">MDC trace</span> 联查。</p>
+
+      <div class="mermaid-wrap">
+        <h5>request_id 贯穿双栈</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant FE as 前端
+  participant BFF as Spring BFF
+  participant PY as FastAPI
+  FE->>BFF: X-Request-Id: abc
+  BFF->>PY: 转发 abc
+  Note over PY: structlog request_id=abc
+  PY-->>BFF: X-Request-Id: abc
+  BFF-->>FE: 同 id</pre>
+        <p class="diagram-caption">联调时在 Jaeger/ELK 用同一 id 检索两端日志。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 response 也要带 X-Request-Id？</summary>
+        <p>方便客户端与 BFF 关联错误响应；若无入站 id，Python 生成的 id 需回传以便 Spring 日志对齐。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>超时</h3>
+      <p>LLM 与 RAG 链路耗时长，但 HTTP 连接不能无限挂起。<span class="term" data-term-id="timeout" tabindex="0">timeout</span> 分层：网关全局、Python middleware、httpx 客户端 per-request。</p>
+
+      <h4>中间件超时（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+class TimeoutMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, seconds: float = 60.0):
+        super().__init__(app)
+        self.seconds = seconds
+
+    async def dispatch(self, request, call_next):
+        try:
+            return await asyncio.wait_for(call_next(request), timeout=self.seconds)
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"code": "GATEWAY_TIMEOUT", "message": "Request timed out"},
+            )</code></pre>
+      </div>
+
+      <ul>
+        <li>流式 SSE 端点应排除或放宽全局 timeout，改用 idle timeout。</li>
+        <li>httpx <code>timeout=httpx.Timeout(30.0, connect=5.0)</code> 控制上游 LLM。</li>
+        <li>与 Spring Cloud Gateway <code>response-timeout</code> 协调，避免一层先断一层仍等。</li>
+      </ul>
+
+      <h4>CORS 与 security header（本地）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from fastapi.middleware.cors import CORSMiddleware
+
+if settings.env == "local":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173"],
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "X-API-Key", "X-Request-Id"],
+    )</code></pre>
+      </div>
+      <p>生产环境 Python 服务通常仅内网可达，<span class="term" data-term-id="cors" tabindex="0">CORS</span> 由 Spring BFF 对外处理。可选添加 <span class="term" data-term-id="security-header" tabindex="0">security header</span>（<code>X-Content-Type-Options</code> 等）于网关层。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="超时层级">
+        <input type="radio" name="prac04-timeout-tab" id="prac04-timeout-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac04-timeout-tab" id="prac04-timeout-tab-b" class="learn-tab-input" />
+        <label for="prac04-timeout-tab-a">网关 / middleware</label>
+        <label for="prac04-timeout-tab-b">httpx 客户端</label>
+        <div class="learn-tab-panel" id="prac04-timeout-panel-a" role="tabpanel">
+          <ul>
+            <li>Spring Gateway <code>response-timeout</code></li>
+            <li>Python <code>TimeoutMiddleware</code> 整请求上限</li>
+            <li>SSE 路由需排除或单独 idle 超时</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac04-timeout-panel-b" role="tabpanel">
+          <ul>
+            <li><code>httpx.Timeout(30.0, connect=5.0)</code></li>
+            <li>仅约束上游 LLM HTTP</li>
+            <li>与 middleware 超时不重复叠加过短</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>CorpAssist 请求头速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>Header</th><th>方向</th><th>用途</th></tr></thead>
+              <tbody>
+                <tr><td><code>X-API-Key</code></td><td>BFF → Python</td><td>服务间鉴权</td></tr>
+                <tr><td><code>Authorization: Bearer</code></td><td>BFF → Python</td><td>用户 JWT</td></tr>
+                <tr><td><code>X-Request-Id</code></td><td>双向</td><td>全链路 trace</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <h4>TestClient 验证中间件（衔接测试章）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from httpx import ASGITransport, AsyncClient
+from middleware_demo import app
+
+@pytest.mark.asyncio
+async def test_request_id_echo():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/ping", headers={"X-Request-Id": "test-rid"})
+    assert resp.headers["X-Request-Id"] == "test-rid"
+    assert resp.json()["ok"] is True</code></pre>
+      </div>
+      <p>中间件行为应用 <a href="#ch-practice-03-testing">测试策略</a> 中的 ASGITransport 覆盖，无需真实端口；401/504 同理断言 status 与 JSON <code>code</code>。</p>
+
+      <div class="learn-interview">
+        <p><strong>答辩题</strong>：为何 API Key 与 JWT 在 CorpAssist 里并存？各解决什么问题？</p>
+        <p>API Key 标识<strong>服务间</strong>调用（BFF→Python）；JWT 携带<strong>用户/租户</strong>身份供审计与多租户 RAG。二者校验层不同，勿用单一方案替代。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，横切关注点四件套复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>API Key</strong>：router 级 <code>Depends(verify_api_key)</code>；401 统一 JSON。</li>
+        <li><strong>JWT 对接 Spring</strong>：校验 issuer/签名；提取 tenant 供多租户 RAG。</li>
+        <li><strong>请求 ID</strong>：中间件读写 <code>X-Request-Id</code>，绑定 structlog。</li>
+        <li><strong>超时</strong>：middleware + httpx 双层；SSE 单独策略。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_practice04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="apikey" /> 无 Key 调 RAG 返回 401</label></li>
+          <li><label><input type="checkbox" data-id="jwt" /> 能说明 issuer 必须与 Spring 一致</label></li>
+          <li><label><input type="checkbox" data-id="rid" /> curl 响应含 <code>X-Request-Id</code></label></li>
+          <li><label><input type="checkbox" data-id="timeout" /> 能区分 middleware 与 httpx timeout</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-05-docker">容器化与本地 compose</a>，把带中间件的服务打进镜像联调。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/middleware/" target="_blank" rel="noopener">FastAPI Middleware</a></li>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/security/api-keys/" target="_blank" rel="noopener">API Key Security</a></li>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/cors/" target="_blank" rel="noopener">CORS</a></li>
+      <li><a href="https://pyjwt.readthedocs.io/" target="_blank" rel="noopener">PyJWT</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">运行 Demo <code>middleware_demo.py</code>，用 curl 验证 <code>X-Request-Id</code> 回显；并对照正文为 RAG router 草拟 API Key Depends 片段。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「Depends 校验 API Key」代码块，为 <code>/v1/rag/query</code> 写 router 级 <code>dependencies=[Depends(verify_api_key)]</code> 伪代码；说明 <code>/health</code> 为何不挂载。</li>
+      <li>对照「JWT 解析 JWT claims」与「Spring 与 Python JWT 字段对照」表，列出必须一致的 issuer 与算法配置项。</li>
+      <li>阅读「RequestIdMiddleware」代码，启动 Demo 后 <code>curl -v -H "X-Request-Id: lab-001" localhost:8000/ping</code>，确认响应头回显；无头时记录生成的 UUID。</li>
+      <li>对照「TimeoutMiddleware」与正文 timeout 分层列表，说明 SSE 端点为何需放宽或跳过全局 60s 限制。</li>
+      <li>（可选）进入 <code>demos/practice-04-middleware-lab/</code>，<code>uvicorn middleware_demo:app --reload</code> 完成上述 curl 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障）BFF 日志有 request_id，Python 日志没有。最可能漏了哪一步？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>RequestIdMiddleware 未注册，或 structlog 未 <code>bind_contextvars(request_id=...)</code>。BFF 已转发头，但 Python 未读头/未写入日志上下文。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（找错）RAG 路由未加 API Key Depends，但 <code>/health</code> 返回 401。最可能误改了什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>把 <code>verify_api_key</code> 挂到了 <code>app</code> 全局 middleware 或根 router，而非仅 <code>/v1/rag</code> 子路由。health 探活不应要求 Key；应改为 router 级 <code>dependencies</code> 或按 path 前缀排除。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：RequestId 中间件</h4>
+      <p>目录：<code>demos/practice-04-middleware-lab/</code>。<strong>验收</strong>：<code>uvicorn middleware_demo:app --reload</code>；<code>curl -s -D - localhost:8000/ping -o /dev/null</code> 响应头含 <code>X-Request-Id</code>；body 为 <code>{"ok":true}</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-03-testing">测试策略</a> · 用 TestClient 测 401/headers</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-docker">容器化与本地 compose</a> · 环境变量注入 API Key</li>
+      <li><a href="https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html" target="_blank" rel="noopener">Spring Security JWT — 对照 issuer 配置</a></li>
+    </ul>
+  </div>
+</section>

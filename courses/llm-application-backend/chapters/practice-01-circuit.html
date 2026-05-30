@@ -1,0 +1,437 @@
+<section id="ch-practice-01-circuit" class="chapter" data-chapter="practice-01-circuit">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>熔断、舱壁与降级</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-circuit" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>弹性与多租户</strong> · 能力：用 Resilience4j 保护 LLM 下游链路并实现可观测降级</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist <strong>S2 智能客服</strong> 高峰时，DashScope 限流、Python RAG OOM、ERP 查单慢都会拖垮 BFF 线程池。没有 <span class="term" data-term-id="circuit-breaker" tabindex="0">circuit breaker</span> 与 <span class="term" data-term-id="model-fallback" tabindex="0">model fallback</span>，一次下游雪崩会让<strong>所有租户</strong>连「转人工」入口都进不去——本课明确的生产坑是：<strong>熔断配了但没 fallback</strong>，客户端只看到 HTTP 500。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 BFF→Python RAG、BFF→模型 API 分别配置 <span class="term" data-term-id="resilience4j" tabindex="0">Resilience4j</span> 熔断实例与 <span class="term" data-term-id="bulkhead" tabindex="0">bulkhead</span> 舱壁</li>
+          <li>设计 <span class="term" data-term-id="default-reply" tabindex="0">default reply</span> 与转人工 <span class="term" data-term-id="degrade-policy" tabindex="0">degrade policy</span>，SSE 流式也能优雅收尾</li>
+          <li>根据 S2 压测数据设置 <span class="term" data-term-id="failure-threshold" tabindex="0">failure threshold</span>，并用 <span class="term" data-term-id="timeout-isolate" tabindex="0">timeout isolate</span> 防止慢调用占满线程</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>熔断保护调用方</strong>：快速失败，把线程还给网关与 SSE 连接，给下游恢复窗口。</li>
+          <li><strong>舱壁隔离资源池</strong>：LLM 长调用与 ERP 短查询用不同 bulkhead，避免「查单慢拖死生成」。</li>
+          <li><strong>降级要有用户可见文案</strong>：不是空白 500，而是「咨询较多，已记录工单，可转人工」+ traceId。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Resilience4j</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S2 · 大促咨询洪峰（45 秒）</span>
+        09:00 活动开始，<code>/v1/chat</code> QPS 从 200 飙到 1800。Python RAG 向量检索 P99 从 800ms 升到 6s；DashScope 返回 429。BFF 若对每个慢请求阻塞 120s，Tomcat 200 线程 30 秒即耗尽——必须在<strong>调用边界</strong>用 Resilience4j 熔断 + 舱壁 + 超时隔离。
+      </aside>
+
+      <p>Spring Cloud 2024+ 推荐 <span class="term" data-term-id="resilience4j" tabindex="0">Resilience4j</span> 替代 Hystrix。CorpAssist 双栈至少包两层下游：</p>
+      <ul>
+        <li><strong><code>pythonRag</code></strong> — BFF 调 FastAPI <code>/v1/rag/query</code>，失败率与慢调用影响检索链路。</li>
+        <li><strong><code>llmProvider</code></strong> — BFF / Spring AI 调 DashScope 等模型 API，429/5xx 须独立熔断，不与 RAG 共用计数窗口。</li>
+        <li><strong><code>erpLookup</code></strong>（可选第三实例）— NS2 查订单工具 Feign 调用，与 LLM bulkhead 隔离。</li>
+      </ul>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">CircuitBreaker</span>
+          <p class="role-card-desc">统计滑动窗口内失败率；超 <span class="term" data-term-id="failure-threshold" tabindex="0">failure threshold</span> 则 Open，直接拒绝调用。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Bulkhead</span>
+          <p class="role-card-desc">限制并发槽位；LLM 与 ERP 分池，防止一类调用饿死另一类。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">TimeLimiter</span>
+          <p class="role-card-desc">与 <span class="term" data-term-id="timeout-isolate" tabindex="0">timeout isolate</span> 配合：超时算失败，计入熔断窗口。</p>
+        </article>
+      </div>
+
+      <h4>CorpAssist 熔断 + 舱壁配置（YAML）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">resilience4j:
+  circuitbreaker:
+    instances:
+      pythonRag:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20          # S2：窗口不宜过大，否则 Open 太慢
+        failureRateThreshold: 50       # 50% 失败率触发 Open
+        slowCallRateThreshold: 60
+        slowCallDurationThreshold: 3s  # RAG P99 目标 &lt; 3s
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 5
+        recordExceptions:
+          - java.util.concurrent.TimeoutException
+          - org.springframework.web.client.HttpServerErrorException
+      llmProvider:
+        slidingWindowSize: 30
+        failureRateThreshold: 40       # 模型 429 更敏感，阈值略低
+        waitDurationInOpenState: 20s
+  bulkhead:
+    instances:
+      llmCall:
+        maxConcurrentCalls: 32         # 对齐 BFF 线程池 × 副本数预算
+        maxWaitDuration: 500ms         # 超出则 BulkheadFullException → fallback
+      erpLookup:
+        maxConcurrentCalls: 64
+        maxWaitDuration: 200ms
+  timelimiter:
+    instances:
+      pythonRag:
+        timeoutDuration: 4s
+      llmProvider:
+        timeoutDuration: 90s           # 流式首 token 可长，但须监控 stall</code></pre>
+      </div>
+
+      <h4>熔断状态机</h4>
+      <div class="mermaid-wrap">
+        <h5>Closed → Open → HalfOpen</h5>
+        <pre class="mermaid">stateDiagram-v2
+  [*] --> Closed
+  Closed --> Open: 失败率超 failureRateThreshold
+  Closed --> Open: 慢调用率超 slowCallRateThreshold
+  Open --> HalfOpen: waitDurationInOpenState 结束
+  HalfOpen --> Closed: 探测调用成功达阈值
+  HalfOpen --> Open: 任一次探测失败
+  note right of Open: 直接走 fallback\n不再打满下游</pre>
+        <p class="diagram-caption">Open 期间所有调用立即失败并触发 <span class="term" data-term-id="default-reply" tabindex="0">default reply</span>；HalfOpen 用少量探测验证下游是否恢复。</p>
+      </div>
+
+      <h4>S2 高峰参数：反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>全下游共用一个 <code>default</code> 熔断实例</li>
+            <li><code>failureRateThreshold: 90</code> + 窗口 200，Open 前已拖垮线程池</li>
+            <li>无 TimeLimiter，仅依赖 Feign readTimeout 120s</li>
+            <li>熔断 Open 仍抛未捕获异常到 SSE 客户端</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>RAG / LLM / ERP 分实例，指标独立暴露到 Actuator</li>
+            <li>结合压测设 <code>slowCallDurationThreshold</code>，慢调用计入失败</li>
+            <li>bulkhead <code>maxWaitDuration</code> 短于用户可感知等待</li>
+            <li>Open 走 fallbackMethod，SSE 发送 terminal event 后关闭</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>BFF 注解式接入（Java）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@CircuitBreaker(name = "pythonRag", fallbackMethod = "ragFallback")
+@Bulkhead(name = "llmCall", type = Bulkhead.Type.SEMAPHORE)
+@TimeLimiter(name = "pythonRag")
+public CompletableFuture&lt;RagResponse&gt; queryRagAsync(RagRequest req) {
+  return CompletableFuture.supplyAsync(() -&gt; pythonRagClient.query(req));
+}
+
+private CompletableFuture&lt;RagResponse&gt; ragFallback(RagRequest req, Throwable t) {
+  log.warn("rag degraded tenant={} trace={}", req.tenantId(), MDC.get("traceId"), t);
+  return CompletableFuture.completedFuture(
+    RagResponse.degraded(DefaultReplies.RAG_BUSY, /* handoffTicket */ true));
+}</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么 LLM 与 ERP 不能共用同一个 bulkhead？</summary>
+        <p>大促时 LLM 长连接占满槽位，NS2 查订单工具会被饿死——用户问「订单到哪了」也超时。舱壁本质是<strong>故障域隔离</strong>，与 <a href="#ch-basics-01-gateway">Gateway 路由分路径</a> 同一思路。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>默认回复</h3>
+      <p><span class="term" data-term-id="default-reply" tabindex="0">Default reply</span> 是熔断 / 舱壁 / 超时后的<strong>用户契约</strong>，不是日志里的异常栈。CorpAssist S2 要求：</p>
+      <ul>
+        <li><strong>可读中文</strong> — 说明「当前咨询较多」，避免技术错误码。</li>
+        <li><strong>可行动</strong> — 提供转人工、工单号或预计回电时间。</li>
+        <li><strong>可追踪</strong> — 响应体含 <code>traceId</code>，客服系统可关联全链路。</li>
+        <li><strong>SSE 友好</strong> — 流式场景发送 <code>event: error</code> 或 <code>event: done</code> 后正常关闭，防客户端挂死。</li>
+      </ul>
+
+      <h4>degrade policy 分级表</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>级别</th><th>触发条件</th><th>用户可见行为</th><th>运维动作</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>D1 · 功能降级</td>
+            <td>RAG 熔断 Open</td>
+            <td>无知识库引用，通用话术 + 转人工入口</td>
+            <td>告警 RAG 失败率；检查 Python 副本与向量库</td>
+          </tr>
+          <tr>
+            <td>D2 · 模型降级</td>
+            <td>主模型 429/5xx</td>
+            <td>切换备用小模型（见下节 L2）</td>
+            <td>监控 fallback 比例；联系厂商提额</td>
+          </tr>
+          <tr>
+            <td>D3 · 全链路</td>
+            <td>LLM + RAG 均 Open</td>
+            <td>静态 FAQ 列表 + 强制转人工</td>
+            <td>P1 on-call；考虑 Gateway 入口限流（见 <a href="#ch-practice-02-rate-limit">限流与配额</a>）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>HTTP JSON 与 SSE 降级响应</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-good">同步 JSON · fallback body</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">json</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-json">{
+  "degraded": true,
+  "message": "当前咨询较多，已为您记录工单 WO-8842，请稍候或点击转人工。",
+  "handoffUrl": "/v1/support/handoff",
+  "traceId": "7f3a2b1c"
+}</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">SSE · terminal event</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">http</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-http">event: degraded
+data: {"message":"当前咨询较多，已转接人工队列","traceId":"7f3a2b1c"}
+
+event: done
+data: [DONE]</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>fallback 里再调 LLM</strong> — 下游已 Open 时二次调用会放大故障；D1/D3 应用静态话术或缓存 FAQ。</li>
+          <li><strong>吞掉异常不记指标</strong> — <code>degraded=true</code> 须计入 Prometheus，否则「静默降级」数周无人知。</li>
+          <li><strong>仅返回 503 无 body</strong> — App 无法展示转人工；违反 S2 体验 SLA。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>模型 fallback</h3>
+      <p><span class="term" data-term-id="model-fallback" tabindex="0">Model fallback</span> 是 <span class="term" data-term-id="degrade-policy" tabindex="0">degrade policy</span> 在模型层的具体实现：主模型不可用时，按预定路由降级，并<strong>缩短 prompt</strong> 以控制成本（NS3）。</p>
+
+      <h4>三级 fallback 路由</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>级别</th><th>触发</th><th>行为</th><th>质量 / 成本</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>L1</strong></td>
+            <td>单次超时 / 5xx（Closed 状态）</td>
+            <td>幂等键下重试 1 次；仍失败进入 L2</td>
+            <td>质量不变；延迟 +1 RTT</td>
+          </tr>
+          <tr>
+            <td><strong>L2</strong></td>
+            <td>熔断 Open 或连续 429</td>
+            <td>路由 <code>qwen-turbo</code> 等小模型；截断 RAG topK 与 history</td>
+            <td>质量略降；Token 成本降 60%+</td>
+          </tr>
+          <tr>
+            <td><strong>L3</strong></td>
+            <td>全模型不可用</td>
+            <td>Redis 缓存 FAQ + 静态 <span class="term" data-term-id="default-reply" tabindex="0">default reply</span> + 转人工</td>
+            <td>无生成；成本为零</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>模型 fallback 决策流</h5>
+        <pre class="mermaid">flowchart TD
+  Req[Chat 请求]
+  CB{circuitbreaker\nllmProvider}
+  L1[L1: 重试 1 次]
+  L2[L2: 小模型 + 短 prompt]
+  L3[L3: FAQ + 转人工]
+  Ok[正常响应]
+  Req --> CB
+  CB -->|Closed 且失败| L1
+  L1 -->|成功| Ok
+  L1 -->|仍失败| L2
+  CB -->|Open| L2
+  L2 -->|仍失败| L3
+  CB -->|Closed 且成功| Ok</pre>
+        <p class="diagram-caption">L2/L3 须打点 <code>llm_fallback_total{level="L2"}</code>；fallback 率 &gt; 5% 持续 10min 应触发告警。</p>
+      </div>
+
+      <h4>Spring AI 路由示意（Java）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@CircuitBreaker(name = "llmProvider", fallbackMethod = "chatFallback")
+public ChatResponse chat(ChatRequest req) {
+  return primaryModel.call(truncateContext(req, PRIMARY_MAX_TOKENS));
+}
+
+ChatResponse chatFallback(ChatRequest req, Throwable t) {
+  meterRegistry.counter("llm_fallback_total", "level", "L2").increment();
+  return fallbackModel.call(truncateContext(req, FALLBACK_MAX_TOKENS));
+}</code></pre>
+      </div>
+
+      <h4>timeout isolate 与慢调用</h4>
+      <p>LLM 流式场景下，「首 token 90s、后续 stall 无数据」也应由 TimeLimiter 或 idle timeout 切断，并计入慢调用统计——否则 <span class="term" data-term-id="failure-threshold" tabindex="0">failure threshold</span> 永远达不到，线程却被挂住。BFF 侧建议：首 token 超时 90s，chunk 间隔超时 15s（详见 <a href="#ch-basics-02-sse">SSE 流式端到端</a>）。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>熔断 Open 后用户反复点「重试」会怎样？</summary>
+          <div class="learn-faq-body">
+            若 App 直连 BFF 重试，Open 期间每次仍快速 fallback，不会打满下游——这是熔断的价值。但若 Gateway 未限流，重试风暴仍会占满 BFF 连接；须配合 <a href="#ch-practice-02-rate-limit">租户 QPS 配额</a> 与客户端指数退避。
+          </div>
+        </details>
+        <details>
+          <summary>HalfOpen 探测失败立刻再 Open，会不会「永远恢复不了」？</summary>
+          <div class="learn-faq-body">
+            会，若下游真未修复。此时应依赖告警与 runbook 修下游，而不是调大 threshold 掩盖问题。可临时手动切 L3 FAQ 保体验，但须记录变更。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节；做题前可先对照自检。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Resilience4j</strong>：RAG / LLM / ERP 分实例熔断 + LLM 专用 bulkhead；S2 窗口 20～30、失败率 40～50% 为起点，压测后微调。</li>
+        <li><strong>默认回复</strong>：<code>fallbackMethod</code> 返回可读降级 + traceId；SSE 发 terminal event，禁止裸 500。</li>
+        <li><strong>模型 fallback</strong>：L1 幂等重试 → L2 小模型短 prompt → L3 FAQ + 人工；须监控 fallback 率并告警。</li>
+        <li><strong>timeout isolate</strong>：TimeLimiter 与慢调用阈值并用；超时计入熔断窗口，避免「假 Closed 真阻塞」。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cb-states" /> 能口述 Closed / Open / HalfOpen 及转换条件</label></li>
+          <li><label><input type="checkbox" data-id="bulkhead" /> 能解释 LLM 与 ERP 分 bulkhead 的原因</label></li>
+          <li><label><input type="checkbox" data-id="fallback-l3" /> 能列举 L1/L2/L3 model fallback 触发与行为</label></li>
+          <li><label><input type="checkbox" data-id="sse-degrade" /> 能说明 SSE 降级时 terminal event 要求</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>circuit breaker</td><td>下游不健康时快速失败，保护调用方线程</td></tr>
+                <tr><td>bulkhead</td><td>并发槽位分池，避免一类调用饿死另一类</td></tr>
+                <tr><td>default reply</td><td>降级必须有用户可读文案 + 转人工路径</td></tr>
+                <tr><td>failure threshold</td><td>滑动窗口失败率超阈 → Open</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-practice-02-rate-limit">限流与配额</a> 在入口 QPS 之外补上 Token 预算与租户公平使用。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j CircuitBreaker — 状态机与配置项</a></li>
+      <li><a href="https://resilience4j.readme.io/docs/bulkhead" target="_blank" rel="noopener">Resilience4j Bulkhead — 信号量舱壁</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-circuitbreaker/docs/current/reference/html/" target="_blank" rel="noopener">Spring Cloud Circuit Breaker — 与 Resilience4j 集成</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html#actuator.endpoints.circuitbreakers" target="_blank" rel="noopener">Spring Boot Actuator — circuitbreakers 端点</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照正文「CorpAssist 熔断 + 舱壁配置（YAML）」，编辑 <code>demos/practice-01-circuit-lab/circuit-config.yaml</code> 完成 S2 高峰参数填写与注释（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>将正文中 <code>pythonRag</code> 的 <code>failureRateThreshold</code>、<code>waitDurationInOpenState</code>、<code>slowCallDurationThreshold</code> 填入 circuit-config.yaml，并注释「S2 为何窗口取 20 而非 200」。</li>
+      <li>为 <code>llmCall</code> bulkhead 设置 <code>maxConcurrentCalls</code> 与 <code>maxWaitDuration</code>，对照 BFF 线程池（如 200）说明「单实例 bulkhead 32」是否合理。</li>
+      <li>编写 <code>ragFallback</code> 一句用户可见中文（含转人工或工单），与正文 JSON 示例字段对齐。</li>
+      <li>在 degrade policy 表中为 D1/D2/D3 各写一条 Prometheus 指标名（如 <code>rag_degraded_total</code>）。</li>
+      <li>（可选）本地启动 BFF 后访问 <code>/actuator/circuitbreakers</code>，观察手动故障注入后状态变化。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">找错：熔断 Open 后直接返回 HTTP 500，响应 body 为空。违反本章哪条原则？应如何改？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反「降级要有用户可见文案」：应走 <code>fallbackMethod</code> 返回 <span class="term" data-term-id="default-reply" tabindex="0">default reply</span>（含转人工与 traceId），SSE 场景发 terminal event。500 无 body 会导致 App 无法兜底。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">排障：S2 高峰 RAG P99 6s，但 circuitbreaker 一直 Closed，BFF 线程仍耗尽。最可能漏配了哪两项？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>① <strong>slowCallRateThreshold / slowCallDurationThreshold</strong> — 慢调用未计入失败；② <strong>bulkhead 或 TimeLimiter</strong> — 无并发/超时隔离，线程被 120s 读超时占满。仅调低 failureRateThreshold 不够。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">权衡：HalfOpen 期间把 <code>permittedNumberOfCallsInHalfOpenState</code> 从 5 调到 50，能加快恢复验证，但有何风险？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>下游仍不稳定时，50 路探测同时涌入可能再次打满 Python/向量库，导致<strong>刚恢复又崩溃</strong>（flapping）。S2 建议保持小批量探测，结合告警人工确认后再放大流量。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：熔断实验室</h4>
+      <p>目录：<code>demos/practice-01-circuit-lab/</code>。<strong>验收</strong>：circuit-config.yaml 含 pythonRag + llmCall breaker/bulkhead 配置、S2 参数注释、以及一条 fallback 中文文案。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-rate-limit">限流与配额</a> — 熔断之外用租户 QPS 与 Token 预算防刷量</li>
+      <li><a href="#ch-basics-04-idempotency">幂等与重试</a> — L1 fallback 重试须幂等键</li>
+      <li><a href="../multimodel-routing-multimodal/index.html">多模型路由与多模态应用</a> — L2 小模型路由策略</li>
+    </ul>
+  </div>
+</section>

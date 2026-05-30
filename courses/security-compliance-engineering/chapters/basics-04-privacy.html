@@ -1,0 +1,339 @@
+<section id="ch-basics-04-privacy" class="chapter" data-chapter="basics-04-privacy">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>隐私与脱敏</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-privacy" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>威胁与模型</strong> · 能力：PII 识别、日志脱敏与最小存储策略（CorpAssist 双栈）</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>LLM 应用天然处理自然语言，<strong>身份证、手机号、薪资、病历</strong>极易进入 prompt、向量库与 trace 日志——对应 OWASP LLM06。阶段二B 要求 basics 阶段建立 <span class="term" data-term-id="pii-detect" tabindex="0">pii detect</span> 与 <span class="term" data-term-id="log-redaction" tabindex="0">log redaction</span> 基线，否则 S2/S5 场景课无法通过合规门禁。本章贯穿 Spring Advisor 预扫描与 Python NER 双栈。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>定义 CorpAssist 场景下的 PII/敏感字段清单与 <span class="term" data-term-id="desensitize" tabindex="0">desensitize</span> 规则</li>
+          <li>在日志、链路追踪、评测集三处落地 <span class="term" data-term-id="data-masking" tabindex="0">data masking</span> 与 <span class="term" data-term-id="secret-scrub" tabindex="0">secret scrub</span></li>
+          <li>设计 <span class="term" data-term-id="privacy-storage" tabindex="0">privacy storage</span> 与 <span class="term" data-term-id="retention-policy" tabindex="0">retention policy</span>，衔接 <a href="#ch-practice-01-tool-authz">工具调用权限</a></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>进模型前先脱敏</strong>：能不进 LLM 的 PII 就不要进；必须进则 token 化或掩码。</li>
+          <li><strong>日志默认有毒</strong>：OpenTelemetry span、prompt debug 是泄露高发区。</li>
+          <li><strong>存储最小化</strong>：对话历史、embedding、审计各设 <span class="term" data-term-id="retention-policy" tabindex="0">retention policy</span>，过期自动 purge。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>PII</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · HR 助手（30 秒）</span>
+        员工问：「帮我查一下张三的手机号和身份证后四位。」若系统把完整 <span class="term" data-term-id="gdpr-pii" tabindex="0">gdpr pii</span> 喂给 LLM 再回答，模型可能在回复中<strong>复述全量 PII</strong>，同时写入 trace——一次问答触发双重泄露。
+      </aside>
+
+      <p>CorpAssist PII 分级（示例，企业可扩展）：</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>级别</th><th>字段示例</th><th>进 LLM 策略</th><th>检测手段</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>L0 公开</strong></td>
+            <td>公司名、部门公开电话</td>
+            <td>允许</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td><strong>L1 内部</strong></td>
+            <td>工号、办公分机</td>
+            <td>掩码后可用</td>
+            <td>正则 + 词典</td>
+          </tr>
+          <tr>
+            <td><strong>L2 敏感</strong></td>
+            <td>手机号、邮箱、地址</td>
+            <td>默认掩码；高敏场景拒答</td>
+            <td>正则 + NER</td>
+          </tr>
+          <tr>
+            <td><strong>L3 高敏</strong></td>
+            <td>身份证、银行卡、薪资、病历</td>
+            <td>禁止进 prompt；工具层授权查询</td>
+            <td>NER + 规则 + 人工复核</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>双栈 PII 检测链路</h4>
+      <div class="mermaid-wrap">
+        <h5>PII 从输入到存储的管控点</h5>
+        <pre class="mermaid">flowchart LR
+  IN[用户/RAG 输入] --> PRE[Spring PII Advisor]
+  PRE -->|mask| LLM[(LLM)]
+  PRE -->|block L3| REJ[拒答]
+  LLM --> OUT[出站 PII 扫描]
+  OUT --> USER[用户可见]
+  PRE -.-> PY[Python NER 复核]
+  OUT -.-> LOG[log redaction]
+  LOG --> STORE[(privacy storage)]</pre>
+        <p class="diagram-caption">L3 字段应在<strong>进 LLM 前</strong> block；出站扫描防模型「补全」泄露。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python — PII 检测与掩码（示意）
+import re
+PHONE = re.compile(r"1[3-9]\d{9}")
+
+def desensitize(text: str, policy: PiiPolicy) -&gt; str:
+    entities = ner.detect(text)  # 双栈：Spring 正则 + Python NER
+    for e in sorted(entities, reverse=True):
+        if e.label in policy.block_labels:
+            raise PiiBlockedError(e.label)
+        text = text[:e.start] + policy.mask(e) + text[e.end:]
+    return text</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么 RAG 索引阶段也要做 PII 扫描？</summary>
+        <p>向量库可能长期保留<strong>明文 chunk</strong>；检索命中即把 PII 拉回上下文。应在 ingest 阶段 <span class="term" data-term-id="desensitize" tabindex="0">desensitize</span> 或打 acl_tags 限制可见范围，而非只在问答时临时处理。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>日志</h3>
+      <p>LLM 应用的 observability 栈（OpenTelemetry、Langfuse、自研 trace）常默认记录<strong>完整 prompt/completion</strong>，是 OWASP LLM06 最高频踩坑点。CorpAssist 要求：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>日志类型</th><th>风险</th><th>redaction 规则</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>请求 trace</strong></td>
+            <td>含用户原文 PII</td>
+            <td>记录 hash + 掩码片段；L3 仅记 event 不记内容</td>
+          </tr>
+          <tr>
+            <td><strong>工具调用 log</strong></td>
+            <td>API 返回全量 JSON</td>
+            <td>字段级 allowlist；<span class="term" data-term-id="secret-scrub" tabindex="0">secret scrub</span> API Key</td>
+          </tr>
+          <tr>
+            <td><strong>评测/坏例集</strong></td>
+            <td>复制生产对话</td>
+            <td>入库前 batch desensitize；隔离环境</td>
+          </tr>
+          <tr>
+            <td><strong>错误栈</strong></td>
+            <td>异常 message 带 prompt</td>
+            <td>全局 log appender 过滤</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>debug 环境开全量 prompt 日志上生产</li>
+            <li>仅人工约定「工程师别看 PII」</li>
+            <li>日志无 retention，永久保存对话</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>统一 <span class="term" data-term-id="log-redaction" tabindex="0">log redaction</span> SDK（Spring Filter + Python processor）</li>
+            <li>结构化日志：pii_detected=true 但不写原文</li>
+            <li>访问日志与内容分离，RBAC 查原文需审批</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring — 日志写入前 redaction（示意）
+log.info("chat_complete trace={} pii_flags={} prompt_len={}",
+    traceId,
+    piiScanner.flags(redactedPrompt),  // 仅标签，非原文
+    redactedPrompt.length());</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>判断：「为了排障，临时打开 24 小时全量 prompt 日志」——合规吗？</summary>
+        <p><strong>高风险。</strong>须走变更审批、限定访问 RBAC、到期自动关闭，且仍应经 redaction。生产默认禁止全量明文 prompt；可用 sampling + 加密 vault 存极少数样本。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>存储</h3>
+      <p><span class="term" data-term-id="privacy-storage" tabindex="0">privacy storage</span> 涵盖对话历史、向量 chunk、审计库、缓存。原则：<strong>最小必要、加密、可删除</strong>。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>数据类</th><th>推荐保留期</th><th>加密</th><th>删除触发</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>在线会话 cache</td>
+            <td>24–72 h</td>
+            <td>内存/TLS</td>
+            <td>TTL 或用户注销</td>
+          </tr>
+          <tr>
+            <td>对话审计（脱敏后）</td>
+            <td>按等保/行业 1–3 年</td>
+            <td>静态加密</td>
+            <td>retention job</td>
+          </tr>
+          <tr>
+            <td>向量 chunk（含 PII）</td>
+            <td>随源文档生命周期</td>
+            <td>collection 级</td>
+            <td>源文档退役级联删</td>
+          </tr>
+          <tr>
+            <td>评测样本</td>
+            <td>项目期 + 90 d</td>
+            <td>隔离库</td>
+            <td>批次 purge</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># corpassist-privacy-retention.yaml
+retention:
+  chat_session_hours: 48
+  audit_log_days: 365
+  eval_sample_days: 90
+storage:
+  pii_in_vector: deny_l3   # L3 不得入 Milvus 明文
+  encryption_at_rest: required
+  user_erase:
+    cascade: [session, audit_pointer, feedback]</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>用户行使「删除权」时 LLM 侧要删什么？</summary>
+          <div class="learn-faq-body">
+            会话、可关联的 audit 指针、用户反馈/评测条目；向量 chunk 若含其 PII 须 re-ingest 或 tombstone。<strong>已进模型 provider 日志</strong>的部分需合同/DPA 约定，CorpAssist 侧仍须停止继续存储。
+          </div>
+        </details>
+        <details>
+          <summary>脱敏后数据还能不能做 RAG？</summary>
+          <div class="learn-faq-body">
+            可以，但语义可能损失（如手机号掩码后无法精确匹配）。高敏字段应通过<strong>授权工具查询</strong>而非 RAG 明文召回，与 <a href="#ch-practice-01-tool-authz">工具权限</a> 联动。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>PII</strong>：L0–L3 分级；进 LLM 前检测/掩码/拒答；双栈 NER + 正则。</li>
+        <li><strong>日志</strong>：默认 redaction；禁止生产全量明文 prompt；结构化记 flags 非原文。</li>
+        <li><strong>存储</strong>：最小保留、加密、级联删除；L3 不进向量明文。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="security-compliance-engineering_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pii-level" /> 能说明 L2/L3 PII 的处理差异</label></li>
+          <li><label><input type="checkbox" data-id="log" /> 能列举 2 类高风险 LLM 日志及 redaction 做法</label></li>
+          <li><label><input type="checkbox" data-id="storage" /> 能解释 retention 与 user erase 要点</label></li>
+          <li><label><input type="checkbox" data-id="dual" /> 能说明 Spring 与 Python 在 PII 检测上的分工</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>pii detect</td><td>进 LLM 前识别敏感字段</td></tr>
+                <tr><td>log redaction</td><td>日志不写 PII 原文</td></tr>
+                <tr><td>data masking</td><td>掩码/token 化后可用</td></tr>
+                <tr><td>retention policy</td><td>到期自动 purge</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>设计 CorpAssist HR 场景的 PII 分级表与 1 条 L3 拒答规则。</li>
+              <li>为什么 trace 里记录 prompt hash 不够，还要 redaction？</li>
+              <li>RAG 索引与对话存储的 retention 如何联动源文档退役？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：勾选过关清单、完成测验与 Demo；下一章 <a href="#ch-practice-01-tool-authz">工具调用权限</a> 讲白名单、OAuth 与沙箱。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://owasp.org/www-project-top-10-for-large-language-model-applications/" target="_blank" rel="noopener">OWASP LLM06 Sensitive Information Disclosure</a></li>
+      <li><a href="https://gdpr.eu/what-is-gdpr/" target="_blank" rel="noopener">GDPR 概述（PII 与删除权）</a></li>
+      <li><a href="https://opentelemetry.io/docs/concepts/signals/" target="_blank" rel="noopener">OpenTelemetry — 日志与 trace 信号</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">编写<strong>PII 分级表</strong>、<strong>日志 redaction 规则</strong>与<strong>retention 配置片段</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>为你所在领域补充 2 个 L3 字段，并写明「进 LLM / 仅工具 / 拒答」策略。</li>
+      <li>列出 chat trace 应记录的 5 个字段，确保不含 PII 原文（示例：trace_id, pii_flags, latency_ms…）。</li>
+      <li>阅读 <code>corpassist-privacy-retention.yaml</code>，说明 <code>pii_in_vector: deny_l3</code> 的工程含义。</li>
+      <li>（可选）打开 <code>demos/basics-04-privacy-lab/pii-checklist.md</code>，勾选 PII/日志/存储三项。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：生产日志发现完整手机号。最应优先？A) 换 embedding 模型 B) 立即启用 log redaction 并轮转密钥 C) 增大 TopK D) 关闭 RAG</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>B</strong>：先止泄露扩大（redaction + 访问审计）；已泄露数据按事件响应流程处理。A/C/D 与日志 PII 无关。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：隐私与脱敏</h4>
+      <p>目录：<code>demos/basics-04-privacy-lab/</code>。<strong>验收</strong>：<code>pii-checklist.md</code> PII/日志/存储各 2 条措施，并附 1 个 desensitize 示例。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-03-injection">注入与越狱</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-tool-authz">工具调用权限</a></li>
+      <li><a href="#ch-practice-03-audit">审计与溯源</a> — compliance log 与等保</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,374 @@
+# -*- coding: utf-8 -*-
+"""One-off generator for four full tutorial chapters. Run then delete."""
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1] / "chapters"
+
+P04 = r'''<section id="ch-practice-04-root-cause" class="chapter" data-chapter="practice-04-root-cause">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>坏例归因方法论</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-root-cause" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈评测落地</strong> · 能力：用指标三角与 trace 区分检索/生成/Prompt 失败，沉淀可回流的案例库</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>线上 <span class="term" data-term-id="thumbs-signal" tabindex="0">thumbs signal</span> 与离线红灯若只停留在「模型不行」，团队会反复调温度却修不好索引切片。CorpAssist <strong>NS1 评测飞轮</strong>要求每条坏例有 <span class="term" data-term-id="root-cause" tabindex="0">root cause</span> 标签，才能进入 <span class="term" data-term-id="fix-loop" tabindex="0">fix loop</span> 并回流 <span class="term" data-term-id="regression-set" tabindex="0">regression set</span>——本章把 <span class="term" data-term-id="error-taxonomy" tabindex="0">error taxonomy</span>、<span class="term" data-term-id="trace-analysis" tabindex="0">trace analysis</span> 与 <span class="term" data-term-id="case-library" tabindex="0">case library</span> 串成可执行方法论。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="context-recall" tabindex="0">context recall</span> / <span class="term" data-term-id="faithfulness" tabindex="0">faithfulness</span> 组合判断 <span class="term" data-term-id="retrieval-failure" tabindex="0">retrieval failure</span>、<span class="term" data-term-id="generation-failure" tabindex="0">generation failure</span> 或 <span class="term" data-term-id="prompt-regression" tabindex="0">prompt regression</span></li>
+          <li>在 LangSmith / OTel 链路上关联 request_id、检索 snapshot 与 prompt_version（双栈同 schema）</li>
+          <li>按 <code>badcase-template.md</code> 维护案例库，并写清回流 <code>hard_cases.jsonl</code> 的 <code>regression_id</code></li>
+          <li>衔接 <a href="#ch-practice-03-ab-online">线上 A/B 与灰度</a> 回滚样本与 <a href="#ch-practice-05-user-feedback">用户反馈与迭代闭环</a></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>先看指标三角</strong>：recall↓ 优先检索；faith↓ 且 recall 正常优先生成；全指标漂移查 Prompt/模型版本。</li>
+          <li><strong>trace 是证据</strong>：没有 retrieve span 与 top_chunks 快照，不要拍脑袋改 Prompt。</li>
+          <li><strong>案例库要可回流</strong>：每条 badcase 带 owner、fix 状态与 <span class="term" data-term-id="version-pin" tabindex="0">version pin</span>，禁止 Excel 散落。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>检索 vs 生成 vs Prompt</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 制度问答</span>
+        用户问「年假可否顺延至次年 Q1」。离线评测：<code>context_recall=0.42</code>、<code>faithfulness=0.91</code>——上下文未命中 HR 制度第 7 条，但模型在已有片段上回答保守，未胡编。应标 <strong>retrieval</strong>，修复 chunk 边界与 embedding，而非改 system Prompt。
+      </aside>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S5 · 营销文案</span>
+        生成活动邮件时 contexts 已含品牌禁用词表，输出仍出现竞品名。recall 正常、faithfulness 低 → <strong>generation</strong>；同时检查 S5 模板 Prompt 是否缺少「禁止提及竞品」约束。
+      </aside>
+      <p>归因不是主观标签，而是<strong>可观测信号 → 错误类型 → 修复入口</strong>。下表是 CorpAssist 默认 <span class="term" data-term-id="error-taxonomy" tabindex="0">error taxonomy</span>（与 RAGAS 指标对齐）。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>观测信号</th><th>优先归因</th><th>典型修复</th><th>勿误判为</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>context_recall</code> ↓，<code>faithfulness</code> 正常或偏高</td>
+              <td><span class="term" data-term-id="retrieval-failure" tabindex="0">retrieval failure</span></td>
+              <td>re-embed、调 topK、改 chunk、加 metadata 过滤</td>
+              <td>生成胡编（上下文根本没进来）</td>
+            </tr>
+            <tr>
+              <td>contexts 含 gold 依据，<code>faithfulness</code> ↓</td>
+              <td><span class="term" data-term-id="generation-failure" tabindex="0">generation failure</span></td>
+              <td>降温度、加强拒答、Citation 指令、工具校验</td>
+              <td>检索失败</td>
+            </tr>
+            <tr>
+              <td>多指标同向漂移，A/B 仅改 Prompt</td>
+              <td><span class="term" data-term-id="prompt-regression" tabindex="0">prompt regression</span></td>
+              <td>prompt_version diff、回滚模板、加 few-shot</td>
+              <td>单条检索坏例</td>
+            </tr>
+            <tr>
+              <td>仅 <span class="term" data-term-id="answer-relevance" tabindex="0">answer relevance</span> ↓，检索与忠实正常</td>
+              <td>指令跟随 / 格式</td>
+              <td>输出 schema、JSON mode、后处理</td>
+              <td>faithfulness 问题</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>指标三角 · Mermaid</h4>
+      <div class="mermaid-wrap">
+        <h5>坏例归因 · 指标三角决策</h5>
+        <pre class="mermaid">flowchart TD
+  START[坏例进入 triage] --> R{context_recall 低?}
+  R -->|是| RET[retrieval failure]
+  R -->|否| F{faithfulness 低?}
+  F -->|是| GEN[generation failure]
+  F -->|否| P{prompt_version 变更?}
+  P -->|是| PR[prompt regression]
+  P -->|否| OTHER[工具/Agent 等扩展类]</pre>
+        <p class="diagram-caption">先判 recall，再判 faith，最后对照发版与 prompt_version；Agent 场景叠加 <span class="term" data-term-id="agent-success" tabindex="0">agent success</span>。</p>
+      </div>
+
+      <h4>单条 badcase 记录（JSONL 字段）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "id": "s1-hr-annual-leave-017",
+  "scenario": "S1",
+  "query": "年假可否顺延至次年 Q1？",
+  "contexts": ["…HR 制度第 3 条…"],
+  "answer": "根据现有制度片段，一般不建议…",
+  "metrics": { "context_recall": 0.42, "faithfulness": 0.91 },
+  "root_cause": "retrieval",
+  "prompt_version": "v12",
+  "fix_owner": "rag-platform",
+  "regression_id": "s1-hr-annual-leave-017"
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反例：只改 Prompt</span>
+          <ul>
+            <li>recall 0.4 仍加「请严格依据上下文」</li>
+            <li>分数不变，浪费一轮发版</li>
+            <li>案例库无检索快照，无法复盘</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐：证据驱动</span>
+          <ul>
+            <li>导出 top_chunks 与 gold doc id 对比</li>
+            <li>标 retrieval + 开 KB 工单</li>
+            <li>修复后把 id 写入 gate 子集</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：faithfulness 低、context_recall 高，最不该做的第一件事是什么？</summary>
+        <p>不应先 re-embed 全库。应打开生成 span，看是否忽略 contexts、是否工具幻觉，再改 Prompt/解码参数。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>工具链</h3>
+      <p><span class="term" data-term-id="trace-analysis" tabindex="0">trace analysis</span> 把一次用户请求拆成可审计片段：检索耗时、rerank 得分、LLM token、prompt_hash。CorpAssist 要求 Python FastAPI 与 Spring BFF <strong>同一 trace_id</strong>，并写入评测 artifact，便于 <span class="term" data-term-id="cross-stack-compare" tabindex="0">cross stack compare</span>。</p>
+
+      <h4>OTel span 结构（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "trace_id": "t-7f3a",
+  "request_id": "req-20260530-8831",
+  "scenario": "S1",
+  "experiment_id": "ca-prompt-v3-202605",
+  "prompt_version": "v12",
+  "spans": [
+    { "name": "retrieve", "duration_ms": 120, "attrs": { "top_k": 8, "index": "hr-handbook-v4" } },
+    { "name": "rerank", "duration_ms": 40, "attrs": { "model": "bge-reranker" } },
+    { "name": "generate", "duration_ms": 800, "attrs": { "model": "gpt-4o-mini", "tokens_out": 312 } }
+  ],
+  "retrieval_snapshot": {
+    "chunk_ids": ["c-883", "c-102", "c-441"],
+    "scores": [0.81, 0.77, 0.71]
+  }
+}</code></pre>
+      </div>
+
+      <h4>Python 侧：把 trace 挂到评测报告</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># eval_runner/attach_trace.py — 失败 case 必带 trace_id
+def enrich_failure(case_id: str, trace_id: str, report: dict) -&gt; None:
+    report.setdefault("failures_detail", []).append({
+        "case_id": case_id,
+        "trace_id": trace_id,
+        "langsmith_url": f"https://smith.langchain.com/o/corp/public/{trace_id}",
+        "prompt_version": otel_get_attr(trace_id, "prompt_version"),
+    })</code></pre>
+      </div>
+
+      <h4>Spring 侧：Advisor 链与检索断言</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 集成测试失败时打印 trace_id，便于与 Python 轨对照
+assertThat(ctx.getRetrievedIds()).contains("c-883");
+// 若断言失败，JUnit 附加：
+// trace_id=t-7f3a prompt_version=v12 scenario=S1</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="工具选型">
+        <input type="radio" name="p04-tool-tab" id="p04-tool-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="p04-tool-tab" id="p04-tool-tab-b" class="learn-tab-input" />
+        <label for="p04-tool-tab-a">LangSmith</label>
+        <label for="p04-tool-tab-b">OTel + 自建</label>
+        <div class="learn-tab-panel" id="p04-tool-panel-a" role="tabpanel">
+          <p>适合 Prompt 迭代与人工标注：按 dataset 回放，对比两次 run 的 retrieval_snapshot。CorpAssist MR 评论机器人可贴 LangSmith 链接。</p>
+        </div>
+        <div class="learn-tab-panel" id="p04-tool-panel-b" role="tabpanel">
+          <p>适合 ToB 私有化：span 写入 ClickHouse，看板按 scenario（S1/S5）聚合 p95 与失败率。需自建「坏例详情页」关联 request_id。</p>
+        </div>
+      </div>
+
+      <table class="outline-table">
+        <thead><tr><th>排查步骤</th><th>看什么</th><th>结论动作</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>retrieve span 是否为空或 lat 异常</td><td>索引/路由问题</td></tr>
+          <tr><td>2</td><td>top_chunks 是否含 gold doc</td><td>检索 vs 切片</td></tr>
+          <tr><td>3</td><td>generate 输入 token 是否截断 contexts</td><td>生成长度/模板</td></tr>
+          <tr><td>4</td><td>prompt_version 是否与 baseline 一致</td><td>Prompt 回归</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：Python trace 正常、Spring 同 query 失败，先查什么？</summary>
+        <p>查双栈 <code>index_version</code>、<code>top_k</code>、rerank 是否启用，以及 BFF 是否走了缓存旧 contexts。用同一 <code>request_id</code> 在两边导出 retrieval_snapshot 做 diff，而不是先改模型。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>案例库</h3>
+      <p><span class="term" data-term-id="case-library" tabindex="0">case library</span> 是 NS1 飞轮的「记忆体」：把 <span class="term" data-term-id="hard-case" tabindex="0">hard case</span>、线上 thumbs、A/B 回滚样本统一入库，带 <span class="term" data-term-id="error-taxonomy" tabindex="0">error taxonomy</span> 与修复状态，最终回流评测集。</p>
+
+      <h4>badcase-template.md（Demo 对齐）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown">## 坏例 ID: s5-campaign-042
+- scenario: S5
+- query: 为 618 大促写短信，强调限时折扣
+- contexts: [品牌调性 v3, 禁用词表]
+- answer: …（含竞品名 X）
+- metrics: { "context_recall": 0.88, "faithfulness": 0.52 }
+- 归因: generation
+- trace_id: t-9c21
+- prompt_version: v7
+- fix_owner: content-platform
+- fix_status: in_progress
+- regression_id: s5-campaign-042
+- 下一步: 增加「禁止竞品」约束 + 加入 gate 子集</code></pre>
+      </div>
+
+      <h4>Git 目录约定</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash">eval/
+  datasets/corpassist-regression-v3.jsonl   # 已回流
+  badcases/inbox/                           # T+1 triage
+  badcases/resolved/                        # 已修复待验证
+  taxonomy/error-taxonomy.yaml              # 标签枚举</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>案例库 · fix loop 与回流</h5>
+        <pre class="mermaid">flowchart LR
+  IN[thumbs / 离线失败] --> TRI[triage 打标]
+  TRI --> LIB[case library Git]
+  LIB --> FIX[fix + MR]
+  FIX --> REG[hard_cases.jsonl]
+  REG --> GATE[CI regression gate]</pre>
+        <p class="diagram-caption">每条入库必须带 regression_id，合并评测集时 bump dataset_version。</p>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>归因速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>症状</th><th>标签</th><th>Owner 典型</th></tr></thead>
+              <tbody>
+                <tr><td>recall↓</td><td>retrieval</td><td>rag-platform</td></tr>
+                <tr><td>faith↓ recall OK</td><td>generation</td><td>prompt-eng</td></tr>
+                <tr><td>发版后全量跌</td><td>prompt_regression</td><td>prompt-eng + QA</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>检索 vs 生成 vs Prompt</strong>：用 recall / faithfulness 与 prompt_version 决策，S1 偏检索、S5 偏生成与模板约束。</li>
+        <li><strong>工具链</strong>：trace 关联 request_id、retrieval_snapshot、prompt_version；双栈 artifact 可 diff。</li>
+        <li><strong>案例库</strong>：Git 管理 badcase + regression_id，修复后回流 jsonl 并过 CI gate。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-evaluation-quality_practice04_root_cause">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="triangle" /> 能根据 recall/faith 说出检索 vs 生成优先级</label></li>
+          <li><label><input type="checkbox" data-id="trace" /> 能列举 trace 中必须关联的 3 类字段</label></li>
+          <li><label><input type="checkbox" data-id="template" /> 能说明 regression_id 在案例库中的作用</label></li>
+          <li><label><input type="checkbox" data-id="s1s5" /> 能各举 S1/S5 一条归因例子</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>离线 faithfulness 0.9 但用户 thumbs_down，你会如何打开 trace 重新归因？</li>
+              <li>案例库与评测集 version pin 如何配合，避免偷换集掩盖修复效果？</li>
+              <li>Python 与 Spring 各报一条 retrieval 失败，如何判定是索引问题还是 BFF 配置？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与章节测验；继续 <a href="#ch-practice-05-user-feedback">用户反馈与迭代闭环</a>，把案例库接入 <span class="term" data-term-id="ns1-flywheel" tabindex="0">ns1 flywheel</span> 与 <span class="term" data-term-id="badcase-reflow" tabindex="0">badcase reflow</span>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.smith.langchain.com/evaluation" target="_blank" rel="noopener">LangSmith — Evaluations &amp; tracing</a></li>
+      <li><a href="https://opentelemetry.io/docs/concepts/signals/traces/" target="_blank" rel="noopener">OpenTelemetry — Traces</a></li>
+      <li><a href="https://docs.ragas.io/en/stable/concepts/metrics/" target="_blank" rel="noopener">RAGAS — Metrics</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-04-root-cause-lab/</code> 用 <code>badcase-template.md</code> 完成 1 条 S1 与 1 条 S5 虚构坏例，并写明回流步骤。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「检索 vs 生成 vs Prompt」<strong>决策表</strong>：为 S1 年假问题填「观测信号 → 归因 → 修复」三列。</li>
+      <li>对照「工具链」OTel JSON：写出 <code>retrieval_snapshot.chunk_ids</code> 与 gold doc 不一致时的排查顺序（4 步表）。</li>
+      <li>复制 <code>badcase-template.md</code> 为 <code>badcase-s1.md</code>，补全 <code>regression_id</code>、<code>fix_owner</code>、<code>fix_status</code>。</li>
+      <li>在草稿中写：该 id 如何进入 <code>corpassist-regression-v3.jsonl</code>（需 bump 哪个 version 字段）。</li>
+      <li>可选：打开 LangSmith 文档，列出 2 个你会在 MR 评论里贴的 trace 字段。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）contexts 已含正确制度条款，答案仍编造不存在的「第 99 条罚款」。context_recall=0.9，faithfulness=0.4。应标哪类 root cause？首要修复方向？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>标 <strong>generation failure</strong>。优先检查生成 Prompt、温度与 citation 约束，而非 re-embed。若 prompt_version 刚变更，同时查 prompt regression diff。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（找错）团队把坏例存在个人 Excel，MR 未更新 jsonl，faithfulness 周报却显示「已修复」。这违反本章哪条约定？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反案例库 Git 化与 <code>regression_id</code> 回流。修复未进入 regression set，CI gate 无法防止回归；NS1 飞轮在「案例库→评测集」环节断裂。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：坏例归因方法论</h4>
+      <p>目录：<code>demos/practice-04-root-cause-lab/</code>。<strong>验收</strong>：<code>badcase-s1.md</code> 含 query/contexts/answer/归因/fix_owner/regression_id；口头说明该条进入 CI 的最短路径（jsonl → pytest → gate）。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-03-ab-online">线上 A/B 与灰度</a> · 回滚样本如何进 triage</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-user-feedback">用户反馈与迭代闭环</a> · 埋点与 NS1 飞轮</li>
+      <li><a href="#ch-advanced-01-regression">回归门禁与发布</a> · 回流后 CI 阻塞策略</li>
+    </ul>
+  </div>
+</section>
+'''
+
+# Additional chapters written in separate write calls due to size — script writes P04 only first
+if __name__ == "__main__":
+    (ROOT / "practice-04-root-cause.html").write_text(P04.strip() + "\n", encoding="utf-8")
+    print("wrote practice-04-root-cause.html", len(P04.splitlines()), "lines")

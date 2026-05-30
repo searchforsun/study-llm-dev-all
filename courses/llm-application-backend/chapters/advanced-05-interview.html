@@ -1,0 +1,411 @@
+<section id="ch-advanced-05-interview" class="chapter" data-chapter="advanced-05-interview">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：高并发 LLM 网关</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-05-interview" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>企业集成</strong> · 能力：<span class="term" data-term-id="s2-system-design" tabindex="0">s2 system design</span> 口述与 <span class="term" data-term-id="architecture-qa" tabindex="0">architecture qa</span> 量化答题</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S2 智能客服面试常问：「日活 50 万、峰值 QPS 2000，如何设计 LLM 网关？」若只会背 Spring Cloud Gateway 配置而说不出 <span class="term" data-term-id="qps-estimate" tabindex="0">qps estimate</span>、SSE 并发连接与 <span class="term" data-term-id="cache-layer" tabindex="0">cache layer</span> 分层，很难通过系统设计轮。本章把 <a href="#ch-basics-01-gateway">Gateway 路由鉴权限流</a>、<a href="#ch-practice-06-corpassist-gw">压测基线</a> 等已学内容压缩成 30 秒～3 分钟口述框架。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用四层结构（入口→编排→能力→观测）回答 <span class="term" data-term-id="interview-gw" tabindex="0">interview gw</span> 类架构题</li>
+          <li>现场估算 Gateway 实例数、SSE 连接上限与 Redis 限流 key 规模（<span class="term" data-term-id="scale-number" tabindex="0">scale number</span>）</li>
+          <li>说明 <span class="term" data-term-id="high-concurrency" tabindex="0">high concurrency</span> 下缓存、异步、降级如何配合，并引用本课程各章实践</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>先画边界再谈技术</strong>：公网只进 Gateway；BFF 编排；Python 能力面；存量 ERP 经 Feign（见 <a href="#ch-advanced-01-legacy">存量集成</a>）。</li>
+          <li><strong>LLM 网关 ≠ 普通 API 网关</strong>：长连接 SSE、Token 计费、模型 RPM 三重约束（<a href="#ch-basics-02-sse">SSE</a>、<a href="#ch-practice-02-rate-limit">配额</a>）。</li>
+          <li><strong>数字要可推导</strong>：峰值 QPS、平均响应时间、连接占用时长 → 实例与连接池（<span class="term" data-term-id="llm-gateway-design" tabindex="0">llm gateway design</span> 量化部分）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>架构</h3>
+      <aside class="learn-scenario" aria-label="面试情境">
+        <span class="learn-scenario-title">S2 系统设计 · 30 秒开场（CorpAssist）</span>
+        「我们做的是 ToC 智能客服：用户经 App 访问 Spring Cloud Gateway，JWT 鉴权 + 租户限流后进入 BFF 做多轮对话与查订单工具；流式回复走 SSE 透传到 Python 生成器；RAG 走独立路由。Gateway 挡入口洪水，BFF 管 Token 预算与熔断，Python 专注推理。」
+      </aside>
+
+      <p>S2 架构题考察的是<strong>分层职责</strong>与<strong>失败模式</strong>，不是背诵某个 Filter 类名。推荐用「入口治理 → 编排确定性 → AI 能力 → 横切观测」四段式展开 <span class="term" data-term-id="architecture-qa" tabindex="0">architecture qa</span>。</p>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">L1 · 入口</span>
+          <p class="role-card-desc">Gateway：路由、JWT、QPS/连接限流、Trace 注入、SSE 超时 0（<a href="#ch-basics-01-gateway">basics-01</a>）。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">L2 · 编排</span>
+          <p class="role-card-desc">BFF：会话 Redis、工具 Feign、Resilience4j 熔断降级（<a href="#ch-practice-01-circuit">practice-01</a>、<a href="#ch-basics-03-session">basics-03</a>）。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">L3 · 能力</span>
+          <p class="role-card-desc">FastAPI：RAG、流式生成；MQ 异步索引（<a href="#ch-practice-04-mq">practice-04</a>）；多租户索引前缀（<a href="#ch-practice-03-multi-tenant">practice-03</a>）。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">L4 · 横切</span>
+          <p class="role-card-desc">缓存、配置 Vault、K8s HPA、CI 门禁（<a href="#ch-advanced-02-config">advanced-02</a>、<a href="#ch-advanced-03-k8s">advanced-03</a>、<a href="#ch-advanced-04-ci">advanced-04</a>）。</p>
+        </article>
+      </div>
+
+      <h4>高并发 LLM 网关分层表</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>层次</th><th>组件</th><th>高并发手段</th><th>本课程章节</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>CDN / WAF</td><td>静态资源、DDoS 初筛</td><td>边缘缓存 FAQ 文案</td><td>—</td></tr>
+          <tr><td>Gateway</td><td>Spring Cloud Gateway</td><td>租户 QPS、SSE 连接上限、429</td><td><a href="#ch-basics-01-gateway">basics-01</a></td></tr>
+          <tr><td>BFF</td><td>Spring Boot + Spring AI</td><td>舱壁、熔断、幂等键</td><td><a href="#ch-basics-04-idempotency">basics-04</a>、<a href="#ch-practice-01-circuit">practice-01</a></td></tr>
+          <tr><td>缓存</td><td>Redis / 本地 Caffeine</td><td>会话、限流计数、热点问答</td><td><a href="#ch-basics-03-session">basics-03</a></td></tr>
+          <tr><td>异步</td><td>RabbitMQ</td><td>索引、通知、削峰</td><td><a href="#ch-practice-04-mq">practice-04</a></td></tr>
+          <tr><td>AI</td><td>FastAPI + 模型 API</td><td>流式、小模型路由、fallback</td><td><a href="#ch-basics-02-sse">basics-02</a></td></tr>
+        </tbody>
+      </table>
+
+      <h4><span class="term" data-term-id="cache-layer" tabindex="0">cache layer</span> 设计要点</h4>
+      <p>面试常追问「缓存放哪一层」。CorpAssist 典型分工：</p>
+      <ul>
+        <li><strong>Gateway 前（CDN）</strong>：静态 FAQ、营销页；不缓存个性化对话。</li>
+        <li><strong>Redis（BFF）</strong>：多轮会话、租户配额计数、限流令牌桶（与 Gateway 共享或分层 key）。</li>
+        <li><strong>语义缓存（Python，可选）</strong>：相同问题 embedding 相似度 &gt; 阈值则直接返回；须带租户隔离与 TTL，避免跨租户泄漏。</li>
+        <li><strong>不缓存</strong>：写操作工具链、含 PII 的订单详情、实时物流状态。</li>
+      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>S2 高并发 LLM 网关 — 面试白板图</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph edge [入口层]
+    CDN[CDN / WAF]
+    GW[Spring Cloud Gateway]
+  end
+  subgraph orch [编排层]
+    BFF[corpassist-bff]
+    Redis[(Redis 会话/限流)]
+  end
+  subgraph ai [能力层]
+    Py[FastAPI 流式/RAG]
+    MQ[RabbitMQ 异步]
+  end
+  subgraph legacy [存量]
+    ERP[订单服务 Feign]
+  end
+  Client --> CDN --> GW
+  GW -->|JWT 限流 SSE| BFF
+  BFF --> Redis
+  BFF -->|工具 NS2| ERP
+  BFF -->|OpenAPI 流式| Py
+  BFF --> MQ
+  Py --> MQ</pre>
+        <p class="diagram-caption">口述时先画 Client→Gateway→BFF→Python 主路径，再补 Redis/MQ/ERP 三条边。强调 Gateway 与 BFF 限流职责不同。</p>
+      </div>
+
+      <h4>架构反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">面试扣分点</span>
+          <ul>
+            <li>「所有流量直连 Python，Gateway 只是 nginx 反代」</li>
+            <li>「高并发 = 无限扩容模型副本」忽略入口限流与 Token 成本</li>
+            <li>「SSE 和普通 REST 同一超时、同一限流 key」</li>
+            <li>「缓存所有 LLM 输出」导致个性化与合规问题</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">加分表述</span>
+          <ul>
+            <li>分层限流：Gateway QPS + BFF Token 预算 + 模型 RPM</li>
+            <li>SSE <code>response-timeout: 0</code> + 建立连接前限流</li>
+            <li>确定性工具走 BFF→Feign，生成走 BFF→Python 流式</li>
+            <li>熔断 fallback 默认回复，保护 ERP 与模型（<a href="#ch-practice-01-circuit">practice-01</a>）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>30 秒 / 3 分钟答题框架（Markdown）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## S2 高并发 LLM 网关 — 口述框架
+
+### 30 秒版
+1. 入口：Gateway 鉴权 + 租户 QPS + SSE 长连接治理
+2. 编排：BFF 会话/工具/熔断；Redis 会话与配额
+3. 能力：Python 流式 + RAG；MQ 削峰索引
+4. 弹性：HPA + 降级文案 + 小模型路由降本
+
+### 3 分钟版（每点 40s）
+- 需求澄清：DAU、峰值 QPS、SSE 占比、SLA
+- 数据流：查订单 vs 纯聊天 vs RAG 三条路径
+- 瓶颈：连接数 &gt; QPS；模型 TPM；ERP 工具 QPS
+- 扩展：Gateway 水平扩展无状态；Redis Cluster；BFF 舱壁
+- 观测：Trace 分段延迟；429/503 告警；压测 baseline（practice-06）</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：面试官问「为什么不用单一 Python 网关？」你怎么答？</summary>
+        <p>治理面（鉴权、限流、审计、与存量 Java Feign 集成）在 Spring 生态更成熟；Python 专注 AI 能力面。双栈分工见 <a href="#ch-basics-01-gateway">basics-01</a> 与 <a href="#ch-practice-06-corpassist-gw">practice-06</a> 全链路压测结论——必须对外入口压测，不能直打 Python。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>数</h3>
+      <p><span class="term" data-term-id="qps-estimate" tabindex="0">qps estimate</span> 与 <span class="term" data-term-id="scale-number" tabindex="0">scale number</span> 是 S2 系统设计第二轮常考点。目标不是精确到个位数，而是<strong>数量级正确、假设可解释、与架构决策一致</strong>。</p>
+
+      <h4>CorpAssist 估算假设（教学基准）</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>指标</th><th>假设值</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>日活 DAU</td><td>50 万</td><td>容量规划起点</td></tr>
+          <tr><td>峰值系数</td><td>×5（晚 8–10 点）</td><td>平均 QPS → 峰值 QPS</td></tr>
+          <tr><td>人均会话请求</td><td>8 次/天（含 SSE 流）</td><td>总请求量</td></tr>
+          <tr><td>SSE 平均时长</td><td>45 s</td><td>并发连接估算</td></tr>
+          <tr><td>Gateway 单实例</td><td>~800 同步 QPS 或 ~2k SSE 连接</td><td>水平扩展除数</td></tr>
+        </tbody>
+      </table>
+
+      <h4>推导示例（可在白板上写）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-text">日均请求 ≈ 50万 × 8 = 400万/天
+平均 QPS ≈ 400万 / 86400 ≈ 46
+峰值 QPS ≈ 46 × 5 ≈ 230（同步 chat 类）
+
+若 40% 为 SSE 流式：
+  峰值 SSE 新建连接/秒 ≈ 230 × 0.4 ≈ 92/s
+  稳态并发连接 ≈ 92 × 45s ≈ 4140 连接
+
+Gateway 实例（按 SSE 连接上限 2000/实例）：
+  ceil(4140 / 2000) ≈ 3 实例 + 1 冗余 = 4
+
+Redis 限流 key（按租户）：
+  活跃租户 200 × 2 key（chat + stream）≈ 400 key — 可单机 Redis</code></pre>
+      </div>
+
+      <h4>量化决策表</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>资源</th><th>估算输入</th><th>公式/经验</th><th>面试一句话</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Gateway Pod</td><td>峰值 SSE 并发</td><td>连接数 / 单 Pod 上限 + 冗余</td><td>「先算长连接，再算 QPS」</td></tr>
+          <tr><td>BFF Pod</td><td>CPU + 工具调用延迟</td><td>压测 P95 × 目标 QPS</td><td>引用 <a href="#ch-practice-06-corpassist-gw">practice-06</a> k6 基线</td></tr>
+          <tr><td>Redis</td><td>会话 + 限流 key</td><td>租户数 × key 类型</td><td>与 <a href="#ch-practice-02-rate-limit">practice-02</a> 配额一致</td></tr>
+          <tr><td>模型 TPM</td><td>峰值 token/s</td><td>QPS × 平均 output token</td><td>「扩容模型前先限流入口」</td></tr>
+          <tr><td>ERP 工具</td><td>lookup_order QPS</td><td>聊天 QPS × 工具触发率</td><td>BFF 舱壁保护存量（<a href="#ch-practice-01-circuit">practice-01</a>）</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-tabs" role="tablist" aria-label="量化场景">
+        <input type="radio" name="interview-num-tab" id="interview-num-qps" class="learn-tab-input" checked />
+        <input type="radio" name="interview-num-tab" id="interview-num-sse" class="learn-tab-input" />
+        <label for="interview-num-qps">同步 QPS</label>
+        <label for="interview-num-sse">SSE 并发</label>
+        <div class="learn-tab-panel" id="interview-num-panel-qps" role="tabpanel">
+          <p>同步 JSON 受 Gateway 线程与下游 BFF 处理时间约束。Little 定律：并发 ≈ QPS × 延迟。P95 800ms、目标 500 QPS → 并发约 400，需结合压测验证而非纯心算。</p>
+        </div>
+        <div class="learn-tab-panel" id="interview-num-panel-sse" role="tabpanel">
+          <p>SSE 占用的是<strong>连接槽位</strong>而非短请求线程。面试应强调：stream 路由单独限流、<code>response-timeout: 0</code>、Gateway HttpClient 连接池 max 与 BFF 对齐（<a href="#ch-basics-02-sse">basics-02</a>）。</p>
+        </div>
+      </div>
+
+      <div class="learn-param-slider" data-storage-key="llm-application-backend_adv05_qps">
+        <label for="adv05-qps-range">峰值 QPS 估算（教学滑块）</label>
+        <input type="range" id="adv05-qps-range" min="50" max="3000" step="50" value="230" />
+        <output for="adv05-qps-range">230 QPS</output>
+        <p class="learn-param-hint">拖动观察：QPS 翻倍时，优先检查限流与模型 TPM，而非只加 Gateway 副本。</p>
+      </div>
+
+      <h4>关键术语速览</h4>
+      <p>
+        <span class="term" data-term-id="interview-gw" tabindex="0">interview gw</span> ·
+        <span class="term" data-term-id="high-concurrency" tabindex="0">high concurrency</span> ·
+        <span class="term" data-term-id="llm-gateway-design" tabindex="0">llm gateway design</span> ·
+        <span class="term" data-term-id="qps-estimate" tabindex="0">qps estimate</span> ·
+        <span class="term" data-term-id="architecture-qa" tabindex="0">architecture qa</span> ·
+        <span class="term" data-term-id="cache-layer" tabindex="0">cache layer</span> ·
+        <span class="term" data-term-id="scale-number" tabindex="0">scale number</span> ·
+        <span class="term" data-term-id="s2-system-design" tabindex="0">s2 system design</span>
+      </p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>估算错了会被挂吗？</summary>
+          <div class="learn-faq-body">
+            <p>通常不会。面试官看你是否<strong>先澄清假设</strong>、能否把数字与 Gateway/BFF/Redis/模型分层对应。数量级差 2× 可接受，但「只扩模型不限流」会扣分。</p>
+          </div>
+        </details>
+        <details>
+          <summary>如何把 practice-06 压测写进答案？</summary>
+          <div class="learn-faq-body">
+            <p>「我们在预发用 k6 从 Gateway 入口压测，30 VU 下 P95 1.2s、failed &lt;1%，以此反推单实例容量并留 30% 冗余。」这比纯理论更有说服力。</p>
+          </div>
+        </details>
+        <details>
+          <summary>429 大量出现说明什么？</summary>
+          <div class="learn-faq-body">
+            <p>入口限流生效或 replenishRate 过低。应先查 Gateway 租户配额（<a href="#ch-practice-02-rate-limit">practice-02</a>），而非盲目升模型规格。</p>
+          </div>
+        </details>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只背组件清单</strong> — 缺少数据流与失败降级路径。</li>
+          <li><strong>忽略 SSE</strong> — 按 REST QPS 扩容会在长连接场景击穿 Gateway。</li>
+          <li><strong>不算 Token 成本</strong> — NS3 成本与 <span class="term" data-term-id="high-concurrency" tabindex="0">high concurrency</span> 强相关，需提 BFF 预算层。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">面试答题 = 本课程知识压缩。每条对应一个小节。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>架构</strong>：四段式（入口 Gateway → BFF 编排 → Python/MQ → 横切）；<span class="term" data-term-id="cache-layer" tabindex="0">cache layer</span> 分层；SSE 与 REST 分治。</li>
+        <li><strong>数</strong>：<span class="term" data-term-id="qps-estimate" tabindex="0">qps estimate</span> 从 DAU 推导；SSE 并发 = 新建率 × 平均时长；<span class="term" data-term-id="scale-number" tabindex="0">scale number</span> 需冗余与压测校验。</li>
+        <li><strong>串联课程</strong>：basics 01–04 打底，practice 01–06 弹性与压测，advanced 01–04 企业集成；下一章 <a href="#ch-advanced-06-capstone">生产清单</a> 补 SLA 与 runbook。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-application-backend_adv05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="framework" /> 能在 30 秒内说出 Gateway→BFF→Python 四层职责</label></li>
+          <li><label><input type="checkbox" data-id="sse-num" /> 能写出 SSE 并发连接估算公式并解释为何单独限流</label></li>
+          <li><label><input type="checkbox" data-id="cache" /> 能说明 cache layer 三层分工及不缓存场景</label></li>
+          <li><label><input type="checkbox" data-id="cross" /> 能引用至少 3 章 basics/practice 支撑架构答案</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>术语</th><th>面试一句</th></tr></thead>
+              <tbody>
+                <tr><td>interview gw</td><td>入口治理 + 流式分路由 + 分层限流</td></tr>
+                <tr><td>qps estimate</td><td>DAU×频次/86400×峰值系数</td></tr>
+                <tr><td>scale number</td><td>SSE 连接优先；实例数 + 冗余</td></tr>
+                <tr><td>s2 system design</td><td>澄清假设→画路径→算数→降级观测</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details open>
+          <summary>S2 系统设计面试 · 口述题</summary>
+          <div class="learn-interview-body">
+            <p><strong>架构类</strong></p>
+            <ol>
+              <li>设计 CorpAssist S2 智能客服 LLM 网关：从 App 到模型 API 经过哪些层？每层的限流与鉴权如何做？（引用 <a href="#ch-basics-01-gateway">Gateway</a>、<a href="#ch-practice-02-rate-limit">配额</a>）</li>
+              <li>用户查订单同时流式生成解释，数据流经过哪些服务？为何 ERP 不直连 Gateway？（<a href="#ch-advanced-01-legacy">Feign</a>、<a href="#ch-basics-02-sse">SSE</a>）</li>
+              <li>Python 推理服务变慢时，你会在 Gateway、BFF、模型侧分别做什么？（<a href="#ch-practice-01-circuit">熔断降级</a>）</li>
+              <li>多租户 SaaS 下，缓存与向量索引如何隔离？（<a href="#ch-practice-03-multi-tenant">practice-03</a>）</li>
+            </ol>
+            <p><strong>量化类</strong></p>
+            <ol start="5">
+              <li>DAU 50 万、人均 8 次/天、峰值系数 5，估算峰值 QPS。若 40% 为 45s 的 SSE，稳态并发连接多少？需几个 Gateway 实例（假设 2000 连接/实例）？</li>
+              <li>Redis 限流 key 数量级如何估算？与租户数、路由类型的关系？</li>
+              <li>模型 TPM 成为瓶颈时，除扩容外还有哪些降本手段？（缓存、小模型路由、入口限流）</li>
+            </ol>
+            <p><strong>深挖类</strong></p>
+            <ol start="8">
+              <li>对比「直压 Python」与「经 Gateway 全链路压测」结论差异，上线前应信哪个？（<a href="#ch-practice-06-corpassist-gw">practice-06</a>）</li>
+              <li>429 与 503 在网关层分别说明什么？oncall 第一步查什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、用 Demo 写 30 秒口述稿并完成测验；下一章 <a href="#ch-advanced-06-capstone">CorpAssist 生产清单</a> 定义 SLA 与 runbook。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank" rel="noopener">Spring Cloud Gateway Reference</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-server-webflux/http-client.html" target="_blank" rel="noopener">Gateway HttpClient — 连接池与超时</a></li>
+      <li><a href="https://resilience4j.readme.io/docs" target="_blank" rel="noopener">Resilience4j — 熔断与限流</a></li>
+      <li><a href="https://grafana.com/docs/k6/latest/" target="_blank" rel="noopener">Grafana k6 — 压测与 threshold</a></li>
+      <li><a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener">Google SRE — SLO 概念（与 advanced-06 衔接）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/advanced-05-interview-lab/</code> 完成 30 秒与 3 分钟两版口述稿，并做一轮量化练习（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 lab 模板，填写 CorpAssist 四段式架构 bullet（入口/编排/能力/横切）。</li>
+      <li>用正文公式计算：峰值 QPS、SSE 并发、Gateway 实例数；写清假设。</li>
+      <li>从 <a href="#ch-basics-01-gateway">basics-01</a>、<a href="#ch-practice-06-corpassist-gw">practice-06</a> 各摘一条事实写入「证据句」。</li>
+      <li>对照 learn-interview 口述题，任选 3 题录音 90 秒 self-review。</li>
+      <li>完成右侧章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">面试答案：「高并发只需 HPA 自动扩 Gateway 到 50 副本，不限流。」请指出<strong>两处</strong>问题。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>① 无限扩容不控模型 TPM/成本，NS3 账单失控；② 不限流时 ERP 工具与下游会被打穿，且 SSE 连接数可能先于 CPU 成为瓶颈。应先入口限流 + 分层配额 + 压测定容量。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">估算：峰值 2000 QPS 全为 60s SSE，单 Gateway 3000 连接上限，最少几实例？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>稳态并发 ≈ 2000 × 60 = 120,000 连接；120000/3000 = 40 实例；加冗余约 41–44。若只按 QPS 算会严重低估。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：面试：高并发 LLM 网关</h4>
+      <p>目录：<code>demos/advanced-05-interview-lab/</code>。<strong>验收</strong>：提交 30s + 3min 口述稿；含 QPS/SSE 估算假设表；能白板画出 Mermaid 等价图并答 learn-interview 任 3 题。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-06-capstone">CorpAssist 生产清单</a> — SLA、runbook 与 go-live</li>
+      <li><strong>Basics</strong>：<a href="#ch-basics-01-gateway">Gateway</a> · <a href="#ch-basics-02-sse">SSE</a> · <a href="#ch-basics-03-session">会话</a> · <a href="#ch-basics-04-idempotency">幂等</a></li>
+      <li><strong>Practice</strong>：<a href="#ch-practice-01-circuit">熔断</a> · <a href="#ch-practice-02-rate-limit">限流配额</a> · <a href="#ch-practice-06-corpassist-gw">网关 capstone 压测</a></li>
+      <li><a href="../llm-composite-integration-workshop/index.html">双栈集成实战</a>：治理面与能力面对照</li>
+    </ul>
+  </div>
+</section>

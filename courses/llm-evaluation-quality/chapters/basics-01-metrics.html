@@ -1,0 +1,344 @@
+<section id="ch-basics-01-metrics" class="chapter" data-chapter="basics-01-metrics">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>指标：准确、召回、忠实、延迟</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01-metrics" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>评测体系设计</strong> · 能力：定义 RAG/Agent 核心指标并与 SLA 对齐</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist <strong>S1 企业知识库 RAG</strong> 上线前，业务会问「比人工客服准多少、够快吗」——若只有「感觉不错」，无法发版、无法 A/B、无法在面试中答辩。本章建立<strong>双栈共用指标口径</strong>，是 <span class="term" data-term-id="ns1-flywheel" tabindex="0">NS1 评测飞轮</span> 的计量基础。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 S1 制度问答列出 faithfulness、context recall、answer relevance 的可接受阈值</li>
+          <li>区分「检索失败」与「生成胡编」在指标上的不同表现</li>
+          <li>设计 Python 与 Spring 侧共用的 JSON 指标 schema，避免各报各的分</li>
+          <li>将 P95 延迟与可用性 SLA 纳入发版门禁，而不只看离线准确率</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>离线 vs 在线</strong>：RAGAS 等指标用于离线回归；线上还要看 thumbs、转人工率、P95。</li>
+          <li><strong>忠实 ≠ 相关</strong>：<span class="term" data-term-id="faithfulness" tabindex="0">faithfulness</span> 看是否胡编；<span class="term" data-term-id="answer-relevance" tabindex="0">answer relevance</span> 看是否答非所问。</li>
+          <li><strong>拒答可评测</strong>：「无法从制度找到依据」是合法输出，应计入 <span class="term" data-term-id="hit-rate" tabindex="0">hit rate</span> 与拒答率。</li>
+          <li><strong>双栈同 schema</strong>：<span class="term" data-term-id="dual-stack-metrics" tabindex="0">dual stack metrics</span> 用同一 JSON 字段名，便于 CI 对比 Python 索引链与 Spring 查询链。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>RAG 指标定义</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S1 制度问答评审</span>
+        法务上传《远程办公管理办法》后，产品问：「模型说审批 3 天，制度里写的是 5 个工作日——这算检索错还是生成错？」本章指标帮你<strong>定位链路环节</strong>，而不是笼统说「模型不行」。
+      </aside>
+      <p>RAG 评测通常从「检索是否找对」「生成是否忠实」「答案是否切题」三个维度展开。CorpAssist 采用 <strong>RAGAS 兼容命名</strong>，便于与后续 <a href="#ch-basics-03-ragas">RAGAS 与自动评测</a> 流水线对接。</p>
+
+      <h4>核心 RAG 指标对照</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>指标</th><th>衡量什么</th><th>低分常见原因</th><th>CorpAssist 阈值示意</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="term" data-term-id="context-recall" tabindex="0">context recall</span></td>
+              <td>检索片段是否覆盖 gold 所需信息</td>
+              <td>分块切坏、Embedding 模型不匹配、TopK 过小</td>
+              <td>≥ 0.85（回归集）</td>
+            </tr>
+            <tr>
+              <td><span class="term" data-term-id="faithfulness" tabindex="0">faithfulness</span></td>
+              <td>回答是否仅依据检索上下文、无胡编</td>
+              <td>Prompt 未约束「仅依据上下文」、模型过度发挥</td>
+              <td>≥ 0.90</td>
+            </tr>
+            <tr>
+              <td><span class="term" data-term-id="answer-relevance" tabindex="0">answer relevance</span></td>
+              <td>回答是否解决用户问题</td>
+              <td>检索偏题、生成跑题、多轮上下文干扰</td>
+              <td>≥ 0.88</td>
+            </tr>
+            <tr>
+              <td>引用覆盖率</td>
+              <td>制度问答是否带 chunk 引用</td>
+              <td>未强制 citation 格式、检索为空仍生成</td>
+              <td>S1 必达 100% 有引用或明确拒答</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>反例 vs 推荐：指标选型</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只报 BLEU/ROUGE 与 gold 文本字面重合</li>
+            <li>用「用户满意度」替代可回归指标</li>
+            <li>检索与生成混在一个「准确率」里</li>
+            <li>拒答样本从评测集删除</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>RAGAS 三维 + 引用率 + 拒答正确率</li>
+            <li>难例库单独统计，不与简单题混平均</li>
+            <li>检索失败与生成失败分开归因（见 <a href="#ch-practice-04-root-cause">坏例归因方法论</a>）</li>
+            <li>拒答作为一等公民写入 gold 标签</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>代码：CorpAssist 指标 schema（双栈共用）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "run_id": "eval-20260530-s1-baseline",
+  "stack": "python-rag-api",
+  "dataset_version": "corpassist-s1-v3",
+  "aggregate": {
+    "faithfulness": 0.92,
+    "answer_relevance": 0.88,
+    "context_recall": 0.85,
+    "citation_rate": 0.97,
+    "refusal_correct_rate": 0.91
+  },
+  "latency": {
+    "p50_ms": 1200,
+    "p95_ms": 2100,
+    "p99_ms": 3800
+  },
+  "sample_count": 120
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>指标：准确、召回、忠实、延迟 · RAG 评测流</h5>
+        <pre class="mermaid">flowchart LR
+  DS[评测集 JSONL] --> RUN[双栈执行 RAG]
+  RUN --> RET[检索 trace]
+  RUN --> GEN[生成 answer]
+  RET --> MET[RAGAS / 自定义 metric]
+  GEN --> MET
+  MET --> GATE[阈值门禁]
+  GATE -->|通过| REL[发布 / A/B]
+  GATE -->|失败| FIX[坏例回流]</pre>
+        <p class="diagram-caption">离线流水线：同一评测集分别跑 Python 与 Spring 链，对比 aggregate 字段差异应在 ±0.02 以内（同模型同索引版本）。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：faithfulness 很高但 answer relevance 很低，最可能哪一环出问题？</summary>
+        <p>检索到的片段「忠实」地被复述，但与用户问题无关——优先查<strong>检索/query 改写</strong>与<strong>多轮上下文污染</strong>，而非换更大模型。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Agent 成功率与 SLA</h3>
+      <p>除 RAG 外，CorpAssist <strong>S2 智能客服</strong> 与 <strong>S3 Agent 任务自动化</strong> 需要 <span class="term" data-term-id="agent-success" tabindex="0">agent success</span>：任务是否在步数预算内完成、工具调用是否成功、最终状态是否符合业务规则。</p>
+      <ul>
+        <li><strong>工具调用成功率</strong>：schema 合法且 HTTP 2xx；失败要区分「模型选错工具」与「下游 API 超时」。</li>
+        <li><strong>任务完成率</strong>：用户意图「改收货地址」是否在规则校验后真正写入订单系统。</li>
+        <li><strong>步数预算</strong>：超过 N 步强制转人工或拒答，避免 Agent 空转烧 Token。</li>
+      </ul>
+
+      <h4>Agent vs RAG 指标侧重</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>场景</th><th>首要指标</th><th>次要指标</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>S1 制度 RAG</td>
+            <td>faithfulness、citation_rate</td>
+            <td>context_recall、P95 延迟</td>
+          </tr>
+          <tr>
+            <td>S2 智能客服</td>
+            <td>任务完成率、转人工率</td>
+            <td>answer_relevance、工具成功率</td>
+          </tr>
+          <tr>
+            <td>S3 办公 Agent</td>
+            <td>agent success、步数分布</td>
+            <td>faithfulness（计划是否可执行）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Agent 场景还要跑 RAGAS 吗？</summary>
+          <p>若 Agent 内部含 RAG 子链（查制度再答），应对该子链单独跑 context recall / faithfulness；整体任务用 agent success + 端到端 rubrics。不要用一个平均分掩盖子链路失败。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>SLA</h3>
+      <p>质量指标必须与 <span class="term" data-term-id="latency-sla" tabindex="0">latency sla</span> 和可用性一起门禁。ToB 验收常见：P95 &lt; 3s、可用性 99.9%、离线 faithfulness 不低于 baseline - 0.02。</p>
+
+      <h4>延迟分位与用户体验</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>分位</th><th>CorpAssist S1 目标</th><th>超标时的工程动作</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="term" data-term-id="p95-latency" tabindex="0">p95 latency</span></td>
+              <td>≤ 2500 ms（含检索+生成）</td>
+              <td>Rerank 降级、缓存热问、小模型路由</td>
+            </tr>
+            <tr>
+              <td>P99</td>
+              <td>≤ 4500 ms</td>
+              <td>排查慢检索、Embedding 冷启动、长上下文</td>
+            </tr>
+            <tr>
+              <td>可用性</td>
+              <td>99.9% / 月</td>
+              <td>模型 Fallback、索引只读副本、熔断</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>代码：发版门禁配置示意</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">eval_gate:
+  dataset: corpassist-s1-v3
+  block_on_fail: true
+  thresholds:
+    faithfulness_min: 0.90
+    context_recall_min: 0.85
+    p95_latency_max_ms: 2500
+  regression_vs_baseline:
+    faithfulness_delta_max: -0.02</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈同口径</h3>
+      <p>Python 侧常负责索引与 RAGAS 批跑；Spring 侧常负责 BFF 与集成测试。若 Python 报 0.92、Spring 报 0.78，多半是<strong>索引版本、Prompt 版本或检索参数不一致</strong>，而非「Java 比较笨」。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="双栈对齐检查项">
+        <input type="radio" name="eq-b01-tabs" id="eq-b01-tab-py" class="learn-tab-input" checked />
+        <input type="radio" name="eq-b01-tabs" id="eq-b01-tab-sp" class="learn-tab-input" />
+        <label for="eq-b01-tab-py">Python 轨责任</label>
+        <label for="eq-b01-tab-sp">Spring 轨责任</label>
+        <div class="learn-tab-panel" id="eq-b01-panel-py" role="tabpanel">
+          <ul>
+            <li>维护评测集 JSONL 与 <code>dataset_version</code></li>
+            <li>批跑 RAGAS，产出 <code>json artifact</code> 上传 CI</li>
+            <li>索引 pipeline 版本写入报告 metadata</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="eq-b01-panel-sp" role="tabpanel">
+          <ul>
+            <li>集成测试读取同一 JSONL 子集</li>
+            <li>Advisor 链路与生产一致，禁止 mock 检索结果做「假绿」</li>
+            <li>报告字段名与 Python schema 逐 key 对齐</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li>Spring 测试用内存 H2 向量库、Python 用 Milvus — 分数不可比。</li>
+          <li>只对比平均分，不看<strong>同一题</strong>的双栈 diff 列表。</li>
+          <li>延迟只测 LLM，不含检索与 Rerank。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">指标是 NS1 飞轮的「刻度尺」。发版前必须同时看质量分与 P95，且 Python/Spring 共用 schema。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>RAG 指标定义</strong>：context recall、faithfulness、answer relevance 分工明确；拒答与引用率单独统计。</li>
+        <li><strong>Agent 成功率</strong>：S2/S3 看任务完成与工具成功，RAG 子链仍要拆出 RAGAS 指标。</li>
+        <li><strong>SLA</strong>：P95/P99 与可用性写入 yaml 门禁，不与离线分混为一谈。</li>
+        <li><strong>双栈同口径</strong>：同一 dataset_version、同一索引与 Prompt pin，字段级 diff 排查 parity。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-evaluation-quality_basics01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="rag-trio" /> 能口述 RAG 三维指标各解决什么问题</label></li>
+          <li><label><input type="checkbox" data-id="refusal" /> 能说明拒答样本为何不能从评测集删除</label></li>
+          <li><label><input type="checkbox" data-id="schema" /> 能写出 aggregate 里至少 4 个字段名</label></li>
+          <li><label><input type="checkbox" data-id="sla" /> 能给出 S1 P95 目标与超标时的 1 条工程对策</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成章节测验与 Demo；下一章 <a href="#ch-basics-02-dataset">评测集构建</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.ragas.io/en/stable/concepts/metrics/" target="_blank" rel="noopener">RAGAS — Metrics</a></li>
+      <li><a href="https://docs.confident-ai.com/docs/metrics-introduction" target="_blank" rel="noopener">DeepEval — Metrics introduction</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/evaluators.html" target="_blank" rel="noopener">Spring AI — Evaluators</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist S1 填写<strong>指标 schema 阈值</strong>，并对照正文对照表解释一条「faithfulness 高、relevance 低」的坏例（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开正文「核心 RAG 指标对照」表，为 faithfulness、context_recall 填写你们 S1 的可接受下限（可沿用示意值或按业务调整）。</li>
+      <li>复制 JSON schema 示例，增加字段 <code>refusal_correct_rate</code> 并设阈值 0.90，说明拒答题在 JSONL 中如何标注 gold。</li>
+      <li>对照 Mermaid 流程图，写出离线流水线中「Python 跑」与「Spring 跑」各发生在哪两个 CI job。</li>
+      <li>可选：进入 <code>demos/basics-01-metrics-lab/</code>，编辑 <code>metrics-schema.json</code> 中 2 个阈值并 README 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">产品要求「只要 faithfulness ≥ 0.95 就发版」，忽略 P95。S1 ToB 合同要求 3 秒内响应。这是否足够？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>不足。高质量但 8s 响应仍违约；且 faithfulness 单指标无法覆盖检索失败、拒答错误等。门禁应<strong>质量 + 延迟 + 相对 baseline 回归</strong>组合（见 yaml 示例）。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：指标 schema 与阈值</h4>
+      <p>目录：<code>demos/basics-01-metrics-lab/</code> — <code>metrics-schema.json</code>。<strong>验收</strong>：文件中 aggregate 含 ≥5 个指标键；latency 含 p95_ms；README 中写明 S1 两条业务解释。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-02-dataset">评测集构建</a>：采样、标注与难例库</li>
+      <li><a href="#ch-basics-03-ragas">RAGAS 与自动评测</a>：如何把本章指标自动化</li>
+      <li><a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener">RAGAS 论文</a></li>
+    </ul>
+  </div>
+</section>

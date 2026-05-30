@@ -1,0 +1,357 @@
+<section id="ch-basics-04-structured-output" class="chapter" data-chapter="basics-04-structured-output">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>结构化输出</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-structured-output" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Spring AI 核心抽象</strong> · 能力：JSON mode、Bean 映射、校验失败处理与 CorpAssist 表单抽取</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>S2 客服里「帮我填请假单」不能只返回散文——下游 OA 系统要<strong>可解析的 JSON</strong>。<span class="term" data-term-id="structured-output" tabindex="0">structured output</span> 把模型输出约束为 <span class="term" data-term-id="record-dto" tabindex="0">record dto</span>，并在 <span class="term" data-term-id="validation-error" tabindex="0">validation error</span> 时走 <span class="term" data-term-id="retry-parse" tabindex="0">retry parse</span> 或降级，这是 NS2 办公 Agent 与 Python 轨表单契约的汇合点。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>开启 <span class="term" data-term-id="json-mode" tabindex="0">json mode</span> 并用 <code>.entity(LeaveRequest.class)</code> 完成 <span class="term" data-term-id="bean-mapping" tabindex="0">bean mapping</span></li>
+          <li>用 <span class="term" data-term-id="schema-hint" tabindex="0">schema hint</span> 与 Bean Validation 处理字段缺失</li>
+          <li>将 <code>LeaveRequest.json</code> 与 CorpAssist <span class="term" data-term-id="form-extraction" tabindex="0">form extraction</span> 业务字段对齐，并与 Python Pydantic 模型对照</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>契约优先</strong>：先定 JSON 字段与校验规则，再写 prompt 让模型填满。</li>
+          <li><strong>失败可恢复</strong>：解析失败 → 收紧 prompt 重试 → 仍失败则转人工。</li>
+          <li><strong>双栈同形</strong>：Java Record 与 Python Pydantic 字段名一致，便于评测。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>JSON mode</h3>
+      <p>厂商支持 <code>response_format: json_object</code> 时，Spring AI 通过 <code>ChatOptions</code> 或 <code>.call().entity(Class)</code> 启用 <span class="term" data-term-id="json-mode" tabindex="0">json mode</span>，减少模型输出 Markdown 包裹或多余解释。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">LeaveRequest draft = chatClient.prompt()
+    .system("""
+        你是 CorpAssist 办公助手。仅输出 JSON，字段：employeeId,startDate,endDate,reason。
+        日期格式 yyyy-MM-dd。无法推断的字段填 null。
+        """)
+    .user("我想请 6月1日到2日年假，工号 E1024")
+    .call()
+    .entity(LeaveRequest.class);</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>方式</th><th>优点</th><th>注意</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>.entity(Record.class)</code></td><td>自动反序列化 + 类型安全</td><td>需模型遵守 JSON；配合 system 约束</td></tr>
+          <tr><td>手动 <code>ObjectMapper</code></td><td>完全控制错误处理</td><td>样板代码多</td></tr>
+          <tr><td><span class="term" data-term-id="schema-hint" tabindex="0">schema hint</span> 在 prompt 中贴 JSON Schema</td><td>对小模型友好</td><td>token 变长；与 Bean 注解保持一致</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>用正则从散文里抠 JSON</li>
+            <li>不校验日期顺序（end &lt; start）</li>
+            <li>把解析失败当 500 直接抛给用户</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Record + Jakarta Validation</li>
+            <li>失败时 <span class="term" data-term-id="retry-parse" tabindex="0">retry parse</span> 一次并收紧 system</li>
+            <li>审计日志存原始模型输出（脱敏后）</li>
+          </ul>
+        </div>
+      </div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：流式场景还能用 .entity() 吗？</summary>
+        <p>流式更适合先收全文再解析，或不用流式做表单抽取；门户展示「正在填写」可用进度事件，最终字段仍走同步 entity。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Bean 映射</h3>
+      <p><span class="term" data-term-id="bean-mapping" tabindex="0">bean mapping</span> 把 JSON 键映射到 Java <span class="term" data-term-id="record-dto" tabindex="0">record dto</span>。CorpAssist 请假单与 Demo 中 <code>LeaveRequest.json</code> 对齐。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "employeeId": "E1024",
+  "startDate": "2026-06-01",
+  "endDate": "2026-06-02",
+  "reason": "年假"
+}</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">public record LeaveRequest(
+    @NotBlank String employeeId,
+    @NotNull LocalDate startDate,
+    @NotNull LocalDate endDate,
+    String reason) {
+
+  @AssertTrue
+  boolean isDateRangeValid() {
+    return endDate == null || startDate == null || !endDate.isBefore(startDate);
+  }
+}</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>JSON 字段</th><th>业务含义</th><th>校验</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>employeeId</td><td>工号，对接 HR 主数据</td><td>@NotBlank</td></tr>
+          <tr><td>startDate / endDate</td><td>请假区间</td><td>LocalDate + 区间合法</td></tr>
+          <tr><td>reason</td><td>事由（年假/病假等）</td><td>可选枚举（扩展）</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>结构化输出：从自然语言到 OA</h5>
+        <pre class="mermaid">flowchart LR
+  NL["员工自然语言"]
+  LLM["ChatClient.entity"]
+  DTO["LeaveRequest"]
+  VAL["Bean Validation"]
+  OA["OA / 工作流 API"]
+  NL --> LLM --> DTO --> VAL --> OA</pre>
+        <p class="diagram-caption">NS2 办公 Agent：模型只负责抽取；提交 OA 前仍走企业权限与审批流。</p>
+      </div>
+      <p>Python 轨可用 Pydantic <code>LeaveRequest</code> 同字段名；评测用同一 golden JSON（<a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener">Python 工程轨</a>）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>校验失败处理</h3>
+      <p>模型 JSON 可能缺字段、日期格式错误或逻辑冲突。<span class="term" data-term-id="validation-error" tabindex="0">validation error</span> 应有<strong>分层策略</strong>，避免直接把堆栈抛给员工。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>失败类型</th><th>用户可见</th><th>系统动作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>JSON 语法错误</td><td>「请补充日期与工号」</td><td><span class="term" data-term-id="retry-parse" tabindex="0">retry parse</span> + 更短 system</td></tr>
+          <tr><td>Bean Validation</td><td>「结束日期不能早于开始日期」</td><td>返回 422 + 字段级错误</td></tr>
+          <tr><td>业务规则（余额不足）</td><td>「年假余额不足」</td><td>调 HR 服务，非 LLM 职责</td></tr>
+          <tr><td>连续失败 ≥2</td><td>「已转人工客服」</td><td>降级 + 工单</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">public LeaveRequest extractLeaveForm(String utterance) {
+  try {
+    LeaveRequest req = chatClient.prompt()
+        .user(utterance)
+        .call()
+        .entity(LeaveRequest.class);
+    validate(req);
+    return req;
+  } catch (Exception first) {
+    LeaveRequest retry = chatClient.prompt()
+        .system("上次输出无效。仅输出合法 JSON，不要 markdown。")
+        .user(utterance)
+        .call()
+        .entity(LeaveRequest.class);
+    validate(retry);
+    return retry;
+  }
+}
+
+private void validate(LeaveRequest req) {
+  var violations = validator.validate(req);
+  if (!violations.isEmpty()) {
+    throw new FormValidationException(violations);
+  }
+}</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 → 办公 Agent</span>
+        员工口语「下周请两天假」——需推断具体日期；若模型填 null，应追问而非提交空表单到 OA。NS2 工具可在校验通过后调用「提交草稿」工具（practice 章）。
+      </aside>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">重试</span>
+          <p class="role-card-desc">限 1～2 次，附带错误摘要给 model，避免无限循环烧 token。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">降级</span>
+          <p class="role-card-desc">转人工或只展示预填草稿让员工改。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">审计</span>
+          <p class="role-card-desc">存 request_id、原始 JSON、校验结果，供合规追溯。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 表单抽取</h3>
+      <p><span class="term" data-term-id="form-extraction" tabindex="0">form extraction</span> 是 S2 客服与 NS2 办公 Agent 的交界：对话理解 → 结构化 DTO → 企业工作流。</p>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>步骤</th><th>组件</th><th>输出</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1. 意图识别</td><td>fast ChatClient</td><td>intent=LEAVE_REQUEST</td></tr>
+          <tr><td>2. 槽位抽取</td><td>quality + entity(LeaveRequest)</td><td>JSON 草稿</td></tr>
+          <tr><td>3. 校验</td><td>Bean Validation + HR API</td><td>通过 / 422</td></tr>
+          <tr><td>4. 确认</td><td>门户 UI</td><td>员工点击提交</td></tr>
+          <tr><td>5. 提交</td><td>NS2 Tool（practice）</td><td>OA 单号</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label">Spring · entity</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-java">.call().entity(LeaveRequest.class);</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label">Python · Pydantic</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-python">LeaveRequest.model_validate_json(model_output)</code></pre>
+          </div>
+        </div>
+      </div>
+      <p>完成 basics 阶段后，进入 <a href="#ch-practice-01-vectorstore">VectorStore 与 Embedding</a> 把制度 FAQ 接上 RAG；<a href="#ch-practice-03-tool-calling">Function Calling / Tools</a> 实现 OA 提交工具。</p>
+      <div class="learn-faq">
+        <details>
+          <summary>能否用 function calling 代替 JSON mode？</summary>
+          <div class="learn-faq-body">可以，且对支持 tool 的模型更稳；本章 entity 更易与 Record 校验结合。practice 章对比 @Tool 与 entity 选型。</div>
+        </details>
+        <details>
+          <summary>敏感字段如何防泄露？</summary>
+          <div class="learn-faq-body">输出 Advisor 打码、日志脱敏；DTO 只含业务必要字段（advanced 护栏章）。</div>
+        </details>
+      </div>
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只信模型不校验</strong> — 幻觉日期会直接进 OA。</li>
+          <li><strong>字段名中英混用</strong> — 双栈解析失败，评测无法对齐。</li>
+          <li><strong>无人工确认</strong> — 高合规场景必须展示草稿再提交。</li>
+        </ul>
+      </div>
+      <h4>评测与观测挂钩</h4>
+      <p>表单抽取应记录：model 名、解析是否一次成功、校验失败字段列表、是否触发 retry。与 Python 轨共用 golden utterance → JSON 用例，在 CI 用 @MockBean 固定模型输出为 <code>LeaveRequest.json</code>，只测校验与 OA 映射逻辑。</p>
+      <p>指标名建议：<code>llm.form.extract.success</code>、<code>llm.form.extract.retry</code>，便于与 S2 对话指标在同一 Grafana 看板对比（advanced Micrometer 章展开）。</p>
+      <ul>
+        <li>一次成功：直接返回 DTO 给门户预览。</li>
+        <li>retry 后成功：日志打 warn，仍允许用户确认。</li>
+        <li>两次失败：触发转人工，不调用 OA 工具。</li>
+      </ul>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li><code>.entity()</code> 与 Function Calling 返回结构化数据各适合什么场景？</li>
+              <li>解析失败时为何限制重试次数？</li>
+              <li>CorpAssist 双栈如何保证 LeaveRequest 字段契约一致？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>JSON mode</strong>：用 entity/API 约束输出形状，system 明确「仅 JSON」。</li>
+        <li><strong>Bean 映射</strong>：Record + Validation 对接 OA；与 Demo LeaveRequest.json 同形。</li>
+        <li><strong>校验失败处理</strong>：有限重试、422 字段错误、多次失败转人工。</li>
+        <li><strong>CorpAssist 表单抽取</strong>：意图 → 抽取 → 校验 → 确认 → NS2 工具提交，全链路可审计。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-engineering_basics04_structured">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="json" /> 能说明 json mode 与 .entity() 的关系</label></li>
+          <li><label><input type="checkbox" data-id="record" /> 能对照 Demo JSON 解释 4 个字段</label></li>
+          <li><label><input type="checkbox" data-id="val" /> 能列出 2 种校验失败的用户提示策略</label></li>
+          <li><label><input type="checkbox" data-id="flow" /> 能口述表单抽取 5 步流水线</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>entity()</td><td>JSON → Record 一步</td></tr>
+                <tr><td>retry parse</td><td>限次、带错误反馈</td></tr>
+                <tr><td>form extraction</td><td>对话到 OA 的桥梁</td></tr>
+                <tr><td>双栈</td><td>与 Pydantic 同字段名</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一阶段：<a href="#ch-practice-01-vectorstore">VectorStore 与 Embedding</a> — 为 S2 制度 FAQ 接上检索增强。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html#_structured_output" target="_blank" rel="noopener">ChatClient Structured Output</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html" target="_blank" rel="noopener">OpenAI ChatOptions</a></li>
+      <li><a href="https://beanvalidation.org/" target="_blank" rel="noopener">Jakarta Bean Validation</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 30 分钟 · 对照 Demo JSON 与 OA 字段，设计校验与重试策略。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读 <code>demos/basics-04-structured-output-lab/LeaveRequest.json</code> 与 README。</li>
+      <li>在笔记画「自然语言 → entity → Validation → OA」流程图。</li>
+      <li>为 <code>endDate &lt; startDate</code> 写用户可见错误文案。</li>
+      <li>设计「第 2 次仍失败」时的降级话术（转人工）。</li>
+      <li>与 Python Pydantic 模型字段对照，标出 1 处必须一致的命名。</li>
+      <li>完成右侧测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">模型返回 ```json ... ``` 代码块导致解析失败。应优先改什么？① 提高 temperature ② 收紧 system「仅 JSON」并重试 ③ 换 embedding 模型</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>② 收紧 system 并 retry parse；与 embedding 无关。</p></div></details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">能否不经员工确认直接把 entity 结果提交 OA？在 CorpAssist 合规场景下是否合理？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>不合理。应展示草稿确认；NS2 工具提交放在确认之后（高合规默认）。</p></div></details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：结构化输出</h4>
+      <p>目录：<code>demos/basics-04-structured-output-lab/</code>。<strong>验收</strong>：JSON 四字段业务含义表 + 校验失败分层策略 + 与 Python 字段对照各 1 条。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-03-prompt-advisor">Prompt 模板与 Advisor</a></li>
+      <li><strong>下一阶段</strong>：<a href="#ch-practice-01-vectorstore">VectorStore 与 Embedding</a></li>
+      <li><a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener">Python 工程轨 — Pydantic 与评测</a></li>
+    </ul>
+  </div>
+</section>

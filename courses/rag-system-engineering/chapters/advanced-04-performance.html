@@ -1,0 +1,204 @@
+<section id="ch-advanced-04-performance" class="chapter" data-chapter="advanced-04-performance">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>性能与成本优化</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-04-performance" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>进阶 RAG</strong> · 能力：缓存、小模型路由、预计算 · NFR 第 3 层（性能/成本）</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-advanced-03-graph-rag">上一章</a> 把图谱治理做扎实后，CorpAssist S1 制度问答在高峰时段 QPS 上升，每次请求仍走「Embed → 检索 → 大模型生成」会拖垮延迟与 Token 账单。ToC 场景下约 30% 问法高度重复（年假、报销入口），需要 <span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span>；简单 FAQ 可走 <span class="term" data-term-id="small-model-route" tabindex="0">small model route</span>；热门文档的向量可 <span class="term" data-term-id="precompute-embed" tabindex="0">precompute embed</span> 预热，形成可观测的 <span class="term" data-term-id="cost-optimize" tabindex="0">cost optimize</span> 组合拳。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 S1 查询链路的 <span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span> 键与失效策略</li>
+          <li>配置 FAQ 类问法的 <span class="term" data-term-id="small-model-route" tabindex="0">small model route</span> 与完整 RAG 回退</li>
+          <li>在 Python 索引侧做 <span class="term" data-term-id="precompute-embed" tabindex="0">precompute embed</span> 与 <span class="term" data-term-id="hot-query" tabindex="0">hot query</span> 预热</li>
+          <li>用 <a href="#ch-practice-05-eval-loop">评测闭环</a> 量化 latency/token 收益，避免「缓存掩盖召回退化」</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>缓存带 ACL</strong>：命中键必须含 user scope，否则跨部门串答。</li>
+          <li><strong>小模型是路由不是替代</strong>：复杂/合规问法仍走 RAG + citation。</li>
+          <li><strong>预计算在索引侧</strong>：Python 批处理预热；Spring 只读已索引向量。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>缓存</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 高峰 FAQ</span>
+        周一上午 2000 次「年假怎么请」——语义相近但字面不同。精确匹配 cache miss；<span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span> 用 query embedding 在 Redis 中找 cosine &gt; 0.92 的历史问答，命中则跳过检索与 LLM。
+      </aside>
+
+      <h4>缓存键设计（Spring 查询侧）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// cache key = hash(kb_id + user_dept + query_embedding_bucket)
+String cacheKey = CacheKeys.semantic(user.getDept(), kbId, queryVector);
+Optional&lt;CachedAnswer&gt; hit = semanticCache.lookup(cacheKey, queryVector, 0.92);
+if (hit.isPresent()) return hit.get().withSource("semantic-cache");</code></pre>
+      </div>
+
+      <h4>Python 侧：embedding 结果缓存</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 索引 job 与在线 query 共用 embed cache，降低重复 chunk 费用
+@lru_cache(maxsize=50_000)
+def embed_text(text_hash: str) -> list[float]:
+    return embedder.embed_query(load_text(text_hash))</code></pre>
+      </div>
+
+      <p>制度更新、ACL 变更、embedding 模型切换时必须 <strong>invalidate</strong> 对应 kb 分区；否则 <span class="term" data-term-id="cost-optimize" tabindex="0">cost optimize</span> 会以旧答案为代价。见 <code>demos/advanced-04-performance-lab/perf-tactics.md</code>。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>小模型路由</h3>
+      <p><span class="term" data-term-id="small-model-route" tabindex="0">small model route</span> 在<strong>进入向量库之前</strong>用轻量分类器或规则判断：若为高频 FAQ、无多跳、无合规歧义，则用小模型（或模板）直接答；否则走完整 RAG。CorpAssist S1 典型路由信号：</p>
+      <ul>
+        <li>intent = faq_entry（入口类）且 confidence &gt; 0.85</li>
+        <li>无跨库/跨部门关键词（「财务+HR 冲突」→ 禁走小模型）</li>
+        <li>用户未要求引用条款编号</li>
+      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>S1 性能路由</h5>
+        <pre class="mermaid">flowchart TD
+  Q[用户问句] --> SC{semantic cache}
+  SC -->|命中| OUT[返回答案]
+  SC -->|未命中| RT{small model route}
+  RT -->|FAQ| SM[小模型/模板]
+  RT -->|复杂| RAG[Embed+检索+大模型]
+  SM --> OUT
+  RAG --> OUT
+  OUT --> W[写 cache + metrics]</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">路由误用</span>
+          <ul>
+            <li>所有问法默认小模型</li>
+            <li>无 citation 的合规 FAQ</li>
+            <li>路由决策不可观测</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">路由正用</span>
+          <ul>
+            <li>仅 hot intent 白名单</li>
+            <li>失败/低置信回退 RAG</li>
+            <li>路由标签进 audit/metrics</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：semantic cache 为何必须把 user_dept 放进 cache key？</summary>
+        <p>不同部门可见文档集不同；若只按 query 相似度命中，可能返回<strong>其他部门可见、本用户不可见</strong>的缓存答案，构成隐性 <a href="#ch-advanced-05-security">acl leak</a>。键必须绑定 ACL scope。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>预计算</h3>
+      <p><span class="term" data-term-id="precompute-embed" tabindex="0">precompute embed</span> 把索引期与查询期的 embedding 成本前移：<strong>热门 chunk</strong>、<strong>高频改写 query</strong> 在离线 job 中算好向量并 pin 到内存/SSD；在线只查表。与 <span class="term" data-term-id="hot-query" tabindex="0">hot query</span> 分析联动——从 access log 取 Top-N 问法， nightly 跑检索 + 答案缓存预热。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>手段</th><th>P95 延迟</th><th>Token 节省</th><th>风险</th></tr></thead>
+          <tbody>
+            <tr><td>semantic-cache</td><td>↓ 60～80%</td><td>↓ 100%（命中时）</td><td>制度变更未失效</td></tr>
+            <tr><td>small-model-route</td><td>↓ 40%</td><td>↓ 70%（FAQ 子集）</td><td>误路由无引用</td></tr>
+            <tr><td>precompute-embed</td><td>↓ 15～25%</td><td>↓ 10%（embed API）</td><td>热点漂移需重算</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>hot query 预热 job（Python）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">hot = access_log.top_queries(kb="corp-hr", days=7, n=500)
+for q in hot:
+    vec = embedder.embed_query(q.text)
+    semantic_cache.warm(key=scope_key(q.user_dept), query_vec=vec, answer=rag_pipeline(q))</code></pre>
+      </div>
+
+      <p>所有优化需进 <a href="#ch-practice-05-eval-loop">eval report</a>：对比开启前后 faithfulness、context_recall，防止「快了但答错」。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>缓存</strong>：semantic-cache + ACL scope；制度/模型变更必 invalidate。</li>
+        <li><strong>小模型路由</strong>：FAQ 白名单 + 低置信回退完整 RAG。</li>
+        <li><strong>预计算</strong>：precompute-embed 与 hot-query 预热；收益用 latency/token 量化。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_advanced04">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cache" /> 能说明 semantic cache 键含哪些维度</label></li>
+          <li><label><input type="checkbox" data-id="route" /> 能列举 small-model-route 的两条回退条件</label></li>
+          <li><label><input type="checkbox" data-id="pre" /> 能描述 hot-query 预热与索引侧 precompute 分工</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；继续 <a href="#ch-advanced-05-security">RAG 安全</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://python.langchain.com/docs/how_to/caching_embeddings/" target="_blank" rel="noopener">LangChain · Embedding Cache</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI · ChatClient 路由</a></li>
+      <li><a href="https://redis.io/docs/latest/develop/use/client-side-caching/" target="_blank" rel="noopener">Redis · 客户端缓存模式</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">阅读 perf-tactics.md，为 S1 高峰 FAQ 设计一条可落地的 cost-optimize 方案并估算收益。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>从 access log 虚构 5 条 <span class="term" data-term-id="hot-query" tabindex="0">hot query</span>，标注是否适合 small-model-route。</li>
+      <li>设计 semantic-cache 键（含 dept/kb/version），写 1 条 invalidate 触发条件。</li>
+      <li>填决策表三行（可调整数值），给出组合策略与 P95 目标。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">semantic cache 命中率 45%，但 faithfulness 从 0.88 降到 0.79。最可能原因与修复？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>制度更新后未 invalidate，缓存仍返回旧版答案。修复：kb version 纳入 cache key；publish 事件触发分区清空；抽样对比缓存命中与 miss 的 faithfulness。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：性能与成本优化</h4>
+      <p>目录：<code>demos/advanced-04-performance-lab/</code>。<strong>验收</strong>：在 perf-tactics.md 选 1 条 tactic 写预期 latency/token 收益与风险。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-03-graph-rag">GraphRAG 与知识库治理衔接</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-05-security">RAG 安全</a></li>
+      <li><a href="#ch-advanced-01-query-transform">查询改写</a>：改写链增加 token，与缓存/route 联合决策</li>
+      <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>：优化策略需过 release gate</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,337 @@
+<section id="ch-practice-01-python-rag" class="chapter" data-chapter="practice-01-python-rag">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Python：LangChain RAG 实现</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-python-rag" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈实现 CorpAssist 知识库</strong> · 能力：用 <span class="term" data-term-id="lcel" tabindex="0">LCEL</span> 搭建 Retriever 链并暴露查询 API</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>basics 阶段定了管线与索引分工；practice 从<strong>可运行的 Python 查询链</strong>起步。CorpAssist 约定：<strong>Python 负责离线索引与可选原型 API</strong>，Spring 负责对外 BFF；若 LCEL 链、Retriever 元数据或 <code>sources</code> 契约在一开始做错，Spring 对照与混合检索会在「空引用、维度不一致」上反复踩坑。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="lcel" tabindex="0">LCEL</span> 组合 <code>retriever → prompt → llm</code>，输出带 <code>sources</code> 的 <span class="term" data-term-id="rag-chain" tabindex="0">RAG chain</span></li>
+          <li>配置 <span class="term" data-term-id="langchain-retriever" tabindex="0">LangChain Retriever</span>（TopK、filter、score）</li>
+          <li>用 <span class="term" data-term-id="debug-trace" tabindex="0">debug trace</span> 逐步查看检索与拼装</li>
+          <li>用 <span class="term" data-term-id="fastapi-rag" tabindex="0">FastAPI</span> 暴露与 Spring 对齐的 JSON 契约</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>链即数据流</strong>：LCEL 用 <code>|</code> 管道传递 dict，检索结果进 <code>context</code> 再进 Prompt。</li>
+          <li><strong>契约先于框架</strong>：<code>answer</code> + <code>sources[]</code> 字段名与 Spring 下一章保持一致。</li>
+          <li><strong>先 Mock LLM</strong>：用 <span class="term" data-term-id="mock-llm" tabindex="0">mock llm</span> 验证检索，再接真实模型网关。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>LCEL 管线：从问题到带引用的回答</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · HR 政策问答</span>
+        员工问「年假几天」——管线必须先检索 <code>corpassist-hr-v2</code> 分块，再把片段填入 Prompt；禁止跳过 Retriever 直接问 LLM。
+      </aside>
+      <p><span class="term" data-term-id="lcel" tabindex="0">LangChain Expression Language（LCEL）</span> 用声明式管道组合 RAG：<strong>输入 dict → 检索 → 模板 → 模型 → 解析</strong>。与 <a href="#ch-basics-04-embedding">Embedding 与索引</a> 中 Python 写库、Spring 查库的分工衔接：本章链读取<strong>同一 collection</strong>。</p>
+
+      <h4>最小 RAG 链（检索 + Prompt + Mock LLM）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># demos/practice-01-python-rag-lab/chain_stub.py 扩展思路
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "仅根据 context 回答；无依据则说不知道。\n{context}"),
+    ("human", "{question}"),
+])
+
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
+
+# retriever 来自 VectorStore.as_retriever(search_kwargs={"k": 4})
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">链式反模式</span>
+          <ul>
+            <li>在 Controller 里手写拼接 Prompt 字符串</li>
+            <li>检索与生成拆成两个无关联 HTTP 调用</li>
+            <li>返回纯文本、无 <code>doc_id</code> 引用</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">LCEL 推荐</span>
+          <ul>
+            <li>单条 <span class="term" data-term-id="rag-chain" tabindex="0">rag chain</span> 可 <code>.invoke</code> / <code>.stream</code></li>
+            <li><span class="term" data-term-id="chain-compose" tabindex="0">chain compose</span> 可插 rerank、filter 中间件</li>
+            <li>统一包装为 <code>{"answer","sources"}</code></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist Python RAG 链（本章范围）</h5>
+        <pre class="mermaid">flowchart LR
+  Q[question] --> R[Retriever]
+  R --> C[context 拼装]
+  C --> P[ChatPrompt]
+  P --> L[LLM / Mock]
+  L --> A[answer + sources]</pre>
+        <p class="diagram-caption">索引侧见 basics-02～04；本章只实现<strong>查询链 + API</strong>，不写离线 ingest。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Retriever：TopK、过滤与元数据</h3>
+      <p><span class="term" data-term-id="langchain-retriever" tabindex="0">LangChain Retriever</span> 封装向量库查询，对上层链暴露 <code>invoke(query) → Document[]</code>。CorpAssist 在 metadata 中写入 <code>tenant_id</code>、<code>dept</code>、<code>doc_id</code>（与后续 <span class="term" data-term-id="acl-filter" tabindex="0">acl filter</span> 章对齐）。</p>
+
+      <h4>Retriever 配置片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">retriever = vectorstore.as_retriever(
+    search_type="similarity",
+    search_kwargs={
+        "k": 4,
+        "filter": {"tenant_id": "corp-a", "kb": "hr"},
+    },
+)
+
+# 调试：只看检索、不调用 LLM
+docs = retriever.invoke("年假 几天")
+for d in docs:
+    print(d.metadata.get("doc_id"), d.page_content[:80])</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>参数</th><th>建议</th><th>CorpAssist 注意点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>k</code></td>
+            <td>4～8 起步，配合 <a href="#ch-basics-05-retrieval-gen">rerank</a></td>
+            <td>过大拖慢 API、挤爆上下文</td>
+          </tr>
+          <tr>
+            <td><code>filter</code></td>
+            <td>检索层强制 tenant / kb</td>
+            <td>勿只靠 Prompt「请勿越权」</td>
+          </tr>
+          <tr>
+            <td>score</td>
+            <td>记录 top1 分数进 trace</td>
+            <td>供拒答阈值（basics-06）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：Retriever 与 VectorStore 谁负责 Embedding？</summary>
+        <p>查询时 Retriever 内部用<strong>与索引相同的</strong> embedding 模型做 query vector；模型版本变更必须 re-embed（见 basics-04）。链上不要手写两套 embed 函数。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>链式调试：trace、分步 invoke</h3>
+      <p>联调 RAG 时 80% 问题在「没检到 / 检错了」。使用 <span class="term" data-term-id="debug-trace" tabindex="0">debug trace</span>：先单独跑 Retriever，再跑半链（到 Prompt 输出），最后全链。</p>
+
+      <h4>分步调试命令（本地）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">cd demos/practice-01-python-rag-lab
+# 仅检索
+python -c "from chain_stub import retriever_only; retriever_only('年假')"
+
+# 全链（Mock LLM，见 chain_stub.py）
+python -c "from chain_stub import rag_query; print(rag_query('年假几天'))"
+
+# 打开 LangSmith / 环境变量 LANGCHAIN_TRACING_V2=true 查看 span</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="常见排障信号">
+        <input type="radio" name="prac01-debug-tab" id="prac01-debug-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac01-debug-tab" id="prac01-debug-tab-b" class="learn-tab-input" />
+        <label for="prac01-debug-tab-a">sources 为空</label>
+        <label for="prac01-debug-tab-b">回答胡编</label>
+        <div class="learn-tab-panel" id="prac01-debug-panel-a" role="tabpanel">
+          <ul>
+            <li>collection / filter 与索引不一致</li>
+            <li>embedding 模型或维度与 basics-04 配置不符</li>
+            <li>问题与文档语言/分词差异大（practice-03 混合检索缓解）</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac01-debug-panel-b" role="tabpanel">
+          <ul>
+            <li>Prompt 未约束「仅根据 context」</li>
+            <li>context 为空仍调用 LLM</li>
+            <li>未设 score 阈值触发拒答</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何先 Mock LLM 再换真模型？</summary>
+        <p>分离检索问题与生成问题：Mock 固定返回可预测文本，若 sources 已错，接真模型只会浪费 token 且难排查。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>API 暴露：FastAPI 与 Spring 契约对齐</h3>
+      <p>对外 BFF 将由 <a href="#ch-practice-02-spring-rag">Spring AI RAG</a> 承担；Python 服务常用于<strong>索引作业、回归脚本、原型</strong>。无论哪条栈，<span class="term" data-term-id="python-rag-api" tabindex="0">python rag api</span> 响应体应对齐：</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># FastAPI 片段 — 与 Spring DTO 同形
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+class AskRequest(BaseModel):
+    question: str
+    tenant_id: str = "corp-a"
+
+class SourceRef(BaseModel):
+    doc_id: str
+    snippet: str
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: list[SourceRef]
+
+@app.post("/v1/rag/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+    out = rag_chain_with_sources(req.question, filter={"tenant_id": req.tenant_id})
+    return AskResponse(answer=out["answer"], sources=out["sources"])</code></pre>
+      </div>
+
+      <h4>curl 验收（本地 8000）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">curl -s -X POST http://localhost:8000/v1/rag/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假几天","tenant_id":"corp-a"}' | jq .
+
+# 期望：answer 非空；sources 至少 1 条含 doc_id</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>与 Spring 对照预览</strong>
+        <p>下一章 <span class="term" data-term-id="question-answer-advisor" tabindex="0">QuestionAnswerAdvisor</span> 在 <span class="term" data-term-id="spring-vectorstore" tabindex="0">VectorStore</span> 上完成同类检索增强；本章 Python API 的 JSON 字段名请与 Java record 一致，便于 <span class="term" data-term-id="parity-test" tabindex="0">parity test</span>。</p>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，practice 起步复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>LCEL</strong>：<code>context=retriever|format</code> 与 <code>question</code> 并行汇入 Prompt，单链可调试可流式。</li>
+        <li><strong>Retriever</strong>：TopK + metadata filter 在检索层做租户/库隔离。</li>
+        <li><strong>调试</strong>：Retriever-only → 半链 → 全链；trace 记录 doc_id 与 score。</li>
+        <li><strong>API</strong>：<code>POST /v1/rag/ask</code> 返回 <code>answer</code> + <code>sources</code>，与 Spring 契约对齐。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="lcel" /> 能画出 LCEL 四段：Retriever → context → Prompt → LLM</label></li>
+          <li><label><input type="checkbox" data-id="retriever" /> 能写出带 tenant filter 的 as_retriever 片段</label></li>
+          <li><label><input type="checkbox" data-id="debug" /> 能说明 sources 为空时先查哪三层</label></li>
+          <li><label><input type="checkbox" data-id="curl" /> curl ask 返回 sources 含 doc_id</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-02-spring-rag">Spring AI：RAG 实现</a>，用 Advisor + VectorStore 对照本章契约。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://python.langchain.com/docs/concepts/lcel/" target="_blank" rel="noopener">LangChain LCEL</a></li>
+      <li><a href="https://python.langchain.com/docs/concepts/rag/" target="_blank" rel="noopener">LangChain RAG</a></li>
+      <li><a href="https://fastapi.tiangolo.com/" target="_blank" rel="noopener">FastAPI Documentation</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI RAG（对照契约）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-01-python-rag-lab/</code> 跑通检索与 Mock 全链，用 curl 验收 JSON 契约。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读 <code>chain_stub.py</code>，将 <code>rag_query</code> 改为先 <code>retriever.invoke</code> 再拼 context（保留 Mock answer）。</li>
+      <li>在 <code>search_kwargs.filter</code> 写入 <code>kb: hr</code>，用错误 <code>kb: finance</code> 观察 sources 为空。</li>
+      <li>启动 FastAPI（或 lab README 中的 uvicorn 命令），<code>curl POST /v1/rag/ask</code>，确认 <code>sources[0].doc_id</code> 存在。</li>
+      <li>写 3 行双栈对照：Python 链哪一段对应 Spring QuestionAnswerAdvisor。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障）curl 返回 <code>sources: []</code> 但向量库有数据。列出按优先级排查的 3 个检查点（配置/代码/数据各至少一项）。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>① filter/collection 是否与索引一致；② embedding 模型与维度是否匹配 basics-04；③ 问题语言/分词是否导致相似度极低（可试混合检索）。勿先换 LLM。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（排障）链式 trace 显示 context 有内容，但 answer 仍胡编。Prompt 与调用顺序上最可能缺哪一环？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>system 未约束「仅根据 context」；或 context 未传入最终 Prompt 模板变量；或绕过了带 context 的链而直接调 LLM。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Python LCEL RAG 链</h4>
+      <p>目录：<code>demos/practice-01-python-rag-lab/</code>（<code>chain_stub.py</code>）。<strong>验收</strong>：Retriever-only 有 doc_id；curl <code>/v1/rag/ask</code> 返回非空 sources。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一阶段回顾</strong>：<a href="#ch-basics-05-retrieval-gen">检索、重排与生成</a> · TopK 与引用</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-spring-rag">Spring AI：RAG 实现</a></li>
+      <li><a href="https://python.langchain.com/docs/tutorials/rag/" target="_blank" rel="noopener">LangChain RAG Tutorial</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,3 @@
+- [ ] liveness
+- [ ] readiness
+- [ ] 资源 request/limit

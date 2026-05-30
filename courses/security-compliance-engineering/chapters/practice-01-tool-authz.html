@@ -1,0 +1,157 @@
+<section id="ch-practice-01-tool-authz" class="chapter" data-chapter="practice-01-tool-authz">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>工具调用权限</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-tool-authz" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>控制措施</strong> · 能力：按角色配置 tool allowlist、OAuth scope 与沙箱执行</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>NS2 要求「模型只提议、业务动作 100% 规则执行」。CorpAssist S2 客服若注册「退款」「改地址」「查他人订单」全套工具且无 <span class="term" data-term-id="tool-authz" tabindex="0">tool authz</span>，一次 prompt injection 即可造成资损——比答错话术严重一个数量级。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 <span class="term" data-term-id="role-tool-map" tabindex="0">role tool map</span> 与 <span class="term" data-term-id="tool-allowlist" tabindex="0">tool allowlist</span></li>
+          <li>在工具执行层校验 <span class="term" data-term-id="oauth-scope" tabindex="0">oauth scope</span> 与 <span class="term" data-term-id="least-privilege" tabindex="0">least privilege</span></li>
+          <li>为高风险工具配置 <span class="term" data-term-id="tool-sandbox" tabindex="0">tool sandbox</span> 与 <span class="term" data-term-id="mcp-auth" tabindex="0">mcp auth</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>动态注册</strong>：ChatClient 可见工具集 = f(用户角色, 会话意图)，非静态全量。</li>
+          <li><strong>二次鉴权</strong>：模型输出的 tool call 只是「意图」；ERP API 仍验 JWT + 业务规则。</li>
+          <li><strong>能力边界</strong>：<span class="term" data-term-id="capability-control" tabindex="0">capability control</span> 含步数预算、单笔金额上限、人工确认。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>白名单</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 客服 Agent</span>
+        普通用户会话仅开放 <code>query_order</code>、<code>faq_search</code>；VIP 座席模式额外开放 <code>apply_refund</code>，且须二次 OTP。模型永远看不到 <code>admin_delete_user</code>。
+      </aside>
+      <table class="outline-table">
+        <thead>
+          <tr><th>角色</th><th>允许工具</th><th>禁止示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>end_user</td><td>query_order, faq_search</td><td>refund, export_all</td></tr>
+          <tr><td>agent_desk</td><td>+ apply_refund (≤500元)</td><td>admin_*</td></tr>
+          <tr><td>system_batch</td><td>report_sync</td><td>任意 user chat tools</td></tr>
+        </tbody>
+      </table>
+      <h4>Spring：按 SecurityContext 注册 Tool</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">List&lt;ToolCallback&gt; allowed = toolRegistry.forRole(
+    SecurityContextHolder.getContext().getAuthentication().getAuthorities());
+return chatClient.prompt(userMsg)
+    .toolCallbacks(allowed)  // 非 defaultTools(ALL)
+    .call();</code></pre>
+      </div>
+      <h4>Python：LangGraph tool 过滤</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def bind_tools_for_session(tools: list, jwt_claims: dict) -&gt; list:
+    allow = ROLE_TOOL_MAP[jwt_claims["role"]]
+    return [t for t in tools if t.name in allow]</code></pre>
+      </div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：prompt 里写「你没有 refund 工具」能否代替白名单？</summary>
+        <p>不能。须从 API 层不注册 + 服务端拒绝未知 tool name 双保险。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>OAuth</h3>
+      <p>工具背后调用 ERP/CRM 时，使用用户委派 token 或 client-credentials + 用户上下文。Scope 须窄于应用默认权限。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># tool-oauth-scopes.yaml
+tools:
+  query_order:
+    required_scopes: ["orders:read"]
+  apply_refund:
+    required_scopes: ["orders:read", "refunds:write"]
+    extra_checks: ["amount_limit", "otp_if_over_500"]</code></pre>
+      </div>
+      <p>Spring <code>@Tool</code> 方法内注入 <code>OAuth2AuthorizedClient</code>；Python 侧 httpx 携带 user token，401 时<strong>勿</strong>让模型重试换参数绕过。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>沙箱</h3>
+      <p><span class="term" data-term-id="tool-sandbox" tabindex="0">tool sandbox</span> 用于代码执行、SQL、Shell 类工具：网络隔离、只读 FS、超时与输出长度上限。</p>
+      <div class="mermaid-wrap">
+        <h5>高风险工具沙箱</h5>
+        <pre class="mermaid">flowchart LR
+  Agent --> Gate[capability control]
+  Gate -->|pass| Sandbox[gVisor/容器]
+  Sandbox --> RO[只读 DB 副本]
+  Sandbox -->|deny| Audit[audit trail]</pre>
+      </div>
+      <p>MCP 服务器须 <span class="term" data-term-id="mcp-auth" tabindex="0">mcp auth</span>：mutual TLS + 每 server 独立 allowlist，禁止 Agent 任意挂载社区 MCP。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>白名单</strong>：按 role-tool-map 动态注册；prompt 不能替代 API 层拒绝。</li>
+        <li><strong>OAuth</strong>：工具级 scope + 业务规则（金额/OTP）二次校验。</li>
+        <li><strong>沙箱</strong>：代码/SQL 类工具必须隔离；MCP 须认证与 allowlist。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：完成测验；下一章 <a href="#ch-practice-02-alignment-guard">价值观与输出护栏</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI Tools</a></li>
+      <li><a href="https://modelcontextprotocol.io/docs/concepts/auth" target="_blank" rel="noopener">MCP Authentication</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">填写 <code>demos/practice-01-tool-authz-lab/tool-matrix.md</code> 并编写 tool-oauth-scopes 片段（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>为 end_user / agent_desk 各列 3 个工具与 1 个明确禁止工具。</li>
+      <li>为 <code>apply_refund</code> 写 <code>extra_checks</code> 两条（金额 + OTP）。</li>
+      <li>对照 Java 代码块，说明若模型 hallucinate 调用未注册 tool 时 Spring 行为。</li>
+      <li>（可选）完成 demo 目录 tool-matrix 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：Agent 越权退款。应先查 ① Prompt ② role-tool-map ③ LLM 温度 ④ 向量库 ACL。排序优先级。</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>② → ④ → ① → ③</strong>：越权优先查工具注册与 ERP 鉴权；ACL 若误返回他人订单也会资损；温度与注入无关性低。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：工具调用权限</h4>
+      <p>目录：<code>demos/practice-01-tool-authz-lab/</code>。<strong>验收</strong>：tool-matrix 三角色 × 工具矩阵完整。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="../agent-orchestration-engineering/index.html" target="_blank" rel="noopener">Agent 编排</a> — NS2</li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-alignment-guard">价值观与输出护栏</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,362 @@
+<section id="ch-basics-03-prompt-advisor" class="chapter" data-chapter="basics-03-prompt-advisor">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Prompt 模板与 Advisor</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-prompt-advisor" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Spring AI 核心抽象</strong> · 能力：用 PromptTemplate 与 Advisor 链构建可测试 Prompt 管线</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>把 prompt 硬编码在 Service 里，会导致<strong>无法版本化、无法单测、无法复用</strong>。CorpAssist S2 客服的 RAG 系统提示、NS2 工具调用前的安全指令，都应通过 <span class="term" data-term-id="prompt-template" tabindex="0">prompt template</span> 与 <span class="term" data-term-id="advisor-chain" tabindex="0">advisor chain</span> 管理；<span class="term" data-term-id="advisor-order" tabindex="0">advisor order</span> 错了等于护栏失效。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <code>PromptTemplate</code> 与 <code>.st</code> 文件管理带 <span class="term" data-term-id="placeholder" tabindex="0">placeholder</span> 的 RAG 提示</li>
+          <li>区分 <span class="term" data-term-id="system-message" tabindex="0">system message</span> 与 <span class="term" data-term-id="user-message" tabindex="0">user message</span>，并说明各自在 S2/NS2 中的职责</li>
+          <li>设计 <span class="term" data-term-id="testable-prompt" tabindex="0">testable prompt</span>：快照测试模板渲染结果，不调用真实 LLM</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>模板</strong>：变量用 <code>{context}</code>、<code>{query}</code> 等占位，渲染与调用分离。</li>
+          <li><strong>消息角色</strong>：System 定边界，User 承载员工提问，Assistant 由模型生成。</li>
+          <li><strong>Advisor</strong>：在 call 前后织入 RAG、记忆、护栏；顺序影响 NS2 工具是否被注入攻击。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>PromptTemplate</h3>
+      <p><span class="term" data-term-id="prompt-template" tabindex="0">prompt template</span> 把「提示词文档」从 Java 字符串挪到可审查的文件（如 <code>classpath:/prompts/rag-system.st</code>），便于产品/合规一起评审。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code>你是 CorpAssist 企业知识库助手（S2）。
+仅根据下列检索片段回答；无依据时回答「未在制度库中找到」。
+引用格式：[doc_id] 片段摘要
+
+上下文：
+{context}
+
+用户：{query}</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Bean
+PromptTemplate ragPromptTemplate(
+    @Value("classpath:/prompts/rag-system.st") Resource resource) {
+  return new PromptTemplate(resource);
+}
+
+public String renderUserMessage(String context, String query) {
+  return ragPromptTemplate.render(Map.of(
+      "context", context,
+      "query", query));
+}</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>占位符</th><th>来源</th><th>CorpAssist 含义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>{context}</code></td><td>VectorStore 检索 Top-K</td><td>制度片段拼接（practice RAG 章）</td></tr>
+          <tr><td><code>{query}</code></td><td>员工原始问题</td><td>门户 POST body</td></tr>
+          <tr><td><code>{sessionId}</code></td><td>网关透传</td><td>Memory Advisor 使用（practice 章）</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Service 内 200 行字符串拼接</li>
+            <li>模板改一字需重新编译整包</li>
+            <li>无渲染单测，只靠肉眼 diff</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li><code>.st</code> 文件进 Git，PR 可 review</li>
+            <li>渲染结果做 <span class="term" data-term-id="testable-prompt" tabindex="0">testable prompt</span> 快照</li>
+            <li>变量缺失时单测失败（Map 缺 key）</li>
+          </ul>
+        </div>
+      </div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：PromptTemplate 与 ChatClient.user() 谁先谁后？</summary>
+        <p>先 <code>render()</code> 得到最终 user 文本（或整段 Prompt），再 <code>chatClient.prompt().user(rendered).call()</code>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Advisor 链</h3>
+      <p><span class="term" data-term-id="advisor-chain" tabindex="0">advisor chain</span> 在模型调用前后插入横切逻辑：检索增强、会话记忆、输入过滤、输出审核。CorpAssist <strong>NS2</strong> 强调工具调用前的白名单与注入防护，常作为<strong>靠前</strong>的 Advisor。</p>
+      <div class="mermaid-wrap">
+        <h5>Advisor 执行顺序（概念）</h5>
+        <pre class="mermaid">flowchart LR
+  IN[用户请求]
+  A1[InputSanitizer]
+  A2[RetrievalAdvisor]
+  A3[ChatMemoryAdvisor]
+  CM[ChatModel]
+  A4[OutputModeration]
+  OUT[响应]
+  IN --> A1 --> A2 --> A3 --> CM --> A4 --> OUT</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="advisor-order" tabindex="0">advisor order</span>：先净化输入，再 RAG，再记忆；模型输出后做审核。advanced 生产护栏章细化实现。</p>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Bean
+ChatClient ragChatClient(ChatModel chatModel, VectorStore vectorStore) {
+  var retrieval = new QuestionAnswerAdvisor(vectorStore, SearchRequest.defaults());
+  return ChatClient.builder(chatModel)
+      .defaultAdvisors(retrieval)
+      .defaultSystem("你是 CorpAssist S2 助手，禁止编造制度条款。")
+      .build();
+}</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>Advisor 类型</th><th>典型作用</th><th>阶段</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>QuestionAnswerAdvisor</td><td>检索片段注入 prompt</td><td>practice RAG</td></tr>
+          <tr><td>MessageChatMemoryAdvisor</td><td>多轮历史拼入</td><td>practice Memory</td></tr>
+          <tr><td>自定义 SafeInputAdvisor</td><td>越狱/注入检测</td><td>advanced 护栏</td></tr>
+          <tr><td>ToolCallingAdvisor</td><td>NS2 工具循环</td><td>practice Tools</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · NS2 · 工具与护栏</span>
+        员工问「帮我导出全部客户手机号」——InputSanitizer 应拦截；合法问「查工单 WO-1024」才进入 ToolCallingAdvisor。顺序错误（先 Tool 后 Sanitizer）可能让恶意 prompt 直接触发工具。
+      </aside>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">before</span>
+          <p class="role-card-desc">改 Prompt、加检索上下文、加载 Memory。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">after</span>
+          <p class="role-card-desc">审核输出、打码 PII、写审计日志。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">链式组合</span>
+          <p class="role-card-desc"><code>.defaultAdvisors(a, b, c)</code> 顺序即执行顺序。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>系统/用户消息</h3>
+      <p>OpenAI 风格对话由多条 <span class="term" data-term-id="message-chat" tabindex="0">message chat</span> 组成。Spring AI 用 <code>.system()</code> / <code>.user()</code> 映射到不同角色。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>角色</th><th>谁写</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="term" data-term-id="system-message" tabindex="0">system message</span></td>
+            <td>平台模板</td>
+            <td>「仅依据 context 回答；无依据说未找到」</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="user-message" tabindex="0">user message</span></td>
+            <td>员工 + 渲染变量</td>
+            <td>含 {context} 与 {query} 的完整 user 段</td>
+          </tr>
+          <tr>
+            <td>assistant</td>
+            <td>模型历史</td>
+            <td>Memory Advisor 注入上轮回复</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="learn-tabs" role="tablist" aria-label="消息组装方式">
+        <input type="radio" name="basics03msg" id="basics03-tab-default" class="learn-tab-input" checked />
+        <input type="radio" name="basics03msg" id="basics03-tab-explicit" class="learn-tab-input" />
+        <label for="basics03-tab-default">defaultSystem</label>
+        <label for="basics03-tab-explicit">每次显式 system</label>
+        <div class="learn-tab-panel" id="basics03-panel-default" role="tabpanel">
+          <p>在 <code>ChatClient.builder</code> 上 <code>.defaultSystem(...)</code>，适合全局不变的 S2 人格与合规边界。</p>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-java">chatClient.prompt()
+    .user(renderedUserMessage)
+    .call();</code></pre>
+          </div>
+        </div>
+        <div class="learn-tab-panel" id="basics03-panel-explicit" role="tabpanel">
+          <p>多租户或 A/B 时每次 <code>.system(dynamicSystem)</code> 覆盖默认。</p>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-java">chatClient.prompt()
+    .system(tenantPolicyLoader.forTenant(tenantId))
+    .user(renderedUserMessage)
+    .call();</code></pre>
+          </div>
+        </div>
+      </div>
+      <p>与 Python 对照：<code>messages=[{"role":"system",...},{"role":"user",...}]</code> 与 Spring 的 system/user 划分一致，便于 <span class="term" data-term-id="python-parity" tabindex="0">python parity</span> 评测。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>可测试 Prompt</h3>
+      <p><span class="term" data-term-id="testable-prompt" tabindex="0">testable prompt</span> 指：单元测试只验证<strong>模板渲染</strong>与 Advisor 是否改写了 Prompt，不必每次打真实 LLM。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Test
+void ragTemplate_rendersPlaceholders() {
+  var template = new PromptTemplate("""
+      上下文：{context}
+      用户：{query}
+      """);
+  String rendered = template.render(Map.of(
+      "context", "[doc-1] 年假 5 天",
+      "query", "还剩几天"));
+  assertThat(rendered).contains("[doc-1]").contains("还剩几天");
+}</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>测试层</th><th>测什么</th><th>不依赖</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>模板渲染</td><td>占位符替换、缺 key 失败</td><td>ChatModel</td></tr>
+          <tr><td>Advisor 单元</td><td>mock Request/Response 改 Prompt</td><td>真实 HTTP</td></tr>
+          <tr><td>集成</td><td>@MockBean ChatModel 固定返回</td><td>厂商配额</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>CI 每条用例打 OpenAI 计费</li>
+            <li>只断言「返回非空」</li>
+            <li>模板改字无快照回归</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>黄金文件存渲染结果（advanced 快照章）</li>
+            <li>Advisor 顺序用专用测试固定</li>
+            <li>与 Python 轨共用 JSON fixture 测 prompt 文本</li>
+          </ul>
+        </div>
+      </div>
+      <div class="learn-faq">
+        <details>
+          <summary>PromptTemplate 与 StringTemplate 选哪个？</summary>
+          <div class="learn-faq-body">Spring AI 的 PromptTemplate 与 ChatClient 集成更好；复杂逻辑可先在 Java 算变量，再传入简单模板。</div>
+        </details>
+        <details>
+          <summary>NS2 工具 prompt 放 system 还是 user？</summary>
+          <div class="learn-faq-body">工具<strong>说明与边界</strong>放 system；具体工具调用上下文由框架生成 tool 消息（practice Tools 章）。</div>
+        </details>
+      </div>
+      <p>延伸阅读：<a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener">Python 工程轨</a> 中 Jinja/字符串模板的评测方法可迁移到 Java 快照测试。</p>
+      <h4>模板版本与变更管理</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>实践</th><th>目的</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>模板文件路径进 Git，PR 必 review</td><td>合规与产品可审计 prompt 变更</td></tr>
+          <tr><td>渲染快照文件名含章节 id</td><td>CI 回归发现无意改字</td></tr>
+          <tr><td>与评测集 golden prompt 同步</td><td>双栈 parity：Python 跑分与 Java 线上一致</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为何 RAG 的 {context} 不建议写在 system 里？</li>
+              <li>Advisor 链与 Servlet Filter 链有何相似与不同？</li>
+              <li>如何在不调用 LLM 的情况下测试 QuestionAnswerAdvisor？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>PromptTemplate</strong>：提示词文件化，<code>{context}</code>、<code>{query}</code> 等变量可 review、可单测。</li>
+        <li><strong>Advisor 链</strong>：RAG/Memory/护栏/工具按顺序织入；NS2 先净化再 Tool。</li>
+        <li><strong>系统/用户消息</strong>：System 定边界，User 承载渲染后的问题与检索上下文。</li>
+        <li><strong>可测试 Prompt</strong>：渲染快照 + Mock ChatModel，CI 不烧配额。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-engineering_basics03_prompt">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="tpl" /> 能列出 rag-system.st 中 3 个占位符含义</label></li>
+          <li><label><input type="checkbox" data-id="adv" /> 能画出 Advisor 链并说明 NS2 为何 Input 在前</label></li>
+          <li><label><input type="checkbox" data-id="msg" /> 能区分 system 与 user 在 S2 RAG 中的内容</label></li>
+          <li><label><input type="checkbox" data-id="test" /> 能写一条只测 render 的单元测试</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一章：<a href="#ch-basics-04-structured-output">结构化输出</a> — JSON mode 与 Bean 映射，完成 CorpAssist 请假表单抽取。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/prompt.html" target="_blank" rel="noopener">Prompt &amp; PromptTemplate</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Advisors</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html#_advisors" target="_blank" rel="noopener">ChatClient Advisors</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 30 分钟 · 编辑 Demo 模板，并设计 Advisor 顺序纸面图。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/basics-03-prompt-advisor-lab/rag-system.st</code>，列出 3 个占位变量及业务含义。</li>
+      <li>在笔记画出 Input → RAG → Memory → Model → Output 顺序图。</li>
+      <li>写一条 JUnit 断言渲染结果包含 <code>[doc_id]</code> 占位示例。</li>
+      <li>说明 NS2 工具调用场景下，哪条 Advisor 必须排在 Tool 之前。</li>
+      <li>完成右侧测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事把 500 字制度全文塞进 <code>defaultSystem</code>，检索片段放 user。请评价是否合理。</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>不推荐。volatile 的 {context} 应走 user 或 Advisor 注入；system 保持短而稳定的边界规则。</p></div></details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">CI 因调用真实 LLM  flaky 失败。最先应引入哪类测试？① 端到点 GPT ② 模板渲染快照 ③ 压测网关</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>② 模板渲染快照 + @MockBean ChatModel；避免 CI 依赖外网。</p></div></details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Prompt 模板与 Advisor</h4>
+      <p>目录：<code>demos/basics-03-prompt-advisor-lab/</code>。<strong>验收</strong>：README 三项占位符说明 + Advisor 顺序图 + 1 条渲染测试思路。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-02-chatclient">ChatClient 与 ChatModel</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-structured-output">结构化输出</a></li>
+      <li><strong>后续</strong>：<a href="#ch-advanced-01-advisors-prod">生产 Advisor：安全与护栏</a></li>
+    </ul>
+  </div>
+</section>

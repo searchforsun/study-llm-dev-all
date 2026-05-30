@@ -1,0 +1,417 @@
+<section id="ch-basics-04-errors-logging" class="chapter" data-chapter="basics-04-errors-logging">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>异常、日志与配置</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-errors-logging" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30 分钟</strong> · 阶段：<strong>Python 工程基座</strong> · 能力：设计 AppError 层次、输出 JSON 日志并与 Java ELK 联查</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>双栈联调时，Java BFF 同事会在 Kibana 用 <code>request_id</code> 串起整条链路。若 Python RAG 服务只打纯文本 <code>print</code>、异常随意抛 <code>Exception</code>，排障成本会指数上升。本章建立与 Spring Logback + MDC 对齐的 <span class="term" data-term-id="structlog" tabindex="0">structlog</span> <span class="term" data-term-id="json-logging" tabindex="0">JSON 日志</span> 与 <span class="term" data-term-id="exception-hierarchy" tabindex="0">异常层次</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>定义 <span class="term" data-term-id="app-error" tabindex="0">AppError</span> 及 LLM/配置子类并映射 HTTP 状态与业务 <code>code</code></li>
+          <li>配置 structlog 输出含 <span class="term" data-term-id="correlation-id" tabindex="0">request_id</span> 的 JSON 行到 stdout</li>
+          <li>按 <span class="term" data-term-id="twelve-factor" tabindex="0">12-factor</span> 实践分离 <span class="term" data-term-id="config-env" tabindex="0">配置与环境</span>，并编写 Java 侧 Kibana 查询</li>
+          <li>衔接 <a href="#ch-practice-01-fastapi-intro">FastAPI 路由与依赖注入</a> 的 exception_handler</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>业务异常可预期</strong>：用 AppError 子类，带 <code>code</code> + <code>http_status</code>，禁止裸 <code>raise Exception("fail")</code>。</li>
+          <li><strong>日志写 stdout JSON</strong>：一行一条 JSON，字段稳定，采集器与 Java 侧同一管道。</li>
+          <li><strong>request_id 全链路透传</strong>：从 Spring 网关 header 绑定到 structlog contextvars。</li>
+          <li><strong>配置不进镜像</strong>：密钥与 URL 仅环境变量；镜像同一份，环境不同。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>异常层次</h3>
+
+      <p>CorpAssist Python 采用分层 <span class="term" data-term-id="exception-hierarchy" tabindex="0">异常层次</span>：底层库错误（httpx、ValidationError）在边界捕获，转换为对外稳定的 <span class="term" data-term-id="app-error" tabindex="0">AppError</span>。</p>
+
+      <h4>基类与子类</h4>
+      <div class="code-block"><pre><code class="language-python">class AppError(Exception):
+    code: str = "INTERNAL_ERROR"
+    http_status: int = 500
+
+    def __init__(self, message: str, *, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
+class LlmUpstreamError(AppError):
+    code = "LLM_UPSTREAM"
+    http_status = 502
+
+class ConfigError(AppError):
+    code = "CONFIG_INVALID"
+    http_status = 500
+
+class ValidationAppError(AppError):
+    code = "VALIDATION_FAILED"
+    http_status = 400</code></pre></div>
+
+      <h4>映射到 HTTP JSON（practice 章实现 handler）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>异常</th><th>code</th><th>HTTP</th><th>典型场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>LlmUpstreamError</code></td><td><code>LLM_UPSTREAM</code></td><td>502</td><td>网关超时、503</td></tr>
+          <tr><td><code>ValidationAppError</code></td><td><code>VALIDATION_FAILED</code></td><td>400</td><td>Pydantic 校验失败</td></tr>
+          <tr><td><code>ConfigError</code></td><td><code>CONFIG_INVALID</code></td><td>500</td><td>启动时缺必填 env</td></tr>
+          <tr><td><code>AppError</code></td><td><code>INTERNAL_ERROR</code></td><td>500</td><td>未分类业务失败</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>异常转换流</h5>
+        <pre class="mermaid">flowchart LR
+  H[httpx.TimeoutException]
+  P[pydantic.ValidationError]
+  A[AppError 子类]
+  J[JSON 响应 + code]
+  H -->|捕获| A
+  P -->|捕获| A
+  A --> J</pre>
+        <p class="diagram-caption">用户可见 <code>code</code> 与 Java BFF 错误码表对齐（advanced 章双栈协作规范）。</p>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li><code>except Exception: pass</code></li>
+            <li>把堆栈直接返回给前端</li>
+            <li>每处 httpx 调用各自定义错误字符串</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>统一 <code>raise LlmUpstreamError(...)</code></li>
+            <li>日志记录 stack，响应用稳定 code</li>
+            <li>与 Spring <code>@ControllerAdvice</code> 对称设计</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：502 和 500 在 CorpAssist 里应如何区分？</summary>
+        <p>502 表示<strong>上游 LLM 网关</strong>可预期失败（超时、不可用），可告警与重试；500 表示本服务未处理好的内部错误，需修代码或配置。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>structlog</h3>
+
+      <p><span class="term" data-term-id="structlog" tabindex="0">structlog</span> 将日志事件变为结构化键值，配合 <code>JSONRenderer</code> 输出 <span class="term" data-term-id="json-logging" tabindex="0">JSON 日志</span>，便于 Filebeat/Logstash 与 Java 日志同索引检索。</p>
+
+      <h4>最小配置</h4>
+      <div class="code-block"><pre><code class="language-python">import structlog
+
+def configure_logging(*, json_output: bool = True) -> None:
+    processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+    if json_output:
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer())
+    structlog.configure(processors=processors)</code></pre></div>
+
+      <h4>绑定 request_id 与打日志</h4>
+      <div class="code-block"><pre><code class="language-python">structlog.contextvars.bind_contextvars(request_id=request_id)
+log = structlog.get_logger("corpassist.llm")
+
+log.info(
+    "llm.chat.completed",
+    request_id=request_id,
+    model="qwen-plus",
+    prompt_tokens=120,
+    completion_tokens=40,
+    latency_ms=842.5,
+    service="corpassist-python",
+)
+
+log.error(
+    "llm.chat.failed",
+    request_id=request_id,
+    code="LLM_UPSTREAM",
+    service="corpassist-python",
+    latency_ms=30001,
+)</code></pre></div>
+
+      <h4>推荐字段（与 Java 对齐）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>含义</th><th>Java 侧</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>request_id</code></td><td>全链路 ID</td><td>MDC <code>X-Request-Id</code></td></tr>
+          <tr><td><code>service</code></td><td><code>corpassist-python</code></td><td><code>spring.application.name</code></td></tr>
+          <tr><td><code>level</code></td><td>info/warn/error</td><td>Logback level</td></tr>
+          <tr><td><code>event</code></td><td>如 <code>llm.chat.completed</code></td><td>自定义 marker/logger name</td></tr>
+          <tr><td><code>code</code></td><td>业务错误码</td><td>BFF 错误码枚举</td></tr>
+          <tr><td><code>latency_ms</code></td><td>耗时</td><td>Micrometer timer</td></tr>
+        </tbody>
+      </table>
+
+      <p><span class="term" data-term-id="log-level" tabindex="0">日志级别</span> 由 <code>CORPASSIST_LOG_LEVEL</code> 控制，与 Spring <code>logging.level.*</code> 同级概念。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>12-factor 配置</h3>
+
+      <p><span class="term" data-term-id="twelve-factor" tabindex="0">12-factor</span> 中与本章最相关的两条：<strong>III Config</strong> 与 <strong>XI Logs</strong>。CorpAssist Python 与 Spring Boot 部署在同一 K8s 集群时，应遵守相同约束。</p>
+
+      <h4>Config：环境注入</h4>
+      <ul>
+        <li><strong>构建时 vs 运行时</strong>：Docker 镜像 build 阶段不含 staging/prod 密钥；运行时由 Secret 挂载 env。</li>
+        <li><strong><span class="term" data-term-id="config-env" tabindex="0">配置与环境分离</span></strong>：<code>CorpAssistSettings</code> 只读 env，不把 <code>.env</code> 打进镜像。</li>
+        <li><strong>启动失败要快</strong>：缺 <code>CORPASSIST_LLM_API_KEY</code> 时 <code>ConfigError</code> 阻止进程起来，而非首请求才炸。</li>
+      </ul>
+
+      <h4>Logs：stdout 事件流</h4>
+      <ul>
+        <li>应用只写 <strong>stdout/stderr</strong>，不写本地 rotating file（容器内路径难采集）。</li>
+        <li>JSON 一行一条，便于 ELK <code>json_lines</code> 解析。</li>
+        <li>人类可读说明可写 stderr（demo 做法），生产 JSON 仍走 stdout。</li>
+      </ul>
+
+      <h4>部署对照</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>实践</th><th>Spring Boot</th><th>CorpAssist-python</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>配置</td><td><code>application.yml</code> + env override</td><td>Settings + <code>CORPASSIST_*</code></td></tr>
+          <tr><td>密钥</td><td>K8s Secret → env</td><td>同上</td></tr>
+          <tr><td>日志</td><td>Logback JSON encoder → stdout</td><td>structlog JSONRenderer</td></tr>
+          <tr><td>链路 ID</td><td>MDC filter</td><td>contextvars + 中间件（practice 章）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>Java 侧消费日志格式</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">联调排障（60 秒）</span>
+        用户反馈「问答超时」。Java 同事在 Kibana 取 BFF 日志中的 <code>request_id=abc-123</code>，查询 Python 服务是否出现 <code>llm.chat.failed</code> 与 <code>code=LLM_UPSTREAM</code>，并对比 <code>latency_ms</code> 是否接近网关 timeout。
+      </aside>
+
+      <h4>示例 JSON 行（成功）</h4>
+      <div class="code-block"><pre><code class="language-json">{
+  "event": "llm.chat.completed",
+  "level": "info",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "service": "corpassist-python",
+  "model": "qwen-plus",
+  "prompt_tokens": 120,
+  "completion_tokens": 40,
+  "latency_ms": 842.5,
+  "timestamp": "2026-05-30T08:15:01.123456Z"
+}</code></pre></div>
+
+      <h4>示例 JSON 行（失败）</h4>
+      <div class="code-block"><pre><code class="language-json">{
+  "event": "llm.chat.failed",
+  "level": "error",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "code": "LLM_UPSTREAM",
+  "service": "corpassist-python",
+  "latency_ms": 30001,
+  "message": "gateway timeout"
+}</code></pre></div>
+
+      <h4>Kibana 查询模板</h4>
+      <div class="code-block"><pre><code class="language-text">service:"corpassist-python" AND request_id:"550e8400-e29b-41d4-a716-446655440000"
+
+service:"corpassist-python" AND code:"LLM_UPSTREAM" AND @timestamp:[now-1h TO now]
+
+service:"corpassist-bff" OR service:"corpassist-python"
+  AND request_id:"550e8400-e29b-41d4-a716-446655440000"</code></pre></div>
+
+      <p>字段名 deliberately 使用 snake_case 的 <code>request_id</code>，与 Python 习惯一致；若 Java JSON encoder 输出 camelCase，在 Logstash 做 normalize 或在双栈规范中统一（见 advanced 双栈协作）。</p>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">SRE</span>
+          <p class="role-card-desc">按 <code>code</code> 建告警：LLM_UPSTREAM 超阈值页面上游。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Java BFF 开发</span>
+          <p class="role-card-desc">转发 header <code>X-Request-Id</code>，勿在 BFF 换 ID。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Python 开发</span>
+          <p class="role-card-desc">任何 outbound LLM 调用必须 log 起止 + latency + request_id。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串讲后做练习与测验。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>异常层次</strong>：AppError 子类携带 code/http_status，边界统一转换，对齐 Spring ControllerAdvice。</li>
+        <li><strong>structlog</strong>：JSON 行 + contextvars 绑定 request_id，字段与 Java 可联查。</li>
+        <li><strong>12-factor 配置</strong>：配置在 env、日志在 stdout；镜像无环境特定密钥。</li>
+        <li><strong>Java 侧消费日志格式</strong>：Kibana 用 service + request_id + code 三板斧跨栈排障。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="apperror" /> 能说出 LlmUpstreamError 的 code 与 HTTP 状态</label></li>
+          <li><label><input type="checkbox" data-id="structlog-fields" /> 能列出 JSON 日志 4 个必填字段</label></li>
+          <li><label><input type="checkbox" data-id="12factor" /> 能解释为何 .env 不打进 Docker 镜像</label></li>
+          <li><label><input type="checkbox" data-id="kibana" /> 能写出一条 request_id 联查 Kibana 查询</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>场景</th><th>动作</th></tr></thead>
+              <tbody>
+                <tr><td>上游 LLM 超时</td><td>LlmUpstreamError + code LLM_UPSTREAM</td></tr>
+                <tr><td>打日志</td><td>structlog + request_id + service</td></tr>
+                <tr><td>配置密钥</td><td>env / Secret，不进镜像</td></tr>
+                <tr><td>联查</td><td>Kibana: service + request_id</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>主题</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>AppError</td><td>稳定 code + http_status</td></tr>
+                <tr><td>structlog</td><td>stdout 一行一条 JSON</td></tr>
+                <tr><td>12-factor</td><td>配置在 env，日志在 stdout</td></tr>
+                <tr><td>Kibana</td><td>service + request_id 联查</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Python 日志能否直接写 Logback 格式？</summary>
+          <div class="learn-faq-body">可以但没必要；统一<strong> JSON 字段契约</strong>比统一 encoder 更重要。双栈约定 service、request_id、code、level 即可。</div>
+        </details>
+        <details>
+          <summary>异常 details 字典可否返回给前端？</summary>
+          <div class="learn-faq-body">仅返回安全字段（如 <code>latency_ms</code>）；内部 stack 与上游 raw body 只进日志。</div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为何 structlog 选 JSON 行而不是纯文本？</li>
+              <li>502 响应时，日志里应有哪些字段便于 SRE 告警？</li>
+              <li>若 BFF 未转发 X-Request-Id，Python 侧应如何处理？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>502 与 500 在 CorpAssist 双栈错误码表中如何区分？</li>
+              <li>为何 request_id 必须由 BFF 传入而非 Python 重新生成？</li>
+              <li>启动时 ConfigError 与请求时 ValidationAppError 各解决什么问题？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章进入 practice 阶段 <a href="#ch-practice-01-fastapi-intro">FastAPI 路由与依赖注入</a>，把本章异常与日志挂到 HTTP 入口。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.structlog.org/en/stable/" target="_blank" rel="noopener">structlog 文档</a></li>
+      <li><a href="https://12factor.net/zh_cn/" target="_blank" rel="noopener">The Twelve-Factor App</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/features.html#features.logging" target="_blank" rel="noopener">Spring Boot Logging</a></li>
+      <li><a href="https://www.elastic.co/guide/en/kibana/current/index.html" target="_blank" rel="noopener">Kibana 查询入门</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照正文异常映射表、structlog 字段表与 Kibana 模板，完成 JSON 样本解读与排障查询（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「映射到 HTTP JSON」表，为 <code>ValidationAppError</code> 写一句何时从 Pydantic ValidationError 转换。</li>
+      <li>对照 structlog「推荐字段（与 Java 对齐）」表，列出 <code>llm.chat.completed</code> 与 <code>llm.chat.failed</code> 各 3 个共有字段名。</li>
+      <li>阅读「12-factor 配置」部署对照表，说明 Spring <code>application.yml</code> 与 Python Settings 在密钥注入上的同构点。</li>
+      <li>复制 demo 输出中的一条 JSON，将 <code>request_id</code> 代入正文 Kibana 模板写出完整查询；可选运行 <code>python structured_logging_demo.py</code> 确认 stdout 含 info + error JSON。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">找错：下列日志做法哪条违反本章规范？① 生产写 <code>/var/log/app.log</code> ② error 日志含 <code>code=LLM_UPSTREAM</code> ③ 在镜像 COPY .env ④ 用 contextvars 绑定 request_id</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>违反：① 和 ③</strong>。12-factor 要求日志写 stdout 由平台采集；密钥不应 bake 进镜像。②④ 是推荐做法。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">权衡：提议「异常只打日志不返回 code，前端看 HTTP 状态即可」。在 Java BFF 与 Python 双栈联调场景是否足够？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不足</strong>。BFF 与 Kibana 告警依赖稳定业务 <code>code</code>（如 <code>LLM_UPSTREAM</code>）；仅 HTTP 状态无法区分同 502 下的超时、限流与配置错误，双栈契约应对齐 code 字段。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：异常与 structlog</h4>
+      <p>目录：<code>demos/basics-04-errors-logging-lab/</code>。<strong>验收</strong>：<code>python structured_logging_demo.py</code> stdout 含 info 与 error JSON；error 行含 <code>code=LLM_UPSTREAM</code> 与 <code>request_id</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-fastapi-intro">FastAPI 路由与依赖注入</a>：HTTP 入口与 exception_handler</li>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/handling-errors/" target="_blank" rel="noopener">FastAPI — Handling Errors（预告）</a></li>
+    </ul>
+  </div>
+</section>

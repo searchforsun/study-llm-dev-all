@@ -1,0 +1,270 @@
+<section id="ch-practice-02-permission" class="chapter" data-chapter="practice-02-permission">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>权限与多租户</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-permission" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>治理实战</strong> · 能力：在 Milvus/Spring 检索层实现 ACL 行级过滤与多租户隔离</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S1 KB 聚合 HR、财务、研发多部门文档。若在 LLM 生成答案后再做权限裁剪，模型已「看过」越权 chunk，存在 <span class="term" data-term-id="permission-leak" tabindex="0">permission leak</span> 风险。Basics 已在 <a href="#ch-basics-03-chunk-metadata">分块与元数据规范</a> 定义 <span class="term" data-term-id="acl-tags" tabindex="0">acl tags</span>；practice 要在<strong>检索层</strong>把 tenant 与 ACL 写进 filter，做到「搜不到 = 不存在」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 <span class="term" data-term-id="kb-acl" tabindex="0">kb acl</span> 元数据模型（tenant + role + doc_type）</li>
+          <li>编写 Milvus / Spring <span class="term" data-term-id="filter-expr" tabindex="0">filter expr</span> 实现 <span class="term" data-term-id="row-filter" tabindex="0">row filter</span></li>
+          <li>为 <span class="term" data-term-id="multi-tenant-kb" tabindex="0">multi tenant kb</span> 配置 collection 或逻辑分区策略</li>
+          <li>排查「能搜到但不应看到」的 <span class="term" data-term-id="retrieval-isolation" tabindex="0">retrieval isolation</span> 故障</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>检索前过滤</strong>：filter 在 vector search 之前，非 prompt 事后删段落。</li>
+          <li><strong>元数据即权限</strong>：ingest 时必须写入 <code>acl_tags</code>；缺字段默认 deny。</li>
+          <li><strong>租户边界</strong>：<code>tenant_id</code> 是每个 filter 的 mandatory 条件。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>ACL</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 财务政策隔离</span>
+        员工张三（tenant=<code>corp-a</code>，roles=<code>employee</code>）问「年终奖计税规则」。KB 含 <code>FIN-TAX-2026</code>（acl=<code>finance,hr-admin</code>）与 <code>EMP-HANDBOOK</code>（acl=<code>all-staff</code>）。检索必须只返回后者相关 chunk。
+      </aside>
+      <p><span class="term" data-term-id="acl-metadata" tabindex="0">acl metadata</span> 在 ingest 阶段由源系统 IAM 映射写入向量库。CorpAssist schema 约定：</p>
+      <ul>
+        <li><code>tenant_id</code>：多租户硬隔离</li>
+        <li><code>acl_tags[]</code>：角色/部门标签，检索时与用户 claims 求交</li>
+        <li><code>doc_type</code>：policy / contract / faq，可叠加额外规则</li>
+      </ul>
+
+      <h4>ingest 写入 ACL 元数据</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># corpassist/ingest/acl_mapper.py
+def map_acl(source_doc) -&gt; dict:
+    return {
+        "tenant_id": source_doc.tenant,
+        "acl_tags": iam.resolve_tags(source_doc.folder, source_doc.classification),
+        "doc_type": source_doc.type,
+    }
+# upsert 时每 chunk 携带上述 metadata</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">事后过滤（禁止）</span>
+          <ul>
+            <li>Top-K 检索后再用 Python 删 chunk</li>
+            <li>把 ACL 写进 system prompt「不要泄露」</li>
+            <li>缺 <code>acl_tags</code> 时默认 allow</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">检索层 filter（推荐）</span>
+          <ul>
+            <li>Milvus expr 带 tenant + acl 交集</li>
+            <li>缺 metadata → 不进入候选集</li>
+            <li>审计日志记录 filter 与用户 claims</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-micro-check">
+        <p><strong>先想 10 秒：</strong>若 K=10 检索后再过滤，剩 2 条合法 chunk，对答案质量有何影响？</p>
+        <details><summary>参考思路</summary><p>有效召回不足，可能空答；且模型已接触 8 条越权上下文，存在泄露风险。必须在 search 前 filter。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>行级过滤</h3>
+      <p><span class="term" data-term-id="row-filter" tabindex="0">row filter</span> 将用户 JWT claims 翻译为 Milvus boolean expr。CorpAssist 规则：<strong>tenant 必等</strong>，acl 为数组包含（ANY）语义。</p>
+
+      <h4>filter 表达式模板</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist/config/acl-filter.yaml
+filter_template: |
+  tenant_id == "{tenant_id}"
+  and (
+    array_contains_any(acl_tags, [{user_tags}])
+    or array_contains(acl_tags, "all-staff")
+  )
+deny_if_missing_acl: true
+max_candidates: 50   # filter 后再取 top_k</code></pre>
+      </div>
+
+      <h4>Spring VectorStore 检索</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public List&lt;Document&gt; search(String query, UserContext ctx) {
+    String filter = aclFilterBuilder.build(
+        ctx.tenantId(),
+        ctx.roles(),
+        ctx.departments()
+    );
+    return vectorStore.similaritySearch(
+        SearchRequest.query(query).withTopK(8).withFilterExpression(filter)
+    );
+}</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>用户场景</th><th>filter 要点</th><th>期望结果</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>跨 tenant 攻击</td>
+            <td><code>tenant_id == user.tenant</code></td>
+            <td>返回 0 条</td>
+          </tr>
+          <tr>
+            <td>同 tenant 无 finance 角色</td>
+            <td>acl 不含 finance 标签</td>
+            <td>财务文档不可见</td>
+          </tr>
+          <tr>
+            <td>hr-admin</td>
+            <td>acl 含 hr-admin 或 all-staff</td>
+            <td>可见 HR 政策</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>检索隔离</h3>
+      <p><span class="term" data-term-id="tenant-kb" tabindex="0">tenant kb</span> 隔离有两种工程选型：物理隔离（每 tenant 独立 collection）与逻辑隔离（共享 collection + 强制 tenant filter）。CorpAssist S1 选<strong>逻辑隔离 + mandatory filter</strong>，advanced 章再讨论联邦多 KB。</p>
+
+      <div class="mermaid-wrap">
+        <h5>检索隔离链路</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 用户
+  participant G as Spring Gateway
+  participant R as RAG Service
+  participant M as Milvus
+  U-&gt;&gt;G: 提问 + JWT
+  G-&gt;&gt;R: 转发 claims
+  R-&gt;&gt;R: 构建 filter expr
+  R-&gt;&gt;M: search(query, filter)
+  M--&gt;&gt;R: 仅授权 chunks
+  R--&gt;&gt;U: 生成答案</pre>
+        <p class="diagram-caption">filter 在 M 侧执行；LLM  never 看到越权 chunk。</p>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="隔离策略">
+        <input type="radio" name="acl-tab" id="acl-tab-logic" class="learn-tab-input" checked />
+        <input type="radio" name="acl-tab" id="acl-tab-phys" class="learn-tab-input" />
+        <label for="acl-tab-logic">逻辑隔离</label>
+        <label for="acl-tab-phys">物理隔离</label>
+        <div class="learn-tab-panel" id="acl-panel-logic" role="tabpanel">
+          <ul>
+            <li>单 collection，运维简单</li>
+            <li>必须代码层保证 filter 不可绕过</li>
+            <li>CorpAssist S1 默认</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="acl-panel-phys" role="tabpanel">
+          <ul>
+            <li>每 tenant 独立 collection/alias</li>
+            <li>误配 filter 风险低</li>
+            <li>成本与运维复杂度更高</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：BM25 混合检索如何加 ACL？</summary>
+        <p>稀疏与稠密两路检索<strong>各自</strong>带相同 filter；RRF 合并前不得引入未过滤结果。CorpAssist 在 hybrid retriever 封装层统一注入 <code>AclFilter</code> 对象。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>ACL</strong>：ingest 写入 tenant + acl_tags；缺字段 deny；禁止 LLM 事后裁剪。</li>
+        <li><strong>行级过滤</strong>：claims → Milvus expr；tenant  mandatory；array_contains_any 匹配角色。</li>
+        <li><strong>检索隔离</strong>：filter 在 vector search 前；审计 claims 与 expr；混合检索两路同 filter。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="klg_practice02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="ingest" /> 能说明 acl_tags 在 ingest 哪步写入</label></li>
+          <li><label><input type="checkbox" data-id="expr" /> 能写出含 tenant_id 的 filter 模板</label></li>
+          <li><label><input type="checkbox" data-id="spring" /> 能指出 Spring search 中 filter 参数位置</label></li>
+          <li><label><input type="checkbox" data-id="hybrid" /> 能解释混合检索为何两路都要 filter</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；继续 <a href="#ch-practice-03-quality">知识质量运营</a>，处理陈旧文档与冲突 chunk。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://milvus.io/docs/boolean.md" target="_blank" rel="noopener">Milvus Boolean Expression</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI VectorStore Filter</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 财务隔离场景编写 acl-filter.yaml 片段，并用表格用例验证 filter 行为。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 <code>acl-filter.md</code> 填写张三（employee）与李四（finance）的 claims JSON。</li>
+      <li>根据正文 yaml 模板，写出李四检索 <code>FIN-TAX-2026</code> 时的完整 Milvus expr。</li>
+      <li>在「用户场景」表中新增一行：guest 用户（无 tenant）应返回什么？</li>
+      <li>对照 Java <code>similaritySearch</code> 片段，说明 <code>withFilterExpression</code> 若省略会怎样。</li>
+      <li>可选：运行 <code>demos/practice-02-permission-lab/validate_acl.py</code> 验收 expr 语法。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）工程师在 RAG prompt 末尾加「若内容涉及财务请回答无权」。为何仍违反本章？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>模型已在 context 中看到财务 chunk，属于 permission leak；必须在 Milvus search 前 filter，使越权 chunk 不进入 context。</p></div></details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（场景）混合检索只给稠密向量加 filter，BM25 路未加。攻击者可能得到什么？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>BM25 路可能召回越权文档进入 RRF 合并，最终答案引用敏感片段。两路检索必须注入相同 AclFilter。</p></div></details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：权限与多租户</h4>
+      <p>目录：<code>demos/practice-02-permission-lab/</code>。<strong>验收</strong>：<code>python validate_acl.py --tenant corp-a --role employee</code> 输出 <code>PASS: finance doc filtered</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-01-incremental">增量更新与重建</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-quality">知识质量运营</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,428 @@
+<section id="ch-basics-02-types-style" class="chapter" data-chapter="basics-02-types-style">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>类型注解与代码规范</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-types-style" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30 分钟</strong> · 阶段：<strong>Python 工程基座</strong> · 能力：为 CorpAssist DTO 编写 typing 模式并通过 ruff/mypy 门禁</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Java 里改 <code>MessageDto</code> 字段，编译器会拦住漏改处；Python 默认运行时才发现。CorpAssist 的 Chat 消息、Embedding 客户端、RAG 检索结果在双栈间频繁重构，<span class="term" data-term-id="type-hint" tabindex="0">类型注解</span> + <span class="term" data-term-id="mypy" tabindex="0">mypy</span> 是把「编译期安全」尽量搬回 Python 的关键。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 LLM 消息链编写 <span class="term" data-term-id="typed-dict" tabindex="0">TypedDict</span>、<span class="term" data-term-id="protocol" tabindex="0">Protocol</span> 与 <span class="term" data-term-id="generics" tabindex="0">泛型</span> 容器</li>
+          <li>配置 <span class="term" data-term-id="ruff" tabindex="0">ruff</span> / mypy 并在 CI 中阻断明显类型错误</li>
+          <li>向 Java 同事解释 <span class="term" data-term-id="duck-typing" tabindex="0">鸭子类型</span> 与 interface 的差异，并应用 <span class="term" data-term-id="readability" tabindex="0">可读性</span> 原则</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>注解是文档 + 门禁</strong>：IDE 补全靠它，mypy strict 靠它，OpenAPI 生成也间接靠 FastAPI 签名。</li>
+          <li><strong>半结构化用 TypedDict</strong>：OpenAI 风格 <code>messages[]</code> 比裸 <code>list[dict]</code> 更可维护。</li>
+          <li><strong>行为接口用 Protocol</strong>：不必继承，只要实现了方法就符合 — 静态侧类似 Java interface。</li>
+          <li><strong>风格与类型一起拦</strong>：ruff 管格式/导入，mypy 管类型，pre-commit 或 CI 统一跑。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>typing 常用模式</h3>
+
+      <p>CorpAssist Python 侧高频类型模式如下；与 demo <code>type_patterns_demo.py</code> 一一对应。</p>
+
+      <h4>TypedDict：Chat 消息</h4>
+      <div class="code-block"><pre><code class="language-python">from typing import Literal, TypedDict
+
+class ChatMessage(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+def build_messages(system: str, history: list[ChatMessage]) -> list[ChatMessage]:
+    return [{"role": "system", "content": system}, *history]</code></pre></div>
+      <p><span class="term" data-term-id="typed-dict" tabindex="0">TypedDict</span> 适合 JSON 形状稳定、字段有限的 DTO；完整校验仍交给 <a href="#ch-basics-03-core-libs">常用库与 HTTP 客户端</a> 中 <span class="term" data-term-id="pydantic" tabindex="0">Pydantic v2</span> 的 <span class="term" data-term-id="base-model" tabindex="0">BaseModel</span>（HTTP 边界）。</p>
+
+      <h4>Protocol：Embedding 客户端</h4>
+      <div class="code-block"><pre><code class="language-python">from typing import Protocol
+
+class EmbeddingClient(Protocol):
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+class MockEmbeddingClient:
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+def index_chunks(client: EmbeddingClient, texts: list[str]) -> list[list[float]]:
+    return client.embed(texts)</code></pre></div>
+      <p><span class="term" data-term-id="protocol" tabindex="0">Protocol</span> 描述「必须有 <code>embed</code> 方法」；<span class="term" data-term-id="duck-typing" tabindex="0">鸭子类型</span> 在运行时成立，mypy 在静态侧验证。Mock 实现无需声明 <code>implements</code>。</p>
+
+      <h4>泛型与可选</h4>
+      <div class="code-block"><pre><code class="language-python">from collections.abc import Sequence
+
+def truncate_history(messages: list[ChatMessage], max_turns: int) -> list[ChatMessage]:
+    if max_turns <= 0:
+        return messages[:1]
+    system = [m for m in messages if m["role"] == "system"]
+    rest = [m for m in messages if m["role"] != "system"]
+    return system + rest[-(max_turns * 2):]
+
+def first_item(items: Sequence[str]) -> str:
+    return items[0]</code></pre></div>
+      <p>Python 3.12+ 使用内置 <span class="term" data-term-id="generics" tabindex="0">泛型</span> <code>list[str]</code>，不再依赖 <code>typing.List</code>。只读参数优先 <code>Sequence</code>，类似 Java 只读视图。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 消息类型分层</h5>
+        <pre class="mermaid">flowchart TB
+  JSON[网关 JSON messages]
+  TD[TypedDict ChatMessage]
+  PYD[Pydantic ChatRequest]
+  API[FastAPI 路由入参]
+  JSON --> TD
+  TD --> PYD
+  PYD --> API</pre>
+        <p class="diagram-caption">内部函数可用 TypedDict；HTTP 边界用 Pydantic；避免全程裸 dict。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不全用 Pydantic，还要 TypedDict？</summary>
+        <p>轻量纯函数、测试 fixture、与 Java 侧简单 JSON 互转时 TypedDict 开销更低；进入 HTTP/配置边界再 model_validate，分层更清晰。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>ruff/mypy</h3>
+
+      <p>CorpAssist 在 <code>pyproject.toml</code> 集中配置两类门禁：<span class="term" data-term-id="ruff" tabindex="0">ruff</span> 负责 lint + format，<span class="term" data-term-id="mypy" tabindex="0">mypy</span> 负责静态类型。</p>
+
+      <h4>pyproject 中的工具段</h4>
+      <div class="code-block"><pre><code class="language-toml">[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]  # pycodestyle, pyflakes, isort, pyupgrade
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true</code></pre></div>
+
+      <h4>本地与 CI 命令</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>命令</th><th>作用</th><th>Java 近似</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>uv run ruff check .</code></td><td>Lint 全仓库</td><td>Checkstyle</td></tr>
+          <tr><td><code>uv run ruff format .</code></td><td>统一格式</td><td>Spotless / google-java-format</td></tr>
+          <tr><td><code>uv run mypy src</code></td><td>类型检查源码</td><td><code>javac</code> + 注解处理器</td></tr>
+        </tbody>
+      </table>
+
+      <h4>strict 模式常见报错与修复</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">mypy 会拦</span>
+          <ul>
+            <li>缺返回类型 / 参数类型</li>
+            <li><code>role = "admin"</code> 赋给 Literal 联合</li>
+            <li>隐式 <code>Any</code> 传播</li>
+            <li>未处理的 <code>Optional</code></li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">修复习惯</span>
+          <ul>
+            <li>公共 API 全标注；私有函数至少标注参数</li>
+            <li>用 <code>Literal</code> / <code>Enum</code> 限制枚举字段</li>
+            <li>第三方缺 stub 时用 <code>types-*</code> 或 targeted <code># type: ignore</code></li>
+            <li><code>if x is None: return</code> 早返回收窄类型</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>CI 门禁建议</h4>
+      <div class="code-block"><pre><code class="language-bash">uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv run pytest</code></pre></div>
+      <p>建议在 PR 模板写清：<strong>ruff + mypy + pytest 三者皆绿</strong>，与 Java 模块「编译 + 单测」同级。AI 生成代码不得跳过 mypy。</p>
+
+      <h4>ruff 与 mypy 分工（标签页）</h4>
+      <div class="learn-tabs" role="tablist" aria-label="ruff 与 mypy 分工">
+        <input type="radio" name="basics02tools" id="basics02-tab-ruff" class="learn-tab-input" checked />
+        <input type="radio" name="basics02tools" id="basics02-tab-mypy" class="learn-tab-input" />
+        <label for="basics02-tab-ruff">ruff</label>
+        <label for="basics02-tab-mypy">mypy</label>
+        <div class="learn-tab-panel" id="basics02-panel-ruff" role="tabpanel">
+          <p><strong>拦什么</strong>：未使用 import、格式不一致、可自动 upgrade 的旧语法（<code>UP</code> 规则）。</p>
+          <p><strong>类比</strong>：Checkstyle + isort + 部分 formatter。</p>
+          <p><strong>CorpAssist</strong>：<code>uv run ruff check .</code> 与 <code>ruff format --check .</code> 进 CI。</p>
+        </div>
+        <div class="learn-tab-panel" id="basics02-panel-mypy" role="tabpanel">
+          <p><strong>拦什么</strong>：类型不匹配、缺注解、<code>Literal</code> 赋值越界、隐式 <code>Any</code>。</p>
+          <p><strong>类比</strong>：<code>javac</code> 类型检查（非运行时）。</p>
+          <p><strong>CorpAssist</strong>：<code>strict = true</code> 覆盖 <code>src/corpassist</code>，DTO 重构前最后一道闸。</p>
+        </div>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>能否用 Pyright 替代 mypy？</summary>
+          <div class="learn-faq-body">可以，团队择一即可。CorpAssist 教学默认 mypy + pyproject 配置，与多数 CI 模板兼容；切 Pyright 时保持同一 strict 标准，勿双跑两套除非有明确收益。</div>
+        </details>
+        <details>
+          <summary>TypedDict 与 @dataclass 怎么选？</summary>
+          <div class="learn-faq-body">与 JSON 互转多、字段即 dict 键 → TypedDict；需要方法、不可变对象、非 dict 序列化 → dataclass。LLM messages 通常 TypedDict + Pydantic 边界。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Java 类型系统对比</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">双栈 DTO 对齐（30 秒）</span>
+        Spring BFF 暴露 <code>List&lt;MessageDto&gt;</code>，Python RAG 服务内部用 <code>list[ChatMessage]</code> 组装 prompt。字段命名：Java camelCase JSON 经网关可配置 alias，Python 侧 Pydantic 用 <code>Field(alias="messageId")</code> 对齐（advanced 章展开）。
+      </aside>
+
+      <h4>概念对照表</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>Java</th><th>Python 3.12</th><th>CorpAssist 备注</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>String</code></td><td><code>str</code></td><td>不可变文本</td></tr>
+          <tr><td><code>List&lt;T&gt;</code></td><td><code>list[T]</code></td><td>消息列表、向量 batch</td></tr>
+          <tr><td><code>Optional&lt;T&gt;</code></td><td><code>T | None</code></td><td>usage 字段可空</td></tr>
+          <tr><td><code>interface</code></td><td><code>Protocol</code></td><td>EmbeddingClient</td></tr>
+          <tr><td><code>record / DTO</code></td><td><code>TypedDict</code> / <code>@dataclass</code></td><td>内部传输</td></tr>
+          <tr><td><span class="term" data-term-id="validation" tabindex="0">Bean Validation</span></td><td><span class="term" data-term-id="pydantic" tabindex="0">Pydantic v2</span></td><td>HTTP 入参校验</td></tr>
+          <tr><td>编译期检查</td><td>mypy strict（可选但推荐）</td><td>CI 阻断</td></tr>
+          <tr><td>运行时多态</td><td><span class="term" data-term-id="duck-typing" tabindex="0">鸭子类型</span></td><td>无需 implements</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Java 有而 Python 需注意的差异</h4>
+      <ul>
+        <li><strong>无默认编译期</strong>：类型错可能跑到生产；mypy 是团队契约，不是语言内置。</li>
+        <li><strong>可变默认参数</strong>：禁用 <code>def f(x=[])</code> 这类 footgun；Java 无此问题。</li>
+        <li><strong>None 即 Null</strong>：函数应显式 <code>| None</code>，避免 Java 式 NPE 的 Python 版。</li>
+      </ul>
+
+      <h4>Java record vs Python TypedDict</h4>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label">Java record</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">java</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-java">public record ChatMessage(String role, String content) {}
+List&lt;ChatMessage&gt; history;</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label">Python TypedDict</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">python</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-python">class ChatMessage(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str
+history: list[ChatMessage]</code></pre>
+          </div>
+        </div>
+      </div>
+      <p>record 在运行时自带校验与不可变语义；TypedDict 主要服务静态检查，运行时仍是普通 dict — HTTP 边界仍应交给 Pydantic。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>可读性原则</h3>
+
+      <p><span class="term" data-term-id="readability" tabindex="0">可读性</span> 不是「代码短」，而是<strong>下一个 Java 同事扫一眼能改对</strong>。CorpAssist Python 约定：</p>
+
+      <ul>
+        <li><strong>命名</strong>：模块/函数/变量 <code>snake_case</code>；类 <code>PascalCase</code>；常量 <code>UPPER_SNAKE</code> — 与 PEP 8 一致，JSON 字段经 Pydantic alias 与 Java camelCase 对齐。</li>
+        <li><strong>早返回</strong>：减少嵌套 <code>if</code>，与 Java Guard Clause 相同。</li>
+        <li><strong>小函数</strong>：<code>truncate_history</code>、<code>build_messages</code> 单一职责；单函数建议 &lt; 40 行。</li>
+        <li><strong>显式优于隐式</strong>：拒绝魔法全局；配置走 Settings（<a href="#ch-basics-03-core-libs">结构化配置</a>）。</li>
+        <li><strong>类型即文档</strong>：公共函数必须有 <span class="term" data-term-id="type-hint" tabindex="0">类型注解</span> 与一句 docstring（非 trivial 时）。</li>
+      </ul>
+
+      <h4>反例 vs 推荐（RAG 片段处理）</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li><code>def go(d, m, f): ...</code> 无类型无 docstring</li>
+            <li>200 行「上帝函数」含 HTTP + 切块 + 向量化</li>
+            <li><code>except:</code> 裸捕获吞掉栈</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li><code>def truncate_history(messages: list[ChatMessage], max_turns: int) -> list[ChatMessage]</code></li>
+            <li>分层：<code>llm/client.py</code> 只谈 HTTP，<code>rag/chunking.py</code> 只谈文本</li>
+            <li>异常转 <code>AppError</code>（见 <a href="#ch-basics-04-errors-logging">异常、日志与配置</a>）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Optional 与类型收窄</h4>
+      <div class="code-block"><pre><code class="language-python">def pick_model(explicit: str | None, settings_default: str) -> str:
+    if explicit is None:
+        return settings_default
+    return explicit  # mypy 知 explicit 为 str</code></pre></div>
+      <p>Java <code>Optional&lt;T&gt;</code> 在 Python 侧常用 <code>T | None</code>；配合早返回，mypy 可自动收窄，减少「忘判空」类 bug。</p>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">Review 清单</span>
+          <p class="role-card-desc">PR 是否通过 ruff/mypy？公共 API 是否有类型？</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">跨栈读者</span>
+          <p class="role-card-desc">假设 Reviewer 是 Spring 开发者 — 命名与分层要可对照。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">LLM 代码</span>
+          <p class="role-card-desc">AI 生成代码必须过同一门禁，不得绕过 mypy。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串讲后做练习与测验。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>typing 常用模式</strong>：TypedDict 描述消息、Protocol 描述客户端、内置泛型描述容器 — 覆盖 CorpAssist 80% 内部签名。</li>
+        <li><strong>ruff/mypy</strong>：工具配置进 pyproject，CI 与本地同命令；strict 把重构风险前置到 PR。</li>
+        <li><strong>与 Java 类型系统对比</strong>：Python 靠 optional 静态检查补编译期；Pydantic 对齐 Bean Validation。</li>
+        <li><strong>可读性原则</strong>：snake_case、早返回、小函数、显式类型 — 为双栈 Review 降低认知差。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="python-engineering-for-llm_basics02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="typeddict" /> 能手写 ChatMessage TypedDict 并说明 Literal 作用</label></li>
+          <li><label><input type="checkbox" data-id="protocol" /> 能解释 Protocol 与 Java interface 的异同</label></li>
+          <li><label><input type="checkbox" data-id="ruff-mypy" /> 能说出 ruff 与 mypy 各拦哪类问题</label></li>
+          <li><label><input type="checkbox" data-id="java-table" /> 能对照 Java/Python 类型表至少 5 行</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>模式</th><th>何时用</th></tr></thead>
+              <tbody>
+                <tr><td>TypedDict</td><td>内部 JSON 形状稳定的 dict</td></tr>
+                <tr><td>Protocol</td><td>可替换客户端/适配器</td></tr>
+                <tr><td>list[T]</td><td>可变容器元素类型</td></tr>
+                <tr><td>ruff + mypy</td><td>风格 + 类型双门禁</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>TypedDict 与 dataclass 怎么选？</summary>
+          <div class="learn-faq-body">dict 互操作多、字段固定用 TypedDict；需要方法或可变实例用 <code>@dataclass</code>。HTTP 边界仍优先 <span class="term" data-term-id="pydantic" tabindex="0">Pydantic v2</span>。</div>
+        </details>
+        <details>
+          <summary>AI 生成的代码可以跳过 mypy 吗？</summary>
+          <div class="learn-faq-body">不可以。生成代码与手写走同一 CI：<code>ruff + mypy + pytest</code>，否则幻觉类型会进入 RAG 主路径。</div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Protocol 与 ABC 抽象基类各适合什么场景？</li>
+              <li>为何 CorpAssist 要求 public API 必须带返回类型？</li>
+              <li>Java record 与 Python TypedDict 在运行时校验上有何差别？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-basics-03-core-libs">常用库与 HTTP 客户端</a> 用 httpx + Pydantic 落地 LLM 调用。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.python.org/3/library/typing.html" target="_blank" rel="noopener">Python typing — 标准库类型系统</a></li>
+      <li><a href="https://mypy.readthedocs.io/en/stable/" target="_blank" rel="noopener">mypy 文档 — strict 选项说明</a></li>
+      <li><a href="https://docs.astral.sh/ruff/" target="_blank" rel="noopener">Ruff — Linter 与 Formatter</a></li>
+      <li><a href="https://peps.python.org/pep-0008/" target="_blank" rel="noopener">PEP 8 — Style Guide for Python Code</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 CorpAssist Chat 消息链，完成<strong>TypedDict 字段清单</strong>、<strong>ruff/mypy 对照</strong>、<strong>Java 类型表</strong>与<strong>可读性改写</strong>（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「typing 常用模式」中 <code>ChatMessage</code> 代码块，写出三字段与 <code>role</code> 的 Literal 集合；对照 Mermaid「消息类型分层」说明 TypedDict 与 Pydantic 分界。</li>
+      <li>对照「ruff/mypy」命令表，写出 <code>uv run ruff check .</code> 与 <code>uv run mypy src</code> 各对应 Java 哪类门禁。</li>
+      <li>填写「与 Java 类型系统对比」表中 Bean Validation 一行：Chat 入参校验在 Python 由谁承担。</li>
+      <li>将「可读性原则」反例 <code>def go(d, m, f)</code> 改写为带完整类型注解的函数签名（纸面即可）。</li>
+      <li>（可选）运行 <code>demos/basics-02-types-style-lab/type_patterns_demo.py</code>，并对非法 <code>role</code> 跑 mypy 记录报错关键词。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">权衡：团队提议「CI 只跑 ruff，mypy 太慢先不上」。作为 CorpAssist 双栈项目，你是否支持？说明一条最强理由。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不支持</strong>。LLM DTO 与网关 JSON 字段频繁变更，缺 mypy 时类型错只能运行时或联调暴露；Java 侧有编译期，Python 侧应对齐用 strict mypy 保契约。可优化 scope（先 <code>src/corpassist</code>）而非取消。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：PR 中 ① 删除所有返回类型注解以「加快开发」② 为第三方库全局 <code># type: ignore</code> ③ 新增 <code>Protocol</code> 描述 EmbeddingClient ④ 在 HTTP 路由参数用裸 <code>dict</code>。哪些应拒绝？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>应拒绝：① ② ④</strong>。公共 API 必须标注；滥用 ignore 掩盖真实类型错误；HTTP 边界应 Pydantic/BaseModel 而非裸 dict。③ 是推荐做法。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：typing 模式与静态检查</h4>
+      <p>目录：<code>demos/basics-02-types-style-lab/</code>。<strong>验收</strong>：<code>python type_patterns_demo.py</code> 输出消息条数与 embedding 维度；mypy 对非法 <code>role</code> 报错。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-core-libs">常用库与 HTTP 客户端</a>：httpx + Pydantic 调用 LLM</li>
+      <li><a href="https://docs.pydantic.dev/latest/concepts/models/" target="_blank" rel="noopener">Pydantic — Models（预告 HTTP DTO）</a></li>
+    </ul>
+  </div>
+</section>

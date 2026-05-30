@@ -1,0 +1,372 @@
+<section id="ch-basics-02-chatclient" class="chapter" data-chapter="basics-02-chatclient">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>ChatClient 与 ChatModel</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-chatclient" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Spring AI 核心抽象</strong> · 能力：掌握调用链、多模型 Bean、流式 Flux 与 Python 客户端对照</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><span class="term" data-term-id="chat-client" tabindex="0">chat client</span> 是 Spring AI 推荐的业务门面；底层 <span class="term" data-term-id="chat-model" tabindex="0">chat model</span> 才对接 HTTP。S2 客服要在门户里<strong>流式吐字</strong>、按意图路由<strong>多模型</strong>，并和 Python 实验脚本保持同一套 <span class="term" data-term-id="openai-compatible" tabindex="0">openai compatible</span> 语义——本章把 <span class="term" data-term-id="call-chain" tabindex="0">call chain</span> 画清楚。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>口述 Controller → ChatClient → ChatModel → 网关的完整 <span class="term" data-term-id="call-chain" tabindex="0">call chain</span></li>
+          <li>用 @Qualifier 注册<strong>快/慢</strong>两路 <span class="term" data-term-id="multi-model" tabindex="0">multi model</span> Bean，并说明 NS2 工具调用前的路由点</li>
+          <li>返回 <code>Flux&lt;String&gt;</code> 对接 SSE，并与 Python <code>stream=True</code> 对照（<span class="term" data-term-id="python-parity" tabindex="0">python parity</span>）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>门面</strong>：业务只调 ChatClient，不直接调 ChatModel API。</li>
+          <li><strong>同步 vs 流式</strong>：<code>.call()</code> 阻塞拿全文；<code>.stream()</code> 走 Reactor Flux。</li>
+          <li><strong>双栈</strong>：同一 prompt 在 Python 脚本与 Spring Service 应得到可比的模型行为（温度、model 名一致）。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>调用链</h3>
+      <p>一次 S2 客服提问从 HTTP 进入，到模型返回，经过多层抽象。理解每层职责，排障时才知道日志该打在哪。</p>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist S2：同步调用链</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 员工门户
+  participant C as ChatController
+  participant CC as ChatClient
+  participant CM as ChatModel
+  participant GW as LLM 网关
+  U->>C: POST /api/chat
+  C->>CC: prompt().user(q).call()
+  CC->>CM: 组装 Prompt / Options
+  CM->>GW: OpenAI 兼容 HTTP
+  GW-->>CM: ChatResponse
+  CM-->>CC: 文本 + 元数据
+  CC-->>C: content()
+  C-->>U: JSON 回复</pre>
+        <p class="diagram-caption">Advisor、Memory、RAG 会在 ChatClient 层挂接（后续章节）；本章先掌握主干。</p>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>层次</th><th>类型</th><th>职责</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Controller</td><td>REST</td><td>鉴权、DTO 校验、request_id</td></tr>
+          <tr><td>ChatClient</td><td>门面</td><td>Fluent API：system/user、options、advisors</td></tr>
+          <tr><td>ChatModel</td><td>端口</td><td>厂商无关的 <code>call(Prompt)</code> / <code>stream(Prompt)</code></td></tr>
+          <tr><td>OpenAiApi</td><td>适配器</td><td>HTTP 序列化、重试（由 Spring AI 封装）</td></tr>
+        </tbody>
+      </table>
+      <h4>同步问答：Service 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Service
+public class CustomerChatService {
+
+  private final ChatClient chatClient;
+
+  public CustomerChatService(ChatClient customerChatClient) {
+    this.chatClient = customerChatClient;
+  }
+
+  public String ask(String question, String sessionId) {
+    return chatClient.prompt()
+        .user(u -> u.text(question).param("sessionId", sessionId))
+        .call()
+        .content();
+  }
+}</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 · 制度 FAQ</span>
+        员工问「年假还剩几天」——当前章用同步 <code>call()</code> 返回完整句子；下一章用 PromptTemplate 注入制度片段；practice 章再接 RAG。
+      </aside>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Controller 内联一长串 prompt 字符串</li>
+            <li>直接注入 OpenAiApi 发 HTTP</li>
+            <li>忽略 <code>ChatResponse</code> 中的 token 用量</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Service 封装 ChatClient，Controller 只传 DTO</li>
+            <li>需要用量时 <code>.call().chatResponse()</code></li>
+            <li>日志记录 model 名、latency（advanced 指标章）</li>
+          </ul>
+        </div>
+      </div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：ChatClient 与 ChatModel 能否只保留一个？</summary>
+        <p>不能省略 ChatModel——它是可替换的「端口」；ChatClient 是易用的「门面」，负责组装 Prompt、Advisor 与默认选项。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>多模型 Bean</h3>
+      <p>生产上常用<strong>快模型</strong>做意图分类与简单 FAQ，<strong>强模型</strong>做复杂工单总结。Spring 容器里注册多个 <code>ChatModel</code>，用 @Qualifier 注入不同 ChatClient。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Configuration
+public class MultiModelConfiguration {
+
+  @Bean
+  @Qualifier("fast")
+  ChatClient fastChatClient(
+      @Qualifier("openAiChatModel") ChatModel chatModel,
+      @Value("${corpassist.ai.fast-model:gpt-4o-mini}") String model) {
+    return ChatClient.builder(chatModel)
+        .defaultOptions(ChatOptions.builder().model(model).temperature(0.0).build())
+        .build();
+  }
+
+  @Bean
+  @Qualifier("quality")
+  ChatClient qualityChatClient(
+      @Qualifier("openAiChatModel") ChatModel chatModel,
+      @Value("${corpassist.ai.quality-model:gpt-4o}") String model) {
+    return ChatClient.builder(chatModel)
+        .defaultOptions(ChatOptions.builder().model(model).temperature(0.2).build())
+        .build();
+  }
+}</code></pre>
+      </div>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>场景</th><th>推荐 Bean</th><th>理由</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>寒暄、分类、是否转人工</td><td><code>fastChatClient</code></td><td>低延迟、低成本</td></tr>
+          <tr><td>多轮工单摘要、合规审核草稿</td><td><code>qualityChatClient</code></td><td>更高推理质量</td></tr>
+          <tr><td>NS2 工具调用后的结果润色</td><td>quality（practice 章 Tools）</td><td>工具返回 JSON，需强模型组织自然语言</td></tr>
+        </tbody>
+      </table>
+      <p>advanced 章的 <span class="term" data-term-id="multi-model" tabindex="0">multi model</span> 路由会加入熔断与成本策略；本章只需会注册两路 Bean 并在 Service 中按意图选择。</p>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">@Primary</span>
+          <p class="role-card-desc">默认注入用；仅应有一个「主」ChatClient，避免歧义。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">@Qualifier</span>
+          <p class="role-card-desc">显式命名 fast/quality；测试时可替换为 Mock。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">配置外部化</span>
+          <p class="role-card-desc">model 名来自 <code>corpassist.ai.*</code>，大促切换不改代码。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>流式 Flux</h3>
+      <p>门户 SSE 需要逐 token 推送。<span class="term" data-term-id="flux-stream" tabindex="0">flux stream</span> 将模型流式响应映射为 Reactor <code>Flux&lt;ChatResponse&gt;</code> 或 <code>Flux&lt;String&gt;</code>。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">public Flux&lt;String&gt; askStream(String question) {
+  return chatClient.prompt()
+      .user(question)
+      .stream()
+      .content();
+}
+
+// Controller 侧（practice REST 章细化）
+// return ResponseEntity.ok()
+//     .contentType(MediaType.TEXT_EVENT_STREAM)
+//     .body(askStream(q));</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>API</th><th>返回</th><th>适用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>.call()</code></td><td>完整字符串</td><td>后台任务、结构化抽取</td></tr>
+          <tr><td><code>.stream().content()</code></td><td><code>Flux&lt;String&gt;</code></td><td>SSE、WebFlux 前端</td></tr>
+          <tr><td><code>.stream().chatResponse()</code></td><td>含 metadata 的块</td><td>需要每块 token 统计</td></tr>
+        </tbody>
+      </table>
+      <div class="notice">
+        <strong>流式注意点</strong>
+        <ul>
+          <li>网关或反向代理需关闭缓冲，否则 SSE 「攒包」看起来像卡住。</li>
+          <li>客户端断开时要 <code>cancel()</code> 订阅，避免浪费 token（Reactor 会向下游传播取消）。</li>
+          <li>NS2 工具调用链通常<strong>先同步拿到 tool 结果</strong>再流式输出最终答案（practice 章）。</li>
+        </ul>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：Flux 与 WebMvc 的 SseEmitter 选哪个？</summary>
+        <p>WebFlux 项目优先 Flux 端到端；传统 Servlet 可用 SseEmitter 包装 Flux 订阅。practice-05 章给出 Controller 模板。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Python 客户端对照</h3>
+      <p><span class="term" data-term-id="python-parity" tabindex="0">python parity</span> 指：同一业务 prompt、同一 model/temperature，在 Python 脚本与 Spring Service 应得到<strong>可比对</strong>的输出，便于评测与排障。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>能力</th><th>Spring AI 1.0.x</th><th>Python（OpenAI SDK）</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>同步补全</td>
+            <td><code>chatClient.prompt().user(q).call().content()</code></td>
+            <td><code>client.chat.completions.create(...)</code></td>
+          </tr>
+          <tr>
+            <td>流式</td>
+            <td><code>.stream().content()</code> → Flux</td>
+            <td><code>stream=True</code> 迭代 chunk</td>
+          </tr>
+          <tr>
+            <td>系统提示</td>
+            <td><code>.defaultSystem(...)</code> 或 <code>.system(...)</code></td>
+            <td><code>messages=[{"role":"system",...}]</code></td>
+          </tr>
+          <tr>
+            <td>配置</td>
+            <td><code>spring.ai.openai.*</code></td>
+            <td><code>OPENAI_API_KEY</code>、<code>base_url</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label">Spring · 流式</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-java">chatClient.prompt().user("制度里年假几天？").stream().content();</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label">Python · 流式</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-python">for chunk in client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "制度里年假几天？"}],
+    stream=True,
+):
+    print(chunk.choices[0].delta.content or "", end="")</code></pre>
+          </div>
+        </div>
+      </div>
+      <p>实验与批量评测多在 <a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 工程轨</span><code class="course-ref-slug">python-engineering-for-llm</code></a> 完成；Spring 轨提供<strong>带鉴权与 Advisor 的在线 API</strong>。双栈联调时对齐：model 名、temperature、base-url、<span class="term" data-term-id="prompt" tabindex="0">prompt</span> 文本。</p>
+      <div class="mermaid-wrap">
+        <h5>双栈联调：同一网关</h5>
+        <pre class="mermaid">flowchart LR
+  Py["Python 评测脚本"]
+  Sp["Spring ChatClient"]
+  GW["CorpAssist LLM 网关"]
+  Py --> GW
+  Sp --> GW</pre>
+        <p class="diagram-caption">差异在「外壳」：Spring 有 Advisor/审计；Python 擅长大批量跑分。</p>
+      </div>
+      <div class="learn-faq">
+        <details>
+          <summary>Flux 一定要 WebFlux 吗？</summary>
+          <div class="learn-faq-body">不一定。可在 Servlet 栈订阅 Flux 写入 SseEmitter；但全链路异步时 WebFlux 更自然。</div>
+        </details>
+        <details>
+          <summary>多模型 Bean 与 advanced 路由章区别？</summary>
+          <div class="learn-faq-body">本章是静态 @Qualifier 选择；advanced 加入熔断、成本与动态 fallback 链。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>调用链</strong>：Controller → ChatClient → ChatModel → 网关；排障按层打日志。</li>
+        <li><strong>多模型 Bean</strong>：fast/quality 两路 ChatClient，配置外部化 model 名。</li>
+        <li><strong>流式 Flux</strong>：<code>.stream().content()</code> 对接 SSE，注意代理缓冲与取消订阅。</li>
+        <li><strong>与 Python 客户端对照</strong>：同步/流式/配置一一对应，双栈共用网关做 parity 验证。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-engineering_basics02_chatclient">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="chain" /> 能画出四层调用链并说明 ChatModel 职责</label></li>
+          <li><label><input type="checkbox" data-id="multi" /> 能解释 fast/quality 两 Bean 的使用场景</label></li>
+          <li><label><input type="checkbox" data-id="flux" /> 能写出流式 API 与 .call() 的区别</label></li>
+          <li><label><input type="checkbox" data-id="py" /> 能对照 Python stream=True 写出等价 Spring 代码</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 Spring AI 推荐 ChatClient 而不是直接注入 ChatModel？</li>
+              <li>SSE 流式时客户端断开，如何减少 token 浪费？</li>
+              <li>双栈 parity 联调要核对哪四个参数？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一章：<a href="#ch-basics-03-prompt-advisor">Prompt 模板与 Advisor</a> — 把 prompt 从 Service 字符串里抽出来，并预习 Advisor 链（含 NS2 护栏落点）。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">ChatClient API</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatmodel.html" target="_blank" rel="noopener">ChatModel API</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html" target="_blank" rel="noopener">OpenAI ChatModel</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 30 分钟 · 在 Demo 中画出调用链，并对照 Python 写一条流式伪代码。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读 <code>demos/basics-02-chatclient-lab/ChatServiceDemo.java</code> 与 README。</li>
+      <li>在笔记画出「POST /api/chat → ChatClient → ChatModel → 网关」序列图（可手绘）。</li>
+      <li>列出 fast/quality 两模型在 S2 客服中的各 1 个用例。</li>
+      <li>写一段 <code>askStream</code> 伪代码，标出返回类型 <code>Flux&lt;String&gt;</code>。</li>
+      <li>对照 <a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener">Python 轨</a> 补全 stream 循环注释。</li>
+      <li>完成右侧测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">团队想在 Controller 直接 <code>openAiApi.chatCompletionEntity(...)</code> 以实现流式。是否违反本章门面原则？应如何改？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>违反。应经 ChatClient <code>.stream()</code>，便于统一 Advisor、选项与测试 Mock。</p></div></details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">SSE 在前端「一次性显示全文」，最可能哪一层配置问题？① ChatClient ② Nginx 缓冲 ③ temperature 过高</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>② 反向代理缓冲未关；与 ChatClient API 无关。</p></div></details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：ChatClient 与 ChatModel</h4>
+      <p>目录：<code>demos/basics-02-chatclient-lab/</code>。<strong>验收</strong>：笔记中有完整调用链图 + Python/Spring 流式对照各 1 段。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-01-setup">项目搭建与自动配置</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-prompt-advisor">Prompt 模板与 Advisor</a></li>
+      <li><a href="https://projectreactor.io/docs/core/release/reference/" target="_blank" rel="noopener">Project Reactor — Flux 基础</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,332 @@
+<section id="ch-basics-06-hallucination" class="chapter" data-chapter="basics-06-hallucination">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>幻觉治理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-06-hallucination" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>RAG 架构与数据管线</strong> · 能力：拒答、置信度、人工审核与指标</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>RAG 不能消除幻觉，只能<strong>约束与兜底</strong>。<span class="term" data-term-id="corpassist-s1" tabindex="0">corpassist s1</span> 制度场景的原则是：<strong>宁可 <span class="term" data-term-id="refusal" tabindex="0">refusal</span>，不可编造</strong>。检索分数低、生成与 context 不符、或涉及敏感政策时，需要拒答、进 <span class="term" data-term-id="human-review" tabindex="0">human review</span>，并用 <span class="term" data-term-id="faithfulness-metric" tabindex="0">faithfulness metric</span> 持续监控。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计分层 <span class="term" data-term-id="hallucination-guard" tabindex="0">hallucination guard</span>：检索阈值拒答、生成后 <span class="term" data-term-id="groundedness" tabindex="0">groundedness</span> 校验</li>
+          <li>用 <span class="term" data-term-id="confidence-score" tabindex="0">confidence score</span> 路由到自动答复 / 拒答 / 人工队列</li>
+          <li>定义 S1 的 <span class="term" data-term-id="faithfulness-metric" tabindex="0">faithfulness metric</span> 与 <span class="term" data-term-id="audit-trail" tabindex="0">audit trail</span> 字段</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>拒答是产品能力</strong>：<span class="term" data-term-id="abstain" tabindex="0">abstain</span> 模板要明确、友好，并引导用户改问法或找人工。</li>
+          <li><strong>置信度多源</strong>：检索 max score、rerank 分差、LLM 自评仅作参考，需组合而非单点。</li>
+          <li><strong>指标闭环</strong>：线上采样 + 人工标注 → 调 threshold → <a href="#ch-practice-05-eval-loop">RAG 评测闭环</a> 回归。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>拒答（Refusal）策略</h3>
+
+      <p>拒答触发条件（满足其一即可 <span class="term" data-term-id="abstain" tabindex="0">abstain</span>）：</p>
+      <ul>
+        <li>检索 top1 score &lt; <code>min_score</code>（无可靠依据）</li>
+        <li>用户问题超出知识库 scope（如问 S4 代码库内容却走 S1 路由）</li>
+        <li>生成后 groundedness 校验失败（答案句无法在 context 中找到支撑）</li>
+        <li>安全策略命中（越权 doc、注入片段）</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">rag:
+  guard:
+    min_score: 0.72
+    refusal_template: "未在制度库中找到可靠依据，请补充关键词或联系 HR 值班。"
+    abstain_on_empty_context: true</code></pre>
+      </div>
+
+      <h4>反例 vs 推荐</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无检索结果仍让 LLM「尽量回答」</li>
+            <li>拒答文案为空或 500 错误</li>
+            <li>拒答不记 <span class="term" data-term-id="audit-trail" tabindex="0">audit trail</span></li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Prompt 明确：无依据则输出固定 <span class="term" data-term-id="refusal" tabindex="0">refusal</span> 句</li>
+            <li>返回 <code>status: refused</code> + 建议动作</li>
+            <li>记录 query、scores、候选 doc_ids</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：拒答率上升 10%，一定是坏事吗？</summary>
+        <p>不一定。可能是 threshold 收紧或库内确实缺文档；需结合 <span class="term" data-term-id="faithfulness-metric" tabindex="0">faithfulness metric</span> 与用户投诉率一起看。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>置信度（Confidence Score）</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 灰色地带（25 秒）</span>
+        问「远程办公补贴标准？」检索 top1=0.74、top2=0.71，条款版本冲突。系统 <span class="term" data-term-id="confidence-score" tabindex="0">confidence score</span> 判为 medium → 生成简答 + 打标进人工复核，而非直接拒答或高置信发布。
+      </aside>
+
+      <p>工程上常用<strong>组合分数</strong>（示意，权重需评测校准）：</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>信号</th><th>含义</th><th>权重思路</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>retrieval_max_score</td>
+            <td>最佳 chunk 相似度</td>
+            <td>低则倾向拒答</td>
+          </tr>
+          <tr>
+            <td>rerank_margin</td>
+            <td>top1 − top2 分差</td>
+            <td>小则 ambiguous</td>
+          </tr>
+          <tr>
+            <td>groundedness_check</td>
+            <td>答案句覆盖 context 比例</td>
+            <td>生成后校验</td>
+          </tr>
+          <tr>
+            <td>citation_valid_rate</td>
+            <td>引用编号合法比例</td>
+            <td>低则拒发或改写</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-param-slider" data-storage-key="rag-system-engineering_basics06_threshold">
+        <label for="basics06-threshold-range">min_score 拒答阈值（教学示意）</label>
+        <input type="range" id="basics06-threshold-range" min="0.5" max="0.9" step="0.02" value="0.72" />
+        <output for="basics06-threshold-range">0.72</output>
+        <p class="learn-param-hint">阈值↑ → 拒答↑、幻觉↓、用户「答不上来」投诉可能↑。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>人工审核（Human Review）</h3>
+
+      <p>并非所有问答都要人工；<span class="term" data-term-id="human-review" tabindex="0">human review</span> 队列应聚焦：</p>
+      <ul>
+        <li>confidence ∈ (review_low, review_high) 的灰色答案</li>
+        <li>用户点击「不准确」反馈</li>
+        <li>涉及薪酬、合规、解雇等高风险 intent</li>
+        <li>faithfulness 自动校验 borderline</li>
+      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>幻觉治理路由</h5>
+        <pre class="mermaid">flowchart TD
+  Q[用户问题] --> RET[检索 + Rerank]
+  RET --> SC{max score >= min?}
+  SC -->|否| REF[拒答模板]
+  SC -->|是| GEN[LLM 生成]
+  GEN --> GD{groundedness OK?}
+  GD -->|否| REF
+  GD -->|是| CF{confidence}
+  CF -->|高| AUTO[自动发布 + citation]
+  CF -->|中| HR[人工审核队列]
+  CF -->|低| REF
+  HR --> AUTO
+  REF --> AUDIT[audit trail]</pre>
+        <p class="diagram-caption">拒答与发布都写 audit；人工审核 SLA 需单独定义（如 4h 内）。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">rag:
+  guard:
+    min_score: 0.72
+    review_band: [0.72, 0.85]
+    human_review_queue: hr-policy-review
+  audit:
+    log: query, scores, chunk_ids, decision, reviewer_id</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>指标与监控</h3>
+
+      <p><span class="term" data-term-id="faithfulness-metric" tabindex="0">faithfulness metric</span> 衡量「答案是否被 context 支撑」；<span class="term" data-term-id="groundedness" tabindex="0">groundedness</span> 常与之同族。S1 建议盯：</p>
+      <ul>
+        <li><strong>faithfulness@sample</strong> — 每日抽检 N 条，人工或 LLM-as-judge</li>
+        <li><strong>refusal_rate</strong> — 拒答占比，按 intent 分桶</li>
+        <li><strong>review_backlog</strong> — 人工队列深度与超时率</li>
+        <li><strong>citation_error_rate</strong> — 引用编号非法占比</li>
+      </ul>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>指标异常</th><th>可能原因</th><th>动作</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>faithfulness 下降</td>
+            <td>chunk 质量差、prompt 过松</td>
+            <td>收紧 prompt、加 groundedness 校验</td>
+          </tr>
+          <tr>
+            <td>refusal_rate 飙升</td>
+            <td>min_score 过高、库缺文档</td>
+            <td>补库或略降阈值 + 评测验证</td>
+          </tr>
+          <tr>
+            <td>review 积压</td>
+            <td>review_band 过宽</td>
+            <td>收窄 band 或增派人手</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-faq">
+        <details>
+          <summary>LLM 自评 confidence 可信吗？</summary>
+          <div class="learn-faq-body">
+            单独使用不可靠；仅作 <span class="term" data-term-id="hallucination-guard" tabindex="0">hallucination guard</span> 的一路信号，必须与检索分、groundedness 交叉验证。
+          </div>
+        </details>
+        <details>
+          <summary>拒答和幻觉哪个更伤业务？</summary>
+          <div class="learn-faq-body">
+            S1 制度场景：<strong>错误答案 &gt; 拒答</strong>。拒答可引导人工；幻觉可能引发合规风险。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>拒答</strong>：无依据 <span class="term" data-term-id="abstain" tabindex="0">abstain</span>，模板 + audit，是正常路径非异常。</li>
+        <li><strong>置信度</strong>：多信号组合，驱动自动 / 拒答 / <span class="term" data-term-id="human-review" tabindex="0">human review</span> 三路。</li>
+        <li><strong>审核</strong>：灰色地带进队列，保留 <span class="term" data-term-id="audit-trail" tabindex="0">audit trail</span>。</li>
+        <li><strong>指标</strong>：<span class="term" data-term-id="faithfulness-metric" tabindex="0">faithfulness metric</span> 与 refusal_rate 联动调参。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="rag-system-engineering_basics06">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="refusal" /> 能列举 3 条拒答触发条件</label></li>
+          <li><label><input type="checkbox" data-id="conf" /> 能说明 confidence 至少两种信号来源</label></li>
+          <li><label><input type="checkbox" data-id="review" /> 能解释 review_band 用途</label></li>
+          <li><label><input type="checkbox" data-id="metric" /> 能说出 faithfulness 与 refusal_rate 的关系</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>refusal</td><td>无依据不编造，返回固定模板</td></tr>
+                <tr><td>groundedness</td><td>答案句能否在 context 找到支撑</td></tr>
+                <tr><td>human review</td><td>灰色置信度进队列，留 audit</td></tr>
+                <tr><td>hallucination guard</td><td>检索前中后多层拦截</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist S1 为何强调「宁可拒答不可编造」？</li>
+              <li>min_score 调高对 faithfulness 与 refusal_rate 各有什么影响？</li>
+              <li>人工审核队列如何与 audit trail 衔接？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">basics 阶段完结；下一步进入 <a href="#ch-practice-01-python-rag">Python：LangChain RAG 实现</a> 动手双栈。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/evaluators.html" target="_blank" rel="noopener">Spring AI Evaluators</a></li>
+      <li><a href="https://python.langchain.com/docs/concepts/evaluation/" target="_blank" rel="noopener">LangChain Evaluation</a></li>
+      <li><a href="https://arxiv.org/abs/2309.11495" target="_blank" rel="noopener">RAGAS: Automated Evaluation of RAG</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">编辑 <code>demos/basics-06-hallucination-lab/guard-config.yaml</code>，完成<strong>阈值实验</strong>、<strong>路由表</strong>与<strong>audit 字段</strong>设计（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 guard-config.yaml，将 <code>min_score</code> 从 0.7 改为 0.75 与 0.65 各跑一次（纸面模拟），分别预测 refusal_rate 与 faithfulness 变化方向。</li>
+      <li>为「远程办公补贴」灰色场景写一条 confidence 组合公式（至少 2 个信号）。</li>
+      <li>设计 audit 日志 JSON：含 query、max_score、decision（auto/refuse/review）、chunk_ids。</li>
+      <li>对照 Mermaid 路由图，标出与 <a href="#ch-basics-05-retrieval-gen">检索、重排与生成</a> 章节的 score threshold 衔接点。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：faithfulness 尚可但用户投诉「总说不确定」。最可能配置问题是？① min_score 过高 ② 未返回 citation ③ review_band 过窄</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>最可能：①</strong>。阈值过高导致频繁 <span class="term" data-term-id="refusal" tabindex="0">refusal</span>。③ 导致人工慢而非直接拒答；② 影响信任但不必然「不确定」文案。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">找错：哪条违反 S1 原则？① 无 chunk 仍生成 ② 低置信进 human review ③ 拒答写 audit</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>答：①</strong>。无依据必须 abstain。②③ 是推荐治理手段。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：幻觉治理实验室</h4>
+      <p>目录：<code>demos/basics-06-hallucination-lab/</code>。<strong>验收</strong>：调整 min_score 并说明对拒答率、faithfulness 的业务影响。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一阶段</strong>：<a href="#ch-practice-01-python-rag">Python：LangChain RAG 实现</a></li>
+      <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a> — faithfulness 基准与发布门禁</li>
+      <li><a href="#ch-advanced-05-security">RAG 安全</a> — 注入与越权检索</li>
+    </ul>
+  </div>
+</section>
