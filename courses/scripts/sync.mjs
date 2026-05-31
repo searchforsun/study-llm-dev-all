@@ -464,6 +464,42 @@ function buildScenarioMeta(spec) {
   return bySlug;
 }
 
+const EN_TITLES = {
+  'llm-application-fundamentals': 'LLM Application Fundamentals',
+  'python-engineering-for-llm': 'Python Engineering for LLM Applications',
+  'spring-ai-engineering': 'Spring AI Engineering',
+  'spring-ai-alibaba-engineering': 'Spring AI Alibaba Engineering',
+  'production-prompt-engineering': 'Production Prompt Engineering',
+  'context-memory-engineering': 'Context & Hybrid Memory Engineering',
+  'llm-evaluation-quality': 'LLM Evaluation & Quality Engineering',
+  'rag-system-engineering': 'RAG System Architecture & Engineering',
+  'rag-system-py': 'RAG System Implementation (Python)',
+  'rag-system-java': 'RAG System Implementation (Java)',
+  'llamaindex-rag-engineering': 'LlamaIndex RAG Engineering',
+  'retrieval-vector-platform': 'Vector Retrieval & Hybrid Search Platform',
+  'agent-orchestration-engineering': 'Agent Orchestration (LangGraph)',
+  'agent-orchestration-java': 'Agent Orchestration (Spring AI Alibaba)',
+  'ai-dev-toolchain': 'AI-Native Development Toolchain',
+  'domain-model-adaptation': 'Domain Model Adaptation: SFT & LoRA',
+  'llm-serving-for-applications': 'LLM Serving & Inference for Applications',
+  'multimodel-routing-multimodal': 'Multi-Model Routing & Multimodal Applications',
+  'knowledge-lifecycle-governance': 'Knowledge Base Lifecycle Governance',
+  'observability-reliability-ops': 'Observability & Reliability Operations',
+  'security-compliance-engineering': 'Security & Compliance Engineering',
+  'llm-application-backend': 'LLM Application Backend & Distributed Governance',
+  'enterprise-llm-solution-delivery': 'Enterprise LLM Solution Delivery',
+  'scenario-py-rag-kb': 'Enterprise RAG Knowledge Base (Python)',
+  'scenario-java-rag-kb': 'Enterprise RAG Knowledge Base (Java)',
+  'scenario-py-customer-service': 'Intelligent Customer Service (Python)',
+  'scenario-java-customer-service': 'Intelligent Customer Service (Java)',
+  'scenario-py-agent-automation': 'Agent Task Automation (Python)',
+  'scenario-java-agent-automation': 'Agent Task Automation (Java)',
+  'scenario-py-code-assistant': 'Code Assistant (Python)',
+  'scenario-java-code-assistant': 'Code Assistant (Java)',
+  'scenario-py-content-studio': 'Content Generation Studio (Python)',
+  'scenario-java-content-studio': 'Content Generation Studio (Java)',
+};
+
 function enrichCourse(slug, c, spec, scenarioMetaBySlug) {
   const rule = spec.learningPath?.completionRule?.requiredScenario;
   let scenarioRole = scenarioMetaBySlug[slug]?.scenarioRole ?? null;
@@ -485,6 +521,7 @@ function enrichCourse(slug, c, spec, scenarioMetaBySlug) {
     trackLabel: TRACK_LABELS[track] ?? track,
     trackOrder: trackOrder[slug] ?? 99,
     title: c.title,
+    enTitle: EN_TITLES[slug] ?? '',
     summary: summaries[slug] ?? c.title,
     path: `${slug}/index.html`,
     themePreset: slug,
