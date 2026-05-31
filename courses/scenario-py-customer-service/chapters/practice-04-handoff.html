@@ -5,267 +5,516 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Python 栈实战</strong> · 场景：<strong>S2</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>没有 AI 客服能做到 100% 的自动化率。当 AI 无法处理、用户情绪负面、或者问题超出边界时，优雅地转接人工是保障用户体验的最后一道防线。糟糕的转接体验会让用户对系统整体的评分直接腰斩。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现置信度阈值触发的自动转接；设计上下文移交机制（转人工时携带对话历史和用户信息）；实现排队与坐席分配策略；搭建转接率监控看板并做优化分析。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><p>1) 转接触发条件：置信度<0.50、用户要求、意图识别失败3次、情感分数<0.3；2) 上下文移交包含：对话历史+已收集参数+用户信息+转接原因；3) 排队策略：优先级队列（投诉>金额>一般），坐席分配用最少占用优先；4) 目标转接率 25-30%，转接后 CSAT ≥ 3.8/5；5) 转接优化最重要的是「少转且转得准」——错误转接比不转接更伤用户体验。</p></div>
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Python 栈实战</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服最怕的不是「不会答」，而是「该转人工时没转」——AI 在低置信度下强行回答导致用户不满、敏感场景由 AI 处理导致法律风险。系统需要可靠的降级机制来决定「什么时候我搞不定了」。从置信度阈值到坐席分配队列到上下文移交，每一个环节都影响用户体验。CorpAssist 的四级降级策略确保每个 AI 无法处理的请求都能平滑过渡到人工坐席，且坐席无需询问用户「之前说什么了」。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>设计四级降级触发条件（置信度 <0.5/超过 maxSteps=8/工具连续失败 3 次/敏感意图）并设置优先级；实现上下文移交——对话历史摘要（LLM 压缩）+ 用户画像 + 当前意图 + 已执行操作序列化为 JSON 并传给坐席；用 Redis List 实现 Round-Robin + 技能匹配 + 负载均衡的坐席分配队列；搭建转接率 Grafana 看板 + 转接率异常告警 + 根因分析 Pipeline。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 四级降级触发条件按优先级排序：敏感意图（法律/投诉）→ 工具连续失败 3 次 → 超过 maxSteps=8 → 置信度 <0.5；2) 上下文移交数据包约 4.2KB，包含对话历史摘要（LLM 压缩至 200 token）+ 用户画像（部门/职级）+ 当前意图 + 已执行操作列表 + 原始对话 JSON；3) Redis List 坐席分配：三级队列（高优/普通/低优）→ Round-Robin 轮询 → 技能匹配（先匹配同技能组）→ 负载均衡（选当前坐席最少的）→ P50 分配延迟 <500ms；4) 转接率监控使用 Grafana + Redis 计数器 + 日志分析 ELK，P99 转接延迟 <30s，高峰期（10:00-11:00 AM）转接率比平均高 40%。</p></div>
     </div>
 
     <div class="section-block">
-      <h3>置信度低于阈值 → 转人工</h3>
-      <p>转接触发条件需要多个维度的综合判断，而非单一阈值。</p>
+      <h3>四级降级触发：优先级设计与实现</h3>
+      <p>降级策略是客服系统的最后一道防线。设计原则是「尽早降级优于错误回复」——让 AI 承认能力边界比编造错误答案更好。CorpAssist 定义了四级降级触发条件，每一级有不同的处理流程和用户感知。</p>
       <div class="mermaid-wrap">
-        <pre class="mermaid">flowchart TD
-    A[对话进行中] --> B{转接条件检查}
-    B --> C[意图置信度 < 0.50]
-    B --> D[用户明确要求转人工]
-    B --> E[意图识别失败 ≥ 3 次]
-    B --> F[情感分数 < 0.3 负面]
-    C --> G[触发转接]
-    D --> G
-    E --> G
-    F --> G
-    G --> H[打包上下文]
-    H --> I[排队]
-    I --> J[分配坐席]
-    J --> K[上下文注入到人工工作台]</pre>
+        <pre class="mermaid">flowchart TB
+    subgraph Triggers[四级降级触发]
+        A[用户消息] --> B{触发检测}
+        B --> C[Grade 1: 敏感意图<br/>法律/投诉关键词]
+        B --> D[Grade 2: 工具连续失败<br/>同工具失败 &gt;= 3 次]
+        B --> E[Grade 3: 超过 maxSteps<br/>step_count &gt;= 8]
+        B --> F[Grade 4: 置信度过低<br/>confidence &lt; 0.50]
+    end
+    subgraph Actions[降级动作]
+        C --> G[AI 回复: 正在转接...<br/>+ 高优队列]
+        D --> H[AI 回复: 系统繁忙...<br/>+ 生成工单]
+        E --> I[AI 回复: 对话太长...<br/>+ 上下文移交]
+        F --> J[AI 反问: 您的问题...<br/>或直接转接]
+    end
+    subgraph Queue[Redis 队列]
+        G --> K["queue:high_priority<br/>(优先级 1)"]
+        H & I & J --> L["queue:normal<br/>(优先级 2)"]
+        L --> M["queue:low_priority<br/>(优先级 3)"]
+    end
+    subgraph Agent[坐席分配]
+        K & L & M --> N[Round-Robin<br/>轮询]
+        N --> O[技能匹配<br/>先匹配同技能组]
+        O --> P[负载均衡<br/>选最少坐席]
+        P --> Q[坐席接受<br/>WebSocket 通知]
+    end</pre>
       </div>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""转接触发与上下文移交"""
-
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""四级降级检测与触发"""
+from enum import IntEnum
 from dataclasses import dataclass, field
 from typing import Optional, List
 from datetime import datetime
+import json
+
+class DegradeGrade(IntEnum):
+    NONE = 0         # 正常
+    SENSITIVE = 1    # 敏感意图 - 最高优先
+    TOOL_FAIL = 2    # 工具连续失败
+    MAX_STEPS = 3    # 超过最大步数
+    LOW_CONF = 4     # 置信度过低
 
 @dataclass
-class TransferContext:
-    """转接上下文"""
+class DegradeDecision:
+    grade: DegradeGrade
+    reason: str
+    priority: str                # high / normal / low
+    context_summary: str = ""
+    should_transfer: bool = True
+    ai_message: str = ""         # 转接前 AI 的最后一条消息
+
+class DegradeDetector:
+    """降级检测器"""
+
+    def __init__(self):
+        self.sensitive_intents = {"complaint", "legal", "transfer_human"}
+        self.sensitive_keywords = {"投诉", "起诉", "律师", "315", "曝光", "媒体"}
+
+    def detect(self, state: dict) -> Optional[DegradeDecision]:
+        """按优先级检测降级触发"""
+        # Grade 1: 敏感意图
+        intent = state.get("intent", "")
+        message = state.get("messages", [{}])[-1].get("content", "")
+
+        if intent in self.sensitive_intents:
+            return DegradeDecision(
+                grade=DegradeGrade.SENSITIVE,
+                priority="high",
+                reason=f"检测到敏感意图: {intent}",
+                ai_message="已了解您的情况，正在为您转接高级客服专员..."
+            )
+        for kw in self.sensitive_keywords:
+            if kw in message:
+                return DegradeDecision(
+                    grade=DegradeGrade.SENSITIVE,
+                    priority="high",
+                    reason=f"包含敏感关键词: {kw}",
+                    ai_message="已了解您的情况，正在为您转接高级客服专员..."
+                )
+
+        # Grade 2: 工具连续失败
+        tool_calls = state.get("tool_calls", [])
+        if len(tool_calls) >= 3:
+            last_three = tool_calls[-3:]
+            if all(t.get("result", "").startswith("错误") for t in last_three):
+                same_tool = len(set(t["tool"] for t in last_three)) == 1
+                if same_tool:
+                    return DegradeDecision(
+                        grade=DegradeGrade.TOOL_FAIL,
+                        priority="normal",
+                        reason=f"工具 {last_three[0]['tool']} 连续失败 3 次",
+                        ai_message="系统暂时无法处理您的请求，已生成工单转人工处理..."
+                    )
+
+        # Grade 3: 超过 maxSteps
+        step_count = state.get("step_count", 0)
+        if step_count >= 8:
+            return DegradeDecision(
+                grade=DegradeGrade.MAX_STEPS,
+                priority="normal",
+                reason=f"对话步骤超过上限 ({step_count})",
+                ai_message="本次对话步骤较多，已为您转接人工客服..."
+            )
+
+        # Grade 4: 置信度过低
+        confidence = state.get("confidence", 1.0)
+        if confidence is not None and confidence < 0.5:
+            return DegradeDecision(
+                grade=DegradeGrade.LOW_CONF,
+                priority="low",
+                reason=f"意图置信度 {confidence:.2f} 低于阈值 0.5",
+                ai_message="抱歉我无法准确理解您的需求，正在转接人工客服..."
+            )
+
+        return None  # 无需降级</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文移交：让坐席 0 门槛接手</h3>
+      <p>转接的最大痛点是「用户需要重复描述问题」。如果 AI 和用户聊了 10 轮然后转人工，坐席完全不知道之前发生了什么，用户需要从头说一遍——这种体验比直接找人工更差。CorpAssist 的上下文移交方案将完整的对话状态序列化为 JSON 数据包，坐席工作台自动填充对话摘要、用户信息和已执行操作。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""上下文移交数据包"""
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+import json
+
+class ContextPackage(BaseModel):
+    """转接上下文数据包"""
+    # 基本信息
     session_id: str
     user_id: str
-    user_name: str
-    dialog_history: str  # 格式化的对话历史
-    collected_params: dict
-    current_intent: str
-    transfer_reason: str  # low_confidence / user_request / sentiment_negative / max_retries
-    priority: str  # high / normal / low
-    sentiment_score: Optional[float] = None
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    transfer_time: str
+    degrade_reason: str
+    priority: str
 
-class TransferDecision:
-    """转接决策器"""
+    # 对话摘要
+    dialog_summary: str                    # LLM 压缩的对话摘要
+    original_messages: List[Dict]          # 原始对话 JSON
 
-    def __init__(self):
-        self.max_intent_failures = 3
-        self.confidence_threshold = 0.50
-        self.sentiment_threshold = 0.3
+    # 用户画像
+    user_name: str = ""
+    user_department: str = ""
+    user_role: str = ""
+    user_vip_level: str = "normal"
 
-    def should_transfer(
-        self,
-        confidence: float,
-        intent_failures: int,
-        user_requested: bool,
-        sentiment: Optional[float],
-    ) -> tuple[bool, str]:
-        """判断是否转接"""
+    # 当前状态
+    current_intent: str = ""
+    confidence: float = 0.0
+    collected_params: Dict = {}
 
-        if user_requested:
-            return True, "user_request"
+    # 已执行的操作
+    executed_actions: List[Dict] = []      # [{"tool": "query_order", "args": {...}, "result": "..."}]
 
-        if intent_failures >= self.max_intent_failures:
-            return True, "max_retries"
+    # 待办事项
+    pending_items: List[str] = []          # ["需要确认退款金额", "需要用户提供订单号"]
 
-        if confidence < self.confidence_threshold:
-            return True, "low_confidence"
+    @property
+    def estimated_size_bytes(self) -> int:
+        return len(json.dumps(self.model_dump(), ensure_ascii=False).encode("utf-8"))
 
-        if sentiment is not None and sentiment < self.sentiment_threshold:
-            return True, "sentiment_negative"
+class ContextTransferBuilder:
+    """上下文移交构建器"""
 
-        return False, ""
+    def __init__(self, llm: ChatOpenAI):
+        self.llm = llm
 
-    def determine_priority(self, intent: str, sentiment: float) -> str:
-        """确定优先级"""
-        if intent == "complaint" or sentiment < 0.2:
-            return "high"
-        elif sentiment < 0.4 or intent in ["apply_refund", "modify_info"]:
-            return "normal"
-        return "low"
+    async def build(self, state: dict, decision: DegradeDecision) -> ContextPackage:
+        """构建移交数据包"""
+        messages = state.get("messages", [])
+        # 生成对话摘要
+        summary = await self._generate_summary(messages)
 
-    def build_transfer_context(
-        self, session_id: str, user_info: dict,
-        history: list, params: dict, intent: str,
-        reason: str, sentiment: float,
-    ) -> TransferContext:
-        """构建转接上下文"""
-        history_text = "\n".join(
-            f"{'用户' if h['role']=='user' else 'AI'}: {h['content']}"
-            for h in history[-20:]
-        )
-        priority = self.determine_priority(intent, sentiment)
-        return TransferContext(
-            session_id=session_id,
-            user_id=user_info.get("user_id", ""),
+        # 提取用户信息
+        user_info = state.get("user_info", {})
+
+        return ContextPackage(
+            session_id=state.get("session_id", ""),
+            user_id=state.get("user_id", ""),
+            transfer_time=datetime.now().isoformat(),
+            degrade_reason=decision.reason,
+            priority=decision.priority,
+            dialog_summary=summary,
+            original_messages=[
+                {"role": "user" if m.get("type") == "human" else "ai", "content": m.get("content", "")}
+                for m in messages[-10:]  # 保留最近 10 轮
+            ],
             user_name=user_info.get("name", ""),
-            dialog_history=history_text,
-            collected_params=params,
-            current_intent=intent,
-            transfer_reason=reason,
-            priority=priority,
-            sentiment_score=sentiment,
-        )</pre></div>
+            user_department=user_info.get("department", ""),
+            user_role=user_info.get("role", ""),
+            user_vip_level=user_info.get("vip_level", "normal"),
+            current_intent=state.get("intent", ""),
+            confidence=state.get("confidence", 0.0),
+            collected_params=state.get("collected_params", {}),
+            executed_actions=state.get("tool_calls", [])[-5:],
+            pending_items=self._extract_pending(messages),
+        )
+
+    async def _generate_summary(self, messages: list) -> str:
+        """LLM 生成对话摘要"""
+        dialog_text = "\n".join(
+            f"{'用户' if m.get('type') == 'human' else 'AI'}: {m.get('content', '')}"
+            for m in messages[-6:]  # 最近 6 轮
+        )
+        prompt = f"""请生成客服对话摘要（50 字以内）：
+用户最初的问题是什么？
+AI 做了什么操作？
+当前处理到什么阶段？
+
+对话：
+{dialog_text}
+
+摘要："""
+        return (await self.llm.ainvoke(prompt)).content.strip()
+
+    def _extract_pending(self, messages: list) -> list:
+        """提取待办事项"""
+        pending = []
+        for m in messages[-4:]:
+            content = m.get("content", "")
+            if "需要" in content or "请" in content or "提供" in content:
+                pending.append(content[:100])
+        return pending[-3:]  # 最多 3 个</code></pre></div>
+      <aside class="learn-scenario"><h4>CorpAssist 转接场景</h4><p>用户投诉「我退的钱怎么还没到！都 10 天了！」AI 检测到投诉情感 >0.7，触发 Grade 1 降级。ContextTransferBuilder 生成数据包：摘要「用户查询退款 ORD-2026001 状态，系统显示已提交但未到账，用户不满投诉」；已执行操作 [query_order, check_refund]；待办事项 [需要确认退款到账时间, 安抚用户情绪]。数据包大小 4.2KB，写入 Redis 队列 queue:high_priority。5 秒内有坐席接单，坐席看到摘要后直接回复「抱歉让您久等了，我先帮您查一下退款到账时间……」——用户无需重复问题。</p></aside>
     </div>
 
     <div class="section-block">
-      <h3>排队与坐席分配策略</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""排队与坐席分配"""
+      <h3>Redis 队列的坐席分配</h3>
+      <p>坐席分配需要解决三个问题：谁来接（Round-Robin）、能不能接（技能匹配）、接不接得下（负载均衡）。CorpAssist 使用 Redis 的 SortedSet + List 数据结构实现三级优先级队列，分配逻辑封装在 AgentDispatcher 类中。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""Redis 坐席分配器"""
+from redis import Redis
+from typing import Optional, List, Dict
+import json, time, random
 
-from dataclasses import dataclass
-from typing import List, Optional
-from datetime import datetime
-import heapq
+class AgentDispatcher:
+    """坐席分配器"""
 
-@dataclass
-class Agent:
-    """坐席"""
-    agent_id: str
-    name: str
-    skills: List[str]  # ["ticket", "refund", "complaint"]
-    status: str  # "idle" / "busy"
-    current_load: int = 0
-    max_concurrent: int = 3
+    def __init__(self, redis: Redis):
+        self.redis = redis
+        self.queue_map = {
+            "high": "queue:high_priority",
+            "normal": "queue:normal",
+            "low": "queue:low_priority",
+        }
 
-class QueueManager:
-    """排队管理器"""
+    def enqueue(self, context: ContextPackage):
+        """入队"""
+        queue = self.queue_map.get(context.priority, "queue:normal")
+        data = json.dumps(context.model_dump(), ensure_ascii=False)
+        self.redis.rpush(queue, data)
+        self.redis.expire(queue, 3600)  # 1h TTL
 
-    def __init__(self):
-        self.queue: List[tuple] = []  # (priority, time, context)
-        self.agents: List[Agent] = []
+        # 触发分配通知
+        self.redis.publish("agent:new_task", json.dumps({
+            "queue": queue,
+            "session_id": context.session_id,
+            "priority": context.priority
+        }))
 
-    def enqueue(self, context: TransferContext):
-        priority_map = {"high": 0, "normal": 1, "low": 2}
-        heapq.heappush(self.queue, (
-            priority_map[context.priority],
-            datetime.utcnow().timestamp(),
-            context,
-        ))
+    def dequeue(self, agent_id: str) -> Optional[ContextPackage]:
+        """出队分配"""
+        # 按优先级从高到低尝试
+        for priority in ["high", "normal", "low"]:
+            queue = self.queue_map[priority]
+            # LPOP 获取队首
+            data = self.redis.lpop(queue)
+            if data:
+                context_dict = json.loads(data)
+                self._record_assignment(agent_id, context_dict["session_id"])
+                return ContextPackage(**context_dict)
 
-    def assign(self) -> Optional[tuple[TransferContext, Agent]]:
-        """分配坐席"""
-        if not self.queue:
+        # 如果所有队列都为空，尝试从其他坐席的 backlog 捞取
+        return self._backlog_steal(agent_id)
+
+    def round_robin(self) -> Optional[str]:
+        """Round-Robin 选择下一个坐席"""
+        agents = self.redis.smembers("agents:online")
+        if not agents:
             return None
-        # 找到最空闲且有对应技能的坐席
-        available = [
-            a for a in self.agents
-            if a.status == "idle" and a.current_load < a.max_concurrent
-        ]
-        if not available:
-            return None
-        _, _, context = heapq.heappop(self.queue)
-        agent = min(available, key=lambda a: a.current_load)
-        agent.current_load += 1
-        if agent.current_load >= agent.max_concurrent:
-            agent.status = "busy"
-        return context, agent
 
-    def complete(self, agent_id: str):
-        """完成服务"""
-        for agent in self.agents:
-            if agent.agent_id == agent_id:
-                agent.current_load = max(0, agent.current_load - 1)
-                agent.status = "idle"
-                break</pre></div>
-    </div>
+        # 获取当前索引
+        current = self.redis.get("agent:round_robin_index")
+        idx = int(current) if current else 0
 
-    <div class="section-block">
-      <h3>上下文移交的端到端测试</h3>
-      <p>转接时的上下文移交是最容易出现细节 bug 的环节。CorpAssist 团队维护了一个端到端测试场景来验证上下文移交的完整性。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""上下文移交的端到端测试"""
+        agent_list = sorted(agents)
+        selected = agent_list[idx % len(agent_list)]
+        self.redis.setex("agent:round_robin_index", 3600, (idx + 1) % len(agent_list))
+        return selected
 
-from src.transfer import TransferDecision, TransferContext
+    def skill_match(self, intent: str) -> List[str]:
+        """技能匹配：找到能处理该意图的坐席"""
+        skill_map = {
+            "query_ticket": ["general", "it_support"],
+            "complaint": ["complaint", "senior"],
+            "reset_password": ["it_support"],
+            "check_refund": ["finance", "general"],
+            "apply_leave": ["hr", "general"],
+        }
+        needed_skills = skill_map.get(intent, ["general"])
 
-def test_transfer_context_integrity():
-    """验证上下文移交完整性"""
-    decision = TransferDecision()
-    history = [
-        {"role": "user", "content": "我要投诉"},
-        {"role": "ai", "content": "请问您遇到了什么问题"},
-        {"role": "user", "content": "我的订单 ORD-123 还没到货"},
-        {"role": "ai", "content": "好的，我查一下。订单显示已发货"},
-        {"role": "user", "content": "但是已经过了预计时间了"},
-    ]
-    ctx = decision.build_transfer_context(
-        session_id="test-001",
-        user_info={"user_id": "u001", "name": "张三"},
-        history=history,
-        params={"order_id": "ORD-123"},
-        intent="complaint",
-        reason="user_request",
-        sentiment=0.15,
-    )
-    # 验证上下文完整性
-    assert ctx.session_id == "test-001"
-    assert ctx.current_intent == "complaint"
-    assert ctx.priority == "high"  # sentiment < 0.2 → high
-    assert "投诉" in ctx.dialog_history
-    assert "ORD-123" in ctx.dialog_history
-    print(f"Context length: {len(ctx.dialog_history)} chars")
-    print(f"Transfer reason: {ctx.transfer_reason}")
-    print(f"Priority: {ctx.priority}")
+        # 找至少匹配一个技能的在线的坐席
+        qualified = []
+        for agent in self.redis.smembers("agents:online"):
+            skills = self.redis.smembers(f"agent:{agent}:skills")
+            if any(s.decode() in needed_skills for s in skills):
+                qualified.append(agent.decode())
+        return qualified
 
-def test_queue_and_assign():
-    """测试排队和分配"""
-    from src.transfer import QueueManager, TransferContext, Agent
-    mgr = QueueManager()
-    mgr.agents = [Agent(agent_id="a1", name="客服A", skills=["complaint"], status="idle")]
-    ctx = TransferContext(
-        session_id="s1", user_id="u1", user_name="李四",
-        dialog_history="测试历史", collected_params={},
-        current_intent="complaint", transfer_reason="user_request",
-        priority="high",
-    )
-    mgr.enqueue(ctx)
-    result = mgr.assign()
-    assert result is not None
-    assigned_ctx, agent = result
-    assert agent.agent_id == "a1"
-    print(f"Assigned {assigned_ctx.session_id} to {agent.name}")
-    print("ALL TESTS PASSED")</pre></div>
-    </div>
+    def load_balance(self, agents: List[str]) -> str:
+        """负载均衡：选择当前负载最低的坐席"""
+        min_load = float("inf")
+        selected = agents[0]
+        for agent in agents:
+            load = int(self.redis.get(f"agent:{agent}:active_sessions") or 0)
+            if load < min_load:
+                min_load = load
+                selected = agent
+        return selected
 
-    <div class="section-block">
-      <h3>转接率监控与优化</h3>
-      <table class="learn-decision-table"><thead><tr><th>指标</th><th>目标</th><th>当前值</th><th>优化方向</th></tr></thead><tbody>
-        <tr><td>整体转接率</td><td>25-30%</td><td>28%</td><td>增加 FAQ 模板覆盖率</td></tr>
-        <tr><td>投诉场景转接率</td><td>100%</td><td>100%</td><td>保持</td></tr>
-        <tr><td>意图失败转接率</td><td>≤ 15%</td><td>18%</td><td>优化意图分类器 + 增加反问话术</td></tr>
-        <tr><td>平均排队等待时长</td><td>< 30s</td><td>25s</td><td>繁忙时段增加机动坐席</td></tr>
-        <tr><td>转接后 CSAT</td><td>≥ 3.8/5</td><td>3.9/5</td><td>减少上下文丢失</td></tr>
+    def dispatch(self, context: ContextPackage) -> Optional[str]:
+        """完整分配流程"""
+        self.enqueue(context)
+
+        # 确定坐席
+        candidates = self.skill_match(context.current_intent)
+        if not candidates:
+            candidates = list(self.redis.smembers("agents:online"))
+
+        if not candidates:
+            return None  # 没有在线坐席
+
+        selected = self.load_balance(candidates)
+
+        # 通知坐席
+        self.redis.publish(f"agent:{selected}:task", json.dumps({
+            "session_id": context.session_id,
+            "priority": context.priority,
+            "summary": context.dialog_summary,
+        }))
+
+        return selected</code></pre></div>
+      <table class="learn-decision-table"><thead><tr><th>分配策略</th><th>实现方式</th><th>平均延迟</th><th>覆盖场景</th><th>公平性</th></tr></thead><tbody>
+        <tr><td>Round-Robin</td><td>Redis 原子计数器轮转</td><td>< 10ms</td><td>所有坐席技能相同</td><td>高（严格轮流）</td></tr>
+        <tr><td>技能匹配</td><td>Redis Set 按技能标签过滤</td><td>< 20ms</td><td>投诉需要资深坐席</td><td>中（仅匹配技能）</td></tr>
+        <tr><td>负载均衡</td><td>按 active_sessions 计数排序</td><td>< 15ms</td><td>高峰期均匀分配</td><td>高（最少连接优先）</td></tr>
+        <tr><td>Backlog Steal</td><td>从其他坐席队列捞取</td><td>< 30ms</td><td>坐席离线后任务复用</td><td>中</td></tr>
       </tbody></table>
-      <p><strong>转接率优化深度分析</strong>：转接率优化不能只看整体数字，需要按维度拆解。CorpAssist 的转接率按意图维度拆解后发现，「查询工单」的转接率仅 8%，「密码重置」为 12%，但「修改个人信息」的转接率高达 45%。深入分析发现，45% 中有一半是因为 AI 无法完成身份验证（需要用户提供更多身份信息），另一半是因为权限不足。针对身份验证问题，我们上线了「多渠道身份验证」——用户可以通过企业微信扫码验证身份，减少对话中的身份确认轮次。该优化将「修改个人信息」的转接率从 45% 降到 28%。</p>
-      <aside class="learn-scenario"><h4>CorpAssist 场景</h4><p>终端用户在企业门户上让 AI 客服「帮我改手机号」。AI 客服发起身份验证流程：通过企业微信 push 一条验证通知到用户的已注册手机，用户点击确认后身份验证自动完成。整个过程不需要用户在对话框中输入任何敏感信息，既安全又高效。这个方案上线后，「修改个人信息」场景的用户满意度从 3.2/5 提升到 4.3/5。</p></aside>
+    </div>
+
+    <div class="section-block">
+      <h3>转接率监控：Grafana + Redis 计数器 + 告警</h3>
+      <p>转接率是衡量智能客服质量的核心指标——转接率太高说明 AI 覆盖不足，转接率太低可能说明 AI 在「不懂装懂」。CorpAssist 的转接率监控体系包含实时计数器和离线分析两个维度。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""转接率监控"""
+from collections import defaultdict
+import time as time_module
+
+class HandoffMonitor:
+    """转接率监控器"""
+
+    def __init__(self, redis: Redis):
+        self.redis = redis
+        self.window_size = 3600  # 1 小时滑动窗口
+
+    def record_conversation(self, session_id: str, was_handed_off: bool,
+                             degrade_grade: int = 0):
+        """记录对话（是否转接）"""
+        hour_key = f"stats:handoff:{time_module.strftime('%Y-%m-%d-%H')}"
+        self.redis.hincrby(hour_key, "total", 1)
+        if was_handed_off:
+            self.redis.hincrby(hour_key, "handoff", 1)
+            self.redis.hincrby(hour_key, f"grade:{degrade_grade}", 1)
+
+    def get_handoff_rate(self, hours: int = 24) -> dict:
+        """获取转接率"""
+        total = 0
+        handoff = 0
+        grade_counts = defaultdict(int)
+        for i in range(hours):
+            key = f"stats:handoff:{time_module.strftime('%Y-%m-%d-%H', time_module.localtime(time_module.time() - i * 3600))}"
+            data = self.redis.hgetall(key)
+            if data:
+                total += int(data.get(b"total", 0))
+                handoff += int(data.get(b"handoff", 0))
+                for k, v in data.items():
+                    if k.startswith(b"grade:"):
+                        grade_counts[int(k.decode().split(":")[1])] += int(v)
+
+        rate = handoff / total if total > 0 else 0
+        return {
+            "total_conversations": total,
+            "handoff_count": handoff,
+            "handoff_rate": round(rate, 4),
+            "by_grade": dict(grade_counts),
+            "alerts": self._check_alerts(rate, grade_counts)
+        }
+
+    def _check_alerts(self, rate: float, grade_counts: dict) -> list:
+        """检查告警条件"""
+        alerts = []
+        if rate > 0.35:
+            alerts.append({"level": "warning", "msg": f"转接率 {rate:.1%} > 35% 阈值"})
+        if grade_counts.get(1, 0) > 50:  # Grade 1 过多
+            alerts.append({"level": "warning", "msg": f"敏感场景转接 {grade_counts[1]} 次/天，可能需要优化"})
+        if rate < 0.10:
+            alerts.append({"level": "info", "msg": f"转接率 {rate:.1%} < 10%，注意 AI 是否在不懂装懂"})
+        return alerts
+
+# Grafana 数据源
+# Prometheus 指标：
+# corp_assist_handoff_rate{grade="total"} 0.28
+# corp_assist_handoff_rate{grade="1_sensitive"} 0.05
+# corp_assist_handoff_rate{grade="2_tool_fail"} 0.02
+# corp_assist_handoff_rate{grade="3_max_steps"} 0.01
+# corp_assist_handoff_rate{grade="4_low_conf"} 0.20
+#
+# Grafana 面板：
+# - 转接率趋势图（24h 滑动窗口）
+# - 按降级等级堆叠柱状图
+# - 转接 P50/P90/P99 延迟折线图
+# - 告警列表
+
+# 根因分析
+class HandoffRootCause:
+    """转接根因分析"""
+
+    def analyze(self, handoffs: list[dict]) -> dict:
+        """分析转接根因分布"""
+        causes = defaultdict(int)
+        for h in handoffs:
+            cause = h.get("reason", "").split(":")[0]
+            causes[cause] += 1
+        total = sum(causes.values())
+        return {
+            "total": total,
+            "top_causes": sorted(
+                [{"cause": k, "count": v, "pct": round(v/total*100, 1)}
+                 for k, v in causes.items()],
+                key=lambda x: x["count"], reverse=True
+            )[:5]
+        }</code></pre></div>
+      <p><strong>线上转接率数据</strong>：CorpAssist 的总体转接率为 28%（目标 ≤30%）。按降级等级分解：置信度过低（Grade 4）占 20%——这是最大的转接来源，主要集中在模糊意图和未知意图；敏感意图（Grade 1）占 5%——主要是投诉和关键词命中；工具失败（Grade 2）占 2%；最大步数（Grade 3）占 1%。高峰时段（10:00-11:00 AM）转接率升到 35%，主要因为投诉类请求增多。P50 转接延迟 2.3s，P99 转接延迟 15.8s（目标 <30s）。Grafana 告警规则：转接率 >35% 触发 Warning 告警 → 运维查看根因并决定扩容或优化。</p>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li>转接触发有 4 个维度：置信度/用户要求/失败次数/情感评分。</li>
-        <li>上下文移交包含完整对话历史 + 参数 + 用户信息 + 转接原因。</li>
-        <li>优先级队列用最小堆实现，坐席分配用最少占用优先策略。</li>
-        <li>目标转接率 25-30%, 转接后 CSAT ≥ 3.8/5。</li>
-        <li>优化转接的核心是减少「错误转接」——本可 AI 处理的问题被转到人工。</li>
+        <li>四级降级按敏感意图 > 工具失败 > 步数超限 > 置信度低排序，Grade 1 敏感意图走高优队列，P50 分配延迟 <500ms</li>
+        <li>上下文移交数据包（4.2KB）包含对话摘要 + 用户画像 + 执行操作 + 待办事项，坐席接手后 0 门槛继续服务</li>
+        <li>Redis 三级队列（高优/普通/低优）配合 Round-Robin + 技能匹配 + 负载均衡，P99 转接延迟 <30s</li>
+        <li>总体转接率 28%（目标 ≤30%），Grade 4（置信度低）占转接原因的 71%，是最大的优化空间</li>
+        <li>Grafana 监控 + Prometheus 指标 + 根因分析 Pipeline 实现转接率实时可见性和异常告警</li>
       </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox" data-check-id="cs-prac-04-1"> 能列出 4 种转接触发条件</label></li>
-        <li><label><input type="checkbox" data-check-id="cs-prac-04-2"> 能实现上下文移交的打包逻辑</label></li>
-        <li><label><input type="checkbox" data-check-id="cs-prac-04-3"> 能设计优先级队列和坐席分配算法</label></li>
-        <li><label><input type="checkbox" data-check-id="cs-prac-04-4"> 能设定转接率监控目标</label></li>
-        <li><label><input type="checkbox" data-check-id="cs-prac-04-5"> 能解释什么是「错误转接」及其危害</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-1"> 能实现四级降级检测并按优先级排序</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-2"> 能实现 ContextPackage 的构建和序列化</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-3"> 能实现 Redis 坐席分配（入队/出队/技能匹配/负载均衡）</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-4"> 能搭建转接率 Grafana 看板并设置告警</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-5"> 能分析转接根因并制定优化方案</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>降级触发</td><td>AI 无法处理时主动转人工的触发条件，按优先级排序</td></tr>
+        <tr><td>上下文移交</td><td>转接时将对话摘要/用户信息/已执行操作序列化传给坐席</td></tr>
+        <tr><td>Round-Robin</td><td>轮询分配算法，所有坐席轮流接单</td></tr>
+        <tr><td>技能匹配</td><td>按意图类型匹配有对应技能的坐席（投诉→资深坐席）</td></tr>
+        <tr><td>负载均衡</td><td>按坐席当前负载选择最空闲的坐席</td></tr>
+        <tr><td>三级队列</td><td>高优/普通/低优三级 Redis List，高优队列优先消费</td></tr>
+        <tr><td>转接率</td><td>AI 转接人工对话数 / 总对话数，目标 ≤30%</td></tr>
+        <tr><td>Backlog Steal</td><td>坐席离线后，其未处理任务被其他坐席捞取</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 降级策略的优先级怎么设计？什么情况必须立刻转人工？</summary><p>降级策略的优先级设计遵循「安全第一」原则——可能造成法律或业务风险的场景必须最高优转人工。CorpAssist 的四级优先级：Grade 1 敏感意图（立即高优转人工）——包括用户投诉、法律关键词、明确要求转人工。这类场景让 AI 继续处理的风险 > 等待人工的风险，必须立刻转接。Grade 2 工具连续失败（正常转人工）——同一个工具连续 3 次都失败，说明系统层面有问题（第三方 API 挂了或用户数据异常），继续重试没有意义。Grade 3 超过最大步数（正常转人工）——对话超过 8 步还没有解决，可能是问题太复杂或 LLM 在绕圈子，继续下去用户会更不满。Grade 4 置信度过低（反问或转人工）——当 LLM 对意图分类的置信度 <0.5 时，系统先反问澄清一轮，如果用户确认后置信度仍然 <0.5，则转人工。这种分级的优势在于：98.5% 需要转人工的对话能在 2 轮内识别并分配坐席，只有 1.5% 的边界案例需要额外一轮反问。</p></details>
+        <details><summary>Q2: 坐席分配怎么保证公平性和效率？Redis 队列容量够吗？</summary><p>公平性和效率是矛盾的——绝对公平（严格轮流）可能导致效率低（技能不匹配）。CorpAssist 的妥协方案是「技能匹配 + 负载均衡」两步。第一步用技能匹配缩小候选范围（投诉意图只能由投诉组坐席接），第二步在有资格的坐席中选负载最低的。如果所有坐席都忙不过来了（active_sessions > 10），启动「溢出机制」——普通组坐席暂时支援投诉组。Redis 队列容量完全够用：每天约 840 次转接（3000 × 28%），平均每条数据包 4.2KB，Redis List 存储量约 3.5MB/天（840 × 4.2KB）。即使高峰期同时排队 100 个转接请求，也只有约 420KB，远小于 Redis 单机的数 GB 内存上限。唯一需要注意的是 List 的消费速度——坐席消费速度低于入队速度会导致队列堆积。CorpAssist 对此设置了告警：当队列长度 >50 时触发 Warning，表示需要增加坐席排班。关键数据：P50 分配延迟 500ms，P99 分配延迟 8s（主要在等待坐席点击「接单」按钮）。</p></details>
+        <details><summary>Q3: 转接率高于 35% 或低于 10% 分别说明什么问题？怎么调整？</summary><p>高于 35% 说明 AI 的覆盖范围不足——太多对话转给了人工。可能的根因：意图分类准确率低（投诉意图的 F1 <0.8，导致本应 AI 处理的被转人工）；工具成功率低（工具超时/错误频繁触发 Grade 2 降级）；置信度阈值设置太高（0.5 的阈值偏保守，可考虑降到 0.4 让 AI 多尝试一轮反问）。低于 10% 说明 AI 可能在「不懂装懂」——它应该转人工的场景没有转。可能的根因：置信度阈值设置太低（LLM 对错误分类也给了高置信度）；敏感场景检测器漏报（投诉关键词匹配不全）；降级检测器故障（tool_calls 没有正确记录失败次数）。CorpAssist 的建议是保持 25-30% 的转接率——在这个范围内 CSAT 最高。如果转接率异常，第一步不是调参数，而是看转接根因分析：哪个 Grade 异常升高/降低？哪个意图的转接率最高？针对性地优化才是最有效的。</p></details>
+      </div>
+    </div>
+
+    <div class="chapter-practice">
+      <h3>动手练习</h3>
+      <div class="steps-operate"><h4>操作步骤</h4><ol>
+        <li><code>pip install redis httpx</code> — 安装 Redis 和 HTTP 客户端依赖</li>
+        <li><code>docker run -d -p 6379:6379 redis:7-alpine</code> 启动 Redis，然后 <code>python -c "import redis; r=redis.Redis(); r.set('test','ok'); print(r.get('test'))"</code> 验证</li>
+        <li>实现一个 AgentDispatcher 类：包含 enqueue（写入 Redis List）/ dequeue（按优先级 LPOP）/ dispatch（完整分配流程：技能匹配→负载均衡→通知坐席） 三个方法</li>
+      </ol></div>
+      <div class="steps-judgment-list"><h4>判断练习</h4>
+        <details><summary>如果某天转接率突然从 28% 飙升到 45%，应该从哪些维度排查根因？</summary><p>第一步看时间维度：是全天都高还是某个时段高？如果是某个时段高（如 10:00-11:00），可能是投诉高峰期的正常波动。第二步看降级等级维度：哪个 Grade 增加了？如果 Grade 2（工具失败）突然增加，说明第三方 API 可能故障；如果 Grade 4（置信度低）增加，可能是用户咨询的主题变了（如新政策发布导致大量未知意图）。第三步看意图维度：哪个意图的转接率升高了？如果 query_ticket 的转接率从 15% 升到 60%，说明工单查询工具可能挂了。第四步看 LLM 维度：检查 LLM 的响应延迟和错误率，如果 LLM API 延迟升高（P99 > 3s），Agent 可能在超时等待中转人工。CorpAssist 的实践中，有一次转接率飙升的原因是法务部门发布了新政策文档（30 页），但文档分块策略 chunk_size=500 对于法律条款太细，导致检索召回率从 92% 降到 65%，AI 找不到答案就全部转人工。修复方案：对法律文档调整 chunk_size=300（更小的块单位更精确），召回率恢复到 88%，转接率回落到 30%。</p></details>
+        <details><summary>如果所有坐席都在忙，新转接请求应该排队等待还是直接拒绝？排队队列怎么防止无限增长？</summary><p>绝对不应该拒绝——用户听到「所有坐席忙，请稍后再拨」的 CSAT 评分会跌到最低（约 2.0/5）。正确方案是「排队等待 + 预期等待时间提示」。排队用 Redis List（queue:high_priority / queue:normal），数据包 4.2KB 非常小。防止队列无限增长：第一，设置队列容量上限（max_size=500），超过上限时将最早进入队列的请求弹出并标记为「超时未处理」，转成工单异步处理。第二，设置单个请求的最大排队时间（timeout=30min），超时后自动转成工单并在第二天由坐席处理。第三，高峰期启动「柔性降级」——当排队人数 >50 时，对普通优先级请求启动「AI 兜底反问」——AI 收集用户完整信息后生成工单，承诺 24h 内人工回复（而不是让用户在线排队）。这个策略使排队体验的 CSAT 从 2.0 提升到 3.5。CorpAssist 的排队数据：高峰时段平均排队等待 45s，P95 等待 3min，<1% 的请求超时转人工。</p></details>
+      </div>
+      <div class="demo-box"><h4>配套实验室</h4><p>降级与转接演示：<code>demos/practice-04-handoff-lab/</code></p><ul>
+        <li>验收标准 1：模拟 Grade 4 降级（置信度 <0.5），AI 回复「抱歉」后自动转人工，Redis 队列 queue:normal 中看到上下文数据包</li>
+        <li>验收标准 2：坐席客户端（模拟）通过 LPOP 从队列获取数据包，显示对话摘要和用户信息</li>
+        <li>验收标准 3：Grafana 面板显示转接率趋势图和按 Grade 堆叠的转接分布柱状图</li>
       </ul></div>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方参考</h3></div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://redis.io/docs/data-types/lists/">Redis List 官方文档</a> — LPUSH/RPOP 实现队列的完整指南</li>
+    <li><a href="https://grafana.com/docs/grafana/latest/dashboards/">Grafana 仪表盘文档</a> — 转接率监控面板和告警规则配置</li>
+  </ul></div>
   <div class="resources content-section"><h3>延伸阅读</h3><ul>
-    <li>下一篇：<a href="#ch-practice-05-eval">客服效果评测</a></li>
+    <li>下一篇：<a href="#ch-practice-05-eval">客服效果评测</a> — 自动评测 + 人工抽检 + A/B 实验 + 坏例库管理</li>
   </ul></div>
 </section>

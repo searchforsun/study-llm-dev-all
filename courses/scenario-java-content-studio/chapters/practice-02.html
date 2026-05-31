@@ -2,217 +2,493 @@
   <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>生成 + 审核流水线</h2><button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>AI 生成的内容不能直接发布——需要安全检测和人工复核。本章实现完整的内容安全检测（Advisor 链）、人工复核（Flowable 工作流）、驳回重写的闭环流程。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>配置 Spring AI Advisor 链实现内容安全检测；基于 Flowable 实现人工复核工作流；实现驳回重写和重新提交；设计审核状态机。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><p>1) Advisor 链依次执行：敏感词过滤→有害内容检测→品牌合规检查→版权检查；2) Flowable 工作流管理"提交→审核→通过/驳回→发布"生命周期；3) 驳回重写时保留审核意见和原始版本，Agent 根据意见修改；4) 审核状态机：DRAFT → SUBMITTED → REVIEWING → APPROVED/REJECTED → PUBLISHED。</p></div>
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>AI 生成的内容不能直接上线——品牌方需要确认语调是否正确、敏感词是否过滤、事实是否准确、合规要求是否满足。CorpAssist 的审核流水线将人工复核和自动检测结合,确保每篇生成内容在发布前经过 4 层过滤检查和 6 状态状态机的流转。本章的 ComplianceAdvisor 和 Flowable 工作流是内容工坊的质量把关者。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 ComplianceAdvisor 四层内容安全链:敏感词过滤（Aho-Corasick 自动机）→ 合规规则引擎（YAML 配置行业规则）→ 品牌语调校验（余弦相似度）→ 事实核查（RAG 知识库）；配置 Flowable 工作流引擎实现人工复核节点和驳回-重写循环（BPMN 2.0 流程定义）;设计和实现审核状态机（待生成→机审→人审→通过/驳回→重写→发布）的 6 种状态和 9 种合法转换；构建审核 Dashboard 展示通过率/驳回原因分布/平均审核周期等核心指标。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) ComplianceAdvisor 四层过滤链:敏感词（Aho-Corasick 自动机,10 万词库,50ms 初始化）→ 合规规则（EasyRules,YAML 配置行业规则）→ 语调校验（五维向量余弦相似度,阈值 0.85）→ 事实核查（RAG 知识库检索,置信度 &gt;0.9 通过）；2) Flowable BPMN 2.0 流程定义:Start → AutoCheck → ManualReview(人工节点) → Approve/Reject → Publish/ReWrite,驳回自动回到 AutoCheck 重走流水线；3) 审核状态机 6 种状态（PENDING_GENERATE/AUTO_CHECKING/AUTO_CHECKED/MANUAL_REVIEWING/APPROVED/REJECTED）和 9 种合法转换,每个转换记录时间戳和操作人；4) Dashboard 指标:审核通过率（目标 &gt;85%）、驳回原因 Top-5（语调偏差/事实错误/敏感词/格式问题/合规违规）、平均审核周期（Target &lt;4 小时）、自动 vs 人工驳回比例（Target 自动 &gt;60%）；5) Flowable 与 Spring 的深度集成:@Deployment 自动部署 BPMN,@EnableFlowableProcess 启用引擎,RuntimeService 启动/查询/操作流程实例。</p></div>
     </div>
 
     <div class="section-block">
-      <h3>内容安全检测（Advisor 链）</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 内容安全 Advisor 链
+      <h3>ComplianceAdvisor 内容安全链：四层过滤架构</h3>
+      <p>ComplianceAdvisor 是审核流水线的第一道关——在内容提交给人审之前,用自动检测系统过滤掉明显的问题。设计模式采用责任链模式（Chain of Responsibility）,四层过滤器按固定顺序执行:敏感词 → 合规规则 → 语调校验 → 事实核查。每层过滤器的输入是 ContentItem（包含 id、content、metadata[autho/channel/brand]）,输出是 FilterResult（passed:boolean, violations: List, riskScore: 0-1）。如果任意一层返回 passed=false 且 riskScore &gt; 0.8（高风险）,内容直接标记为 REJECTED 不进入人审；如果 0.5 ≤ riskScore ≤ 0.8（中风险）,内容进入人审并携带违规标记；如果 riskScore &lt; 0.5（低风险）,内容自动通过机审进入人审。各层依次执行,后一层依赖前一层的通过——如果敏感词层已经驳回,合规规则层无需执行。这种"短路"设计节省了约 40% 的 LLM-as-Judge 调用量（语调校验和事实核查需要 LLM 调用,成本较高）。</p>
+      <p>第一层敏感词过滤使用 Aho-Corasick 自动机实现 O(n) 级别的多模式匹配（同时匹配 10 万+ 敏感词）,初始化建立 Trie 树耗时约 50ms,单篇 500 字内容匹配耗时 &lt;1ms。敏感词库按行业分类（金融/医疗/教育/广告/政治/暴力等 12 个类别）,支持精确词（"保本"）和正则模式（"年化\d+%"）。第二层合规规则引擎基于 EasyRules 框架,规则以 YAML 文件存储（rules/finance.yaml/rules/medical.yaml）,每条规则包含 name、description、condition（SpEL 表达式）、action（BLOCK/WARN/ALLOW）、priority。金融行业的典型规则:condition = "content.contains('保本') || content.contains('稳赚')" → action=BLOCK,priority=1。规则引擎在 Spring 启动时加载所有规则文件并编译为 Rule 对象,单条规则匹配耗时 &lt;0.1ms。第三层品牌语调校验使用五维语调向量的余弦相似度:将生成内容的五维语调向量与目标品牌语调向量做余弦相似度计算,相似度 &lt;0.85 时触发"语调偏差"告警。第四层事实核查通过 RAG 知识库检索:从生成内容中提取关键断言（如"2025 年全球新能源汽车销量突破 2000 万辆"）,去知识库中检索支持该断言的数据来源,如果找不到可信来源则标记为"事实未验证"。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">import org.jeasy.rules.api.*;
+import org.jeasy.rules.mvel.MVELRule;
+import org.jeasy.rules.support.YamlRuleDefinitionReader;
+import org.springframework.stereotype.Component;
+import java.util.*;
+
 @Component
-public class ContentSafetyAdvisorChain {
+public class ComplianceAdvisor {
 
-    @Bean
-    public ChatClient safeChatClient(ChatClient.Builder builder,
-                                      List&lt;Advisor&gt; advisors) {
-        return builder
-            .defaultAdvisors(advisors)
-            .build();
-    }
+    private final List<ContentFilter> filters;
+    private final FactsEngine factsEngine;
 
-    @Bean
-    public List&lt;Advisor&gt; contentSafetyAdvisors() {
-        return List.of(
-            new SensitiveWordFilter(),      // 1. 敏感词过滤
-            new HarmfulContentDetector(),    // 2. 有害内容检测
-            new BrandComplianceChecker(),    // 3. 品牌合规检查
-            new CopyrightChecker()           // 4. 版权来源检查
+    public ComplianceAdvisor(SensitiveWordFilter swFilter,
+                             IndustryRuleEngine irEngine,
+                             ToneValidator toneValidator,
+                             FactsEngine factsEngine) {
+        this.factsEngine = factsEngine;
+        this.filters = List.of(
+            swFilter,       // 第一层: 敏感词
+            irEngine,       // 第二层: 合规规则
+            toneValidator,  // 第三层: 语调校验
+            factsEngine     // 第四层: 事实核查
         );
     }
-}
 
-// 敏感词过滤器
-@Component
-public class SensitiveWordFilter implements Advisor {
+    public ComplianceResult check(ContentItem item) {
+        List<Violation> violations = new ArrayList<>();
+        double maxRiskScore = 0.0;
+        String blockedBy = null;
 
-    private final Set&lt;String&gt; sensitiveWords = Set.of(
-        "敏感词A", "敏感词B", "敏感词C");
+        for (ContentFilter filter : filters) {
+            FilterResult result = filter.check(item);
 
-    @Override
-    public AdviceResponse before(AdviceRequest request) {
-        String content = request.getContent();
-        for (String word : sensitiveWords) {
-            if (content.contains(word)) {
-                return new AdviceResponse(false,
-                    "内容包含敏感词: " + word);
+            if (!result.passed() && blockedBy == null) {
+                // 记录第一个未通过的过滤器
+                blockedBy = filter.name();
+            }
+
+            violations.addAll(result.violations());
+            maxRiskScore = Math.max(maxRiskScore, result.riskScore());
+
+            // 高风险短路: 如果当前滤器高风险驳回,后面的不用执行
+            if (!result.passed() && result.riskScore() > 0.8) {
+                return new ComplianceResult(item.id(), false,
+                    violations, maxRiskScore, "HIGH_RISK_BLOCK",
+                    blockedBy);
+            }
+
+            // 中风险: 继续执行但标记待人工审核
+            if (!result.passed() && result.riskScore() > 0.5) {
+                // 继续执行后面的滤器
             }
         }
-        return new AdviceResponse(true);
+
+        String action = maxRiskScore > 0.8 ? "REJECT" :
+            maxRiskScore > 0.5 ? "MANUAL_REVIEW" : "AUTO_PASS";
+
+        return new ComplianceResult(item.id(),
+            maxRiskScore <= 0.5, violations, maxRiskScore,
+            action, blockedBy);
     }
+
+    // 内容过滤器接口
+    public interface ContentFilter {
+        String name();
+        FilterResult check(ContentItem item);
+    }
+
+    public record ContentItem(String id, String content,
+        Map<String, Object> metadata, String channel) {}
+
+    public record FilterResult(boolean passed,
+        List<Violation> violations, double riskScore) {}
+
+    public record Violation(String type, String rule,
+        String detail, double severity) {}
+
+    public record ComplianceResult(String itemId, boolean passed,
+        List<Violation> violations, double riskScore,
+        String action, String blockedBy) {}
 }
 
-// 有害内容检测器（基于 LLM）
 @Component
-public class HarmfulContentDetector implements Advisor {
-
-    private final ChatClient detectorClient;
+class SensitiveWordFilter implements ComplianceAdvisor.ContentFilter {
+    // Aho-Corasick 自动机实现
+    @Override
+    public String name() { return "敏感词过滤"; }
 
     @Override
-    public AdviceResponse before(AdviceRequest request) {
-        String result = detectorClient.prompt()
-            .user(u -&gt; u.text("""
-                检查以下内容是否包含：暴力、色情、歧视、虚假宣传。
-                内容：{content}
-                输出 JSON：{"safe":true/false,"reason":"","riskLevel":"NONE/LOW/MEDIUM/HIGH"}
-                """)
-                .param("content", request.getContent())
-            )
-            .call()
-            .content();
+    public ComplianceAdvisor.FilterResult check(
+            ComplianceAdvisor.ContentItem item) {
+        // 使用 AC 自动机 O(n) 匹配
+        List<ComplianceAdvisor.Violation> violations = new ArrayList<>();
+        String content = item.content();
 
-        DetectionResult dr = parseResult(result);
-        if (!dr.isSafe()) {
-            return new AdviceResponse(false,
-                "有害内容检测未通过: " + dr.getReason());
+        // 模拟匹配过程
+        if (content.contains("保本")) {
+            violations.add(new ComplianceAdvisor.Violation(
+                "SENSITIVE_WORD", "金融禁止词",
+                "禁止使用'保本'等承诺性表述", 0.95));
         }
-        return new AdviceResponse(true);
-    }
-}</pre></div>
-    </div>
+        if (content.contains("包治")) {
+            violations.add(new ComplianceAdvisor.Violation(
+                "SENSITIVE_WORD", "医疗禁止词",
+                "禁止使用'包治'等绝对化表述", 0.95));
+        }
 
-    <div class="section-block">
-      <h3>人工复核（Flowable/Activity）</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Flowable 审核工作流
-@Component
-public class ReviewWorkflowService {
+        boolean passed = violations.isEmpty();
+        double risk = violations.stream()
+            .mapToDouble(ComplianceAdvisor.Violation::severity)
+            .max().orElse(0.0);
 
-    private final RuntimeService runtimeService;
-    private final TaskService taskService;
-
-    public String startReview(String contentId, String reviewerId) {
-        Map&lt;String, Object&gt; variables = new HashMap&lt;&gt;();
-        variables.put("contentId", contentId);
-        variables.put("reviewerId", reviewerId);
-        variables.put("status", "SUBMITTED");
-        variables.put("reviewCount", 0);
-
-        ProcessInstance instance = runtimeService
-            .startProcessInstanceByKey("contentReview", variables);
-        return instance.getId();
-    }
-
-    public void approve(String taskId, String comment) {
-        Map&lt;String, Object&gt; variables = new HashMap&lt;&gt;();
-        variables.put("status", "APPROVED");
-        variables.put("comment", comment);
-        taskService.complete(taskId, variables);
-    }
-
-    public void reject(String taskId, String comment) {
-        Map&lt;String, Object&gt; variables = new HashMap&lt;&gt;();
-        variables.put("status", "REJECTED");
-        variables.put("comment", comment);
-        taskService.complete(taskId, variables);
+        return new ComplianceAdvisor.FilterResult(passed, violations, risk);
     }
 }
 
-// 审核状态机
-// DRAFT --> SUBMITTED --> REVIEWING --> APPROVED --> PUBLISHED
-//                          REVIEWING --> REJECTED --> DRAFT (修改后重新提交)
-// REJECTED --> SUBMITTED (修改后重新提交)
+@Component
+class IndustryRuleEngine implements ComplianceAdvisor.ContentFilter {
+    // EasyRules 规则引擎
+    private final Rules rules = new Rules();
 
-// Flowable BPMN 定义 (content-review.bpmn20.xml)
-// &lt;process id="contentReview"&gt;
-//   &lt;startEvent id="start" /&gt;
-//   &lt;userTask id="reviewTask" name="内容审核" /&gt;
-//   &lt;exclusiveGateway id="gateway" /&gt;
-//   &lt;endEvent id="approved"&gt;
-//     &lt;extensionElements&gt;
-//       &lt;activiti:executionListener event="end"
-//         class="com.corpassist.PublishListener"/&gt;
-//     &lt;/extensionElements&gt;
-//   &lt;/endEvent&gt;
-//   &lt;endEvent id="rejected" /&gt;
-// &lt;/process&gt;</pre></div>
+    public IndustryRuleEngine() {
+        // 加载 YAML 规则文件
+        rules.register(new MVELRule()
+            .name("金融产品禁止保本承诺")
+            .description("金融行业禁止使用保本/稳赚/无风险等表述")
+            .priority(1)
+            .when("content.contains('保本') || content.contains('稳赚')")
+            .then("violated=true"));
+    }
+
+    @Override public String name() { return "合规规则引擎"; }
+
+    @Override
+    public ComplianceAdvisor.FilterResult check(
+            ComplianceAdvisor.ContentItem item) {
+        Facts facts = new Facts();
+        facts.put("content", item.content());
+        facts.put("violated", false);
+        rulesEngine.fire(rules, facts);
+        boolean violated = facts.get("violated");
+        return new ComplianceAdvisor.FilterResult(!violated, List.of(),
+            violated ? 0.9 : 0.0);
+    }
+}</code></pre></div>
     </div>
 
     <div class="section-block">
-      <h3>驳回重写</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 驳回重写服务
-@Component
-public class RewriteService {
+      <h3>Flowable 工作流引擎实现人工复核与驳回-重写循环</h3>
+      <p>Flowable 是一个轻量级的 BPMN 2.0 工作流引擎,与 Spring Boot 深度集成。在内容流水线中,Flowable 负责人工复核节点的生命周期管理——生成内容通过 ComplianceAdvisor 机审后,视风险等级决定是否进入人工复核。Flowable 的 BPMN 2.0 流程定义（.bpmn20.xml）部署在 classpath:processes/ 目录下,Spring Boot 启动时通过 @Deployment 注解自动部署到 Flowable 引擎。流程定义包含五个节点:StartEvent（流程启动,参数:contentId,brandId,channel）→ ServiceTask（AutoCheckTask—调用 ComplianceAdvisor 执行机审）→ ExclusiveGateway（判断机审结果:通过→ManualReviewTask,驳回→EndEvent,中风险→ManualReviewTask 带标记）→ UserTask（ManualReviewTask—人工审核节点,分配到审核员用户组）→ ExclusiveGateway（人工审核结果:通过→PublishTask,驳回→RejectTask）→ PublishTask（执行发布操作）→ RejectTask（记录驳回原因,触发重写请求）→ EndEvent。驳回节点增加了一个 ServiceTask（ReWriteTask）自动创建一条"重写请求"发送到生成队列,内容工坊重写后再次提交审核。</p>
+      <p>人工审核节点（UserTask）是审核员的操作界面:审核员在 CorpAssist 的审核后台看到待审核内容列表,点击"审核"进入详情页,查看 AI 生成内容、模板变量、品牌语调参数和机审结果,然后在三个操作中选择:通过（Approve,内容进入发布流程）、驳回（Reject,填写驳回原因和修改建议,内容回到重写队列）、转审（Reassign,将审核任务转给其他审核员）。Flowable 的 IdentityService 管理审核员用户和用户组（Group: senior_reviewer/junior_reviewer/brand_manager）,通过 TaskService 的 setAssignee() 和 setCandidateGroup() 实现任务的分配和流转。审核超时机制:如果人工审核节点在 4 小时内未被处理,Flowable 的 TimerBoundaryEvent 触发超时通知——发送钉钉/邮件到审核员的上级主管,超时 8 小时自动升级到部门负责人。超时率是审核面板的核心质量指标之一,目标 &lt;5%。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">xml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-xml"><?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:flowable="http://flowable.org/bpmn"
+    targetNamespace="http://www.corpassist.com/content-review">
 
-    private final ChatClient rewriteClient;
+    <process id="contentReviewProcess" name="内容审核流程" isExecutable="true">
+        <startEvent id="startEvent" name="开始">
+            <extensionElements>
+                <flowable:formProperty id="contentId" type="string" required="true"/>
+                <flowable:formProperty id="brandId" type="string" required="true"/>
+                <flowable:formProperty id="channel" type="string" required="true"/>
+            </extensionElements>
+        </startEvent>
 
-    public String rewrite(String original, String reviewComment) {
-        return rewriteClient.prompt()
-            .user(u -&gt; u.text("""
-                请根据审核意见修改以下内容。
+        <!-- 机审服务节点 -->
+        <serviceTask id="autoCheckTask" name="自动审核(ComplianceAdvisor)"
+            flowable:delegateExpression="${autoCheckDelegate}"
+            flowable:async="true" flowable:exclusive="false">
+        </serviceTask>
 
-                原始内容：
-                {original}
+        <!-- 排他网关:判断机审结果 -->
+        <exclusiveGateway id="autoCheckGateway" name="机审结果判断"/>
 
-                审核意见：
-                {comment}
+        <!-- 机审通过(低风险):进入人审 -->
+        <sequenceFlow id="autoPassFlow" sourceRef="autoCheckGateway"
+            targetRef="manualReviewTask">
+            <conditionExpression xsi:type="tFormalExpression">
+                <![CDATA[${autoCheckResult == 'PASS'}]]>
+            </conditionExpression>
+        </sequenceFlow>
 
-                要求：
-                - 保留原始内容的核心信息
-                - 针对审核意见逐条修改
-                - 保持品牌语调一致
-                - 输出修改后的完整内容
-                """)
-                .param("original", original)
-                .param("comment", reviewComment)
-            )
-            .call()
-            .content();
+        <!-- 机审驳回(高风险):结束 -->
+        <sequenceFlow id="autoRejectFlow" sourceRef="autoCheckGateway"
+            targetRef="rejectEndEvent">
+            <conditionExpression xsi:type="tFormalExpression">
+                <![CDATA[${autoCheckResult == 'REJECT'}]]>
+            </conditionExpression>
+        </sequenceFlow>
+
+        <!-- 中风险:人审并标记 -->
+        <sequenceFlow id="autoReviewFlow" sourceRef="autoCheckGateway"
+            targetRef="manualReviewTask">
+            <conditionExpression xsi:type="tFormalExpression">
+                <![CDATA[${autoCheckResult == 'REVIEW'}]]>
+            </conditionExpression>
+        </sequenceFlow>
+
+        <!-- 人工审核用户任务 -->
+        <userTask id="manualReviewTask" name="人工审核"
+            flowable:candidateGroups="senior_reviewer"
+            flowable:dueDate="${dateTime.now().plusHours(4)}">
+            <extensionElements>
+                <flowable:formProperty id="reviewComment" type="string"/>
+                <flowable:formProperty id="reviewAction"
+                    type="enum" required="true">
+                    <flowable:value id="approve" name="通过"/>
+                    <flowable:value id="reject" name="驳回"/>
+                    <flowable:value id="reassign" name="转审"/>
+                </flowable:formProperty>
+            </extensionElements>
+            <!-- 超时边界事件: 4 小时 -->
+            <boundaryEvent id="timeoutBoundary" attachedToRef="manualReviewTask">
+                <timerEventDefinition>
+                    <timeDuration>PT4H</timeDuration>
+                </timerEventDefinition>
+            </boundaryEvent>
+        </userTask>
+
+        <!-- 超时通知服务任务 -->
+        <serviceTask id="timeoutNotifyTask" name="超时通知"
+            flowable:delegateExpression="${timeoutNotifyDelegate}">
+        </serviceTask>
+
+        <!-- 人审排他网关 -->
+        <exclusiveGateway id="reviewGateway" name="人审结果"/>
+
+        <!-- 人审通过 -->
+        <sequenceFlow id="approveFlow" sourceRef="reviewGateway"
+            targetRef="publishTask">
+            <conditionExpression xsi:type="tFormalExpression">
+                <![CDATA[${reviewAction == 'approve'}]]>
+            </conditionExpression>
+        </sequenceFlow>
+
+        <!-- 人审驳回 -->
+        <sequenceFlow id="rejectFlow" sourceRef="reviewGateway"
+            targetRef="reWriteTask">
+            <conditionExpression xsi:type="tFormalExpression">
+                <![CDATA[${reviewAction == 'reject'}]]>
+            </conditionExpression>
+        </sequenceFlow>
+
+        <!-- 发布 -->
+        <serviceTask id="publishTask" name="发布上线"
+            flowable:delegateExpression="${publishDelegate}">
+        </serviceTask>
+
+        <!-- 驳回重写 -->
+        <serviceTask id="reWriteTask" name="驳回→重写"
+            flowable:delegateExpression="${reWriteDelegate}">
+        </serviceTask>
+
+        <endEvent id="rejectEndEvent" name="驳回结束"/>
+        <endEvent id="publishEndEvent" name="发布完成"/>
+    </process>
+</definitions></code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>审核状态机的完整设计与实现</h3>
+      <p>审核状态机是审核流水线的核心数据结构,定义了内容在整个审核生命周期中的状态和转换规则。状态机包含 6 种状态: PENDING_GENERATE（待生成,初始状态）、AUTO_CHECKING（自动审核中,ComplianceAdvisor 正在执行）、AUTO_CHECKED（自动审核完成,等待人审或发布）、MANUAL_REVIEWING（人工审核中,审核员正在操作）、APPROVED（审核通过,可以发布）、REJECTED（已驳回,需要重写）。9 种合法状态转换分别是:① PENDING_GENERATE → AUTO_CHECKING（提交审核请求）、② AUTO_CHECKING → AUTO_CHECKED（机审完成,低风险）、③ AUTO_CHECKED → MANUAL_REVIEWING（进入人审）、④ AUTO_CHECKING → REJECTED（机审直接驳回,高风险）、⑤ MANUAL_REVIEWING → APPROVED（人审通过）、⑥ MANUAL_REVIEWING → REJECTED（人审驳回）、⑦ REJECTED → PENDING_GENERATE（驳回后触发重写,状态重置）、⑧ MANUAL_REVIEWING → MANUAL_REVIEWING（转审,assignee 变更但状态不变）、⑨ AUTO_CHECKED → APPROVED（低风险机审通过且无需人审的简化路径）。任何不在上述 9 种的转换都被视为非法,会被状态机拒绝并记录告警日志。</p>
+      <p>状态机的实现基于 Spring StateMachine 框架（或自行实现的枚举状态机）。使用 Spring StateMachine 的优势是支持嵌套状态、状态转换的 Action 执行、状态转换的 Guard 条件检查以及状态的持久化（通过 StateMachinePersist 接口存储到 Redis）。状态转换时执行的 Action 包括:记录审计日志（插入 content_audit_log 表）、发布 Spring 事件（ApplicationEventPublisher.publishEvent(new StateChangeEvent()) 通知其他模块）、以及触发 MQ 消息（如审核通过后发送 publish 消息到分发队列）。状态机的并发安全通过乐观锁（@Version 注解 + content_review 表的 version 字段）保证——每次状态转换前检查数据库中的 version 与当前状态机的 version 是否一致,不一致则抛出 OptimisticLockingException 并重试。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">import org.springframework.messaging.Message;
+import org.springframework.statemachine.StateMachine;
+import org.springframework.statemachine.config.*;
+import org.springframework.statemachine.listener.StateMachineListenerAdapter;
+import org.springframework.statemachine.state.State;
+import org.springframework.statemachine.transition.Transition;
+import reactor.core.publisher.Mono;
+
+public enum ContentState {
+    PENDING_GENERATE,
+    AUTO_CHECKING,
+    AUTO_CHECKED,
+    MANUAL_REVIEWING,
+    APPROVED,
+    REJECTED
+}
+
+public enum ContentEvent {
+    SUBMIT_REVIEW,
+    AUTO_CHECK_PASS,
+    AUTO_CHECK_FAIL,
+    ENTER_MANUAL_REVIEW,
+    MANUAL_APPROVE,
+    MANUAL_REJECT,
+    TRIGGER_REWRITE,
+    REASSIGN
+}
+
+@Configuration
+@EnableStateMachine(name = "contentReviewMachine")
+public class ReviewStateMachineConfig
+        extends StateMachineConfigurerAdapter<ContentState, ContentEvent> {
+
+    @Override
+    public void configure(StateMachineStateConfigurer<ContentState, ContentEvent>
+                              states) throws Exception {
+        states
+            .withStates()
+            .initial(ContentState.PENDING_GENERATE)
+            .state(ContentState.AUTO_CHECKING)
+            .state(ContentState.AUTO_CHECKED)
+            .state(ContentState.MANUAL_REVIEWING)
+            .end(ContentState.APPROVED)
+            .end(ContentState.REJECTED);
     }
 
-    // 版本管理：保留每次修改的版本
-    public ContentVersion saveVersion(String contentId, String content,
-                                       String reviewComment) {
-        ContentVersion version = new ContentVersion();
-        version.setContentId(contentId);
-        version.setContent(content);
-        version.setReviewComment(reviewComment);
-        version.setVersionNumber(getNextVersion(contentId));
-        version.setCreatedAt(Instant.now());
-        return versionRepository.save(version);
+    @Override
+    public void configure(
+            StateMachineTransitionConfigurer<ContentState, ContentEvent>
+                transitions) throws Exception {
+        transitions
+            // ① 提交审核
+            .withExternal()
+                .source(ContentState.PENDING_GENERATE)
+                .target(ContentState.AUTO_CHECKING)
+                .event(ContentEvent.SUBMIT_REVIEW)
+                .action(context -> {
+                    System.out.println("开始自动审核");
+                    // 调用 ComplianceAdvisor
+                })
+            // ② 机审通过(低风险)
+            .and().withExternal()
+                .source(ContentState.AUTO_CHECKING)
+                .target(ContentState.AUTO_CHECKED)
+                .event(ContentEvent.AUTO_CHECK_PASS)
+                .guard(context -> {
+                    double riskScore = (double) context.getMessageHeaders()
+                        .get("riskScore");
+                    return riskScore <= 0.5; // 低风险通过
+                })
+            // ③ 机审驳回(高风险)
+            .and().withExternal()
+                .source(ContentState.AUTO_CHECKING)
+                .target(ContentState.REJECTED)
+                .event(ContentEvent.AUTO_CHECK_FAIL)
+            // ④ 进入人审
+            .and().withExternal()
+                .source(ContentState.AUTO_CHECKED)
+                .target(ContentState.MANUAL_REVIEWING)
+                .event(ContentEvent.ENTER_MANUAL_REVIEW)
+            // ⑤ 人审通过
+            .and().withExternal()
+                .source(ContentState.MANUAL_REVIEWING)
+                .target(ContentState.APPROVED)
+                .event(ContentEvent.MANUAL_APPROVE)
+            // ⑥ 人审驳回
+            .and().withExternal()
+                .source(ContentState.MANUAL_REVIEWING)
+                .target(ContentState.REJECTED)
+                .event(ContentEvent.MANUAL_REJECT)
+            // ⑦ 驳回后重写
+            .and().withExternal()
+                .source(ContentState.REJECTED)
+                .target(ContentState.PENDING_GENERATE)
+                .event(ContentEvent.TRIGGER_REWRITE);
     }
-}</pre></div>
+
+    @Override
+    public void configure(StateMachineConfigurationConfigurer
+                              <ContentState, ContentEvent> config)
+            throws Exception {
+        config.withConfiguration()
+            .autoStartup(true)
+            .listener(new StateMachineListenerAdapter<>() {
+                @Override
+                public void stateChanged(State<ContentState, ContentEvent> from,
+                        State<ContentState, ContentEvent> to) {
+                    System.out.printf("[状态机] %s → %s%n",
+                        from != null ? from.getId() : "NONE",
+                        to != null ? to.getId() : "NONE");
+                    // 记录审计日志
+                }
+
+                @Override
+                public void eventNotAccepted(Message<ContentEvent> event) {
+                    System.err.printf("[状态机] 非法事件 %s 被拒绝%n",
+                        event.getPayload());
+                }
+            });
+    }
+}
+
+// 使用示例
+@Service
+public class ReviewService {
+
+    private final StateMachine<ContentState, ContentEvent> stateMachine;
+
+    public ReviewService(
+            StateMachine<ContentState, ContentEvent> stateMachine) {
+        this.stateMachine = stateMachine;
+    }
+
+    public boolean submitReview(String contentId) {
+        stateMachine.getExtendedState().getVariables()
+            .put("contentId", contentId);
+        stateMachine.start();
+        return stateMachine.sendEvent(Mono.just(
+            MessageBuilder.withPayload(ContentEvent.SUBMIT_REVIEW)
+                .setHeader("contentId", contentId)
+                .setHeader("riskScore", 0.3)
+                .build())).block();
+    }
+
+    public boolean approve(String contentId, String reviewer) {
+        return stateMachine.sendEvent(Mono.just(
+            MessageBuilder.withPayload(ContentEvent.MANUAL_APPROVE)
+                .setHeader("reviewer", reviewer)
+                .build())).block();
+    }
+
+    public boolean reject(String contentId, String reviewer, String reason) {
+        return stateMachine.sendEvent(Mono.just(
+            MessageBuilder.withPayload(ContentEvent.MANUAL_REJECT)
+                .setHeader("reviewer", reviewer)
+                .setHeader("reason", reason)
+                .build())).block();
+    }
+}</code></pre></div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
-      <li>Advisor 链依次执行 4 道安全检测（敏感词/有害/品牌/版权）</li>
-      <li>Flowable 工作流管理审核生命周期</li>
-      <li>驳回重写保留审核意见和版本历史</li>
-      <li>审核状态机 6 个状态闭环流转</li>
+      <li>ComplianceAdvisor 四层过滤（敏感词→合规规则→语调校验→事实核查）使用责任链模式,高风险短路节省 40% LLM 调用成本</li>
+      <li>Flowable BPMN 2.0 流程定义 5 个节点（Start→机审→人审→发布/驳回→重写）,人审节点 4 小时超时自动通知主管</li>
+      <li>审核状态机 6 状态 9 转换,基于 Spring StateMachine 实现,每次转换记录审计日志并发布 Spring 事件</li>
+      <li>审核 Dashboard 监控通过率（目标 &gt;85%）/驳回原因 Top-5/平均审核周期（Target &lt;4h）/自动vs人工驳回比（Target 自动 &gt;60%）</li>
+      <li>人审驳回后通过 ReWriteDelegate 自动生成重写请求发送到 MQ 队列,重写后重新走完整审核流水线</li>
     </ul></div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox"> 我能配置 Advisor 安全检测链</label></li>
-        <li><label><input type="checkbox"> 我能用 Flowable 实现审核工作流</label></li>
-        <li><label><input type="checkbox"> 我能实现驳回重写</label></li>
-        <li><label><input type="checkbox"> 我能设计审核状态机</label></li>
+        <li><label><input type="checkbox"> 我能实现 ComplianceAdvisor 四层过滤链,使用责任链模式并配置高风险短路逻辑</label></li>
+        <li><label><input type="checkbox"> 我能编写 Flowable BPMN 2.0 流程定义包含机审/人审/发布/驳回节点,配置 4 小时超时边界事件</label></li>
+        <li><label><input type="checkbox"> 我能使用 Spring StateMachine 定义 6 状态 9 转换的状态机,并通过 @EnableStateMachine 集成</label></li>
+        <li><label><input type="checkbox"> 我能构建审核 Dashboard 监控通过率/驳回原因/审核周期/自动vs人工驳回比四个核心指标</label></li>
+        <li><label><input type="checkbox"> 我能实现驳回→重写的自动触发机制,重写后重新走完整审核流水线</label></li>
       </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语/概念</th><th>一句话定义</th></tr></thead><tbody>
+        <tr><td>ComplianceAdvisor</td><td>四层过滤责任链 敏感词→合规规则→语调校验→事实核查 高风险短路 节省 40% LLM 费用</td></tr>
+        <tr><td>Aho-Corasick 自动机</td><td>多模式字符串匹配算法 O(n) 时间 10 万词库约 50ms 初始化 单篇匹配 &lt;1ms</td></tr>
+        <tr><td>EasyRules 引擎</td><td>轻量级 Java 规则引擎 YAML 定义规则 SpEL 条件 金融/医疗/教育各行业 BLOCK/WARN/ALLOW</td></tr>
+        <tr><td>Flowable BPMN 2.0</td><td>轻量级工作流引擎 5 节点流程定义 @Deployment 自动部署 RuntimeService 操作流程实例</td></tr>
+        <tr><td>审核状态机 6+9</td><td>6 种状态 9 种合法转换 Spring StateMachine 乐观锁 @Version 并发安全</td></tr>
+        <tr><td>TimerBoundaryEvent</td><td>Flowable 计时边界事件 4h→通知主管 8h→升级部门负责人 超时率目标 &lt;5%</td></tr>
+        <tr><td>驳回原因 Top-5</td><td>语调偏差(35%) / 事实错误(25%) / 敏感词(18%) / 格式问题(12%) / 合规违规(10%)</td></tr>
+        <tr><td>ReWriteDelegate</td><td>Flowable ServiceTask 驳回后自动发送重写请求到 MQ 生成队列 触发重写后走完整流水线</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview-qa"><h4>面试常见问答</h4>
+        <div class="learn-faq"><details><summary>内容审核流水线如何设计？自动过滤和人工审核如何配合？</summary><p>内容审核流水线采用"自动过滤→人工复核"的二级配合模式。自动过滤阶段由 ComplianceAdvisor 实现四层过滤链:敏感词过滤（Aho-Corasick 匹配 10 万词库）→ 合规规则引擎（EasyRules 执行行业 YAML 规则）→ 品牌语调校验（五维向量余弦阈值 0.85）→ 事实核查（RAG 知识库检索置信度 0.9）。通过责任链模式,高风险内容直接"短路"返回不需要后续层执行。自动过滤有三个输出路径:低风险（riskScore≤0.5）直接进入人审轻量级通道,中风险（0.5-0.8）进入人审标准通道并携带违规标记,高风险（&gt;0.8）直接驳回不进入人审。人工审核阶段基于 Flowable BPMN 2.0 工作流,审核员在审核后台查看 AI 生成内容和机审结果后选择通过/驳回/转审操作。人审超时 4 小时触发通知主管,8 小时升级到部门负责人。驳回后自动触发 ReWriteDelegate 发送重写请求到 MQ 队列,重写后重新完整走流水线。这种配合模式既降低了人审的工作量（自动过滤掉约 20% 的高风险内容）,又确保了对机器难以判断的品牌一致性和创意类问题的把关。</p></details></div>
+        <div class="learn-faq"><details><summary>审核状态机如何定义并发安全问题如何处理？</summary><p>审核状态机包含 6 种状态（PENDING_GENERATE/AUTO_CHECKING/AUTO_CHECKED/MANUAL_REVIEWING/APPROVED/REJECTED）和 9 种合法转换,使用 Spring StateMachine 框架实现。并发安全的保证通过三点:第一是数据库乐观锁——content_review 表增加 @Version 字段（int 类型）,每次状态转换前检查 version 与数据库一致,转换完成后 version+1,如果被其他线程修改则抛出 OptimisticLockingException；第二是状态机的串行执行——Spring StateMachine 默认在单线程中执行,避免同一状态机的状态并发修改；第三是状态转换的原子性——状态转换、审计日志写入和事件发布在同一个 @Transactional 事务中,要么全部成功要么全部回滚。对于人审节点的分配,Flowable 的 UserTask 分配通过 setAssignee() 设置审核员 ID,同一个内容同时只能被一个人审核。当两个审核员同时打开审核页面时,先执行 approve/reject 操作的生效,后操作的需要重新加载页面（页面显示"该内容已被其他审核员处理"）。</p></details></div>
+        <div class="learn-faq"><details><summary>驳回→重写循环的具体实现机制和防止死循环的策略？</summary><p>驳回→重写循环由 Flowable BPMN 流程中的 ReWriteDelegate 触发:当审核员选择驳回并填写原因后,流程流转到 reWriteTask（ServiceTask）,ReWriteDelegate 执行时:①记录驳回原因到 content_review.reject_reason 字段；②将原始 ContentInput + 驳回原因 + 修改建议封装为重写请求发送到 RocketMQ 的 content-rewrite-topic；③生成队列的 Consumer 收到重写请求后,调用 LLM 重新生成内容（Prompt 中加入"上次被驳回,原因是:{rejectReason},请按以下建议修改:{suggestion}"）；④重新生成的 ContentOutput 通过审核流水线的 API 提交,启动一个新的审核流程实例（contentId+版本号递增）。防止死循环的策略:①最大驳回次数限制——每个内容在同一审核流程中最多被驳回 3 次,第 3 次驳回后进入 REVIEW_ESCALATED 状态,转交品牌总监手动处理,不再触发自动重写；②驳回原因分类——如果驳回原因是"事实错误"（如数据引用不准确）,重写时通过 RAG 知识库提供准确数据源；如果驳回原因是"语调偏差",重写时调整语调参数（temperature 降低 0.1）再生成。③重写自动降级——如果同一个内容连续 2 次被驳回且驳回原因相同（如都是"语调偏差"）,自动降级为"纯人工创作"模式,不再触发 AI 重写,而是将该内容分配到人工创作队列。</p></details></div>
+      </div>
     </div>
   </div>
 
   <div class="official-links content-section"><h3>官方参考</h3><ul>
-    <li><a href="https://www.flowable.com/" target="_blank" rel="noopener">Flowable 官方</a></li>
+    <li><a href="https://www.flowable.com/open-source/docs/bpmn" target="_blank" rel="noopener">Flowable BPMN 2.0 文档 — 流程定义与 Spring 集成</a></li>
+    <li><a href="https://spring.io/projects/spring-statemachine" target="_blank" rel="noopener">Spring StateMachine — 审核状态机框架</a></li>
+    <li><a href="https://github.com/j-easy/easy-rules" target="_blank" rel="noopener">EasyRules — 轻量级合规规则引擎</a></li>
   </ul></div>
   <div class="chapter-practice"><h3>动手练习</h3>
-    <div class="steps-operate"><ol>
-      <li>配置 Advisor 安全检测链</li>
-      <li>部署 Flowable 审核流程</li>
-      <li>测试驳回重写功能</li>
-      <li>验证审核状态机流转</li>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li><code>curl -X POST http://localhost:8080/api/v1/review/submit -H "Content-Type: application/json" -d '{"contentId":"content-001","content":"本产品年化收益率8%保本保息","channel":"wechat","brandId":"brand-finance"}'</code> — 提交内容审核,验证返回的 JSON 包含 reviewId/state=REJECTED/reason 字段（因为"保本"触发了金融行业的禁止词规则）</li>
+      <li><code>curl -X GET http://localhost:8080/api/v1/review/pending?assignee=reviewer01</code> — 查询审核员 reviewer01 的待审核列表,验证返回的结果包含 contentId/submitTime/autoCheckResult/riskLevel 四个字段,且内容按提交时间倒序排列</li>
+      <li><code>curl -X POST http://localhost:8080/api/v1/review/content-001/approve -H "Content-Type: application/json" -d '{"reviewer":"reviewer01","comment":"内容准确,通过"}'</code> — 通过审核,验证状态机状态从 MANUAL_REVIEWING 转换为 APPROVED,且 content_audit_log 表新增一条审核记录</li>
     </ol></div>
-    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-02-lab/</code></p></div>
+    <div class="learn-compare"><div class="learn-compare-col learn-compare-judge"><h4>场景判断 1: 审核驳回率异常</h4><p>某品牌的内容审核通过率从上周的 88% 骤降至 62%,其中"语调偏差"的驳回占比 52%。请分析原因并提出改进方案。<br/><strong>正确分析:</strong> 可能的原因:①品牌语调参数在这周被修改（如五维向量重新配置）,但模板和示例库没有同步更新；②LLM 模型版本变更（如从 DeepSeek-V3 切换到 V4）,新模型的输出语调有系统性偏差。改进方案:①检查最近的模板/模型变更记录,确认是否有触发语调偏移的改动；②将最近的 50 篇驳回内容的语调向量与目标语调向量做对比分析,找出偏差最大的维度；③如果是模型变更导致的,调整 new 模型的温度参数（降低 0.05-0.1）或补充 5-10 条语调校准的 few-shot 示例；④在合规规则引擎中增加一条"语调偏差率监控"规则:当单个维度偏差超过 2.0 分的比例超过 30% 时自动告警。</p></div><div class="learn-compare-col learn-compare-judge"><h4>场景判断 2: 审核超时严重</h4><p>内容审核平均周期从 2 小时急剧上升到 6.5 小时,超时率从 3% 上升到 22%。审核团队 8 人,日均审核量 200 篇。请分析原因并提出改进方案。<br/><strong>正确分析:</strong> 可能的原因:①内容生成量突然增加（营销活动导致日均从 200 篇增加到 350 篇）,而审核团队没有增加编制；②高难度内容比例上升（如从常规产品描述变为 PR 稿和投资分析）,每篇审核时间从平均 12 分钟增加到 25 分钟。改进方案:①短期——启用"自动通过"白名单规则:对于机审评分 &gt;0.9、品牌语调偏差 &lt;0.5、且内容类型为"内部通知"的内容,自动通过不需要人工审核,审核员只处理中高风险内容,预计降低人审量 35%；②中期——将审核团队按品牌分组（每组 2-3 人,专门负责 1-2 个品牌）,减少品牌切换的上下文成本,预计每篇审核时间降低 20%；③长期——优化自动过滤的阈值,将低风险自动通过的比例从 20% 提升到 40%,同时补充反驳回原因自动生成的功能帮助审核员快速填写驳回建议。</p></div></div>
+    <div class="demo-box"><h4>配套实验室:审核流水线</h4><p>demos/practice-02-review-lab/ 实现了 ComplianceAdvisor / Flowable 流程 / 状态机 / Dashboard 的完整代码。</p><ul>
+      <li>验收标准 1: 提交包含"年化收益8%保本"的内容后,ComplianceAdvisor 第一层敏感词直接拦截,返回 REJECTED 状态和具体违规词列表</li>
+      <li>验收标准 2: 启动 Flowable 流程后,通过 REST API 查询流程实例状态,验证节点从 autoCheckTask 流转到 manualReviewTask,且 candidateGroup=senior_reviewer</li>
+      <li>验收标准 3: 连续提交 20 篇内容（10 篇合规+10 篇含各类违规）,Dashboard 接口返回的通过率接近 50%,驳回原因分布中敏感词和事实错误分别占 40% 和 30%</li>
+    </ul></div>
   </div>
-  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-03">千人千面个性化</a></li></ul></div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-03">千人千面个性化 — 用户画像和动态模板选择</a></li></ul></div>
 </section>

@@ -2,194 +2,413 @@
   <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>Spring 编排创作 API</h2><button type="button" class="btn-mark-done" data-chapter="practice-05" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>内容工坊的 API 设计需要支持交互式生成（SSE 流式）和批量生成（回调通知）。本章实现完整的创作 API：Controller + SSE 流式输出、批量生成回调、与 Python 生成服务的契约对接。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 Controller + SSE 流式内容生成；配置批量生成完成后回调通知；定义 Python 生成服务的 API 契约；执行验收测试。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><p>1) SSE 流式：/api/content/generate-stream 实时输出生成 Token；2) 批量生成回调：/api/content/batch/callback 接收完成通知；3) Python 生成服务契约：OpenAPI 3.0 规范生成接口；4) 验收清单 8 项覆盖功能/性能/安全。</p></div>
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>内容工坊的前端和后端需要通过 API 交互——用户在前端编写模板、提交生成请求、查看生成结果。CorpAssist 的 Spring 编排 API 提供 REST 接口管理资源和模板,SSE 流式输出实时推送生成结果,WebSocket 推送批量进度,以及与 Python 生成服务的 OpenAPI 契约定义。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 REST Controller + SSE 流式输出的端到端 API（单篇生成 3-5 秒流式返回）,构建批量生成请求的异步回调与 WebSocket 进度推送机制,定义与 Python 生成服务的 OpenAPI 契约（DTO/错误码/版本管理,遵循 API First 开发模式）,编写完整的功能/性能/安全/可靠性验收 checklist。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) REST + SSE:POST /api/v1/generate/stream 接收生成请求,返回 SseEmitter(超时 60s),LLM 调用结果按 token 流式推送到前端,前端使用 EventSource API 接收并逐步展示内容;2) WebSocket 进度推送:批量提交 POST /api/v1/batch/generate 返回 batchId,前端通过 STOMP over SockJS 订阅 /topic/batch/{batchId} 实时接收进度；3) Python 生成服务契约:两个服务间通过 OpenAPI 3.0 定义契约,DTO 使用 @Schema 注解标注字段说明,错误码遵循 IEEE 标准（4xx 客户端/5xx 服务端）,版本通过 Accept-Version 请求头协商；4) API 验收清单包含功能（CRUD 正确性/分页/排序）、性能（500 QPS / P99 &lt;500ms 读 / P99 &lt;30s 生成）、安全（JWT 鉴权 / IP 白名单 / 请求频率限制）和可靠性（熔断降级 / 超时处理 / 优雅关闭）四个维度共 27 项检查点。</p></div>
     </div>
 
     <div class="section-block">
-      <h3>Controller + SSE 流式</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 内容生成 API
+      <h3>REST Controller + SSE 流式输出的端到端实现</h3>
+      <p>内容生成 API 的核心用户体验是"不要让我等"——如果用户提交生成请求后需要等待 5-10 秒才能看到结果,用户会焦虑甚至关闭页面。CorpAssist 采用 SSE（Server-Sent Events）流式输出方案,让 LLM 的 token 逐字推送到前端,用户在生成开始后的 1-2 秒就能看到第一行内容,后续内容逐步展示,显著降低感知延迟。实现方案:Controller 接口 POST /api/v1/generate/stream,接收生成请求（templateId + variables + toneParams）,返回 SseEmitter。SseEmitter 是 Spring 提供的 SSE 抽象,设置超时时间 60 秒（超过自动关闭连接）。Controller 中启用 @Async 注解,将 LLM 调用放入独立线程池执行（TaskExecutor 配置 corePoolSize=10,maxPoolSize=50,queueCapacity=200）,防止 SSE 长连接阻塞 Tomcat 的请求处理线程。LLM 调用使用 ChatClient 的 stream() 方法（而不是 call()）,返回 Flux&lt;String&gt;,每个 token 通过 SseEmitter.send() 推送到前端,推送完成（complete）或异常（completeWithError）时结束 SSE 流。</p>
+      <p>前端的接收代码使用原生 EventSource API（或 fetch + ReadableStream）,也可以使用 Spring 的 WebClient 做后端到后端的 SSE 对接。生产环境的优化点包括:①缓冲区控制——LLM 的单个 token 推送太快（每秒 20-50 个 token）会导致前端渲染卡顿,建议在 SseEmitter.send() 之前增加一个小型缓冲区（50ms 或 5 个 token 积压一次发送）,降低推送频率但保证流畅度；②心跳机制——SSE 连接可能因为网络中间件（Nginx/网关）的空闲超时而断开,需要每隔 15 秒发送一条空注释（": heartbeat\n\n"）保持连接存活；③断线重连——前端检测到 SSE 连接断开后,自动在 1 秒后重新连接,并在请求头中携带 lastTokenIndex（已接收到的最后一个 token 的索引）,服务端支持从断点处继续推送（需要 ChatClient 支持设置 startTokenIndex）。④前端的渲染优化——对于长内容（2000+ token）,前端不应该等全部 token 到达后才渲染,而应该使用增量渲染,每收到 5-10 个 token 就更新一次 DOM。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.ai.chat.client.ChatClient;
+import reactor.core.publisher.Flux;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
 @RestController
-@RequestMapping("/api/content")
-public class ContentController {
+@RequestMapping("/api/v1/generate")
+public class ContentGenerateController {
 
-    private final ContentGenerator generator;
-    private final BatchContentService batchService;
+    private final ChatClient chatClient;
+    private final TemplateEngine templateEngine;
+    private final ContentBatchService batchService;
 
-    @PostMapping("/generate")
-    public ResponseEntity&lt;GenerateResponse&gt; generate(
-            @RequestBody GenerateRequest request) {
-        String content = generator.generate(request);
-        return ResponseEntity.ok(new GenerateResponse(content));
+    public ContentGenerateController(ChatClient.Builder builder,
+                                     TemplateEngine templateEngine,
+                                     ContentBatchService batchService) {
+        this.chatClient = builder.build();
+        this.templateEngine = templateEngine;
+        this.batchService = batchService;
     }
 
-    @PostMapping(value = "/generate-stream",
-                 produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter generateStream(@RequestBody GenerateRequest request) {
-        SseEmitter emitter = new SseEmitter(60_000L);
+    // 单篇同步生成 (非流式)
+    @PostMapping("/sync")
+    public GenerateResponse generateSync(@RequestBody GenerateRequest request) {
+        String prompt = templateEngine.fill(
+            request.templateId(), request.variables());
+        String content = chatClient.prompt()
+            .user(u -> u.text(prompt))
+            .call()
+            .content();
+        return new GenerateResponse(request.templateId(), content, "SUCCESS");
+    }
 
-        executor.execute(() -&gt; {
+    // 单篇流式生成 (SSE)
+    @PostMapping("/stream")
+    @Async("contentTaskExecutor")
+    public SseEmitter generateStream(@RequestBody GenerateRequest request) {
+        SseEmitter emitter = new SseEmitter(60_000L);  // 60s 超时
+
+        // 心跳保活 (每15秒)
+        new Thread(() -> {
             try {
-                // 流式生成 Token
-                Flux&lt;String&gt; stream = generator.generateStream(request);
-                stream.subscribe(
-                    token -&gt; emitter.send(SseEmitter.event()
-                        .name("token").data(token)),
-                    err -&gt; {
-                        emitter.send(SseEmitter.event()
-                            .name("error").data(err.getMessage()));
-                        emitter.complete();
-                    },
-                    () -&gt; {
-                        emitter.send(SseEmitter.event()
-                            .name("done").data(""));
-                        emitter.complete();
+                while (true) {
+                    TimeUnit.SECONDS.sleep(15);
+                    emitter.send(SseEmitter.event()
+                        .comment("heartbeat")
+                        .name("heartbeat")
+                        .data(""));
+                }
+            } catch (Exception ignored) {}
+        }).start();
+
+        try {
+            String prompt = templateEngine.fill(
+                request.templateId(), request.variables());
+
+            Flux<String> tokenStream = chatClient.prompt()
+                .user(u -> u.text(prompt))
+                .stream()
+                .content();
+
+            StringBuilder fullContent = new StringBuilder();
+            int tokenCount = 0;
+
+            tokenStream.subscribe(
+                token -> {
+                    try {
+                        fullContent.append(token);
+                        tokenCount++;
+
+                        // 每 5 个 tokens 推送一次,降低推送频率
+                        if (tokenCount % 5 == 0) {
+                            emitter.send(SseEmitter.event()
+                                .name("token")
+                                .data(Map.of(
+                                    "partial", fullContent.toString(),
+                                    "tokenCount", tokenCount,
+                                    "finished", false)));
+                        }
+                    } catch (Exception e) {
+                        emitter.completeWithError(e);
                     }
-                );
-            } catch (Exception e) {
-                emitter.completeWithError(e);
-            }
-        });
+                },
+                error -> {
+                    try {
+                        emitter.send(SseEmitter.event()
+                            .name("error")
+                            .data(Map.of("error", error.getMessage())));
+                        emitter.complete();
+                    } catch (Exception ignored) {}
+                },
+                () -> {
+                    try {
+                        // 流完成,推送完整内容
+                        emitter.send(SseEmitter.event()
+                            .name("complete")
+                            .data(Map.of(
+                                "content", fullContent.toString(),
+                                "tokenCount", tokenCount,
+                                "finished", true)));
+                        emitter.complete();
+                    } catch (Exception ignored) {}
+                }
+            );
+        } catch (Exception e) {
+            try {
+                emitter.send(SseEmitter.event()
+                    .name("error")
+                    .data(Map.of("error", e.getMessage())));
+                emitter.complete();
+            } catch (Exception ignored) {}
+        }
+
         return emitter;
     }
 
+    // 批量生成 (异步,返回 batchId)
     @PostMapping("/batch")
-    public ResponseEntity&lt;BatchResponse&gt; batchGenerate(
-            @RequestBody BatchRequest request) {
-        String batchId = batchService.startBatch(
-            request.getTemplateId(),
-            request.getVariablesList(),
-            request.getCallbackUrl()  // 生成完成后的回调
-        );
-        return ResponseEntity.accepted()
-            .body(new BatchResponse(batchId, "IN_PROGRESS"));
+    public BatchResponse generateBatch(@RequestBody BatchRequest request) {
+        String batchId = batchService.submitBatch(request.inputs());
+        return new BatchResponse(batchId, "SUBMITTED",
+            "批次已提交,通过 WebSocket /topic/batch/" + batchId + " 查看进度");
     }
 
+    // 查询批次进度
     @GetMapping("/batch/{batchId}/progress")
-    public ResponseEntity&lt;BatchProgress&gt; getProgress(
-            @PathVariable String batchId) {
-        return ResponseEntity.ok(progressTracker.getProgress(batchId));
+    public BatchProgress getBatchProgress(@PathVariable String batchId) {
+        return batchService.getProgress(batchId);
     }
-}</pre></div>
+
+    // DTO 记录
+    record GenerateRequest(String templateId, Map<String, Object> variables,
+        double[] toneParams) {}
+    record GenerateResponse(String templateId, String content, String status) {}
+    record BatchRequest(String batchName, java.util.List<ContentInput> inputs) {}
+    record BatchResponse(String batchId, String status, String message) {}
+    record BatchProgress(String batchId, int total, int completed,
+        int failed, int percentage, String status) {}
+    record ContentInput(String id, String templateId,
+        Map<String, Object> variables, String channel) {}
+}
+
+// SSE 客户端 (前端 JavaScript 参考)
+// const source = new EventSource('/api/v1/generate/stream');
+// source.addEventListener('token', (e) => {
+//   const data = JSON.parse(e.data);
+//   document.getElementById('content').innerText = data.partial;
+// });
+// source.addEventListener('complete', (e) => {
+//   console.log('生成完成');
+// });</code></pre></div>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant F as 前端
+    participant C as Controller
+    participant E as SseEmitter
+    participant L as LLM
+
+    F->>C: POST /generate/stream
+    C->>E: 创建SseEmitter(60s超时)
+    C-->>F: 200 OK (SSE连接)
+
+    activate E
+    C->>L: chatClient.stream()
+    L-->>C: token 1
+    C->>E: send(token 1-5)
+    E-->>F: SSE event "token"
+    L-->>C: token 6-10
+    C->>E: send(token 6-10)
+    E-->>F: SSE event "token"
+    Note over C,E: 每5个token推送一次
+    L-->>C: 完成
+    C->>E: send(complete event)
+    E-->>F: SSE event "complete"
+    deactivate E
+            </pre>
+      </div>
     </div>
 
     <div class="section-block">
-      <h3>批量生成回调与 Python 契约</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 批量生成回调处理
-@Component
-public class BatchCallbackHandler {
+      <h3>批量生成的异步回调与 WebSocket 进度推送</h3>
+      <p>批量生成的场景（如 100 篇产品描述）不适合使用 SSE——单篇生成的流式体验是好的,但 100 篇内容串行流式输出需要 8-10 分钟,前端保持长连接过于吃资源。CorpAssist 的批量生成 API 采用"异步提交 + WebSocket 进度推送 + 回调通知"的架构。用户通过 POST /api/v1/generate/batch 提交批量化请求,API 返回 batchId 和 HTTP 202 Accepted 状态码。后端异步执行生成（通过 RocketMQ + Spring Batch）,进度通过 WebSocket 实时推送给前端。WebSocket 基于 STOMP over SockJS 协议——前端使用 @stomp/stompjs 库连接 ws://host:port/ws-endpoint,订阅 /topic/batch/{batchId} 主题。后端在进度更新时通过 SimpMessagingTemplate.convertAndSend() 推送进度消息。批量完成时,推送一条 status=COMPLETED 的最终消息,前端收到后关闭订阅并触发结果展示。</p>
+      <p>回调通知机制:当批量生成完全部内容后,系统通过 Webhook 调用用户注册的回调 URL（在提交批量请求时通过 callbackUrl 参数指定）。Webhook 的 Payload 包含 batchId、totalCount、successCount、failCount、summaryReportUrl（包含所有生成内容的概览报告下载链接）、以及失败条目的错误信息列表。Webhook 的重试策略:如果回调返回非 2xx 状态码,系统在 5 分钟/15 分钟/30 分钟后各重试一次,最多 3 次。如果 3 次都失败,记录到 webhook_failure_log 表由运维人员手动处理。Webhook 的签名安全:Payload 通过 HMAC-SHA256 签名（密钥在注册回调时协商）,接收方验证签名确保消息未被篡改。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.util.*;
 
+@RestController
+@RequestMapping("/api/v1/generate/batch")
+public class BatchWithCallbackController {
+
+    private final SimpMessagingTemplate messagingTemplate;
+    private final BatchProgressTracker progressTracker;
     private final RestTemplate restTemplate;
+    private static final String HMAC_KEY = "webhook-hmac-key-2026";
 
-    @Async
-    public void notifyCompletion(String batchId, String callbackUrl) {
-        BatchResult result = batchService.getResult(batchId);
-        CallbackPayload payload = new CallbackPayload(
-            batchId, "COMPLETED",
-            result.getTotalCount(), result.getSuccessCount(),
-            result.getFailedCount(), result.getResults()
-        );
+    public BatchWithCallbackController(
+            SimpMessagingTemplate messagingTemplate,
+            BatchProgressTracker progressTracker) {
+        this.messagingTemplate = messagingTemplate;
+        this.progressTracker = progressTracker;
+        this.restTemplate = new RestTemplate();
+    }
 
-        try {
-            restTemplate.postForEntity(callbackUrl, payload, String.class);
-            log.info("Batch {} callback sent to {}", batchId, callbackUrl);
-        } catch (Exception e) {
-            log.error("Batch {} callback failed: {}", batchId, e.getMessage());
-            // 重试 3 次
-            retryCallback(batchId, callbackUrl, 0);
+    @PostMapping
+    public BatchResponse submitBatch(@RequestBody BatchWithCallbackRequest req) {
+        String batchId = UUID.randomUUID().toString();
+
+        // 保存回调信息
+        progressTracker.saveCallback(batchId, req.callbackUrl());
+
+        // 异步启动生成
+        progressTracker.initBatch(batchId, req.inputs().size());
+        asyncGenerate(batchId, req.inputs());
+
+        return new BatchResponse(batchId, "ACCEPTED",
+            "批量任务已提交,通过 WebSocket 追踪进度");
+    }
+
+    private void asyncGenerate(String batchId, List<ContentInput> inputs) {
+        // 异步: RocketMQ 或 CompletableFuture
+        CompletableFuture.runAsync(() -> {
+            int success = 0, fail = 0;
+            List<Map<String, String>> errors = new ArrayList<>();
+
+            for (ContentInput input : inputs) {
+                try {
+                    String content = generateOne(input);
+                    progressTracker.recordSuccess(batchId, 1);
+                    success++;
+
+                    // WebSocket 推送进度
+                    pushProgress(batchId);
+
+                } catch (Exception e) {
+                    progressTracker.recordFailure(batchId, 1);
+                    fail++;
+                    errors.add(Map.of(
+                        "id", input.id(), "error", e.getMessage()));
+                }
+            }
+
+            // 完成时推送最终状态并触发回调
+            pushFinalStatus(batchId, success, fail, errors);
+            triggerCallback(batchId, success, fail, errors);
+        });
+    }
+
+    private void pushProgress(String batchId) {
+        var progress = progressTracker.getProgress(batchId);
+        if (progress != null) {
+            messagingTemplate.convertAndSend(
+                "/topic/batch/" + batchId, progress);
         }
     }
 
-    private void retryCallback(String batchId, String url, int attempt) {
-        if (attempt &gt;= 3) return;
-        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-        scheduler.schedule(() -&gt; {
-            try {
-                notifyCompletion(batchId, url);
-            } catch (Exception e) {
-                retryCallback(batchId, url, attempt + 1);
-            }
-        }, 5 * (attempt + 1), TimeUnit.SECONDS);
+    private void pushFinalStatus(String batchId, int success,
+                                  int fail, List<Map<String, String>> errors) {
+        messagingTemplate.convertAndSend(
+            "/topic/batch/" + batchId,
+            Map.of("batchId", batchId, "status", "COMPLETED",
+                "total", success + fail, "success", success,
+                "failure", fail, "errors", errors));
     }
-}
 
-// Python 生成服务契约（OpenAPI 3.0）
-// openapi: 3.0.0
-// info:
-//   title: CorpAssist Content Generation Service
-//   version: 1.0.0
-// paths:
-//   /api/generate:
-//     post:
-//       requestBody:
-//         content:
-//           application/json:
-//             schema:
-//               type: object
-//               properties:
-//                 template_id: { type: string }
-//                 variables: { type: object }
-//                 brand_tone: { type: object }
-//               required: [template_id, variables]
-//       responses:
-//         '200':
-//           description: 生成成功
-//           content:
-//             text/event-stream:
-//               schema:
-//                 type: string
-//   /api/health:
-//     get:
-//       responses:
-//         '200':
-//           description: 健康检查</pre></div>
+    private void triggerCallback(String batchId, int success,
+                                  int fail, List<Map<String, String>> errors) {
+        String callbackUrl = progressTracker.getCallback(batchId);
+        if (callbackUrl == null || callbackUrl.isBlank()) return;
+
+        // 构建回调 Payload
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("batchId", batchId);
+        payload.put("status", "COMPLETED");
+        payload.put("total", success + fail);
+        payload.put("successCount", success);
+        payload.put("failCount", fail);
+        payload.put("timestamp", System.currentTimeMillis());
+
+        // HMAC-SHA256 签名
+        String signature = signPayload(payload, HMAC_KEY);
+
+        // 发送回调 (重试 3 次)
+        for (int retry = 0; retry < 3; retry++) {
+            try {
+                var entity = org.springframework.http.HttpEntity
+                    .<Map<String, Object>>builder()
+                    .body(payload)
+                    .header("X-Signature", signature)
+                    .header("Content-Type", "application/json")
+                    .build();
+                var response = restTemplate.postForEntity(
+                    callbackUrl, entity, String.class);
+                if (response.getStatusCode().is2xxSuccessful()) break;
+            } catch (Exception e) {
+                System.err.printf("[CALLBACK] retry=%d failed: %s%n",
+                    retry, e.getMessage());
+                try { Thread.sleep(300_000L * (retry + 1)); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private String signPayload(Map<String, Object> payload, String key) {
+        try {
+            String json = new com.fasterxml.jackson.databind
+                .ObjectMapper().writeValueAsString(payload);
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key.getBytes(), "HmacSHA256"));
+            return Base64.getEncoder().encodeToString(mac.doFinal(json.getBytes()));
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private String generateOne(ContentInput input) { return "生成内容"; }
+
+    record BatchWithCallbackRequest(List<ContentInput> inputs,
+        String callbackUrl) {}
+}</code></pre></div>
     </div>
 
     <div class="section-block">
-      <h3>验收</h3>
-      <table class="outline-table">
-        <thead><tr><th>验收项</th><th>标准</th><th>方法</th></tr></thead>
-        <tbody>
-          <tr><td>SSE 流式</td><td>首 Token &lt; 1s</td><td>curl 测试</td></tr>
-          <tr><td>批量生成</td><td>100 条 &lt; 5 分钟</td><td>Jmeter</td></tr>
-          <tr><td>回调通知</td><td>成功率 &gt; 99%</td><td>Mock 回调服务</td></tr>
-          <tr><td>Python 对接</td><td>契约测试通过</td><td>OpenAPI 验证</td></tr>
-          <tr><td>错误处理</td><td>错误时返回友好提示</td><td>模拟故障</td></tr>
-        </tbody>
-      </button>
+      <h3>完整验收清单</h3>
+      <p>API 的验收清单需要覆盖功能正确性、性能容量、安全防护和可靠性保障四个维度。功能维度的核心检查点:所有 REST API 端点返回正确的 HTTP 状态码（201 Created/202 Accepted/200 OK/400 Bad Request/404 Not Found/500 Internal Server Error）、分页参数支持 page/size/sort 三个标准参数、请求和响应的 JSON 字段符合 OpenAPI 契约定义、SSE 流式接口在前端断线重连后能恢复推送、WebSocket 订阅和退订正确。性能维度:读 API（GET 查询模板/进度）的基准线为 500 QPS,P99 延迟 &lt;500ms；写 API（POST 生成内容）在 50 QPS 负载下 P99 &lt;30s（含 LLM 调用时间）；WebSocket 的并发连接数支持 1000+；SSE 同时连接数支持 200+。安全维度:所有 API 必须通过 JWT Token 鉴权（Bearer Authentication）,Token 过期时间 30 分钟；写操作的 API 需要额外的 IP 白名单限制（只允许 CorpAssist 内网 IP 和已注册的客户端 IP）；重要 API（批量生成）增加请求频率限制 Rate Limiter（每分钟最多 10 次/用户）,使用 Redis + Lua 脚本实现分布式限流;API 响应头包含严格的安全头部（X-Content-Type-Options=nosniff,X-Frame-Options=DENY,Content-Security-Policy=default-src 'self'）。可靠性维度:API 网关配置 Hystrix/Sentinel 熔断器——错误率超过 50% 时熔断 10 秒；重要请求增加重试机制（幂等 key + 最多 3 次重试）;应用优雅关闭（Graceful Shutdown）确保正在进行的生成任务完成或保存状态后再关闭;所有 API 的 Timeout 配置明确,不依赖默认值。</p>
+      <table class="learn-decision-table"><thead><tr><th>验收维度</th><th>检查项</th><th>测试方法</th><th>通过标准</th><th>优先级</th></tr></thead><tbody>
+        <tr><td>功能</td><td>REST CRUD 正确性</td><td>Postman/E2E 测试</td><td>所有端点返回正确状态码和响应体</td><td>P0</td></tr>
+        <tr><td>功能</td><td>SSE 流式输出</td><td>前端 EventSource 连接</td><td>1-2 秒内看到第一行内容</td><td>P0</td></tr>
+        <tr><td>功能</td><td>WebSocket 进度</td><td>STOMP 客户端订阅</td><td>每秒至少收到 1 次进度推送</td><td>P0</td></tr>
+        <tr><td>功能</td><td>Webhook 回调</td><td>注册测试 URL 验证签名</td><td>HMAC 签名验证通过</td><td>P1</td></tr>
+        <tr><td>性能</td><td>读 API 吞吐</td><td>wrk -c 50 -t 10 -d 60s</td><td>500 QPS,P99&lt;500ms</td><td>P0</td></tr>
+        <tr><td>性能</td><td>写 API 延迟</td><td>50 并发请求</td><td>P99&lt;30s（含 LLM 调用）</td><td>P0</td></tr>
+        <tr><td>安全</td><td>JWT 鉴权</td><td>无 Token 请求</td><td>返回 401 Unauthorized</td><td>P0</td></tr>
+        <tr><td>安全</td><td>频率限制</td><td>50 次/分钟 同一用户</td><td>第 11 次返回 429</td><td>P1</td></tr>
+        <tr><td>可靠性</td><td>熔断降级</td><td>模拟 LLM 100% 超时</td><td>10 秒内触发熔断</td><td>P1</td></tr>
+        <tr><td>可靠性</td><td>优雅关闭</td><td>kill -15 应用进程</td><td>正在生成的任务完成或保存状态</td><td>P2</td></tr>
+      </tbody></table>
     </div>
 
     <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
-      <li>SSE 流式 API 首 Token &lt; 1s，支持实时内容生成</li>
-      <li>批量生成回调支持 3 次重试（间隔 5/10/15 秒）</li>
-      <li>Python 服务契约基于 OpenAPI 3.0</li>
-      <li>验收 5 项：SSE/批量/回调/契约/错误处理</li>
+      <li>SSE 流式输出基于 SseEmitter(60s 超时)+@Async+ChatClient.stream(),每 5 个 token 推送一次,1-2 秒首屏可见</li>
+      <li>WebSocket 进度推送基于 STOMP over SockJS,SimpMessagingTemplate 推送,批量完成时触发 Webhook 回调（HMAC-SHA256 签名验证）</li>
+      <li>Python 生成服务契约基于 OpenAPI 3.0,DTO 使用 @Schema 注解,错误码遵循 IEEE 标准,版本通过 Accept-Version 请求头协商</li>
+      <li>API 验收清单 27 项检查点:功能(P0/P1) + 性能(读 500 QPS/写 P99&lt;30s) + 安全(JWT/IP 白名单/速率限制) + 可靠性(熔断/重试/优雅关闭)</li>
+      <li>API 网关配置 Sentinel 熔断（错误率 50% 熔断 10 秒）、分布式限流（Redis+Lua,10 次/分钟/用户）、安全头部（X-Frame-Options/CSP）</li>
     </ul></div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox"> 我能实现 SSE 流式 API</label></li>
-        <li><label><input type="checkbox"> 我能配置回调通知</label></li>
-        <li><label><input type="checkbox"> 我能定义 Python 服务契约</label></li>
-        <li><label><input type="checkbox"> 我能执行验收测试</label></li>
+        <li><label><input type="checkbox"> 我能实现 SseEmitter + @Async + ChatClient.stream() 的流式生成 API,配置超时和心跳保活</label></li>
+        <li><label><input type="checkbox"> 我能实现 STOMP WebSocket 进度推送和 Webhook 回调（含 HMAC-SHA256 签名和重试机制）</label></li>
+        <li><label><input type="checkbox"> 我能定义 OpenAPI 3.0 契约（DTO/错误码/版本）,实现 API First 开发模式</label></li>
+        <li><label><input type="checkbox"> 我能编写完整的 API 验收清单（功能/性能/安全/可靠性）并执行验收测试</label></li>
+        <li><label><input type="checkbox"> 我能配置 Sentinel 熔断、Redis+Lua 限流和优雅关闭</label></li>
       </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语/概念</th><th>一句话定义</th></tr></thead><tbody>
+        <tr><td>SseEmitter</td><td>Spring SSE 抽象 设置超时 60s @Async 独立线程池 每 5 tokens 推送一次</td></tr>
+        <tr><td>STOMP WebSocket</td><td>SockJS 传输协议 订阅 /topic/batch/{id} 接收进度 SimpMessagingTemplate 推送</td></tr>
+        <tr><td>Webhook 回调</td><td>批量完成后的 HTTP POST 通知 HMAC-SHA256 签名重试 3 次（5min/15min/30min）</td></tr>
+        <tr><td>OpenAPI 3.0 契约</td><td>API 规范定义 @Schema 标注 DTO 按 IEEE 规范错误码 Accept-Version 版本协商</td></tr>
+        <tr><td>Sentinel 熔断</td><td>错误率 &gt;50% 熔断 10 秒 半开后尝试 1 个请求 成功则关闭熔断</td></tr>
+        <tr><td>Redis+Lua 限流</td><td>分布式滑动窗口限流 10 次/分钟/用户 Lua 脚本原子操作 空间占用 &lt;100KB/用户</td></tr>
+        <tr><td>优雅关闭</td><td>kill -15 → 停止接受新请求 → 等正在生成任务（最多 60s）→ 关闭线程池</td></tr>
+        <tr><td>27 项验收清单</td><td>功能 10 项/性能 6 项/安全 6 项/可靠性 5 项 P0-P2 优先级 全通过方可上线</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview-qa"><h4>面试常见问答</h4>
+        <div class="learn-faq"><details><summary>Spring 中 SSE 流式输出如何实现？生产环境的优化和注意事项？</summary><p>SSE 流式输出基于 Spring 的 SseEmitter 类实现。Controller 方法返回 SseEmitter 类型,设置超时时间（通常 60 秒）,并用 @Async 注解将 LLM 调用放入独立线程池（Tomcat 的请求线程不阻塞）。核心流程:创建 SseEmitter → 调用 ChatClient.stream() 获取 Flux&lt;String&gt; token 流 → 在 subscribe 的 onNext 回调中通过 emitter.send() 将 token 推送出去 → 流完成后调用 emitter.complete()。生产环境的优化:①缓冲区控制——单个 token 推送频率太高（每秒 20-50 次）会导致前端渲染卡顿,建议每 5 个 token 或每 50ms 做一次批量推送；②心跳机制——Nginx/网关可能因为 60 秒无数据传输而中断 SSE 连接,需要每隔 15 秒发送一条注释行保持连接存活；③断线重连——前端需要监听 onerror 事件,在断线后 1-3 秒自动重连,并在请求头携带 lastTokenIndex 让服务端支持断点续推；④线程池配置——建议 corePoolSize=10,maxPoolSize=50,queueCapacity=200,拒绝策略为 CallerRunsPolicy（调用者线程执行,降级为同步生成）。</p></details></div>
+        <div class="learn-faq"><details><summary>与 Python 生成服务的 OpenAPI 契约如何定义才能避免跨团队协作冲突？</summary><p>跨团队（Java 编排层 + Python 生成层）的 API 契约设计遵循 API First 开发模式:先定义契约再开发实现。具体做法:①两个团队共同维护一个 OpenAPI 3.0 规范的 YAML 文件（存储在 Git 仓库的 api/ 目录下）,所有 DTO 的字段名/POST 内容/响应结构/错误码都在这个文件中定义；②每个 DTO 字段使用 @Schema 注解标注描述（如 @Schema(description="品牌语调五维向量",example="[6,5,8,4,5]")）,字段类型明确（string/number/array）,不允许使用 Object 或 Any 类型；③错误码遵循 IEEE 标准——4xx 表示客户端错误（400 参数不合法/401 未授权/403 无授权/404 资源不存在/429 频率超限）,5xx 表示服务端错误（500 服务器内部错误/502 网关超时/503 服务暂不可用）；④版本协商通过 Accept-Version 请求头:客户端发送 Accept-Version: 2.1,服务端返回对应版本的响应,不支持的版本返回 406 Not Acceptable；⑤契约定义后双方使用契约生成工具:Java 侧使用 OpenAPI Generator 生成 Spring Controller 接口,Python 侧生成 FastAPI 路由定义,确保两端的 API 实现与契约完全一致。冲突发生时,不修改运行时的 API 实现,而是先修改 YAML 契约文件,双团队 review 后再同步修改两端代码。</p></details></div>
+        <div class="learn-faq"><details><summary>API 验收清单包含哪些维度？如何执行性能和安全验收？</summary><p>API 验收清单覆盖四个维度共 27 项检查点。功能维度（10 项,P0-P1 优先级）:所有端点返回正确的状态码,分页参数支持 page/size/sort,SSE 在断线重连后恢复,WebSocket 订阅正确,文件上传下载正常。性能维度（6 项,P0 优先级）:读 API 使用 wrk -c 50 -t 10 -d 60s 压测,通过标准为 500 QPS 且 P99 &lt;500ms；写 API 使用 50 并发请求,SSE 流式接口在 1-2 秒内返回第一个 token,WebSocket 每秒至少推送一次进度。安全维度（6 项,P0-P1）:使用 curl 测试无 Token 请求返回 401,测试 XSS 注入返回 400,用 50 次/分钟的请求测试频率限制返回 429。可靠性维度（5 项,P1-P2）:模拟 LLM 100% 超时测试熔断在 10 秒内触发,kill -15 测试进程是否在 60 秒内完成优雅关闭,模拟断网测试重试机制在 3 次内恢复。建议验收工具使用 Postman Collection + Newman 命令行做自动化功能验收,Gatling 做性能验收,OWASP ZAP 做安全扫描。每次上线前必须执行完整的 27 项验收流程,任何 P0 项不通过则阻止上线。</p></details></div>
+      </div>
     </div>
   </div>
 
   <div class="official-links content-section"><h3>官方参考</h3><ul>
-    <li><a href="https://swagger.io/specification/" target="_blank" rel="noopener">OpenAPI 3.0</a></li>
+    <li><a href="https://spring.io/guides/gs/messaging-stomp-websocket/" target="_blank" rel="noopener">Spring WebSocket + STOMP 官方指南</a></li>
+    <li><a href="https://github.com/OpenAPITools/openapi-generator" target="_blank" rel="noopener">OpenAPI Generator — API 契约代码生成</a></li>
+    <li><a href="https://sentinelguard.io/" target="_blank" rel="noopener">Sentinel 熔断限流 — API 可靠性保障</a></li>
   </ul></div>
   <div class="chapter-practice"><h3>动手练习</h3>
-    <div class="steps-operate"><ol>
-      <li>实现 SSE 流式生成</li>
-      <li>实现批量回调通知</li>
-      <li>定义 Python 服务契约</li>
-      <li>执行 5 项验收测试</li>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li><code>curl -N -X POST http://localhost:8080/api/v1/generate/stream -H "Content-Type: application/json" -d '{"templateId":"product-desc","variables":{"productName":"测试产品"},"toneParams":[6,5,8,4,5]}'</code> — 使用 -N 参数禁用 curl 缓冲,观察 SSE 流式输出,确认 1-2 秒内收到第一个 token 事件</li>
+      <li><code>wscat -c ws://localhost:8080/ws-endpoint</code> — 连接 WebSocket 端点（需先获取 JWT）,发送 SUBSCRIBE /topic/batch/test-001 命令,然后调用 POST /api/v1/generate/batch 提交批量任务,观察是否收到进度推送</li>
+      <li><code>wrk -t 10 -c 50 -d 60s --latency http://localhost:8080/api/v1/templates?page=1&size=20</code> — 使用 wrk 对读 API 执行 60 秒压测,观察输出的 P99 延迟是否 &lt;500ms 且 QPS &gt;500</li>
     </ol></div>
-    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-05-lab/</code></p></div>
+    <div class="learn-compare"><div class="learn-compare-col learn-compare-judge"><h4>场景判断 1: SSE 连接中断</h4><p>用户在使用流式生成时,前 3 秒正常收到 token,第 4 秒突然连接中断,前端 onerror 触发。用户需要重新提交生成请求。请分析可能原因和改进方案。<br/><strong>正确分析:</strong> 可能原因:①Nginx 的 proxy_read_timeout 配置为 5 秒,超时后断开连接；②SseEmitter 的 60 秒超时被错误地设置为了 5 秒（检查代码中 SseEmitter 的参数）；③LLM 调用在第 3 秒时抛出了异常（如 API 限流错误）,emitter.completeWithError() 被调用。改进方案:①检查 Nginx 的 proxy_read_timeout 设置为 120 秒以上；②前端 onerror 处理中自动重新连接,并带上 lastToken 字段,服务端支持断点恢复；③添加心跳机制（每 15 秒发送注释行）,确保 Nginx 不会因为"无数据传输"而超时断开。</p></div><div class="learn-compare-col learn-compare-judge"><h4>场景判断 2: 契约冲突</h4><p>Java 编排层和 Python 生成层的 API 联调时发现:Java 端发送的 GenerateRequest 中 toneParams 字段的 JSON 结构为 {"formality":6,"emotion":5,"expertise":8,"warmth":4,"creativity":5},但 Python 端期望的是 [6,5,8,4,5] 数组形式。450 错误。请判断问题原因和修正方案。<br/><strong>正确判断:</strong> 违反 API First 原则——OpenAPI 契约中 toneParams 定义不明确,Java 和 Python 团队各自按照自己的理解实现。修正方案:①立即在 OpenAPI YAML 契约中明确 toneParams 的格式（如 type:array,items:type:number,minItems:5,maxItems:5,example:[6,5,8,4,5]）；②使用 OpenAPI Generator 重新生成两端的代码,确保实现与契约完全一致；③增加契约自动化测试——每次 CI/CD 构建时自动运行契约兼容性检查（使用 spring-cloud-contract 或 pact 框架）,验证两端 API 的请求/响应与契约匹配。</p></div></div>
+    <div class="demo-box"><h4>配套实验室:创作 API 网关</h4><p>demos/practice-05-api-lab/ 实现了完整的 REST/SSE/WebSocket/Webhook API 以及 Sentinel 熔断/Redis 限流/优雅关闭的集成。</p><ul>
+      <li>验收标准 1: 使用 curl -N 调用 SSE 流式生成 API,从请求开始到收到第一个 token 的时间 &lt;2 秒,且最后一个 event 的 finished=true</li>
+      <li>验收标准 2: 模拟 LLM 服务 100% 超时（调低 LLM 超时到 1 秒）,5 秒内 Sentinel 熔断器开启,10 秒后尝试 1 个请求恢复</li>
+      <li>验收标准 3: 12 秒内发送 11 次 POST 生成请求（同一用户）,第 11 次返回 429 Too Many Requests,响应头中包含 Retry-After 字段</li>
+    </ul></div>
   </div>
   <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-advanced-01">合规与有害内容防护</a></li></ul></div>
 </section>

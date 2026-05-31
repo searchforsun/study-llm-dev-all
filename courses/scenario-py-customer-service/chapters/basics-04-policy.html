@@ -1,0 +1,511 @@
+<section id="ch-basics-04-policy" class="chapter" data-chapter="basics-04-policy">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>政策话术与合规</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-policy" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服最危险的场景不是「答不上来」而是「答错了但听起来很对」。LLM 的强项是生成流利自然的话术，但弱项是严格遵循企业政策——它可能错误地承诺不符合规定的退款、编造不存在的优惠方案、或者在一单投诉中给出冲突的政策解读。CorpAssist 必须确保每一句话都来自企业政策的精确检索，每一个回复都经过合规审核，否则公司会面临法律风险和品牌损失。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>搭建政策文档 RAG 检索管线——从文档分块到 Embedding 到检索增强话术生成；用 Jinja2 模板引擎设计可配置的客服话术模板，支持变量注入和条件分支；实现四层输出安全审核——敏感词过滤→合规规则→品牌语调→事实核查；自动识别敏感场景（退款纠纷/投诉升级/法律风险）并触发人工升级流程。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 政策 RAG 管线：制度文档→语义分块（RecursiveCharacterTextSplitter, chunk_size=500, overlap=50）→text-embedding-3-small 向量化→Milvus 检索（top_k=3）→LLM 增强生成；2) Jinja2 话术模板支持 {{policy_refund}} 变量注入和 {% if risk_level > 0.7 %} 条件分支；3) 四层审核顺序——敏感词（正则匹配，25μs/条）、合规规则（700+ 业务规则，2ms/条）、品牌语调（LLM 判断，500ms/条）、事实核查（RAG 交叉验证，300ms/条）；4) 敏感场景自动升级规则：退款金额 >5000 元强制人工、法律风险 >0.8 分强制法务介入、投诉情感 >0.7 转高优坐席。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>政策库 RAG 的实现：文档分块到检索增强话术</h3>
+      <p>客服系统必须基于真实的企业政策文档回答用户问题，不能依赖 LLM 的预训练知识——因为企业政策随时可能更新（如今年年假从 5 天改成 7 天），而 LLM 的训练数据可能是 6 个月前的。CorpAssist 的政策 RAG 管线负责将企业制度文档转化为可检索和可引用的知识库，确保每一条 AI 回复都有政策依据。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+    subgraph Pipeline[RAG 管线流程]
+        A[Word/PDF<br/>制度文档] --> B[文档解析<br/>python-docx / PyMuPDF]
+        B --> C[语义分块<br/>RecursiveCharacterTextSplitter<br/>chunk_size=500]
+        C --> D[Embedding<br/>text-embedding-3-small<br/>维度 1536]
+        D --> E[(Milvus<br/>向量库)]
+        E --> F[检索<br/>top_k=3]
+        F --> G[LLM 增强<br/>GPT-4o-mini + 引用]
+        G --> H{审核通过?}
+        H -->|是| I[回复用户]
+        H -->|否| J[转人工]
+    end
+    subgraph Stats[数据]
+        K[文档数: 120+]
+        L[Chunks: 8500+]
+        M[检索延迟: P99 80ms]
+        N[检索召回率: 92%]
+    end
+    Pipeline -.-> Stats</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""政策库 RAG 完整管线"""
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_milvus import Milvus
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.documents import Document
+
+# 1. 文档加载与分块
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50,
+    separators=["\n\n", "\n", "。", "；", " ", ""],
+    length_function=len,
+)
+
+with open("policies/refund_policy_2026.docx", "rb") as f:
+    raw_text = f.read().decode("utf-8", errors="ignore")
+chunks = text_splitter.split_text(raw_text)
+documents = [Document(page_content=chunk, metadata={"source": "refund_policy_2026"})
+             for chunk in chunks]
+
+# 2. Embedding 与向量存储
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")  # 维度 1536
+vector_store = Milvus.from_documents(
+    documents,
+    embeddings,
+    connection_args={"host": "milvus.internal", "port": 19530},
+    collection_name="policy_docs",
+)
+
+# 3. 检索增强生成 (RAG)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+rag_prompt = ChatPromptTemplate.from_template(
+    """你是一名企业客服助手。请基于以下政策文档回答用户问题。
+如果政策文档中没有相关信息，请说「根据现有政策文档，我没有找到相关信息，建议转人工处理」。
+
+政策文档：
+{context}
+
+用户问题：{question}
+
+请回答，并在回答末尾标注引用的政策文档来源。"""
+)
+
+def retrieve_docs(question: str) -> str:
+    docs = vector_store.similarity_search(question, k=3)
+    return "\n\n".join(
+        f"[来源: {d.metadata.get('source', '未知')}] {d.page_content}"
+        for d in docs
+    )
+
+rag_chain = (
+    {"context": retrieve_docs, "question": RunnablePassthrough()}
+    | rag_prompt
+    | llm
+)
+
+# 测试
+result = rag_chain.invoke("退款需要什么条件？")
+print(result.content)
+# 输出: 根据公司退款政策（今年有效），7 天内无理由退换...
+# [来源: refund_policy_2026]</code></pre></div>
+      <p><strong>检索质量指标</strong>：CorpAssist 政策库包含 120+ 份制度文档，分为 8500+ 个 Chunk。使用 text-embedding-3-small（1536 维度）的检索召回率（Recall@3）为 92%，P99 检索延迟 80ms。当检索召回率低于 85% 时，触发告警并提示知识库管理员检查文档分块策略是否需要调整。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Jinja2 话术模板引擎</h3>
+      <p>纯 Prompt 生成的话术在格式一致性和合规性方面存在风险——同样的退款政策，AI 每次生成的措辞可能不同，有些版本可能遗漏了关键免责声明。CorpAssist 使用 Jinja2 模板引擎来管理标准话术模板。运营团队可以在管理后台配置模板，AI 客服在运行时根据上下文变量渲染模板，既保证话术一致性又保留个性化空间。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""Jinja2 话术模板引擎"""
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+from typing import Optional, Dict, Any
+from pathlib import Path
+import yaml
+
+class PolicyTemplateEngine:
+    """政策话术模板引擎"""
+
+    def __init__(self, templates_dir: str = "templates"):
+        self.env = Environment(
+            loader=FileSystemLoader(templates_dir),
+            autoescape=False,
+            trim_blocks=True,
+            lstrip_blocks=True,
+        )
+        self._load_risk_rules()
+
+    def _load_risk_rules(self):
+        """加载业务规则配置"""
+        with open("config/risk_rules.yaml") as f:
+            self.risk_rules = yaml.safe_load(f)
+
+    def render(self, template_name: str,
+               variables: Dict[str, Any]) -> tuple[str, bool]:
+        """
+        渲染话术模板
+        返回: (rendered_text, needs_human_review)
+        """
+        try:
+            template = self.env.get_template(template_name)
+        except TemplateNotFound:
+            return f"模板 {template_name} 未找到", True
+
+        # 注入全局变量
+        variables["company_name"] = "CorpAssist 科技"
+        variables["current_year"] = "2026"
+
+        # 渲染
+        rendered = template.render(**variables)
+        needs_review = variables.get("risk_level", 0) > 0.7
+        return rendered, needs_review
+
+    def validate_template(self, template_name: str) -> list[str]:
+        """预验证模板语法"""
+        errors = []
+        try:
+            template_source = self.env.loader.get_source(
+                self.env, template_name
+            )[0]
+            self.env.parse(template_source)
+        except Exception as e:
+            errors.append(f"模板语法错误: {e}")
+        return errors
+
+# 模板文件: templates/refund_reply.jinja2
+"""
+{% if risk_level > 0.7 %}
+⚠️ 您的退款申请涉及 {{ refund_amount }} 元，已超出自动处理限额。
+{% else %}
+根据公司退款政策（{{ policy_version }}），您的退款申请已提交。
+{% endif %}
+
+预计处理时间：{{ processing_time }} 个工作日
+{% if refund_amount > 5000 %}
+（温馨提示：大额退款需要人工审核，实际到账时间可能延长）
+{% endif %}
+
+感谢您的理解与配合。
+"""
+
+# 使用示例
+engine = PolicyTemplateEngine()
+text, review = engine.render("refund_reply.jinja2", {
+    "risk_level": 0.3,
+    "refund_amount": 2000,
+    "policy_version": "2026-v2",
+    "processing_time": 3
+})
+print(text)
+# 输出: 根据公司退款政策（2026-v2），您的退款申请已提交。...</code></pre></div>
+      <table class="learn-decision-table"><thead><tr><th>话术模板类型</th><th>变量数量</th><th>条件分支</th><th>使用频率</th><th>合规风险</th></tr></thead><tbody>
+        <tr><td>退款回复</td><td>6 个（金额、政策版本、处理时间、风险等级等）</td><td>3 条（大额/小额/异常）</td><td>高频（日均 800 次）</td><td>低</td></tr>
+        <tr><td>投诉处理</td><td>8 个（投诉类型、升级路径、承诺回复时间等）</td><td>5 条（不同投诉类型 × 不同情感等级）</td><td>中频（日均 200 次）</td><td>中</td></tr>
+        <tr><td>法律声明</td><td>3 个（条款名称、生效日期、适用场景）</td><td>1 条（是否涉及法律风险）</td><td>低频（日均 50 次）</td><td>高</td></tr>
+        <tr><td>产品推荐</td><td>4 个（产品名、价格、适用条件、有效期）</td><td>2 条（按用户等级）</td><td>中频（日均 300 次）</td><td>低</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block">
+      <h3>输出内容的四层安全审核</h3>
+      <p>LLM 生成的回复必须经过安全审核才能发送给用户。CorpAssist 设计了四层串联审核管线，每一层解决不同维度的安全问题。总审核延迟目标 <1.5s（P99），逐层通过审核才放行。如果任何一层检测到问题，回复被拦截并回退到安全话术或转人工。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart LR
+    subgraph Audit[四层安全审核管线]
+        A[LLM 原始回复] --> B[第一层: 敏感词过滤<br/>❌ 正则匹配 25μs]
+        B -->|通过| C[第二层: 合规规则<br/>❌ 700+ 规则 2ms]
+        C -->|通过| D[第三层: 品牌语调<br/>❌ LLM 判断 500ms]
+        D -->|通过| E[第四层: 事实核查<br/>❌ RAG 交叉验证 300ms]
+        E -->|通过| F[✅ 发送给用户]
+        B -->|拒绝| G[❌ 封禁词/敏感词]
+        C -->|拒绝| H[❌ 违规表述]
+        D -->|拒绝| I[❌ 语调不符]
+        E -->|拒绝| J[❌ 与政策矛盾]
+    end
+    subgraph Fallback[拦截处理]
+        G & H & I & J --> K[回退安全话术]
+        K --> L[记录审核日志]
+        L --> M[通知运营团队]
+    end</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""四层输出安全审核实现"""
+import re, json, time
+from typing import List, Tuple, Optional
+from langchain_openai import ChatOpenAI
+from redis import Redis
+
+class OutputAuditor:
+    """输出安全审核器"""
+
+    def __init__(self, redis_client: Redis, llm: ChatOpenAI):
+        self.redis = redis_client
+        self.llm = llm
+        self._load_sensitive_words()
+        self._load_compliance_rules()
+
+    def _load_sensitive_words(self):
+        """从 Redis 加载敏感词列表"""
+        words = self.redis.smembers("sensitive_words")
+        if not words:
+            words = ["竞争产品名", "负面评价", "绝对化用语"]
+        self.sensitive_pattern = re.compile(
+            "|".join(re.escape(w.decode() if isinstance(w, bytes) else w)
+                     for w in words),
+            re.IGNORECASE
+        )
+
+    def _load_compliance_rules(self):
+        """加载合规规则"""
+        self.compliance_rules = [
+            ("禁止承诺退款", r"保证.*退款|一定退款|100%退款"),
+            ("禁止绝对用语", r"最好|第一|最便宜"),
+            ("禁止医疗承诺", r"治疗|治愈|疗效"),
+            ("禁止金融承诺", r"保本|无风险|稳赚"),
+            ("禁止价格误导", r"免费.*限时|限时.*免费"),
+        ]
+
+    def audit(self, text: str, source_policy: str) -> Tuple[bool, str, dict]:
+        """执行四层审核"""
+        start = time.time()
+        layers = [
+            ("敏感词过滤", self._check_sensitive_words),
+            ("合规规则", self._check_compliance_rules),
+            ("品牌语调", self._check_brand_tone),
+            ("事实核查", lambda t: self._check_facts(t, source_policy)),
+        ]
+        for layer_name, check_fn in layers:
+            passed, reason = check_fn(text)
+            if not passed:
+                elapsed = (time.time() - start) * 1000
+                return False, f"{layer_name} 拦截: {reason}", {
+                    "layer": layer_name, "reason": reason, "elapsed_ms": elapsed
+                }
+        elapsed = (time.time() - start) * 1000
+        return True, "审核通过", {"elapsed_ms": elapsed}
+
+    def _check_sensitive_words(self, text: str) -> Tuple[bool, str]:
+        if self.sensitive_pattern.search(text):
+            return False, "包含敏感词"
+        return True, ""
+
+    def _check_compliance_rules(self, text: str) -> Tuple[bool, str]:
+        for rule_name, pattern in self.compliance_rules:
+            if re.search(pattern, text):
+                return False, f"违反合规规则: {rule_name}"
+        return True, ""
+
+    def _check_brand_tone(self, text: str) -> Tuple[bool, str]:
+        prompt = f"""判断以下客服回复是否符合企业品牌语调。要求：
+- 专业、礼貌、耐心
+- 不使用过于随意的口语
+- 不使用负面或防御性措辞
+- 使用「您」而非「你」
+回复内容：{text}
+
+返回 JSON: {{"passed": bool, "reason": "str"}}"""
+        result = self.llm.invoke(prompt).content
+        try:
+            data = json.loads(result.strip())
+            return data["passed"], data.get("reason", "")
+        except:
+            return True, ""
+
+    def _check_facts(self, text: str, source_policy: str) -> Tuple[bool, str]:
+        """用 RAG 结果交叉验证"""
+        prompt = f"""以下回答是否与政策文档的内容一致？请找出任何矛盾之处。
+政策文档：{source_policy[:2000]}
+回答：{text}
+返回: "一致" 或 "矛盾: 具体矛盾内容" """
+        result = self.llm.invoke(prompt).content.strip()
+        if result.startswith("矛盾"):
+            return False, result
+        return True, ""
+
+# 使用示例
+auditor = OutputAuditor(
+    redis_client=Redis(host="redis.internal"),
+    llm=ChatOpenAI(model="gpt-4o-mini", temperature=0)
+)
+passed, reason, meta = auditor.audit(
+    "您的退款申请正在处理中",
+    "refund_policy_2026: 退款在 7 个工作日内处理"
+)
+print(f"审核结果: {'通过' if passed else '拦截'}, {reason}, 耗时: {meta['elapsed_ms']:.1f}ms")</code></pre></div>
+      <p><strong>审核效果数据</strong>：在 CorpAssist 线上的 30 天运行数据中，四层审核管线每天处理约 4200 条回复。敏感词层拦截率 0.8%（主要拦截了 LLM 偶尔生成的产品名称），合规规则层拦截率 1.2%（主要拦截了「保证退款」类违规表述），品牌语调层拦截率 0.5%（主要拦截了过于随意的回复），事实核查层拦截率 0.3%（主要拦截了与政策文档不一致的表述）。总拦截率 2.8%，其中 67% 的拦截通过回退安全话术即可解决，33% 需要转人工处理。审核管线平均延迟 845ms（P50）和 1.3s（P99），指标在预算目标内。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>敏感场景的自动识别与人工升级</h3>
+      <p>有些场景无论 AI 答得多么准确，都不应该由 AI 处理——比如涉及高额退款的法律纠纷、可能升级的投诉。CorpAssist 在对话引擎中嵌入了一个「敏感场景分类器」，在意图识别之后、正式处理之前判断当前对话是否属于敏感场景。如果分类器输出风险评分高于阈值，自动触发人工升级流程。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""敏感场景自动识别与升级"""
+from pydantic import BaseModel, Field
+from typing import Optional
+from enum import IntEnum
+
+class RiskLevel(IntEnum):
+    LOW = 0       # 正常，AI 处理
+    MEDIUM = 1    # 需要审核后回复
+    HIGH = 2      # 立即转人工
+    CRITICAL = 3  # 转人工 + 通知主管
+
+class SensitiveSceneResult(BaseModel):
+    """敏感场景识别结果"""
+    is_sensitive: bool
+    risk_level: RiskLevel
+    scene_type: str                # refund_dispute / complaint / legal
+    risk_score: float              # 0.0 - 1.0
+    escalation_reason: str
+    required_action: str           # ai_handle / review_first / transfer / escalate
+
+class SensitiveSceneDetector:
+    """敏感场景检测器"""
+
+    def __init__(self, llm: ChatOpenAI):
+        self.llm = llm
+
+        # 硬编码的高风险规则
+        self.high_risk_keywords = {
+            "投诉": "complaint",
+            "起诉": "legal",
+            "律师": "legal",
+            "315": "legal",
+            "媒体": "complaint",
+            "曝光": "complaint",
+        }
+
+    async def detect(self, text: str, intent: str,
+                     refund_amount: Optional[float] = None) -> SensitiveSceneResult:
+        # 规则检查
+        for keyword, scene in self.high_risk_keywords.items():
+            if keyword in text:
+                return SensitiveSceneResult(
+                    is_sensitive=True,
+                    risk_level=RiskLevel.HIGH,
+                    scene_type=scene,
+                    risk_score=0.9,
+                    escalation_reason=f"包含高风险关键词: {keyword}",
+                    required_action="transfer"
+                )
+
+        # 金额检查
+        if refund_amount and refund_amount > 5000:
+            return SensitiveSceneResult(
+                is_sensitive=True,
+                risk_level=RiskLevel.MEDIUM,
+                scene_type="refund_dispute",
+                risk_score=min(0.5 + refund_amount / 50000, 0.95),
+                escalation_reason=f"退款金额 {refund_amount} 元超过阈值 5000 元",
+                required_action="review_first"
+            )
+
+        # LLM 判断
+        prompt = f"""分析以下客服对话内容，判断是否属于敏感场景。
+
+敏感场景定义：
+1. refund_dispute: 涉及退款纠纷/不满
+2. complaint: 投诉升级倾向
+3. legal: 涉及法律风险
+4. normal: 正常咨询
+
+用户消息：{text}
+意图：{intent}
+
+请返回 JSON:
+{{"scene": "str", "risk_score": float (0-1), "reason": "str"}}"""
+        result = self.llm.invoke(prompt).content
+        import json
+        data = json.loads(result.strip())
+        is_sensitive = data["scene"] != "normal"
+        risk = RiskLevel.HIGH if data["risk_score"] > 0.8 else (
+            RiskLevel.MEDIUM if data["risk_score"] > 0.5 else RiskLevel.LOW
+        )
+        action_map = {
+            0: "ai_handle", 1: "review_first",
+            2: "transfer", 3: "escalate"
+        }
+        return SensitiveSceneResult(
+            is_sensitive=is_sensitive,
+            risk_level=risk,
+            scene_type=data["scene"],
+            risk_score=data["risk_score"],
+            escalation_reason=data["reason"],
+            required_action=action_map[risk.value]
+        )
+
+# 升级流程
+async def escalate_to_human(result: SensitiveSceneResult, session_id: str):
+    """根据风险等级执行升级"""
+    if result.risk_level >= RiskLevel.HIGH:
+        # 写入 Redis 高优队列
+        redis_client.lpush("queue:high_priority", json.dumps({
+            "session_id": session_id,
+            "risk_score": result.risk_score,
+            "scene": result.scene_type,
+            "reason": result.escalation_reason,
+            "timestamp": str(datetime.now())
+        }))
+        # 通知坐席
+        redis_client.publish("agent:notification", json.dumps({
+            "type": "urgent_transfer",
+            "session_id": session_id,
+            "risk_level": result.risk_level
+        }))</code></pre></div>
+      <table class="learn-decision-table"><thead><tr><th>敏感场景</th><th>识别方式</th><th>风险阈值</th><th>升级动作</th><th>日均触发</th><th>平均处理时间</th></tr></thead><tbody>
+        <tr><td>退款纠纷</td><td>金额 >5000 元规则 + LLM 判断</td><td>金额 >5000 或风险 >0.5</td><td>先审核后回复</td><td>~35 次</td><td>2.5min（审核）</td></tr>
+        <tr><td>投诉升级</td><td>高频词匹配（投诉/315/媒体）+ LLM</td><td>关键词命中即 HIGH</td><td>立即转高优坐席</td><td>~12 次</td><td>30s（分配）</td></tr>
+        <tr><td>法律风险</td><td>关键词（起诉/律师）+ LLM 深度分析</td><td>风险 >0.8 即 CRITICAL</td><td>转人工 + 法务通知</td><td>~3 次</td><td>5min（法务）</td></tr>
+        <tr><td>情感冲突</td><td>情感分析模型</td><td>情感分数 >0.7</td><td>转人工 + 高优标记</td><td>~20 次</td><td>1min（分配）</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>政策 RAG 管线使用 text-embedding-3-small（1536 维度）在 8500+ 政策 Chunk 上达到 92% 的 Recall@3，P99 检索延迟 80ms</li>
+        <li>Jinja2 话术模板引擎管理 200+ 标准话术模板，每条模板含 3-8 个变量和 1-5 个条件分支，预验证确保语法 100% 正确</li>
+        <li>四层审核管线（敏感词→合规规则→品牌语调→事实核查）日处理 4200 条回复，总拦截率 2.8%，平均审核延迟 845ms</li>
+        <li>敏感场景自动升级系统基于关键词匹配 + 金额阈值 + LLM 判断三层检测，高优转接队列确保 30s 内坐席分配</li>
+        <li>审核拦截回退机制：67% 的拦截可通过回退安全话术解决，33% 需要转人工处理，无需用户感知到拦截过程</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-basics-04-1"> 能实现完整的政策 RAG 管线（分块→向量化→检索→增强生成）</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-04-2"> 能用 Jinja2 设计带条件分支和变量注入的话术模板</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-04-3"> 能实现四层输出审核并说明每层的延迟和拦截率</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-04-4"> 能设计敏感场景自动识别与升级流程</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-04-5"> 能解释审核拦截回退机制的实现和用户体验保障</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>RAG</td><td>检索增强生成，先从知识库检索相关文档，再基于检索结果生成回答</td></tr>
+        <tr><td>Chunk</td><td>文档分块，将长文档切分为可检索的短片段（500 token 每块）</td></tr>
+        <tr><td>Jinja2</td><td>Python 模板引擎，支持变量注入和 {% if %} 条件分支</td></tr>
+        <tr><td>敏感词过滤</td><td>正则匹配检查回复中是否包含违禁词，延迟 25μs</td></tr>
+        <tr><td>合规规则</td><td>700+ 业务规则检查是否包含违规表述，延迟 2ms</td></tr>
+        <tr><td>事实核查</td><td>用 RAG 检索结果交叉验证 LLM 回答与政策文档是否一致</td></tr>
+        <tr><td>敏感场景</td><td>退款纠纷/投诉升级/法律风险等需要人工介入的场景</td></tr>
+        <tr><td>自动升级</td><td>检测到敏感场景后自动转人工或通知法务/主管</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 怎么保证 AI 客服的回答符合公司政策？具体用了什么技术方案？</summary><p>保证 AI 客服回答符合公司政策是一个系统工程，不是靠一个措施就能解决的。CorpAssist 采用了「事前、事中、事后」三层机制。事前是政策库 RAG——所有企业政策文档通过 RecursiveCharacterTextSplitter 分块（chunk_size=500, overlap=50），用 text-embedding-3-small 向量化后存入 Milvus。LLM 在生成回答时必须先检索相关政策文档，并在上下文中包含检索结果，Prompt 要求严格基于政策文档回答。事中是输出审核管线——LLM 生成的原始回复不直接发送给用户，而是经过四层审核：敏感词过滤（正则匹配，25μs）、合规规则（700+ 规则，2ms）、品牌语调（LLM 判断是否符合企业语气，500ms）、事实核查（与政策文档交叉验证，300ms）。任何一层不通过就回退安全话术或转人工。事后是离线质检——每天对所有对话进行 LLM-as-Judge 评分，发现不合规回答自动收录到坏例库并通知运营团队修改 Prompt 或模板。这套三层机制上线后，CorpAssist 的合规事件率从 5.2% 降到 0.3%。</p></details>
+        <details><summary>Q2: 如果 LLM 回答错了，但回答很流利，怎么发现和纠正？</summary><p>LLM 的「流利的错误」是最难处理的——用户发现不了，监控也难以判断。CorpAssist 的发现机制分两条线。第一条线是实时检测：第四层事实核查专门针对这个问题——它将 LLM 回答与 RAG 检索到的政策文档进行交叉验证，让 LLM 自己判断回答是否与政策矛盾。这个方法利用了 LLM 的批判性思维——虽然 LLM 在生成时可能犯错，但在评判时（Judge Mode）准确率更高。第二条线是离线回放：质检系统每天对所有对话做 LLM-as-Judge 评分，发现问题后自动收录到坏例库。纠正分三步：第一步，修改问题对话的 Prompt（通常在 20 分钟内）。第二步，将纠正后的回答加入标准话术模板库，下次同样问题不会再错。第三步，运行坏例库回归测试确保修改没有引入新问题。从数据看，事实核查层每天约拦截 12 条流利错误（拦截率 0.3%），离线质检每天额外发现约 5 条漏网之鱼。经过 3 个月的持续迭代，流利错误率从 2.1% 降到 0.4%。</p></details>
+        <details><summary>Q3: 话术模板和 LLM 自由生成怎么平衡？什么时候用模板，什么时候用 LLM？</summary><p>平衡原则是「用模板兜底稳定性，用 LLM 覆盖多样性」。具体划分：标准化高频率场景（退款回复、物流查询、密码重置）用 Jinja2 模板。这些场景的话术高度固定——退款回复永远是「根据退款政策 X，您的申请正在处理中，预计 Y 个工作日到账」。模板保证 100% 合规、100% 一致，零 token 成本。复杂低频率场景（政策解读、投诉处理、特殊需求）用 LLM 生成。这些场景的每一条用户问题都可能不同，模板无法穷举。但在 LLM 生成后必须经过四层审核管线。混合场景是「模板框架 + LLM 填充」——模板定义了回复的结构和必须包含的合规条款，LLM 在框架内填充个性化内容。比如投诉处理的模板包含「理解您的不满 → 确认投诉内容 → 说明处理流程 → 承诺反馈时间」四个段落，LLM 只需填充每段的细节。CorpAssist 线上数据：模板占 45%（零 token 成本），纯 LLM 生成占 25%（平均 800 token/次），混合占 30%（平均 300 token/次）。这种混合方案比纯 LLM 方案降低 55% 的 token 成本，同时合规事件率降低 80%。</p></details>
+      </div>
+    </div>
+
+    <div class="chapter-practice">
+      <h3>动手练习</h3>
+      <div class="steps-operate"><h4>操作步骤</h4><ol>
+        <li><code>pip install langchain langchain-openai langchain-milvus jinja2 pyyaml</code> — 安装政策 RAG 和模板引擎依赖</li>
+        <li><code>docker run -d -p 19530:19530 milvusdb/milvus:latest</code> — 启动 Milvus 向量数据库</li>
+        <li>编写一个 RefundPolicyRAG 类：加载退款政策文档→分块→向量化→检索→生成回复，要求每个回复末尾标注政策来源引用</li>
+      </ol></div>
+      <div class="steps-judgment-list"><h4>判断练习</h4>
+        <details><summary>如果 LLM 生成的退款回复说「我们保证在 3 天内退款」，但公司政策规定是 7-15 个工作日。怎么拦截和纠正？</summary><p>这个错误会在两个关卡被拦截。第一关是合规规则层——「保证.*退款」模式匹配到「保证在 3 天内退款」，直接触发合规规则「禁止承诺退款」，拦截并记录违规日志。第二关是事实核查层——即使用户加了「大约」之类的词绕过正则，RAG 交叉验证也会发现「3 天」与政策文档中的「7-15 个工作日」矛盾。拦截后的处理流程：回复回退到安全话术「根据公司退款政策，退款一般在 7-15 个工作日内处理。请问您需要我帮您查询具体进度吗？」，同时违规记录写入审核日志，运营团队收到通知。如果这个错误频繁出现（同一天 >5 次），触发告警并冻结该 Prompt 版本，要求 Prompt 工程师审核修改。实际线上 Data：在这类合规拦截中，93% 的纠正能在 2 小时内通过模板更新完成。</p></details>
+        <details><summary>运营团队想在 Jinja2 模板中增加一个新的退款政策变量「是否支持国际退款」，你怎么设计实现？</summary><p>这是一个完整的端到端变更流程，需要以下步骤。第一，在 Jinja2 模板文件中增加变量引用：`{% if international_refund %}国际退款政策：{{ international_policy }}{% endif %}`。第二，在 PolicyTemplateEngine 的 render 方法传入新变量：`engine.render("refund_reply.jinja2", {"international_refund": True, "international_policy": "支持海外信用卡退款，3-5 个工作日到账"})`。第三，在 RAG 检索时增加对国际退款政策文档的检索——如果用户问题涉及国际退款，在检索参数中增加 filter 条件。第四，在运营后台的模板配置页面增加「国际退款」开关和富文本编辑框。第五，运行模板预验证脚本 `validate_template("refund_reply.jinja2")` 确保语法正确。第六，A/B 测试——旧模板组 vs 新模板组，对比 CSAT 和转人工率，运行 3 天后如果新模板组 CSAT 不低于对照组 0.1 分则全量上线。整个过程如果运营团队有 In-house 配置后台，可以在 30 分钟内完成从配置到上线的全流程，无需代码部署。</p></details>
+      </div>
+      <div class="demo-box"><h4>配套实验室</h4><p>政策话术合规演示：<code>demos/basics-04-policy-lab/</code></p><ul>
+        <li>验收标准 1：上传一份退款政策 TXT 文件后，系统自动完成分块、向量化，检索「退款需要什么条件」返回正确的政策条款并标注来源</li>
+        <li>验收标准 2：输入有问题的退款回复「保证在 3 天内退款」，四层审核管线正确拦截，返回安全话术并记录审核日志</li>
+        <li>验收标准 3：运营后台可编辑 Jinja2 模板，保存后实时生效，无需重启服务</li>
+      </ul></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://jinja.palletsprojects.com/en/stable/">Jinja2 模板引擎文档</a> — 变量、过滤器、条件、宏的完整语法</li>
+    <li><a href="https://python.langchain.com/docs/integrations/vectorstores/milvus/">LangChain Milvus 集成文档</a> — Milvus 向量存储的检索和过滤</li>
+  </ul></div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-01-intent-router">意图识别与路由</a> — 基于 LLM 的结构化输出分类与规则引擎双引擎路由</li>
+  </ul></div>
+</section>

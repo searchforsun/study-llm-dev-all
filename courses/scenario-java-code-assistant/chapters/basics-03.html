@@ -1,250 +1,765 @@
 <section id="ch-basics-03" class="chapter" data-chapter="basics-03">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>代码库 RAG 架构（Java 侧）</h2><button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>代码库 RAG 架构（Java 侧）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03"
+      aria-label="标记本章完成">标记完成</button>
+  </header>
   <div class="concept">
+
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S4 代码助手</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>代码问答的核心是 RAG——从代码库中检索相关代码段，然后让 LLM 基于检索结果回答。与通用的文本 RAG 不同，代码 RAG 需要理解代码结构（AST）、支持多语言、提供引用跳转。本章深入 Spring AI 的 DocumentReader 体系和代码 RAG 的 Java 实现。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 AST 切片策略，用 Spring AI DocumentReader 解析代码文件；构建仓库索引流水线；支持 Java/Python/TypeScript 等多语言检索；实现检索结果的引用跳转。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><p>1) AST 切片按函数/类/接口边界切分，比固定行数切分准确率高 30%；2) Spring AI DocumentReader 可扩展，通过自定义 Reader 支持多种代码文件；3) 仓库索引包含代码 Embedding 和元数据（文件路径、语言、符号名）；4) 引用跳转通过 LSP 获取符号位置信息，在检索结果中直接返回行号。</p></div>
+      <p class="chapter-meta">
+        约 <strong>40</strong> 分钟 · 阶段：<strong>架构设计</strong> ·
+        场景：<strong>S4 代码助手</strong> · 难度：★★★☆☆
+      </p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4>
+        <p>
+          代码库 RAG（Retrieval-Augmented Generation）是代码助手的核心架构
+          模式。与通用文档 RAG 不同，代码 RAG 需要处理代码的结构化特性——
+          函数定义、类继承、接口实现、方法调用等关系无法被简单的文本分块
+          策略正确处理。本章深入 AST 切片策略、Spring AI DocumentReader
+          与 TreeSitter 的集成、多语言支持的抽象 Reader 接口设计，以及符
+          号跳转与引用关系图谱的构建。掌握这些知识后你将能设计一套适用于
+          任何编程语言的代码库索引系统。
+        </p>
+      </div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4>
+        <p>
+          设计函数级/类级/文件级三层 AST 切片策略；用 TreeSitter 解析多语
+          言代码并提取 AST 结构；实现 Spring AI DocumentReader 接口为不同
+          语言编写 Reader 实现；构建代码符号的引用关系图谱并实现跳转查询；
+          设计一套 RAG 检索质量的评估方案（Recall/Precision/MRR）。
+        </p>
+      </div>
+      <div class="notice"><h4>本章要点速记</h4>
+        <p>
+          1) 切片策略三层粒度：函数级（50-200 行，用于精准检索）、类级
+          （100-500 行，用于上下文理解）、文件级（200-2000+ 行，用于整体
+          概览），默认检索 Top-5 兼顾精度和召回。2) Spring AI
+          DocumentReader 接口定义了 get() 和 accept() 方法，TreeSitter
+          集成方案：通过 JNI 调用 libtree-sitter-native 解析代码并生成
+          Document 实例。3) 多语言支持通过抽象 Reader 接口 + 工厂模式实现，
+          每种语言注册自己的 Parser 和 Chunker，添加新语言只需实现接口。
+          4) 引用关系图谱用 Neo4j 图数据库存储，节点是符号定义，边是
+          调用/继承/实现/引用关系，跳转查询延迟 &lt;10ms。
+        </p>
+      </div>
     </div>
 
     <div class="section-block">
-      <h3>AST 切片与 Spring AI DocumentReader</h3>
-      <p>代码文件的切片策略直接影响检索效果。基于 AST（抽象语法树）的切片按代码的逻辑边界（函数、类、接口）切分，每个切片是一个语义完整的代码单元。</p>
-      <div class="mermaid-wrap">
-        <pre class="mermaid">
-flowchart TD
-    A[代码文件] --> B[解析器 Parser]
-    B --> C{AST 节点遍历}
-    C --> D[ClassDeclaration]
-    C --> E[MethodDeclaration]
-    C --> F[FieldDeclaration]
-    C --> G[InterfaceDeclaration]
-    D --> H[生成切片: Class]
-    E --> I[生成切片: Method]
-    F --> J[生成切片: Field]
-    G --> K[生成切片: Interface]
-    H --> L[切片元数据<br/>路径/语言/符号名/行号]
-    I --> L
-    J --> L
-    K --> L
-    L --> M[存储到 VectorStore]
-        </pre>
-      </div>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 自定义代码 DocumentReader
-@Component
-public class CodeDocumentReader implements DocumentReader {
+      <h3>AST 切片策略：函数级 / 类级 / 方法级的三层索引粒度</h3>
+      <p>
+        通用文档 RAG 通常采用固定大小的文本分块策略（如每 512 Token 一块），
+        这对代码完全不适用——代码有明确的结构边界（函数、类、接口、注解），
+        如果随意跨越这些边界切片，会破坏语法完整性和语义连贯性。代码 RAG
+        的核心原则是"尊重代码的自然结构边界"。CorpAssist 采用三层索引粒
+        度策略，每层针对不同的检索场景优化。第一层是函数级（Function-Level）
+        切片，以每个函数/方法为基本单位，包含完整的函数签名、参数列表、返
+        回类型和函数体，平均 50-200 行代码。这是最常用的检索粒度，适用于
+        准确定位某个方法的实现细节。函数级切片生成的 Document 包含元数据：
+        函数名、所属类名、参数列表（含类型）、返回类型、起始行号、复杂度。
+      </p>
+      <p>
+        第二层是类级（Class-Level）切片，以每个类/接口/枚举为基本单位，包
+        含类注解、字段定义、构造函数、所有方法，平均 100-500 行。适用于理
+        解一个类的整体职责和结构。类级切片在函数级检索找不到完整答案时作
+        为上下文补充——先检索到某个函数，再加载其所在类的完整结构以获得更
+        多上下文。第三层是文件级（File-Level）切片，包含整个文件内容，平
+        均 200-2000+ 行。适用于项目概览和文件级配置理解（如 application.yml、
+        pom.xml）。三层的元数据互相关联——函数级记录所属类名和文件名，类级
+        记录所属文件名和包名，文件级记录文件路径、语言、最后修改时间。检索
+        时默认返回函数级 Top-5，如果函数级结果不够完整，自动升级到类级。
+        实测三层策略在 500 个查询样本中，函数级单独检索的覆盖率 71.2%，
+        自动升级后达到 89.6%。
+      </p>
+      <div class="mermaid-wrap"><pre class="mermaid">
+flowchart TB
+    subgraph 三层索引粒度[三层索引粒度策略]
+        A["代码仓库<br/>50 万行 Java 代码"] --> B["TreeSitter AST 解析<br/>全量 / 增量"]
+        B --> C1["函数级切片<br/>50-200 行<br/>方法签名 + 体"]
+        B --> C2["类级切片<br/>100-500 行<br/>类结构 + 字段 + 方法"]
+        B --> C3["文件级切片<br/>200-2000+ 行<br/>完整文件内容"]
+        C1 --> D1["向量化 Embedding<br/>voyage-code-2<br/>768 维向量"]
+        C2 --> D2["向量化 Embedding<br/>voyage-code-2<br/>768 维向量"]
+        C3 --> D3["向量化 Embedding<br/>voyage-code-2<br/>768 维向量"]
+        D1 --> E["Milvus Collection<br/>function_snippets<br/>索引: IVF_FLAT"]
+        D2 --> E2["Milvus Collection<br/>class_snippets<br/>索引: IVF_FLAT"]
+        D3 --> E3["Milvus Collection<br/>file_snippets<br/>索引: IVF_FLAT"]
+    end
+    subgraph 检索策略[检索策略]
+        F["用户查询"] --> G1["检索函数级 Top-5"]
+        G1 --> G2{"覆盖率评估<br/>是否满足需求?"}
+        G2 -->|是| H["返回函数级结果"]
+        G2 -->|否| I["升级检索类级 Top-3<br/>补充上下文"]
+        I --> J["合并函数级+类级结果<br/>去重排序"]
+    end
+      </pre></div>
+      <table class="outline-table">
+        <thead><tr>
+          <th>索引粒度</th><th>平均大小</th><th>元数据</th>
+          <th>适用场景</th><th>覆盖率</th>
+        </tr></thead>
+        <tbody>
+          <tr><td>函数级</td><td>50-200 行</td>
+            <td>函数名+类名+参数+返回类型+行号+复杂度</td>
+            <td>精准定位方法实现</td><td>71.2%</td></tr>
+          <tr><td>类级</td><td>100-500 行</td>
+            <td>类名+包名+注解+字段列表+方法列表</td>
+            <td>理解类整体职责</td><td>18.4%</td></tr>
+          <tr><td>文件级</td><td>200-2000+ 行</td>
+            <td>文件路径+语言+包+修改时间</td>
+            <td>配置/概览理解</td><td>10.4%</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario">
+        <h4>企业实践：切片粒度的调优经验</h4>
+        <p>
+          某 100 万行 Java 项目在使用函数级切片时发现一个问题：对于大型类
+          （超过 1000 行），单一函数级切片无法理解类的整体状态。例如当用户
+          问"OrderService 的状态机转换逻辑是否正确"时，需要同时看到多
+          个方法的调用关系和共享状态。解决方案是引入"上下文窗口自适应"切
+          片——当函数级检索结果的排序得分低于 0.6 阈值时，自动加载其所属类
+          级切片作为额外上下文。实现后在 300 个测试查询中将 Recall@5 从
+          74.5% 提升至 88.2%，但 Token 消耗仅增加 23%。调优关键是在召回率
+          和 Token 成本之间找到平衡点。
+        </p>
+      </aside>
+    </div>
 
+    <div class="section-block">
+      <h3>Spring AI DocumentReader + TreeSitter 的代码解析 Pipeline</h3>
+      <p>
+        Spring AI 定义了 DocumentReader 接口作为文档加载的抽象，方法签名
+        为 List&lt;Document&gt; get()，结合接受文件路径或 URL 的构造参数。
+        CorpAssist 实现了 CodeDocumentReader 子接口，专门用于代码文件的
+        解析。解析 Pipeline 包含四个阶段：文件发现、语言检测、AST 解析、
+        切片生成。文件发现阶段通过递归扫描仓库目录树并根据 .gitignore 过滤
+        无关文件（如 node_modules、target）。语言检测阶段根据文件扩展名和
+        shebang 确定编程语言——Java(.java)、Python(.py)、Go(.go)、
+        TypeScript(.ts/.tsx) 等。AST 解析阶段调用 TreeSitter 的对应语言
+        解析器生成语法树，TreeSitter 的优势在于增量解析：第一次全量解析后，
+        后续只需要解析变更的文件，且支持在解析过程中出错时返回部分 AST 而
+        不是完全失败。
+      </p>
+      <div class="code-block"><div class="code-toolbar">
+        <span class="lang-tag">java</span>
+        <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+      </div><pre><code class="language-java">package com.corpassist.indexing.reader;
+
+import org.springframework.ai.document.Document;
+import org.springframework.ai.reader.DocumentReader;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * TreeSitter 驱动的代码文档阅读器抽象基类。
+ * 子类实现各语言的 AST 切片逻辑。
+ */
+public abstract class TreeSitterCodeReader implements DocumentReader {
+
+    protected final Path filePath;
+    protected final String language;
+
+    public TreeSitterCodeReader(Path filePath, String language) {
+        this.filePath = filePath;
+        this.language = language;
+    }
+
+    /**
+     * 解析文件生成多个 Document（函数级切片）。
+     */
     @Override
-    public List&lt;Document&gt; read(String filePath) {
-        String language = detectLanguage(filePath);
-        String content = readFile(filePath);
-
-        // 使用对应语言的 AST 解析器
-        CodeParser parser = getParser(language);
-        List&lt;AstNode&gt; nodes = parser.parse(content);
-
-        // 按 AST 节点切片
+    public List&lt;Document&gt; get() {
+        String sourceCode = readFileAsString(filePath);
+        TreeSitterAst ast = parseAst(sourceCode, language);
+        List&lt;AstNode&gt; functionNodes = extractFunctions(ast);
         List&lt;Document&gt; documents = new ArrayList&lt;&gt;();
-        for (AstNode node : nodes) {
-            Document doc = new Document(
-                node.getCode(),  // 切片内容
-                Map.of(
-                    "filePath", filePath,
-                    "language", language,
-                    "symbolName", node.getName(),
-                    "symbolKind", node.getKind(),  // CLASS/METHOD/FIELD
-                    "startLine", node.getStartLine(),
-                    "endLine", node.getEndLine(),
-                    "signature", node.getSignature(),
-                    "project", extractProjectName(filePath)
-                )
-            );
-            documents.add(doc);
+        for (int i = 0; i &lt; functionNodes.size(); i++) {
+            AstNode func = functionNodes.get(i);
+            String content = sourceCode.substring(
+                func.startByte(), func.endByte());
+            Map&lt;String, Object&gt; metadata = new HashMap&lt;&gt;();
+            metadata.put("file_path", filePath.toString());
+            metadata.put("language", language);
+            metadata.put("function_name", func.name());
+            metadata.put("class_name", func.parentName());
+            metadata.put("start_line", func.startLine());
+            metadata.put("end_line", func.endLine());
+            metadata.put("slice_level", "function");
+            metadata.put("chunk_index", i);
+            metadata.put("complexity",
+                computeCyclomaticComplexity(func));
+            documents.add(new Document(content, metadata));
         }
         return documents;
     }
 
-    // 使用示例：解析 Java 文件
-    // CodeDocumentReader reader = new CodeDocumentReader();
-    // List&lt;Document&gt; docs = reader.read("src/main/java/UserService.java");
-    // docs.get(0).getMetadata().get("symbolName") -> "getUser"
-    // docs.get(0).getMetadata().get("startLine") -> 25
-    // docs.get(0).getMetadata().get("endLine") -> 45</pre></div>
-      <table class="outline-table">
-        <thead><tr><th>切片策略</th><th>粒度</th><th>检索准确率</th><th>切片数/文件</th><th>说明</th></tr></thead>
-        <tbody>
-          <tr><td>固定行数（50行）</td><td>粗</td><td>62%</td><td>5-20</td><td>切断了代码逻辑，跨切片查询效果差</td></tr>
-          <tr><td>函数级别 AST</td><td>中</td><td>82%</td><td>3-15</td><td>函数是代码的最小逻辑单元</td></tr>
-          <tr><td>类级别 AST</td><td>中</td><td>78%</td><td>1-5</td><td>适合"这个类干什么"类的问题</td></tr>
-          <tr><td>AST 混合（类+方法）</td><td>细</td><td>88%</td><td>5-30</td><td>CorpAssist 默认策略</td></tr>
-        </tbody>
-      </button>
+    /**
+     * 调用 TreeSitter 原生库解析 AST。
+     * 通过 JNI 调用 libtree-sitter-native。
+     */
+    protected abstract TreeSitterAst parseAst(
+        String sourceCode, String language);
+
+    /**
+     * 从 AST 中提取函数定义节点。
+     * 各语言 AST 结构不同，由子类实现。
+     */
+    protected abstract List&lt;AstNode&gt; extractFunctions(
+        TreeSitterAst ast);
+
+    /**
+     * 计算函数的圈复杂度。
+     */
+    private int computeCyclomaticComplexity(AstNode func) {
+        return 1
+            + countKeyword(func, "if")
+            + countKeyword(func, "else if")
+            + countKeyword(func, "for")
+            + countKeyword(func, "while")
+            + countKeyword(func, "case")
+            + countKeyword(func, "catch")
+            + countKeyword(func, "&&")
+            + countKeyword(func, "||");
+    }
+
+    private String readFileAsString(Path path) {
+        try {
+            return java.nio.file.Files.readString(path);
+        } catch (Exception e) {
+            throw new RuntimeException(
+                "Failed to read file: " + path, e);
+        }
+    }
+}
+</code></pre></div>
+      <p>
+        TreeSitter 的 Java 绑定通过 JNI 调用原生库 libtree-sitter-native。
+        每个语言解析器是一个独立的 .so/.dll 文件（如 java.so、python.so），
+        在首次解析时加载到内存。CorpAssist 使用 cn.tree-sitter:libtree-sitter
+        的 Java 封装库，通过 try-with-resources 管理解析器的生命周期。树
+        形结构查询使用 TreeSitter 的 S 表达式查询语言——例如在 Java 中查询
+        所有方法定义的 S 表达式为 (method_declaration name: (identifier)
+        @method.name)，查询结果返回匹配的节点和捕获名称。Pipeline 的最后
+        阶段将切片结果组装为 Spring AI 的 Document 对象，每个 Document 包
+        含代码内容和完整的元数据 Map，随后由 EmbeddingModel 批量向量化后
+        写入 Milvus。单线程解析速度约 1000 文件/分钟，启用并行流后可达
+        4000 文件/分钟（8 核机器），对于 10 万文件的仓库，首次全量索引约
+        25 分钟。
+      </p>
+      <div class="code-block"><div class="code-toolbar">
+        <span class="lang-tag">java</span>
+        <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+      </div><pre><code class="language-java">package com.corpassist.indexing.reader;
+
+import org.springframework.ai.document.Document;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Java 文件的 TreeSitter 读取器。
+ * 实现 parseAst 和 extractFunctions 方法，
+ * 使用 Java 语言解析器提取方法级和类级切片。
+ */
+public class JavaCodeReader extends TreeSitterCodeReader {
+
+    public JavaCodeReader(Path filePath) {
+        super(filePath, "java");
+    }
+
+    @Override
+    protected TreeSitterAst parseAst(
+            String sourceCode, String language) {
+        // 通过 JNI 调用 libtree-sitter-native 的 Java 解析器
+        NativeParser parser = new NativeParser();
+        parser.setLanguage(Language.JAVA);
+        TreeSitterAst ast = parser.parse(sourceCode);
+        return ast;
+    }
+
+    @Override
+    protected List&lt;AstNode&gt; extractFunctions(
+            TreeSitterAst ast) {
+        // 使用 S 表达式查询 Java 中的方法声明
+        // (method_declaration name: (identifier) @name)
+        String queryStr = "(method_declaration " +
+            "name: (identifier) @method.name)";
+        Query query = Query.compile(queryStr);
+        QueryCursor cursor = query.execute(ast.getRootNode());
+        List&lt;AstNode&gt; methods = new ArrayList&lt;&gt;();
+        cursor.forEach(match -&gt; {
+            AstNode nameNode = match
+                .getCapture("method.name");
+            AstNode methodNode = nameNode.getParent();
+            methods.add(new AstNode(
+                methodNode.getType(),
+                methodNode.getStartByte(),
+                methodNode.getEndByte(),
+                methodNode.getStartPosition().row + 1,
+                methodNode.getEndPosition().row + 1,
+                nameNode.getSource(),
+                extractParentClassName(ast, methodNode)
+            ));
+        });
+        return methods;
+    }
+
+    private String extractParentClassName(
+            TreeSitterAst ast, AstNode methodNode) {
+        AstNode parent = methodNode.getParent();
+        while (parent != null && !"class_declaration"
+                .equals(parent.getType())) {
+            parent = parent.getParent();
+        }
+        if (parent == null) return "";
+        return extractClassName(parent);
+    }
+
+    private String extractClassName(AstNode classNode) {
+        String queryStr = "(class_declaration " +
+            "name: (identifier) @class.name)";
+        Query query = Query.compile(queryStr);
+        QueryCursor cursor = query.execute(classNode);
+        var match = cursor.next();
+        if (match != null) {
+            return match.getCapture("class.name")
+                .getSource();
+        }
+        return "";
+    }
+}
+</code></pre></div>
     </div>
 
     <div class="section-block">
-      <h3>仓库索引构建</h3>
-      <p>代码索引流水线需要处理仓库的初始全量索引和日常增量更新。Spring Scheduling 实现定期索引更新。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 代码仓库索引构建器
+      <h3>多语言支持架构：Java / Python / Go / TypeScript 的抽象 Reader 接口</h3>
+      <p>
+        企业级代码库通常不是单一语言——Java 后端、Python 数据科学、Go 微服
+        务、TypeScript 前端并存。CorpAssist 通过工厂模式 + 策略模式的组合
+        实现多语言支持：每个语言注册一个 CodeReaderFactory 实现，根据文件
+        扩展名分发到对应的 Reader。扩展名为 .java 时使用 JavaCodeReader，
+        .py 时使用 PythonCodeReader，.go 时使用 GoCodeReader，.ts/.tsx
+        时使用 TypeScriptCodeReader。通过 Spring 的 @Autowired 注入所有
+        CodeReaderFactory Bean，代码索引器自动发现并匹配。添加新语言只需
+        三步：1) 创建新的 Reader 类继承 TreeSitterCodeReader；2) 实现
+        CodeReaderFactory 返回该 Reader 实例；3) 在 TreeSitter 中加载对应
+        语言的 .so 解析器文件。整个架构对上层索引 Pipeline 完全透明。
+      </p>
+      <p>
+        每种语言的 AST 结构差异体现在三个层面。方法定义节点命名不同：Java
+        用 method_declaration、Python 用 function_definition、Go 用
+        function_declaration、TypeScript 用 method_definition。类定义节
+        点命名不同：Java 用 class_declaration、Python 用 class_definition、
+        Go 无类概念但可用 type_declaration、TypeScript 用
+        class_declaration。注释语法不同：Java/TypeScript 用 // 和 /* */、
+        Python 用 #、Go 用 // 和 /* */。这些差异都在各语言的 Reader 实现
+        中处理。抽象 Reader 接口定义了解析管线——language()、parseAst()、
+        extractFunctions()、extractClasses()、extractImports() 五个方
+        法。每种语言只需实现这些方法，基类负责 Document 组装和元数据封装。
+        使用统一的 Document 格式后，下游的向量化、检索、生成阶段完全与语
+        言无关，极大降低了系统复杂度。
+      </p>
+      <div class="code-block"><div class="code-toolbar">
+        <span class="lang-tag">java</span>
+        <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+      </div><pre><code class="language-java">package com.corpassist.indexing.factory;
+
+import com.corpassist.indexing.reader.*;
+import org.springframework.stereotype.Component;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 代码阅读器工厂。
+ * 根据文件扩展名自动选择对应语言的 Reader。
+ * 新增语言只需注册新的 CodeReaderFactory Bean。
+ */
 @Component
-public class CodeIndexBuilder {
+public class CodeReaderFactory {
 
-    private final GitService gitService;
-    private final CodeDocumentReader documentReader;
-    private final VectorStore vectorStore;
-    private final EmbeddingModel embeddingModel;
+    private final Map&lt;String, CodeReaderFactory&gt;
+        readerFactories = new ConcurrentHashMap&lt;&gt;();
 
-    @Scheduled(cron = "0 0 2 * * ?")  // 每天凌晨 2 点全量索引
-    public void fullIndex() {
-        List&lt;String&gt; projects = gitService.listProjects();
-        for (String project : projects) {
-            try {
-                indexProject(project);
-            } catch (Exception e) {
-                log.error("全量索引失败: {}", project, e);
+    public CodeReaderFactory(
+            List&lt;CodeReaderFactory&gt; factories) {
+        for (CodeReaderFactory factory : factories) {
+            for (String ext : factory.supportedExtensions()) {
+                readerFactories.put(
+                    ext.toLowerCase(), factory);
             }
         }
     }
 
-    @Scheduled(fixedRate = 300000)  // 每 5 分钟增量索引
-    public void incrementalIndex() {
-        List&lt;GitChange&gt; changes = gitService.getRecentChanges(5);
-        for (GitChange change : changes) {
-            if (change.getType() == GitChange.Type.DELETE) {
-                // 从向量库删除
-                vectorStore.delete(
-                    filterExp -&gt; filterExp.eq("filePath", change.getFilePath())
-                );
-            } else {
-                // 更新或新增
-                List&lt;Document&gt; docs = documentReader.read(change.getFilePath());
-                // 先删除旧的再添加新的
-                vectorStore.delete(
-                    filterExp -&gt; filterExp.eq("filePath", change.getFilePath())
-                );
-                vectorStore.add(docs);
-            }
+    public TreeSitterCodeReader createReader(Path filePath) {
+        String ext = getExtension(filePath).toLowerCase();
+        CodeReaderFactory factory = readerFactories.get(ext);
+        if (factory == null) {
+            throw new IllegalArgumentException(
+                "Unsupported file extension: " + ext);
         }
+        return factory.createReader(filePath);
     }
 
-    private void indexProject(String project) {
-        List&lt;String&gt; files = gitService.listFiles(project);
-        for (String file : files) {
-            List&lt;Document&gt; docs = documentReader.read(file);
-            vectorStore.add(docs);
-        }
-        log.info("全量索引完成: {}, 文件数: {}", project, files.size());
-    }
-}</pre></div>
-    </div>
-
-    <div class="section-block">
-      <h3>多语言支持与引用跳转</h3>
-      <p>企业代码库通常包含多种语言。CorpAssist 的代码 RAG 支持 Java/Python/TypeScript/Go/SQL 等 8 种语言。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 多语言解析器工厂
-@Component
-public class CodeParserFactory {
-
-    private final Map&lt;String, CodeParser&gt; parsers = Map.of(
-        "java", new JavaParser(),
-        "py", new PythonParser(),
-        "ts", new TypeScriptParser(),
-        "js", new JavaScriptParser(),
-        "go", new GoParser(),
-        "sql", new SqlParser(),
-        "kt", new KotlinParser(),
-        "xml", new XmlParser()
-    );
-
-    public CodeParser getParser(String extension) {
-        CodeParser parser = parsers.get(extension);
-        if (parser == null) {
-            return new GenericParser();  // 不支持的语言用通用文本解析
-        }
-        return parser;
-    }
-
-    public List&lt;String&gt; getSupportedExtensions() {
-        return new ArrayList&lt;&gt;(parsers.keySet());
+    private String getExtension(Path filePath) {
+        String name = filePath.getFileName().toString();
+        int dotIndex = name.lastIndexOf('.');
+        return dotIndex &gt; 0 ? name.substring(dotIndex) : "";
     }
 }
 
-// 检索结果包含引用跳转信息
-@Data
-@Builder
-public class SearchResult {
-    private String codeSnippet;
-    private String filePath;
-    private int startLine;
-    private int endLine;
-    private String symbolName;
-    private String language;
-    private double score;
+/**
+ * 各语言注册的工厂接口。
+ */
+interface CodeReaderFactory {
+    List&lt;String&gt; supportedExtensions();
+    TreeSitterCodeReader createReader(Path filePath);
+}
 
-    // 引用跳转 URL（用于 IDE 插件）
-    public String getJumpUrl() {
-        return String.format("file://%s#L%d-L%d", filePath, startLine, endLine);
+@Component
+class JavaCodeReaderFactory implements CodeReaderFactory {
+    public List&lt;String&gt; supportedExtensions() {
+        return List.of(".java");
     }
+    public TreeSitterCodeReader createReader(Path filePath) {
+        return new JavaCodeReader(filePath);
+    }
+}
 
-    // 代码引用格式
-    public String formatCitation() {
-        return String.format("【%s:%d-%d】\n```%s\n%s\n```",
-            filePath, startLine, endLine, language, codeSnippet);
+@Component
+class PythonCodeReaderFactory implements CodeReaderFactory {
+    public List&lt;String&gt; supportedExtensions() {
+        return List.of(".py");
     }
-}</pre></div>
-      <aside class="learn-scenario">
-        <h4>CorpAssist 场景</h4>
-        <p>开发者提问"UserService 的 getUser 方法是怎么实现的？" 代码 RAG 检索流程：1) 向量检索找到相似度最高的切片（预期是 UserService.java 的 getUser 方法切片）；2) 元数据过滤确认 language=java 且 project=user-service；3) 返回切片内容 + 引用跳转 file://UserService.java#L25-L45；4) LLM 基于切片内容生成回答。整个过程约 800ms。如果检索不到准确的切片（比如 getUser 方法太长被切成了多段），回退策略是从向量库检索文件的整体切片，然后使用正则提取目标方法。</p>
-      </aside>
+    public TreeSitterCodeReader createReader(Path filePath) {
+        return new PythonCodeReader(filePath);
+    }
+}
+</code></pre></div>
+      <table class="outline-table">
+        <thead><tr>
+          <th>语言</th><th>方法定义节点</th><th>类定义节点</th>
+          <th>注释语法</th><th>Reader 实现</th>
+        </tr></thead>
+        <tbody>
+          <tr><td>Java</td><td>method_declaration</td>
+            <td>class_declaration</td><td>// 和 /* */</td>
+            <td>JavaCodeReader</td></tr>
+          <tr><td>Python</td><td>function_definition</td>
+            <td>class_definition</td><td>#</td>
+            <td>PythonCodeReader</td></tr>
+          <tr><td>Go</td><td>function_declaration</td>
+            <td>type_declaration</td><td>// 和 /* */</td>
+            <td>GoCodeReader</td></tr>
+          <tr><td>TypeScript</td><td>method_definition</td>
+            <td>class_declaration</td><td>// 和 /* */</td>
+            <td>TypeScriptCodeReader</td></tr>
+        </tbody>
+      </table>
     </div>
 
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
-      <li>AST 混合切片（类+方法）检索准确率 88%，优于固定行数切片的 62%</li>
-      <li>Spring AI DocumentReader 可扩展，通过自定义 Reader 支持 8+ 种语言</li>
-      <li>全量索引（每日凌晨）+ 增量索引（每 5 分钟）通过 Spring Scheduling 实现</li>
-      <li>引用跳转通过 LSP 获取符号位置，在检索结果中直接提供 file:// URL</li>
-      <li>CorpAssist 检索 + 生成流程约 800ms，回退策略保障检索不到时的可用性</li>
-    </ul></div>
+    <div class="section-block">
+      <h3>符号跳转与引用关系图谱的构建与检索</h3>
+      <p>
+        代码理解不仅仅是找到相关的函数定义——还需要理解函数之间的调用关系、
+        类之间的继承层次、接口与实现之间的映射。CorpAssist 使用 Neo4j 图
+        数据库构建代码的符号引用关系图谱（Code Knowledge Graph），节点是
+        符号定义（函数、类、接口、字段），边是各种关系（CALLS、EXTENDS、
+        IMPLEMENTS、REFERENCES、CONTAINS）。图谱的构建与向量索引的构建
+        是并行的：TreeSitter 解析 AST 时，除了提取切片内容还提取符号间关
+        系。例如解析到 UserService 调用 userRepository.findById() 时，在
+        图谱中添加一条 (UserService.findById) -[CALLS]-&gt;
+        (UserRepository.findById) 的有向边。图谱构建完成后，可使用 Cypher
+        查询语言执行复杂的图遍历查询。
+      </p>
+      <p>
+        图检索为代码助手提供了三类关键能力。第一是"定义-使用链"查询：给定
+        一个函数，找出所有直接和间接调用它的位置——这在方法重命名或签名修
+        改时评估影响范围。使用 Cypher 的 MATCH (caller)-[:CALLS*1..3]-&gt;
+        (target {name: 'createUser'}) RETURN caller 可实现最多 3 层的调
+        用链扩展。第二是"继承层次"查询：给定一个接口，找出所有直接和间接
+        实现类——这在理解 Spring @Autowired 注入类型时非常有用。第三是"影
+        响范围分析"：修改一个公共方法时，找出所有可能受影响的测试类和配置
+        类。图谱与向量结合的检测策略称为 Graph-RAG：先通过图检索找到相关
+        符号的邻居节点，再将邻居节点的代码内容作为向量检索的额外上下文。
+        相比纯向量检索，Graph-RAG 的 Recall@10 从 86.3% 提升至 91.8%，
+        但检索延迟从 380ms 增加至 620ms。在有延迟要求的补全场景中仍然
+        用纯向量检索（保持 &lt;500ms），仅在问答场景（可接受 &lt;5s）中使用
+        Graph-RAG。
+      </p>
+      <div class="code-block"><div class="code-toolbar">
+        <span class="lang-tag">java</span>
+        <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+      </div><pre><code class="language-java">package com.corpassist.knowledgegraph;
+
+import org.neo4j.driver.*;
+import org.springframework.stereotype.Service;
+import java.util.*;
+
+/**
+ * 代码知识图谱查询服务。
+ * 使用 Neo4j 图数据库存储符号定义和关系，
+ * 提供调用链查询、继承层次查询、影响范围分析。
+ */
+@Service
+public class CodeGraphService {
+
+    private final Driver neo4jDriver;
+
+    public CodeGraphService(Driver neo4jDriver) {
+        this.neo4jDriver = neo4jDriver;
+    }
+
+    /**
+     * 查询指定方法的所有直接和间接调用方。
+     * 递归深度默认 3 层。
+     */
+    public List&lt;CallerInfo&gt; findCallers(
+            String className, String methodName, int maxDepth) {
+        String cypher = """
+            MATCH (caller:Method)-[:CALLS*1..%d]-&gt;(target:Method
+                {name: $methodName, className: $className})
+            RETURN DISTINCT caller.className AS callerClass,
+                   caller.name AS callerMethod,
+                   length(p) AS depth
+            ORDER BY depth
+            """.formatted(maxDepth);
+        try (Session session = neo4jDriver.session()) {
+            var result = session.run(cypher,
+                Values.parameters(
+                    "methodName", methodName,
+                    "className", className));
+            List&lt;CallerInfo&gt; callers = new ArrayList&lt;&gt;();
+            while (result.hasNext()) {
+                var record = result.next();
+                callers.add(new CallerInfo(
+                    record.get("callerClass").asString(),
+                    record.get("callerMethod").asString(),
+                    record.get("depth").asInt()
+                ));
+            }
+            return callers;
+        }
+    }
+
+    /**
+     * 查询接口的所有实现类。
+     */
+    public List&lt;String&gt; findImplementations(String interfaceName) {
+        String cypher = """
+            MATCH (impl:Class)-[:IMPLEMENTS]-&gt;
+                (iface:Interface {name: $interfaceName})
+            RETURN impl.name AS implName
+            """;
+        try (Session session = neo4jDriver.session()) {
+            return session.run(cypher,
+                Values.parameters("interfaceName", interfaceName))
+                .list(r -&gt; r.get("implName").asString());
+        }
+    }
+
+    /**
+     * 影响范围分析：修改方法后找出所有可能受影响的文件。
+     */
+    public Set&lt;String&gt; findImpactScope(
+            String className, String methodName) {
+        Set&lt;String&gt; impacted = new HashSet&lt;&gt;();
+        // 1. 直接调用方
+        for (var caller : findCallers(className, methodName, 3)) {
+            impacted.add(caller.callerClass());
+        }
+        // 2. 测试类
+        try (Session session = neo4jDriver.session()) {
+            var testClasses = session.run("""
+                MATCH (test:Class)-[:TESTS]-&gt;(target:Class
+                    {name: $className})
+                RETURN test.name
+                """, Values.parameters("className", className));
+            while (testClasses.hasNext()) {
+                impacted.add(
+                    testClasses.next().get(0).asString());
+            }
+        }
+        return impacted;
+    }
+
+    public record CallerInfo(
+        String callerClass, String callerMethod, int depth) {}
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><pre class="mermaid">
+flowchart TB
+    subgraph 索引阶段[索引阶段：图谱构建]
+        A["TreeSitter AST 解析"] --> B["提取符号定义<br/>类/方法/接口/字段"]
+        A --> C["提取符号关系<br/>调用/继承/实现/引用"]
+        B --> D["Neo4j 节点创建<br/>MERGE 幂等写入"]
+        C --> D
+        D --> E["(:Method {name, className})<br/>-[:CALLS]-&gt;(:Method)"]
+        D --> F["(:Class {name, pkg})<br/>-[:EXTENDS|IMPLEMENTS]-&gt;(:Class)"]
+    end
+    subgraph 检索阶段[检索阶段：图谱查询]
+        G["用户查询<br/>"UserService.createUser 被谁调用?""] --> H["Cypher: MATCH (caller)-[:CALLS*1..3]-&gt;(target)"]
+        H --> I["返回调用链<br/>三层深度 &lt;10ms"]
+        G --> J["Cypher: MATCH (impl)-[:IMPLEMENTS]-&gt;(iface)"]
+        J --> K["返回实现类列表<br/>&lt;5ms"]
+    end
+      </pre></div>
+      <div class="learn-faq">
+        <details>
+          <summary>图索引 vs 向量索引：什么时候该用哪个？两者如何协同？</summary>
+          <p>
+            向量索引适合"语义相似"检索——用自然语言找出语义相近的代码片段，
+            例如找到所有"处理用户登录"的代码，不管它们的具体函数名叫什么。
+            图索引适合"关系明确"的检索——精确的调用链、继承层次、引用关系，
+            这些信息向量索引无法表达。CorpAssist 采用"图检索引向量检索"
+            的混合架构：收到用户问题后，先用轻量级 NLP 分类器（BART 模型，
+            &lt;5ms）判断问题类型——关系型问题（"被谁调用""继承自谁"）路由到
+            图检索，语义型问题（"怎么实现登录""异常处理策略"）路由到向量检
+            索。对于复杂问题（"修改 UserService.createUser 的影响范围"），
+            需要两者协同：先用图检索找到受影响的文件列表，再用向量检索从这
+            些文件中找到最相关的代码片段送入 Prompt。这种 Graph-RAG 架构在
+            CorpAssist 中将准确率提升 5.5%（从 86.3% 至 91.8%），代价是
+            检索延迟增加 240ms。
+          </p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>三层 AST 切片策略（函数级/类级/文件级）尊重代码自然边界，
+          默认函数级检索覆盖率 71.2%，自动升级后达 89.6%。</li>
+        <li>Spring AI DocumentReader + TreeSitter 的解析 Pipeline 实现
+          了代码到向量的自动化流程，全量索引 10 万文件约 25 分钟。</li>
+        <li>多语言支持通过工厂模式实现，新增语言只需三步：创建 Reader、
+          实现 Factory、加载解析器，对上层系统透明。</li>
+        <li>Neo4j 图数据库构建的代码知识图谱支撑调用链查询（&lt;10ms）、
+          继承层次查询、影响范围分析。</li>
+        <li>Graph-RAG 混合架构根据问题类型路由，语义问题用向量检索、
+          关系问题用图检索，准确率 91.8%、延迟 620ms。</li>
+      </ul>
+    </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox"> 我能实现 AST 切片并配置自定义 DocumentReader</label></li>
-        <li><label><input type="checkbox"> 我能配置全量+增量索引调度</label></li>
-        <li><label><input type="checkbox"> 我能添加一种新的语言支持</label></li>
-        <li><label><input type="checkbox"> 我能实现检索结果的引用跳转</label></li>
-        <li><label><input type="checkbox"> 我能解释不同切片策略的优劣</label></li>
+        <li><label><input type="checkbox"> 我能解释三层索引粒度的划分
+          依据和各自适用场景</label></li>
+        <li><label><input type="checkbox"> 我会使用 TreeSitter 解析代码
+          并提取函数级切片</label></li>
+        <li><label><input type="checkbox"> 我理解多语言支持架构中的工厂
+          模式和 Reader 抽象</label></li>
+        <li><label><input type="checkbox"> 我能用 Neo4j Cypher 查询代码
+          调用链和继承关系</label></li>
+        <li><label><input type="checkbox"> 我能区分向量索引和图索引的适用
+          场景并设计协同策略</label></li>
       </ul></div>
-      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
-        <tr><td>AST</td><td>Abstract Syntax Tree，抽象语法树</td></tr>
-        <tr><td>DocumentReader</td><td>Spring AI 文档读取接口，将文件转为 Document</td></tr>
-        <tr><td>切片</td><td>将代码文件按逻辑边界切分为检索单元</td></tr>
-        <tr><td>符号元数据</td><td>切片的 filePath/language/symbolName/startLine 等</td></tr>
-        <tr><td>全量索引</td><td>从头构建整个仓库的代码索引</td></tr>
-        <tr><td>增量索引</td><td>仅索引最近变更的文件</td></tr>
-        <tr><td>引用跳转</td><td>检索结果到 IDE 中代码位置的直接跳转</td></tr>
-        <tr><td>CodeParser</td><td>特定语言的代码解析器接口</td></tr>
-      </tbody></table></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4>
+        <table class="outline-table"><thead><tr>
+          <th>术语</th><th>一句话定义</th>
+        </tr></thead><tbody>
+          <tr><td>函数级切片</td><td>以单个函数为单位的代码切片，
+            平均 50-200 行</td></tr>
+          <tr><td>TreeSitter</td><td>增量式多语言语法解析器，
+            生成具体语法树（CST）</td></tr>
+          <tr><td>DocumentReader</td><td>Spring AI 接口，将外部文档
+            加载为 Document 对象列表</td></tr>
+          <tr><td>多语言工厂</td><td>按文件扩展名分发到对应语言
+            Reader 的设计模式</td></tr>
+          <tr><td>代码知识图谱</td><td>Neo4j 中存储符号定义和关系的
+            图结构，支撑精确关系查询</td></tr>
+          <tr><td>Graph-RAG</td><td>图检索与向量检索的混合架构，
+            先图后向量提升召回率</td></tr>
+          <tr><td>Cypher</td><td>Neo4j 的图查询语言，支持模式匹配
+            和路径遍历</td></tr>
+          <tr><td>S 表达式查询</td><td>TreeSitter 的节点查询语法，
+            如 (method_declaration name: (identifier))</td></tr>
+        </tbody></table>
+      </div>
       <div class="learn-interview"><h4>面试可能问</h4>
-        <details><summary>AST 切片和固定行数切片的效果差异有多大？为什么？</summary><p>差异约 26%（88% vs 62%）。原因：固定行数切片会切断代码的逻辑边界。比如一个 80 行的 getUser 方法被 50 行限制切成两段，用户问"getUser 的逻辑"时只检索到上半段（变量声明部分），缺少下半段（核心逻辑部分），LLM 无法给出完整回答。AST 切片按方法边界切分，确保 getUser 作为一个整体进入检索，LLM 能看到完整的逻辑。CorpAssist 实践中还有"重叠切片"策略——每个切片包含前后 5 行相邻代码作为上下文，弥补 AST 边界处可能丢失的关联信息，准确率进一步提升到 91%。</p></details>
+        <details>
+          <summary>设计一个支持 20 种编程语言的代码 RAG 系统，你如何保证
+            架构的可扩展性？</summary>
+          <p>
+            核心原则是对扩展开放、对修改封闭。架构分为三层：语言无关的管线
+            层（文件发现、向量化、存储、检索）、语言适配层（Reader 接口）、
+            语言实现层（各语言的 Reader 和 Parser）。当新增语言时，只需要在
+            语言实现层添加一个类，不需要修改管线层的任何代码。具体实现通过
+            Spring 的 @OnBeanCondition 条件注解自动注册——在 classpath 上
+            发现新语言的 TreeSitter 解析器 JAR 时自动启用对应的 Reader
+            Bean。为了管理 20 种语言的不同 AST 结构差异，采用"解析器适配器"
+            模式：每个语言实现一个 ParserAdapter 接口，将 TreeSitter 的原
+            生 AST 节点映射为统一的 CodeStructure 结构（函数、类、接口、
+            字段、枚举等），管线层只处理 CodeStructure。这样即使一种语言
+            的 AST 结构发生变化（如 Java 后续版本新增 record、sealed class
+            等特性），只需要更新该语言的 ParserAdapter 即可。对于 20 种
+            语言中 TreeSitter 未覆盖的少数语言（如 Kotlin、Swift），可以
+            使用进程外服务器——通过 LSP 的 documentSymbol 请求获取符号表，
+            再用启发式规则切片。CorpAssist 通过这种方式在一周内集成了
+            Kotlin 支持。
+          </p>
+        </details>
       </div>
     </div>
   </div>
 
   <div class="official-links content-section"><h3>官方参考</h3><ul>
-    <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval.html" target="_blank" rel="noopener">Spring AI DocumentReader</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval/document-reader.html"
+      target="_blank" rel="noopener">Spring AI DocumentReader 文档
+    </a> — 文档阅读器接口定义和内置实现</li>
+    <li><a href="https://tree-sitter.github.io/tree-sitter/"
+      target="_blank" rel="noopener">TreeSitter 官方文档
+    </a> — 解析器使用指南和语法查询语言参考</li>
+    <li><a href="https://neo4j.com/docs/cypher-manual/current/"
+      target="_blank" rel="noopener">Neo4j Cypher 查询语言手册
+    </a> — 图数据查询的完整语法参考</li>
   </ul></div>
   <div class="chapter-practice"><h3>动手练习</h3>
     <div class="steps-operate"><ol>
-      <li>为 Java 文件实现 AST 切片（按方法和类边界）</li>
-      <li>继承 DocumentReader 实现 CodeDocumentReader</li>
-      <li>配置 Spring Scheduling 全量+增量索引</li>
-      <li>添加 Python 语言支持</li>
-      <li>测试检索结果的引用跳转功能</li>
+      <li><code>docker run -p 7474:7474 -p 7687:7687 neo4j:5-community</code>
+        启动 Neo4j 图数据库，运行 CodeGraphServiceTest 构建示例代码图谱</li>
+      <li><code>cd indexing-pipeline && mvn test -Dtest=JavaCodeReaderTest
+        -pl reader-module</code> 测试三层切片的 Document 生成和元数据正确性</li>
+      <li><code>python -c "from tree_sitter import Language;
+        Language.build_library('build/my-languages.so',
+        ['tree-sitter-java', 'tree-sitter-python'])"</code> 编译
+        TreeSitter 多语言解析器动态库</li>
     </ol></div>
-    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-03-lab/</code></p></div>
+    <div class="steps-judgment-list">
+      <details>
+        <summary>场景：仓库问答中检索到的代码片段经常不完整，一个函数被
+          截断成两段了，怎么排查改进？</summary>
+        <p>这是典型的切片边界问题——切片算法没有正确识别函数边界。首先确
+          认 TreeSitter 的 AST 解析是否正确：检查 S 表达式查询是否捕捉到
+          所有函数声明模式（包括嵌套函数、匿名类中的方法、lambda 表达式）。
+          第二步检查切片合并逻辑：函数级切片是否只包含了函数体（{...}）而
+          遗漏了注解和 Javadoc？建议将函数签名前的所有注解和注释也包含在
+          切片中。第三步检查特殊语法：Java record、Kotlin 的 fun 关键字
+          等新式语法是否需要更新查询模式。根本解决方案是引入"边界感知合并"
+          策略：先按函数级边界切片，然后将相邻的 Javadoc 注解和注解自动
+          合并到对应函数切片中，确保每个切片在语义上是自包含的。CorpAssist
+          采用此策略后切片完整性从 89% 提升至 98.5%。
+        </p>
+      </details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4>
+      <p>见 <code>demos/basics-03-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>JavaCodeReader 正确解析 10 个示例文件并生成函数级/类级切片</li>
+        <li>多语言工厂按扩展名正确分发到 Java/Python/Go/TS Reader</li>
+        <li>Neo4j 图谱中可查询到示例代码的调用链和继承关系</li>
+      </ul>
+    </div>
   </div>
   <div class="resources content-section"><h3>延伸阅读</h3><ul>
-    <li>下一篇：<a href="#ch-basics-04">质量与安全检测</a></li>
+    <li>上一篇：<a href="#ch-basics-02">长代码上下文工程</a>
+      — Token 预算分配与文件选择算法</li>
+    <li>下一篇：<a href="#ch-basics-04">质量与安全检测</a>
+      — 静态规则与 LLM 协作的缺陷检测</li>
   </ul></div>
 </section>
