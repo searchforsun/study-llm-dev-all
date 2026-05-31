@@ -2,4 +2,15 @@
 
 [章节](../../index.html#ch-practice-04-red-team)
 
-勾选 redteam-checklist
+## 目标
+建立攻击用例库并集成安全回归。
+
+## 步骤
+1. 在 red-team-corpus.json 中写 10 个攻击用例
+2. 实现 Python RedTeamRunner 的 run_single 方法
+3. 设计 CI/CD 安全回归 pipeline
+
+## 验收标准
+- [ ] red-team-corpus.json 含至少 10 个用例
+- [ ] 覆盖注入、越狱、越权三大类
+- [ ] 每个用例有预期结果

@@ -5,67 +5,410 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈评测落地</strong> · 能力：用 pytest + RAGAS 产出报告并 threshold block</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Python 轨是 CorpAssist RAG 索引与批评的主战场。流水线要可重复、可 artifact、可 gate。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul><li>pytest 集成 eval fixture</li><li>上传 json artifact</li><li>实现 threshold_block</li><li>对接 GitHub Actions</li></ul></div>
-      <div class="notice"><strong>本章先记住 3 件事</strong><ul><li>pytest 收集 eval 用 marker</li><li>报告进 CI artifact</li><li>失败 exit 1</li><li>与 dataset pin 绑定</li></ul></div>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈评测落地</strong> · 能力：用 pytest + RAGAS 产出报告并实现 threshold block</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Python 轨是 CorpAssist RAG 索引与批评的主战场。流水线要可重复、可 artifact、可 gate。没有自动化的 pytest eval，每次发版都是手工点检——在 S1 ToB 交付中不可接受。</p></div>
+      <div class="notice notice-outcome"><strong>学完你能</strong><ul><li>pytest 集成 eval fixture 实现自动化评测</li><li>上传 json artifact 到 CI 供下游消费</li><li>实现 threshold_block 阻塞低质量 MR</li><li>对接 GitHub Actions required check</li><li>设计 regression set 并与 dataset_version pin 绑定</li></ul></div>
+      <div class="notice"><strong>本章先记住 4 件事</strong><ul><li><strong>pytest eval</strong>：用 @pytest.mark.eval 标记评测用例</li><li><strong>报告进 CI</strong>：eval_report.json 作为 artifact 持久化</li><li><strong>失败 exit 1</strong>：阈值命中 -> pytest.fail -> GitHub required check 变红</li><li><strong>dataset pin</strong>：每次评测绑定 dataset_version，防止偷换评测集</li></ul></div>
     </div>
-<div class="section-block"><h3>pytest + RAGAS</h3>
-<p><span class="term" data-term-id="pytest-eval" tabindex="0">pytest eval</span>：把 evaluate 包在 test 里，或单独 job。</p>
-<h4>代码示例</h4>
-<div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-<pre><code class="language-python">@pytest.mark.eval
-def test_s1_faithfulness(eval_runner):
-    report = eval_runner.run("corpassist-s1-v3.jsonl")
-    assert report["faithfulness"] &gt;= 0.90</code></pre></div>
-</div>
-<div class="section-block"><h3>报告</h3>
-<p><span class="term" data-term-id="eval-report" tabindex="0">eval report</span> 写 <span class="term" data-term-id="json-artifact" tabindex="0">json artifact</span>，含 git sha、prompt_version、index_version。</p>
-<div class="mermaid-wrap"><h5>Python eval CI</h5>
-<pre class="mermaid">flowchart LR
-  PY[pytest eval] --&gt; ART[report.json]
-  ART --&gt; S3[artifact store]
-  S3 --&gt; SPRING[Spring 对比 job]</pre>
-</div>
-</div>
-<div class="section-block"><h3>阈值闸门</h3>
-<p><span class="term" data-term-id="threshold-block" tabindex="0">threshold block</span>：任一项低于 yaml 阈值则 pytest.fail。</p>
-<div class="learn-compare"><div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不推荐</span><ul><li>只 print warning</li></ul></div>
-<div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐</span><ul><li>exit 1 block merge</li></ul></div></div>
-<h4>代码示例</h4>
-<div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-<pre><code class="language-yaml">thresholds:
+
+    <div class="section-block">
+      <h3>pytest + RAGAS：评测用例标准化</h3>
+      <p><span class="term" data-term-id="pytest-eval" tabindex="0">pytest eval</span> 把 evaluate 包在 test 函数中。每个 test 对应一条评测样本或一组聚合指标的断言。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · 发版前回归</span>
+        Python 轨每周发版前自动跑 200 条回归集。pytest 收集 eval marker 的测试，依次：① 初始化 eval_runner fixture ② 逐条跑 RAG 管线 ③ 调用 RAGAS 计算指标 ④ 聚合后与阈值比较 ⑤ 生成 <span class="term" data-term-id="eval-report" tabindex="0">eval report</span> 写入 <span class="term" data-term-id="json-artifact" tabindex="0">json artifact</span>
+      </aside>
+
+      <h4>代码：pytest eval fixture 与用例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># conftest.py — pytest 评测 fixture
+import pytest
+import json
+from pathlib import Path
+from ragas_eval import RAGEvaluator
+
+@pytest.fixture(scope="session")
+def eval_runner():
+    """评测执行器 fixture"""
+    return RAGEvaluator()
+
+@pytest.fixture(scope="session")
+def eval_dataset():
+    """加载评测集"""
+    path = Path("./data/eval_dataset.jsonl")
+    samples = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            samples.append(json.loads(line))
+    return samples
+
+@pytest.fixture(scope="session")
+def thresholds():
+    """从 YAML 加载阈值"""
+    import yaml
+    with open("./config/eval-gate.yaml", "r") as f:
+        config = yaml.safe_load(f)
+    return config["thresholds"]</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># test_s1_eval.py — S1 评测用例
+import pytest
+import json
+from datasets import Dataset
+
+@pytest.mark.eval
+class TestS1Regression:
+    """S1 回归评测"""
+
+    def test_s1_faithfulness(self, eval_runner, eval_dataset, thresholds):
+        """S1 忠实度门禁"""
+        dataset = self._build_dataset(eval_dataset)
+        scores = eval_runner.evaluate(dataset)
+        assert scores["faithfulness"] >= thresholds["faithfulness_min"], \
+            f"Faithfulness {scores['faithfulness']:.3f} < {thresholds['faithfulness_min']}"
+
+    def test_s1_context_recall(self, eval_runner, eval_dataset, thresholds):
+        """S1 检索召回门禁"""
+        dataset = self._build_dataset(eval_dataset)
+        scores = eval_runner.evaluate(dataset)
+        assert scores["context_recall"] >= thresholds["context_recall_min"], \
+            f"Context recall {scores['context_recall']:.3f} < {thresholds['context_recall_min']}"
+
+    def test_s1_hard_case(self, eval_runner, thresholds):
+        """难例子集门禁"""
+        # 只加载 hard_case.jsonl
+        hard_case_dataset = self._load_hard_cases()
+        scores = eval_runner.evaluate(hard_case_dataset)
+        assert scores["faithfulness"] >= thresholds["hard_case_faithfulness_min"], \
+            f"Hard case faithfulness {scores['faithfulness']:.3f} < threshold"
+
+    def _build_dataset(self, samples):
+        return Dataset.from_dict({
+            "question": [s["question"] for s in samples],
+            "answer": [self._mock_answer(s) for s in samples],
+            "contexts": [s.get("contexts", []) for s in samples],
+        })
+
+    def _mock_answer(self, sample):
+        # 实际场景调用 RAG API
+        return f"Mock answer for: {sample['question'][:20]}"
+
+    def _load_hard_cases(self):
+        hard = []
+        with open("./data/hard_cases.jsonl", "r") as f:
+            for line in f:
+                hard.append(json.loads(line))
+        return self._build_dataset(hard)</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>报告：结构化 JSON Artifact</h3>
+      <p><span class="term" data-term-id="eval-report" tabindex="0">eval report</span> 写 <span class="term" data-term-id="json-artifact" tabindex="0">json artifact</span>，含 git sha、prompt_version、index_version。报告不仅是门禁依据，也是版本基线比较的基础。</p>
+
+      <h4>代码：评测报告生成</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># report_generator.py — 结构化报告生成
+import json
+import subprocess
+from datetime import datetime
+from typing import Dict, List
+
+class EvalReport:
+    """评测报告生成器"""
+
+    @staticmethod
+    def get_git_sha() -> str:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"]
+        ).decode().strip()
+
+    @classmethod
+    def build(cls, scores: Dict[str, float],
+              thresholds: Dict[str, float],
+              dataset_version: str,
+              passed: bool,
+              per_sample: List[Dict] = None) -> Dict:
+        return {
+            "run_id": f"eval-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}",
+            "git_sha": cls.get_git_sha(),
+            "dataset_version": dataset_version,
+            "timestamp": datetime.utcnow().isoformat(),
+            "aggregate": scores,
+            "thresholds": thresholds,
+            "passed": passed,
+            "sample_count": len(per_sample) if per_sample else 0,
+            "per_sample": per_sample or [],
+        }
+
+    @staticmethod
+    def save(report: Dict, path: str = "./data/eval_report.json"):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f"Report saved: {path}")
+
+    @staticmethod
+    def compare(current: Dict, baseline: Dict) -> Dict:
+        """对比当前报告与 baseline"""
+        deltas = {}
+        for metric in current["aggregate"]:
+            if metric in baseline["aggregate"]:
+                deltas[metric] = round(
+                    current["aggregate"][metric] - baseline["aggregate"][metric], 4
+                )
+        return {
+            "deltas": deltas,
+            "regression": any(v < 0 for v in deltas.values()),
+        }</code></pre>
+      </div>
+
+      <h4>报告 JSON 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "run_id": "eval-20260530-143022",
+  "git_sha": "a1b2c3d",
+  "dataset_version": "corpassist-s1-v3",
+  "aggregate": {
+    "faithfulness": 0.92,
+    "answer_relevancy": 0.88,
+    "context_recall": 0.85
+  },
+  "thresholds": {
+    "faithfulness_min": 0.90,
+    "context_recall_min": 0.85
+  },
+  "passed": true,
+  "sample_count": 200
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>阈值闸门：阻塞低质量合并</h3>
+      <p><span class="term" data-term-id="threshold-block" tabindex="0">threshold block</span>：任一项低于 yaml 阈值则 pytest.fail，GitHub required check 变红，阻止 MR 合并。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Python 评测流水线</h5>
+        <pre class="mermaid">flowchart LR
+  PY[pytest eval] --> ART[report.json]
+  ART --> GATE{Threshold Gate}
+  GATE -->|pass| S3[artifact store]
+  GATE -->|fail| FAIL[exit 1 ❌]
+  S3 --> SPRING[Spring 对比 job]</pre>
+        <p class="diagram-caption">pytest eval 作为 GitHub required check，失败时阻塞合并。Spring job 读取同一 artifact 做 cross-stack diff。</p>
+      </div>
+
+      <h4>阈值 YAML 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># config/eval-gate.yaml
+thresholds:
   faithfulness_min: 0.90
-  hard_case_faithfulness_min: 0.88</code></pre></div>
-</div>
+  context_recall_min: 0.85
+  answer_relevancy_min: 0.88
+  hard_case_faithfulness_min: 0.85
+
+regression:
+  baseline_path: ./data/baseline_report.json
+  max_delta: -0.02
+
+dataset:
+  name: corpassist-s1
+  version: v3
+  path: ./data/eval_dataset.jsonl</code></pre>
+      </div>
+
+      <h4>GitHub Actions 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># .github/workflows/python-eval.yml
+name: Python Eval Gate
+on: [pull_request]
+jobs:
+  pytest-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-eval.txt
+      - run: pytest tests/test_s1_eval.py -m eval -v --junitxml=report.xml
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: ./data/eval_report.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-report
+          path: report.xml</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只 print warning，不阻塞合并</li>
+            <li>无 baseline 对比，只看绝对分数</li>
+            <li>每次评测用不同 dataset 版本</li>
+            <li>无 junit report 不利于 CI 集成</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>pytest.fail + exit 1 block merge</li>
+            <li>对比 baseline delta（如 -0.02 以内）</li>
+            <li>dataset_version 与 git tag pin 绑定</li>
+            <li>junit.xml 与 json artifact 双输出</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Regression Set 与版本管理</h3>
+      <p><span class="term" data-term-id="regression-set" tabindex="0">regression set</span> 是 gold 评测集中最稳定的子集。每次发版前跑回归集，确保核心能力不退化。</p>
+      <ul>
+        <li><strong>稳定子集</strong>：从完整评测集选 50-100 条最稳定的 QA 对</li>
+        <li><strong>难例全量</strong>：hard_cases.jsonl 全量跑，不允许任何退化</li>
+        <li><strong>版本锁定</strong>：regression set 版本号与 dataset_version 独立，更少更新</li>
+        <li><strong>基线存储</strong>：每次通过的评测报告作为下一次 baseline</li>
+      </ul>
+
+      <details class="learn-faq">
+        <summary>regression set 与完整评测集什么关系？</summary>
+        <p>regression set ⊆ 完整集。regression set 用于快速门禁（5 分钟），完整集用于详细报告（15 分钟）。MR 时跑 regression，发版前跑完整集。</p>
+      </details>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
-      <p class="chapter-conclusions-lead">本章能力将接入 CorpAssist NS1 评测飞轮与双栈 CI。</p>
-      <ul class="chapter-conclusions-list"><li><strong>pytest + RAGAS</strong>：<span class="term" data-term-id="pytest-eval" tabindex="0">pytest eval</span>：把 </li>
-<li><strong>报告</strong>：<span class="term" data-term-id="eval-report" tabindex="0">eval report</span> 写 </li>
-<li><strong>阈值闸门</strong>：<span class="term" data-term-id="threshold-block" tabindex="0">threshold block</</li></ul>
+      <p class="chapter-conclusions-lead">Python 评测流水线是 NS1 飞轮中「自动评测」的工程实现。pytest + RAGAS + threshold block 形成可重复的 CI 门禁。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>pytest + RAGAS</strong>：@pytest.mark.eval 标记评测用例，eval_runner fixture 封装 RAGAS。</li>
+        <li><strong>报告</strong>：json artifact 含 git sha、dataset_version、per sample 指标。</li>
+        <li><strong>阈值闸门</strong>：pytest.fail -> exit 1 -> GitHub required check 变红，block merge。</li>
+        <li><strong>Regression Set</strong>：稳定子集快速门禁 + 难例全量不退化。</li>
+      </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="llm-evaluation-quality_practice_01_python_eval">
         <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
         <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
-        <ul><li><label><input type="checkbox" data-id="c0" /> 能复述本章 4 条核心 takeaway</label></li><li><label><input type="checkbox" data-id="c1" /> 完成正文对照表或代码示例阅读</label></li><li><label><input type="checkbox" data-id="c2" /> 完成判断练习</label></li><li><label><input type="checkbox" data-id="c3" /> 完成 Demo 或等价笔记</label></li><li><label><input type="checkbox" data-id="c4" /> 已完成章节测验</label></li></ul>
+        <ul>
+          <li><label><input type="checkbox" data-id="pytest-eval" /> 能写出 @pytest.mark.eval 测试用例</label></li>
+          <li><label><input type="checkbox" data-id="artifact" /> 能说出 eval_report.json 应含的 3 个 metadata</label></li>
+          <li><label><input type="checkbox" data-id="threshold" /> 能解释 threshold block 如何阻止低质量合并</label></li>
+          <li><label><input type="checkbox" data-id="baseline" /> 能设计 baseline 对比机制</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
       </div>
-      
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>pytest eval</td><td>@pytest.mark.eval 标注评测用例</td></tr>
+                <tr><td>eval report</td><td>json artifact 含 metadata + aggregate</td></tr>
+                <tr><td>threshold block</td><td>低于阈值 exit 1，阻止 MR 合并</td></tr>
+                <tr><td>baseline</td><td>每次通过的报告作为下次对比基线</td></tr>
+                <tr><td>regression set</td><td>稳定子集快速门禁</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 pytest eval 要用 fixture 而非在每个 test 里初始化？</li>
+              <li>threshold block 是 print warning 还是 exit 1？为什么？</li>
+              <li>如何防止工程师绕过 eval gate 合并低质量代码？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-practice-02-spring-eval">Spring AI 服务评测</a>。</p>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul><li><a href="https://docs.pytest.org/" target="_blank" rel="noopener">pytest documentation</a></li></ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.pytest.org/" target="_blank" rel="noopener">pytest documentation</a></li>
+      <li><a href="https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions" target="_blank" rel="noopener">GitHub Actions workflow syntax</a></li>
+      <li><a href="https://docs.ragas.io/en/latest/" target="_blank" rel="noopener">RAGAS 官方文档</a></li>
+    </ul>
+  </div>
+
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <p class="steps-intro">阅读 test_regression_demo.py，写出一条 failing threshold 用例。</p>
+    <p class="steps-intro">编写 pytest eval 测试并配置 threshold gate。</p>
     <h4 class="practice-section-title">操作步骤</h4>
-    <ol class="steps steps-operate"><li>打开 demos/practice-01-python-eval-lab/test_regression_demo.py</li><li>指出 assert 对应的 metric 名</li><li>写出 report.json 应含的 3 个 metadata 字段</li><li>说明 threshold 失败时 MR 能否合并</li></ol>
+    <ol class="steps steps-operate">
+      <li>打开 demos/practice-01-python-eval-lab/test_regression_demo.py</li>
+      <li>指出 assert 对应的 metric 名</li>
+      <li>写出 report.json 应含的 3 个 metadata 字段</li>
+      <li>说明 threshold 失败时 MR 能否合并</li>
+    </ol>
     <h4 class="practice-section-title">判断练习</h4>
-    <ol class="steps-judgment-list"><li><p class="judgment-stem">发版前只跑 10 条样例手工点检，不做回归集与 CI 门禁。在 CorpAssist 双栈评测落地 场景下风险是什么？</p>
-    <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>无法发现 Prompt/索引变更导致的回归；难例与拒答边界未覆盖；不符合 NS1 飞轮。应固定 dataset_version + 阈值门禁。</p></div></details></div></li></ol>
-    <div class="demo-box"><h4 class="demo-box-title">Demo：Python 服务评测流水线</h4><p>目录：<code>demos/practice-01-python-eval-lab/</code> — <strong>验收</strong>：pytest 可运行（mock 即可）。</p></div>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">MR 的 eval 报告显示 faithfulness=0.89，阈值是 0.90。该不该合并？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不应合并。阈值门禁的目的是阻止退化。如果 0.89 是合理波动，应调整阈值而非绕过。临时 bypass 需 quality owner 审批，并在周报中记录。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Python 服务评测流水线</h4>
+      <p>目录：<code>demos/practice-01-python-eval-lab/</code> — <strong>验收</strong>：pytest 可运行（mock 即可），report.json 含 git_sha + dataset_version 字段。</p>
+    </div>
   </div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul><li><strong>下一章</strong>：<a href="#ch-practice-02-spring-eval">Spring AI 服务评测</a></li></ul></div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-spring-eval">Spring AI 服务评测</a></li>
+    </ul>
+  </div>
 </section>

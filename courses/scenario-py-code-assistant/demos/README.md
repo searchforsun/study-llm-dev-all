@@ -1,19 +1,12 @@
-# 课程 Demo 索引
+# CorpAssist 代码助手 · 实验目录
 
-企业落地 · 代码助手 · CorpAssist Python 服务配套练习。
+企业落地代码助手课程的配套动手实验。
 
-| 章 | 目录 |
-|----|------|
-| basics-01-business | [basics-01-business-lab](./basics-01-business-lab/) |
-| basics-02-architecture | [basics-02-architecture-lab](./basics-02-architecture-lab/) |
-| basics-03-chunking | [basics-03-chunking-lab](./basics-03-chunking-lab/) |
-| basics-04-retrieval | [basics-04-retrieval-lab](./basics-04-retrieval-lab/) |
-| practice-01-index | [practice-01-index-lab](./practice-01-index-lab/) |
-| practice-02-qa-api | [practice-02-qa-api-lab](./practice-02-qa-api-lab/) |
-| practice-03-completion | [practice-03-completion-lab](./practice-03-completion-lab/) |
-| practice-04-latency | [practice-04-latency-lab](./practice-04-latency-lab/) |
-| practice-05-ide-bridge | [practice-05-ide-bridge-lab](./practice-05-ide-bridge-lab/) |
-| practice-06-production-pitfalls | [practice-06-production-pitfalls-lab](./practice-06-production-pitfalls-lab/) |
-| advanced-01-production | [advanced-01-production-lab](./advanced-01-production-lab/) |
-| advanced-02-metrics | [advanced-02-metrics-lab](./advanced-02-metrics-lab/) |
-| advanced-03-interview | [advanced-03-interview-lab](./advanced-03-interview-lab/) |
+| 实验 | 对应章节 | 核心练习 |
+|------|----------|----------|
+| practice-01-index-lab | 代码索引流水线 | Git 增量索引 + Milvus 写入 |
+| practice-02-qa-api-lab | 仓库问答 API | FastAPI + RAG 问答服务 |
+| practice-03-completion-lab | 补全与生成 Prompt | FIM 补全服务 + 风格约束 |
+| practice-04-latency-lab | 延迟优化 | 语义缓存 + 小模型路由 |
+| practice-05-ide-bridge-lab | IDE 集成 | VS Code LSP 协议桥接 |
+| practice-06-production-pitfalls-lab | 生产可靠性 | 熔断器 + 降级验证 |

@@ -1,5 +1,18 @@
 # Demo：内容生产场景与 ROI
 
-[章节](../../index.html#ch-basics-01-business)
+## 目标
+完成 ROI 粗算表与场景优先级排序。
 
-填 1 个 ROI 指标
+## 文件说明
+- `roi-metrics.md` — ROI 指标表（推文/物料/私域三类）
+- `README.md` — 本说明
+
+## 操作步骤
+1. 打开 `roi-metrics.md`，填写三类场景的月需求量和预估单篇成本
+2. 使用章节中的 Python ROI 粗算脚本计算 FTE 节省
+3. 输出效率提升倍数
+
+## 验收标准
+- [ ] ROI 粗算表已填写完整
+- [ ] 三类场景的优先级排序有依据
+- [ ] Python/Java 代码至少运行并输出一个指标

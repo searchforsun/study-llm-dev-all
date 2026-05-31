@@ -1,0 +1,345 @@
+<section id="ch-practice-06-production-pitfalls" class="chapter" data-chapter="practice-06-production-pitfalls">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>生产坑：承诺、审核与记忆</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-06-production-pitfalls" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Python实战</strong> · 能力：识别和解决内容生成生产环境中的承诺、审核与记忆三类坑</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>内容生成上线后最常见的三类坑：<span class="term" data-term-id="inventory-api" tabindex="0">库存/政策API真查</span>（LLM过度承诺）、<span class="term" data-term-id="decoding-constraint" tabindex="0">解码约束与对抗样本</span>（违规内容绕过检测）、<span class="term" data-term-id="memory-tiered" tabindex="0">私域记忆分层</span>（个性化记忆混乱）、<span class="term" data-term-id="role-ooc" tabindex="0">角色OOC</span>（超出角色行为）。本章逐个剖析并给出解决方案。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>实现库存/政策API真查，防止AI过度承诺</li>
+          <li>设计解码约束和对抗样本防御</li>
+          <li>实现私域记忆分层存储</li>
+          <li>检测和预防角色OOC</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住3件事</strong>
+        <ul>
+          <li><strong>不说「一定有货」</strong>：生成内容中的承诺必须通过API确认，不能依赖LLM记忆。</li>
+          <li><strong>对抗样本会绕开规则</strong>：基于正则的安全检测不够，需要LLM二次判別。</li>
+          <li><strong>记忆分层保护核心配置</strong>：System Prompt > 用户画像 > 短期记忆，上层不受下层影响。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>库存/政策API真查 — 防止过度承诺</h3>
+
+      <p>LLM生成内容时天然倾向于「答应客户一切」，包括承诺有货、承诺折扣、承诺服务。必须在生成内容中插入真实的API查询结果。</p>
+
+      <div class="mermaid-wrap">
+        <h5>API真查数据流</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant LLM as LLM生成
+    participant Guard as API真查守卫
+    participant API as 库存/政策API
+
+    LLM->>Guard: 生成内容含承诺声明
+    Guard->>API: 查询库存/价格/政策
+    API-->>Guard: 返回真实数据
+    Guard->>Guard: 替换生成内容中的承诺
+    Guard-->>LLM: 返回修正后内容</pre>
+        <p class="diagram-caption">API真查守卫在LLM生成后，用真实API数据替换所有承诺性声明。</p>
+      </div>
+
+      <h4>Python：API真查守卫</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># api_guard.py — API真查守卫
+import re
+from typing import Dict, Optional
+import httpx
+
+class APIGuard:
+    def __init__(self, inventory_api: str, policy_api: str):
+        self.inventory_api = inventory_api
+        self.policy_api = policy_api
+
+    def scan_promises(self, text: str) -> list:
+        """扫描内容中的承诺性表述"""
+        patterns = [
+            (r"(?P<product>.{2,20})库存充足|有货|现货", "inventory"),
+            (r"价格.*?(?P<price>\d+(\.\d+)?)元", "price"),
+            (r"(?P<days>\d+)天.*?退货|退款|保修", "policy"),
+            (r"(?P<discount>\d+)折|打.*?折|优惠.*?\d+%", "discount"),
+        ]
+        promises = []
+        for pat, ptype in patterns:
+            for match in re.finditer(pat, text):
+                promises.append({"type": ptype, "text": match.group(), "span": match.span()})
+        return promises
+
+    async def verify(self, text: str, sku: str) -> str:
+        """真查并替换承诺"""
+        # 查询真实库存
+        async with httpx.AsyncClient() as client:
+            inv_resp = await client.get(f"{self.inventory_api}/{sku}")
+            inv_data = inv_resp.json()
+
+        # 查询真实政策
+        policy_resp = await client.get(f"{self.policy_api}/{sku}")
+        policy_data = policy_resp.json()
+
+        # 替换承诺
+        text = re.sub(
+            r"库存充足|有货|现货",
+            f"当前库存{inv_data['stock']}件" if inv_data['stock'] > 0 else "需确认库存",
+            text
+        )
+        return text</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>解码约束与对抗样本防御</h3>
+
+      <p>对抗样本通过特殊编码（Unicode变体、Base64、反转文本）绕过内容安全检测。</p>
+
+      <table class="outline-table">
+        <thead><tr><th>攻击类型</th><th>示例</th><th>检测方法</th></tr></thead>
+        <tbody>
+          <tr><td>Unicode变体</td><td>𝓋𝒾𝑜𝓁𝑒𝓃𝒸𝑒代替violence</td><td>Unicode归一化</td></tr>
+          <tr><td>Base64编码</td><td>dmlvbGVuY2U=</td><td>Base64解码检测</td></tr>
+          <tr><td>反转文本</td><td>「力暴」代替「暴力」</td><td>反转+再检测</td></tr>
+          <tr><td>同音字替换</td><td>「赌伯」代替「赌博」</td><td>拼音/模糊匹配</td></tr>
+          <tr><td>间隔插入</td><td>「赌 博」插入空格</td><td>去空白+再检测</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Python：对抗样本防御</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># adversarial_defense.py — 对抗样本防御
+import re, unicodedata, base64
+
+class AdversarialDefense:
+    def normalize(self, text: str) -> str:
+        """Unicode归一化"""
+        text = unicodedata.normalize("NFKC", text)
+        # 去零宽字符
+        text = re.sub(r"[​‌‍⁠﻿]", "", text)
+        # 去多余空格
+        text = re.sub(r"\s+", "", text)
+        return text
+
+    def check_base64(self, text: str) -> list:
+        """检测Base64编码的敏感内容"""
+        found = []
+        b64_pattern = r"[A-Za-z0-9+/]{20,}={0,2}"
+        for match in re.finditer(b64_pattern, text):
+            try:
+                decoded = base64.b64decode(match.group()).decode("utf-8", errors="ignore")
+                if self._is_sensitive(decoded):
+                    found.append({"type": "base64", "decoded": decoded[:50]})
+            except Exception:
+                pass
+        return found
+
+    def check_reversed(self, text: str) -> list:
+        words = text.split()
+        for w in words:
+            if self._is_sensitive(w[::-1]):
+                return [{"type": "reversed", "original": w[::-1]}]
+        return []
+
+    def _is_sensitive(self, text: str) -> bool:
+        sensitive = ["暴力", "赌博", "色情", "毒品", "枪支"]
+        return any(s in text for s in sensitive)
+
+    def full_check(self, text: str) -> dict:
+        normalized = self.normalize(text)
+        return {
+            "base64": self.check_base64(text),
+            "reversed": self.check_reversed(text),
+            "normalized_sensitive": self._is_sensitive(normalized),
+        }</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>私域记忆分层与角色OOC</h3>
+
+      <p>私域记忆分三层：System Prompt（固定角色）、用户画像（中期）、短期记忆（对话轮次）。分层目的是防止短期记忆污染角色定义。角色OOC（Out Of Character）检测确保LLM不超出预设角色行为边界。</p>
+
+      <h4>Python：记忆分层与OOC检测</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># memory_tier.py — 记忆分层与OOC检测
+from typing import List, Dict
+
+class MemoryTier:
+    LAYER_0 = "system"     # 固定，不可覆盖
+    LAYER_1 = "profile"    # 用户画像，持久化
+    LAYER_2 = "session"    # 短期记忆，滑动窗口
+
+class TieredMemory:
+    def __init__(self):
+        self.system_prompt = ""
+        self.profile = {}
+        self.session: List[Dict] = []
+
+    def set_system(self, prompt: str):
+        self.system_prompt = prompt
+
+    def update_profile(self, key: str, value: str):
+        self.profile[key] = value
+
+    def add_session(self, turn: Dict):
+        self.session.append(turn)
+        if len(self.session) > 10:
+            self.session.pop(0)
+
+    def build_context(self) -> str:
+        return f"{self.system_prompt}\n{self.profile}\n{self.session}"
+
+class OOCDetector:
+    def __init__(self, role_boundary: dict):
+        self.role = role_boundary
+
+    def check(self, response: str) -> dict:
+        violations = []
+        if self.role.get("forbidden_actions"):
+            for action in self.role["forbidden_actions"]:
+                if action in response:
+                    violations.append({"type": "forbidden_action", "match": action})
+        if self.role.get("allowed_topics"):
+            if not any(t in response for t in self.role["allowed_topics"]):
+                violations.append({"type": "off_topic", "detail": "超出允许话题范围"})
+        return {"is_ooc": len(violations) > 0, "violations": violations}</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 生产坑案例分析</span>
+        CorpAssist上线后遇到三个典型坑：1) AI自动说「此商品24小时发货」，但实际库存系统显示部分地区缺货。2) 用户用Unicode变体绕过敏感词检测。3) 客服场景中新对话轮次覆盖了System Prompt，导致AI开始回答与角色无关的问题。API真查守卫+对抗样本检测+记忆分层修复了这三个坑。
+      </aside>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>LLM直接承诺「有货」「包邮」不验证</li>
+            <li>安全检测只用简单关键词匹配</li>
+            <li>System Prompt和短期记忆混在一起</li>
+            <li>无角色边界定义和OOC检查</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>API真查替换所有承诺性声明</li>
+            <li>对抗样本检测（Unicode/Base64/反转）</li>
+            <li>System > Profile > Session三层记忆</li>
+            <li>OOC检测器防止角色越界</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>常见问题（FAQ）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>API真查会不会增加响应延迟？</summary>
+          <div class="learn-faq-body">会，约增加50-200ms。优化：1) 对高频查询商品用Redis缓存库存数据（TTL 30s）；2) 将API查询与LLM生成并行执行；3) 非承诺性内容跳过真查。</div>
+        </details>
+        <details>
+          <summary>对抗样本检测的漏报率多高？</summary>
+          <div class="learn-faq-body">单纯依赖规则（正则/归一化）漏报率约15-20%。建议叠加LLM判別层：将疑似内容送给qwen-turbo做二次判別。规则层拦截80%，LLM层再拦截15%，综合漏报率降至5%以下。</div>
+        </details>
+        <details>
+          <summary>记忆分层后用户画像更新太慢怎么办？</summary>
+          <div class="learn-faq-body">用户画像更新应该走异步事件（用户行为→MQ→画像更新），不阻塞推理路径。画像的TTL设为24小时，确保次日看到最新数据。紧急更新（如用户主动修改偏好）走同步路径。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>API真查</strong>：所有承诺性声明必须通过真实API验证，不能依赖LLM输出。</li>
+        <li><strong>对抗样本防御</strong>：Unicode归一化+Base64检测+反转检测+LLM二次判別。</li>
+        <li><strong>记忆分层</strong>：System > Profile > Session三层，上层保护下层。</li>
+        <li><strong>OOC检测</strong>：角色边界定义+禁止行为+允许话题，越界时拦截或修正。</li>
+        <li><strong>生产坑是常态</strong>：上线前做红队测试，覆盖承诺/对抗/角色三类场景。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="scenario-py-content-studio_practice06">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="api-guard" /> 能实现API真查守卫替换承诺</label></li>
+          <li><label><input type="checkbox" data-id="adversarial" /> 能实现对抗样本多层检测</label></li>
+          <li><label><input type="checkbox" data-id="memory-tier" /> 能实现三层记忆分层</label></li>
+          <li><label><input type="checkbox" data-id="ooc" /> 能实现角色OOC检测</label></li>
+          <li><label><input type="checkbox" data-id="red-team" /> 能设计红队测试覆盖三类坑</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="inventory-api" tabindex="0">库存API真查</span></td><td>生成内容中的承诺需真实API验证</td></tr>
+                <tr><td><span class="term" data-term-id="decoding-constraint" tabindex="0">解码约束</span></td><td>对抗样本绕过规则的多层防御</td></tr>
+                <tr><td><span class="term" data-term-id="memory-tiered" tabindex="0">私域记忆分层</span></td><td>System/Profile/Session三层隔离</td></tr>
+                <tr><td><span class="term" data-term-id="role-ooc" tabindex="0">角色OOC</span></td><td>超出角色行为的检测和拦截</td></tr>
+                <tr><td>Unicode归一化</td><td>NFKC归一化对抗Unicode变体</td></tr>
+                <tr><td>Base64检测</td><td>解码Base64内容做安全检测</td></tr>
+                <tr><td>红队测试</td><td>上线前模拟攻击验证防御</td></tr>
+                <tr><td>承诺性声明</td><td>LLM输出的确定性承诺必须验证</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>AI生成内容中「有货」「包邮」「明天到」这类承诺怎么处理？技术方案有哪些？</li>
+              <li>用户用Unicode和Base64绕过敏感词检测，你的防御方案是什么？</li>
+              <li>记忆分层中，如何防止短期记忆污染System Prompt？OOC检测的触发条件是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一章：<a href="#ch-advanced-01-compliance">权限、审计与多租户</a></p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.python.org/3/library/unicodedata.html" target="_blank">Python Unicode数据处理</a></li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy" target="_blank">Content Security Policy</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol class="steps steps-operate">
+      <li>模拟LLM生成了「此商品库存充足，立即下单」的文案，用API真查守卫替换。</li>
+      <li>构造5个对抗样本，验证防御系统能否全部拦截。</li>
+      <li>实现三层记忆存储，验证System Prompt不被短期记忆覆盖。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：生产坑防御系统</h4>
+      <p>目录：<code>demos/practice-06-production-pitfalls-lab/</code>。</p>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,449 @@
+<section id="ch-practice-01-dataset-pipeline" class="chapter" data-chapter="practice-01-dataset-pipeline">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>数据集构建管线实战</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-dataset-pipeline" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>55 分钟</strong> · 阶段：<strong>双栈实践</strong> · 能力：用 Python 搭建完整的语料清洗与训练流水线</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>前几章讲了 SFT/LoRA 原理和语料清洗的理论，本章将这些付诸实践。你将用 Python + Hugging Face 构建一个完整的 <span class="term" data-term-id="lora-pipeline" tabindex="0">LoRA 训练流水线</span>：从 JSONL 加载、字段映射、Tokenize 到 Trainer 训练，最终产出 <span class="term" data-term-id="adapter-artifact" tabindex="0">adapter artifact</span> 并上传到 <span class="term" data-term-id="wandb-log" tabindex="0">W&B</span> 记录实验。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="hf-trainer" tabindex="0">HFTrainer</span> + PEFT 跑通 LoRA 训练全流程</li>
+          <li>配置 <span class="term" data-term-id="train-script" tabindex="0">train script</span>：参数、回调、checkpoint 保存</li>
+          <li>用 <span class="term" data-term-id="wandb-log" tabindex="0">W&B</span> 记录训练曲线，用 <span class="term" data-term-id="checkpoint-save" tabindex="0">checkpoint</span> 实现训练中断恢复</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>流水线 > 脚本</strong>：可复现的流水线比一次性脚本重要 10 倍。</li>
+          <li><strong>Tokenize 是关键</strong>：数据格式必须匹配模型 chat template，否则 loss 异常。</li>
+          <li><strong>实验追踪不可省</strong>：没有 W&B/MLflow 记录，你无法知道哪个超参组合最好。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>流水线架构概览</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 语料 → 训练 → 产出（120 秒）</span>
+        CorpAssist 数据团队交付了清洗后的 2000 条 JSONL 语料（corpassist_v2_scrubbed.jsonl）。你需要跑通一条从「加载语料」到「产出 LoRA adapter」的完整流水线，记录实验参数和训练曲线，并将 adapter 保存到制品库。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>Python LoRA 训练流水线</h5>
+        <pre class="mermaid">flowchart LR
+    JSONL[JSONL 语料] --> Load[load_dataset]
+    Load --> Map[字段映射\nchat template]
+    Map --> Tokenize[Tokenize + 打包]
+    Tokenize --> Trainer[SFTTrainer]
+    Trainer --> Log[W&B 记录]
+    Trainer --> CKPT[Checkpoint 保存]
+    CKPT --> Merge[合并 Adapter]
+    Merge --> Upload[上传至 HF/DashScope]
+
+    style JSONL fill:#4A90D9,color:#fff
+    style Trainer fill:#D2691E,color:#fff
+    style Upload fill:#228B22,color:#fff</pre>
+        <p class="diagram-caption">完整的训练流水线包含 7 个环节，每个环节都可独立调试。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>数据集加载与字段映射</h3>
+
+      <p>Hugging Face <span class="term" data-term-id="hf-trainer" tabindex="0">Datasets</span> 库原生支持 JSONL 加载。关键步骤是<strong>字段映射</strong>：将 JSONL 中的 instruction/input/output 转换成模型 chat template 格式。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># load_dataset.py — 加载并映射 JSONL 到 chat format
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+model_name = "Qwen/Qwen2.5-7B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+def format_corpassist(example):
+    """将 JSONL 三字段映射为 chat template 格式"""
+    instruction = example.get("instruction", "")
+    input_text = example.get("input", "")
+    output = example.get("output", "")
+
+    # 构建 messages 格式
+    user_content = f"{instruction}: {input_text}" if input_text else instruction
+    messages = [
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": output},
+    ]
+    # 用 tokenizer.apply_chat_template 格式化
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False,
+    )
+    return {"text": text}
+
+# 加载 JSONL
+dataset = load_dataset("json", data_files="data/corpassist_v2_scrubbed.jsonl")
+# 映射格式
+dataset = dataset.map(format_corpassist)
+# 分割 train/val
+dataset = dataset["train"].train_test_split(test_size=0.1, seed=42)
+print(f"Train: {len(dataset['train'])}, Val: {len(dataset['test'])}")
+print(f"Example:\n{dataset['train'][0]['text'][:200]}...")</pre></code>
+      </div>
+
+      <h4>Chat Template 说明</h4>
+      <p>不同模型的 chat template 不同。Qwen2.5 的 template 会添加 <code><|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n...<|im_end|></code> 等特殊 token。必须使用 <code>apply_chat_template</code> 方法而不是手动拼接，否则 loss 计算会包含特殊 token 导致训练异常。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>完整训练脚本</h3>
+
+      <p><span class="term" data-term-id="train-script" tabindex="0">训练脚本</span> 是流水线的核心。使用 <code>SFTTrainer</code> 可以简化大量样板代码。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># train_lora.py — CorpAssist LoRA 训练全流程
+import os, torch, json
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer,
+    TrainingArguments, BitsAndBytesConfig,
+)
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer
+
+# ---- 配置 ----
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+DATA_PATH = "data/corpassist_v2_scrubbed.jsonl"
+OUTPUT_DIR = "./outputs/corpassist-lora-v1"
+
+# ---- 1. 加载 Tokenizer ----
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.padding_side = "right"
+
+# ---- 2. 加载 Base Model（4-bit QLoRA） ----
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_quant_type="nf4",
+)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map="auto",
+    torch_dtype=torch.bfloat16,
+)
+
+# ---- 3. LoRA 配置 ----
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()  # 应显示 ~0.2% 参数可训练
+
+# ---- 4. 加载数据集 ----
+def format_fn(examples):
+    texts = []
+    for inst, inp, out in zip(
+        examples["instruction"], examples["input"], examples["output"]
+    ):
+        user_content = f"{inst}: {inp}" if inp else inst
+        messages = [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": out},
+        ]
+        texts.append(tokenizer.apply_chat_template(messages, tokenize=False))
+    return {"text": texts}
+
+dataset = load_dataset("json", data_files=DATA_PATH)
+dataset = dataset.map(format_fn, batched=True)
+dataset = dataset["train"].train_test_split(test_size=0.1, seed=42)
+
+# ---- 5. Training Arguments ----
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    learning_rate=2e-4,
+    warmup_steps=20,
+    num_train_epochs=3,
+    logging_steps=10,
+    save_steps=100,           # 每 100 步保存 checkpoint
+    save_total_limit=2,       # 最多保留 2 个 checkpoint
+    evaluation_strategy="steps",
+    eval_steps=100,
+    bf16=True,
+    report_to="wandb",        # 记录到 W&B
+    run_name="corpassist-lora-v1",
+    remove_unused_columns=False,
+)
+
+# ---- 6. SFTTrainer ----
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["test"],
+    tokenizer=tokenizer,
+    args=training_args,
+    dataset_text_field="text",
+    max_seq_length=2048,
+)
+
+# ---- 7. 训练 ----
+trainer.train()
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+print(f"模型保存至: {OUTPUT_DIR}")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>实验追踪：W&B 集成</h3>
+
+      <p><span class="term" data-term-id="wandb-log" tabindex="0">W&B 实验追踪</span> 是生产环境必不可少的环节。它记录每次训练的超参、loss 曲线、学习率和显存占用，便于对比不同实验。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>训练脚本里 print loss 就完事</li>
+            <li>超参先写死在代码里，不用 config 文件</li>
+            <li>不看 loss 曲线，只看最终 loss 判断模型好坏</li>
+            <li>多个实验没有统一追踪，靠文件名区分</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>W&B 或 MLflow 记录每次实验</li>
+            <li>超参写在 YAML config 中，用 argparse 加载</li>
+            <li>观察 loss 曲线的收敛趋势和过拟合拐点</li>
+            <li>实验标签化（语料版本 + 超参缩写）</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># wandb_config.py — W&B 初始化与超参记录
+import wandb
+import yaml
+
+def init_wandb(config_path: str):
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    run = wandb.init(
+        project="corpassist-ft",
+        name=config["run_name"],
+        config=config,
+        tags=["lora", "qwen2.5-7b", "v2-corpus"],
+    )
+    return run
+
+# 使用示例
+# yaml config:
+# run_name: corpassist-lora-v2
+# model: Qwen/Qwen2.5-7B-Instruct
+# lora_r: 16
+# lora_alpha: 32
+# learning_rate: 2e-4
+# batch_size: 16
+# epochs: 3</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Checkpoint 保存与恢复</h3>
+
+      <p><span class="term" data-term-id="checkpoint-save" tabindex="0">Checkpoint 保存</span> 是训练可靠性的重要保障。SFTTrainer 支持自动 checkpoint，训练中断后可从最新 checkpoint 恢复。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 从 checkpoint 恢复训练
+python train_lora.py --resume_from_checkpoint ./outputs/corpassist-lora-v1/checkpoint-500
+
+# 查看训练曲线（CLI）
+wandb online
+# 然后打开 W&B 网页查看</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># checkpoint_callback.py — 自定义保存策略
+from transformers import TrainerCallback
+
+class CustomSaveCallback(TrainerCallback):
+    """在 eval loss 新低时额外保存"""
+    def __init__(self, output_dir):
+        self.best_loss = float("inf")
+        self.output_dir = output_dir
+
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
+        eval_loss = metrics.get("eval_loss")
+        if eval_loss and eval_loss < self.best_loss:
+            self.best_loss = eval_loss
+            print(f"New best eval loss: {eval_loss:.4f}, saving...")
+            # 保存最佳 checkpoint
+            kwargs["model"].save_pretrained(
+                f"{self.output_dir}/best-checkpoint"
+            )</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>产物管理：Adapter 保存与上传</h3>
+
+      <p><span class="term" data-term-id="adapter-artifact" tabindex="0">Adapter artifact</span> 是训练的最终产物。一个 LoRA adapter 包含：</p>
+      <ul>
+        <li><code>adapter_config.json</code> — LoRA 超参（r, alpha, target_modules）</li>
+        <li><code>adapter_model.safetensors</code> — 适配器权重（~16MB for 7B r=16）</li>
+        <li><code>tokenizer_config.json</code> 和 <code>tokenizer.json</code></li>
+      </ul>
+
+      <p>生产环境中，adapter 应该上传到模型注册中心而非留在本地。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># upload_adapter.py — 上传 adapter 到 Hugging Face Hub
+from huggingface_hub import HfApi
+
+api = HfApi()
+adapter_path = "./outputs/corpassist-lora-v1"
+repo_id = "corp-ai/corpassist-tone-v1-lora"
+
+api.create_repo(repo_id, private=True, exist_ok=True)
+api.upload_folder(
+    folder_path=adapter_path,
+    repo_id=repo_id,
+    repo_type="model",
+    commit_message="CorpAssist 话术 LoRA v1 - 基于 Qwen2.5-7B",
+)
+print(f"已上传至: https://huggingface.co/{repo_id}")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>流水线结构</strong>：加载 → 映射 → Tokenize → 训练 → 保存 → 上传。</li>
+        <li><strong>字段映射</strong>：必须用 apply_chat_template 而非手动拼接。</li>
+        <li><strong>SFTTrainer</strong>：简化 SFT 训练，内置 LoRA 支持和 W&B 集成。</li>
+        <li><strong>实验追踪</strong>：W&B 记录超参和训练曲线，便于对比。</li>
+        <li><strong>Checkpoint</strong>：自动保存 + 断点恢复 + 最佳模型保留。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="domain-model-adaptation_practice01">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pipeline-steps" /> 能画出训练流水线 7 个环节</label></li>
+          <li><label><input type="checkbox" data-id="chat-template" /> 能解释 apply_chat_template 的必要性</label></li>
+          <li><label><input type="checkbox" data-id="sft-trainer" /> 能用 SFTTrainer + LoRA 写出完整训练脚本</label></li>
+          <li><label><input type="checkbox" data-id="wandb" /> 能配置 W&B 记录实验</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="peft-train" tabindex="0">peft train</span></td><td>PEFT 参数效率微调全流程</td></tr>
+                <tr><td><span class="term" data-term-id="hf-trainer" tabindex="0">hf trainer</span></td><td>Hugging Face Trainer 封装训练循环</td></tr>
+                <tr><td><span class="term" data-term-id="lora-pipeline" tabindex="0">lora pipeline</span></td><td>JSONL → LoRA adapter 的完整流水线</td></tr>
+                <tr><td><span class="term" data-term-id="train-script" tabindex="0">train script</span></td><td>可复现的训练脚本，YAML 配置超参</td></tr>
+                <tr><td><span class="term" data-term-id="adapter-artifact" tabindex="0">adapter artifact</span></td><td>LoRA 产出物：~16MB，含 config + weights</td></tr>
+                <tr><td><span class="term" data-term-id="wandb-log" tabindex="0">wandb log</span></td><td>W&B 实验追踪，记录超参和曲线</td></tr>
+                <tr><td><span class="term" data-term-id="checkpoint-save" tabindex="0">checkpoint save</span></td><td>自动保存 + 断点恢复</td></tr>
+                <tr><td><span class="term" data-term-id="python-ft" tabindex="0">python ft</span></td><td>Python 双栈微调的第一栈</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>描述一次你用 Python + HF 做 LoRA 训练的经历，遇到过什么问题？</li>
+              <li>训练 loss 正常下降但 eval loss 上升，你怎么排查？</li>
+              <li>如果训练中途 OOM，你会调整哪些参数？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一章 <a href="#ch-practice-02-dashscope-custom">DashScope 微调实战</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://huggingface.co/docs/transformers/main/en/trainer" target="_blank" rel="noopener">HF Trainer 文档</a></li>
+      <li><a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">PEFT 文档</a></li>
+      <li><a href="https://huggingface.co/docs/trl/sft_trainer" target="_blank" rel="noopener">TRL SFTTrainer 文档</a></li>
+      <li><a href="https://docs.wandb.ai/" target="_blank" rel="noopener">W&B 实验追踪</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol class="steps steps-operate">
+      <li>基于 corpassist_v2_scrubbed.jsonl 运行完整训练脚本。</li>
+      <li>对比 r=8 和 r=32 两组实验的 loss 曲线。</li>
+      <li>从 checkpoint-500 恢复训练并完成剩余 epoch。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：数据集构建管线实战</h4>
+      <p>目录：<code>demos/practice-01-dataset-pipeline-lab/</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-02-dashscope-custom">DashScope 微调实战</a></li>
+      <li><a href="https://huggingface.co/docs/trl">TRL 文档</a></li>
+    </ul>
+  </div>
+</section>

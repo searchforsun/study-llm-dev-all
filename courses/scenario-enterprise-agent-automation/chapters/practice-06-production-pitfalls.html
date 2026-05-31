@@ -3,43 +3,346 @@
   <button type="button" class="btn-mark-done" data-chapter="practice-06-production-pitfalls" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：观察循环、步数/返回长度预算、假执行检测、记忆分层</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>S3 四大生产坑专章。</p></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：诊断并修复观察循环缺失、步数/返回长度预算超标、工具假执行、记忆分层与溢出</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>S3 四大生产坑专章。Agent 上线后的绝大多数故障都集中在规划（无观察循环）、工具（假执行）、记忆（无限堆积）和预算（无限制）这四个方面。本章带你逐个排查并修复。</p></div>
       <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S3 办公自动化场景端到端落地</li>
-        <li>贯通 LangGraph 与 Spring AI Alibaba 双栈 Agent</li>
-        <li>完成 Demo 与测验</li></ul></div>
+        <li>强制 ReAct 循环中有观察步骤</li>
+        <li>配置步数预算和返回长度上限</li>
+        <li>实现工具假执行检测</li>
+        <li>设计记忆分层和裁剪策略</li>
+      </ul></div>
     </div>
-    <div class="section-block"><h3>观察循环与预算</h3><p>每步必须 observe；工具返回截断 2k tokens。 关联：<span class="term" data-term-id="observe-loop" tabindex="0">observe loop</span>、<span class="term" data-term-id="return-length-cap" tabindex="0">return length cap</span>。</p></div>
-    <div class="section-block"><h3>假执行与记忆</h3><p>校验 tool 真调用；长期记忆摘要。 关联：<span class="term" data-term-id="fake-tool-detect" tabindex="0">fake tool detect</span>、<span class="term" data-term-id="memory-tiering" tabindex="0">memory tiering</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="observe-loop" tabindex="0">observe loop</span> · <span class="term" data-term-id="return-length-cap" tabindex="0">return length cap</span> · <span class="term" data-term-id="fake-tool-detect" tabindex="0">fake tool detect</span> · <span class="term" data-term-id="memory-tiering" tabindex="0">memory tiering</span> · <span class="term" data-term-id="pitfall-s3" tabindex="0">pitfall s3</span> · <span class="term" data-term-id="step-budget-pitfall" tabindex="0">step budget pitfall</span> · <span class="term" data-term-id="tool-verify" tabindex="0">tool verify</span> · <span class="term" data-term-id="memory-prune" tabindex="0">memory prune</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-markdown">## S3 生产坑
-1. 无观察循环 → 强制 ReAct
-2. 工具返回过长 → truncate
-3. 假执行 → 校验 API 响应
-4. 记忆堆积 → 分层+摘要</code></pre></div>
-      <div class="mermaid-wrap"><h5>生产坑：规划、工具与记忆</h5>
-      <pre class="mermaid">flowchart LR
-  User --> Agent[办公 Agent]
-  Agent --> Tools[MCP 工具]
-  Agent --> Human[人工审批]</pre></div>
+
+    <div class="section-block"><h3>坑 1：无观察循环</h3>
+    <p><span class="term" data-term-id="observe-loop" tabindex="0">observe loop</span> 是最常见的生产事故。Agent 规划了 3 步以上任务但不观察中间结果，直接按初始计划执行到底。一旦第一步结果和预期不符，后续步骤全部错误。</p>
+
+    <div class="mermaid-wrap"><h5>有观察 vs 无观察循环</h5>
+    <pre class="mermaid">flowchart LR
+      subgraph Bad[无观察循环 - 错误]
+        Plan[初始计划] --> Act1[行动 1]
+        Act1 --> Act2[行动 2]
+        Act2 --> Act3[行动 3]
+        Act3 --> Output[错误输出]
+      end
+      subgraph Good[每步观察 - 正确]
+        Plan2[初始计划] --> Think1[思考]
+        Think1 --> Act1G[行动 1]
+        Act1G --> Observe1[观察 1]
+        Observe1 -->|调整| Think2[再思考]
+        Think2 --> Act2G[行动 2]
+        Act2G --> Observe2[观察 2]
+        Observe2 -->|完成| OutputG[正确输出]
+      end</pre>
+      <p class="diagram-caption"><span class="term" data-term-id="step-budget-pitfall" tabindex="0">step budget pitfall</span>：无观察循环的 Agent 可能在第一步失败后继续执行。</p>
     </div>
+
+    <p>解决方案：在 LangGraph 中强制每步有条件边，Observe 结果必须影响下一轮的 Think。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># observe_guard.py
+def observe_guard(state) -> str:
+    """强制观察检查：如果没有最新观察结果，不允许继续"""
+    if not state.get("latest_observation"):
+        return "observe_missing_error"
+    # 检查观察结果是否有实质内容
+    obs = state["latest_observation"]
+    if "ERROR" in obs or "失败" in obs:
+        return "observation_failed"
+    if state["step"] >= state["max_steps"]:
+        return "step_limit_exceeded"
+    return "continue"</pre></div>
+
+    <p>在 Spring AI Alibaba 中，通过自定义 ToolCallback 包装器强制校验工具返回结果：</p>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// ObservedToolWrapper.java
+public class ObservedToolWrapper implements ToolCallback {
+    private final ToolCallback delegate;
+
+    @Override
+    public String call(String toolInput) {
+        String result = delegate.call(toolInput);
+        // 校验工具实际调用了（防假执行）
+        if (result == null || result.isEmpty()) {
+            throw new FakeToolCallException(
+                "工具 " + getName() + " 返回空结果，疑似假执行");
+        }
+        return result;
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>坑 2：步数与返回长度预算</h3>
+    <p><span class="term" data-term-id="return-length-cap" tabindex="0">return length cap</span> 控制工具返回结果的长度。如果工具返回 10 万字符的文档，Agent 的上下文会瞬间爆满。<span class="term" data-term-id="step-budget-pitfall" tabindex="0">step budget pitfall</span> 指无步数上限导致的无限循环。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># budget_guard.py
+from typing import Dict, Any
+
+MAX_TOOL_RETURN_CHARS = 2000
+MAX_STEPS = 15
+
+def truncate_tool_return(result: str) -> str:
+    """截断工具返回结果"""
+    if len(result) > MAX_TOOL_RETURN_CHARS:
+        return result[:MAX_TOOL_RETURN_CHARS] + \
+               f"\n... (已截断，共 {len(result)} 字符)"
+    return result
+
+def check_step_budget(state: Dict[str, Any]) -> str:
+    """检查步数预算"""
+    if state["step"] >= MAX_STEPS:
+        return "budget_exceeded"
+    # 检查是否连续重复步骤
+    if len(state["actions"]) >= 3:
+        last_three = state["actions"][-3:]
+        if all(a == last_three[0] for a in last_three):
+            return "repeated_action"
+    return "ok"
+
+class BudgetEnforcedTool:
+    """带预算限制的工具包装器"""
+    def __init__(self, tool_fn, name: str):
+        self.tool_fn = tool_fn
+        self.name = name
+        self.call_count = 0
+
+    def call(self, **kwargs) -> str:
+        self.call_count += 1
+        if self.call_count > 5:  # 单工具调用上限
+            return "TOOL_CALL_LIMIT_EXCEEDED"
+        result = self.tool_fn(**kwargs)
+        return truncate_tool_return(result)</pre></div>
+
+    <p>Java 侧用 Spring AOP 实现：</p>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">@Aspect
+@Component
+public class BudgetAspect {
+    @Around("@annotation(ToolCall)")
+    public Object enforceToolBudget(ProceedingJoinPoint pjp) throws Throwable {
+        String result = (String) pjp.proceed();
+        if (result.length() > 2000) {
+            result = result.substring(0, 2000)
+                + "\n... (truncated, total " + result.length() + " chars)";
+        }
+        return result;
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>坑 3：工具假执行检测</h3>
+    <p><span class="term" data-term-id="fake-tool-detect" tabindex="0">fake tool detect</span> 指 Agent 声称调用了工具但实际没有调用，直接在输出中伪造了工具返回结果。这是 LLM 的 hallucination 在工具层面的表现。<span class="term" data-term-id="tool-verify" tabindex="0">tool verify</span> 通过以下方式检测：</p>
+    <ul>
+      <li><strong>响应签名校验</strong>：工具返回结果必须携带签名或时间戳</li>
+      <li><strong>调用链追踪</strong>：每次工具调用在日志中有唯一 trace_id</li>
+      <li><strong>结果可验证</strong>：工具返回的数据可以通过另一个只读工具交叉验证</li>
+    </ul>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># fake_tool_detector.py
+import hashlib
+import json
+import time
+
+class FakeToolDetector:
+    def __init__(self):
+        self.call_log = []
+
+    def verify_call(self, tool_name: str, args: dict, result: str) -> bool:
+        """验证工具是否真的被调用了"""
+        # 1. 检查结果格式是否符合工具契约
+        if not self._validate_schema(tool_name, result):
+            return False
+
+        # 2. 检查结果中的时间戳是否接近当前时间
+        try:
+            data = json.loads(result)
+            ts = data.get("timestamp", 0)
+            if abs(time.time() - ts) > 5:  # 5 秒偏差
+                return False  # 可能是伪造的结果
+        except:
+            pass
+
+        # 3. 验证签名（如果工具有签名机制）
+        if not self._verify_signature(tool_name, result):
+            return False
+
+        self.call_log.append({
+            "tool": tool_name,
+            "args": args,
+            "time": time.time(),
+            "verified": True
+        })
+        return True
+
+    def _validate_schema(self, tool_name: str, result: str) -> bool:
+        contract = tool_registry.get_contract(tool_name)
+        # 检查返回结果是否包含契约中的必需字段
+        for field in contract.required_return_fields:
+            if field not in result:
+                return False
+        return True</pre></div>
+
+    <h4>Java 侧：工具调用签名校验</h4>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// ToolVerificationFilter.java
+@Component
+public class ToolVerificationFilter {
+
+    public String verifyAndCall(ToolCall call) {
+        // 生成调用 ID
+        String callId = UUID.randomUUID().toString();
+
+        // 实际调用工具
+        String result = toolRegistry.call(call.name(), call.args());
+
+        // 在结果中注入调用证据
+        String verifiedResult = result +
+            "\n<!-- tool_call_id: " + callId + " -->";
+
+        // 记录调用日志
+        auditLog.record(callId, call.name(), call.args(), result);
+        return verifiedResult;
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>坑 4：记忆分层与溢出</h3>
+    <p><span class="term" data-term-id="memory-tiering" tabindex="0">memory tiering</span> 解决记忆无限堆积问题。<span class="term" data-term-id="memory-prune" tabindex="0">memory prune</span> 策略包括滑动窗口、摘要归档和时间衰减。</p>
+
+    <table class="outline-table">
+      <thead><tr><th>层级</th><th>容量</th><th>淘汰策略</th><th>存储</th></tr></thead>
+      <tbody>
+        <tr><td>L1: 当前会话</td><td>20 轮 / 4K tokens</td><td>FIFO 滑动窗口</td><td>Redis List</td></tr>
+        <tr><td>L2: 近期摘要</td><td>50 条 / 8K tokens</td><td>LRU + 时间衰减</td><td>Redis String</td></tr>
+        <tr><td>L3: 长期记忆</td><td>无限制</td><td>LLM 摘要 + 向量化</td><td>Vector DB</td></tr>
+      </tbody>
+    </table>
+
+    <div class="learn-compare">
+      <div class="learn-compare-col learn-compare-bad">
+        <span class="learn-compare-heading">记忆坏实践</span>
+        <ul>
+          <li>所有历史消息直接塞入上下文</li>
+          <li>无摘要、无裁剪</li>
+          <li>爆窗后 Agent 行为异常</li>
+        </ul>
+      </div>
+      <div class="learn-compare-col learn-compare-good">
+        <span class="learn-compare-heading">记忆好实践</span>
+        <ul>
+          <li>分层存储：短/中/长期</li>
+          <li>短期溢出后自动摘要归档</li>
+          <li>长期记忆向量化后 RAG 检索</li>
+        </ul>
+      </div>
+    </div>
+
+    <p><span class="term" data-term-id="pitfall-s3" tabindex="0">pitfall s3</span> 总结：四大生产坑的检测和修复都要形成自动化检查项，纳入 CI/CD 流水线。</p>
+
+    <div class="section-block"><h3>自动化巡检：四大坑的 CI/CD 检测</h3>
+    <p>为了避免这些坑反复出现，建议将其自动化检测集成到 CI/CD 流水线中。每次 Agent 代码变更时自动运行以下检查：</p>
+
+    <table class="outline-table">
+      <thead><tr><th>检查项</th><th>检测方法</th><th>通过标准</th></tr></thead>
+      <tbody>
+        <tr><td>Observe Loop</td><td>静态分析 Graph 定义，检查每条条件边是否依赖最新 observation</td><td>100% 的边依赖最新观察</td></tr>
+        <tr><td>Step Budget</td><td>检查 max_steps 配置，运行时监控步数消耗</td><td>max_steps ≤ 15</td></tr>
+        <tr><td>Fake Tool</td><td>在每个 ToolCallback 中注入 mock 验证器</td><td>工具调用覆盖率达到 100%</td></tr>
+        <tr><td>Memory Overflow</td><td>测试长会话（50+ 轮）后的 Token 消耗</td><td>Token 增长曲线收敛</td></tr>
+      </tbody>
+    </table>
+
+    <p>将这些检查写入 GitHub Actions 或 GitLab CI：</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-yaml"># .github/workflows/agent-ci.yml
+name: Agent Quality Gate
+on: [pull_request]
+
+jobs:
+  pitfall-detection:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Observe Loop
+        run: python scripts/check_observe_loop.py chapters/
+      - name: Check Step Budget
+        run: python scripts/check_step_budget.py --max-steps=15
+      - name: Fake Tool Simulation
+        run: python -m pytest tests/test_fake_tool_detection.py -v
+      - name: Memory Overflow Test
+        run: python -m pytest tests/test_memory_overflow.py --session-length=50</pre></div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>观察循环、步数/返回长度预算、假执行检测、记忆分层</li>
-    <li>下一步：可靠性：重试、熔断与人工兜底</li></ul></div>
+    <ul class="chapter-conclusions-list">
+      <li>无观察循环：强制每步有条件边，Observe 影响下一轮 Think</li>
+      <li>步数预算：max_steps 硬限制 + 连续重复步骤检测</li>
+      <li>返回长度预算：工具结果截断 + 签名校验防止假执行</li>
+      <li>工具假执行：响应签名、调用链追踪、交叉验证</li>
+      <li>记忆溢出：分层存储 + 滑动窗口 + 摘要归档</li>
+    </ul></div>
+
+    <div class="section-block"><h3>常见问题（FAQ）</h3>
+    <div class="learn-faq">
+      <details><summary>工具假执行是 LLM 的问题还是我们代码的问题？</summary><div class="learn-faq-body">两者都有。LLM 可能「编造」工具结果，但代码层可以通过强制验证（签名、时间戳、追踪链）来检测和阻断。修复重点在代码层。</div></details>
+      <details><summary>截断工具返回结果会不会丢失重要信息？</summary><div class="learn-faq-body">会。所以截断策略是返回摘要 + 截断正文。先让 LLM 看摘要决定是否需要完整内容，需要时再查详情。</div></details>
+      <details><summary>记忆分层的容量参数怎么定？</summary><div class="learn-faq-body">根据模型窗口大小和场景需要。以 32K 窗口为例：system prompt 占 4K、工具返回占 8K、短期记忆占 10K、检索结果占 10K。按这个比例分配。</div></details>
+    </div></div>
+
+    <div class="section-block learn-review-block"><h3>复习与自检</h3>
+    <div class="learn-checklist" data-storage-key="scenario_practice06">
+      <p class="learn-checklist-lead">过关清单</p>
+      <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+      <ul>
+        <li><label><input type="checkbox" data-id="observe" /> 能强制 Agent 每步观察再规划</label></li>
+        <li><label><input type="checkbox" data-id="budget" /> 能给工具调用设步数和长度上限</label></li>
+        <li><label><input type="checkbox" data-id="fake-tool" /> 能检测工具假执行</label></li>
+        <li><label><input type="checkbox" data-id="memory" /> 能设计三层记忆分层策略</label></li>
+        <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+      </ul>
+    </div>
+
+    <div class="learn-cheat-sheet"><details><summary>本章速查卡</summary><div class="learn-cheat-body"><table>
+      <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term" data-term-id="observe-loop" tabindex="0">observe loop</span></td><td>必须观察再执行下一步</td></tr>
+        <tr><td><span class="term" data-term-id="return-length-cap" tabindex="0">return length cap</span></td><td>工具返回长度上限</td></tr>
+        <tr><td><span class="term" data-term-id="fake-tool-detect" tabindex="0">fake tool detect</span></td><td>检测 Agent 是否假调工具</td></tr>
+        <tr><td><span class="term" data-term-id="memory-tiering" tabindex="0">memory tiering</span></td><td>记忆三层分层架构</td></tr>
+        <tr><td><span class="term" data-term-id="pitfall-s3" tabindex="0">pitfall s3</span></td><td>S3 生产四大坑</td></tr>
+        <tr><td><span class="term" data-term-id="step-budget-pitfall" tabindex="0">step budget pitfall</span></td><td>步数预算耗尽</td></tr>
+        <tr><td><span class="term" data-term-id="tool-verify" tabindex="0">tool verify</span></td><td>工具调用真实性验证</td></tr>
+        <tr><td><span class="term" data-term-id="memory-prune" tabindex="0">memory prune</span></td><td>记忆裁剪与归档</td></tr>
+      </tbody>
+    </table></div></details></div>
+
+    <div class="learn-interview"><details><summary>答辩 / 面试口述题</summary><div class="learn-interview-body"><ol>
+      <li>线上 Agent 突然开始无限重复调用同一个工具，你怎么排查和修复？</li>
+      <li>怎么判断工具返回结果是 LLM 伪造的还是真实 API 返回的？代码层有几种检测手段？</li>
+      <li>Agent 跑了一周后 Token 消耗涨了 10 倍，你会从哪些方面定位原因？</li>
+    </ol></div></details></div>
+    </div>
   </div>
+
   <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a></li>
-    <li><a href="https://java2ai.com/docs/dev/models/dashScope/" target="_blank" rel="noopener">Spring AI Alibaba</a></li>
+    <li><a href="https://langchain-ai.github.io/langgraph/concepts/agentic_concepts/" target="_blank" rel="noopener">LangGraph — Agentic 概念</a></li>
+    <li><a href="https://java2ai.com/docs/dev/tutorials/agent/react/" target="_blank" rel="noopener">Spring AI Alibaba ReactAgent</a></li>
+    <li><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct: Reasoning and Acting</a></li>
   </ul></div>
+
   <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-06-production-pitfalls-lab/</code></li>
-  <li>写一条 S3 Agent 落地笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：生产坑：规划、工具与记忆</h4>
-  <p><code>demos/practice-06-production-pitfalls-lab/</code> — 填两行 pitfall</p></div></div>
+  <ol class="steps steps-operate">
+    <li>编写一个 Observe Guard 函数，强制 ReAct 循环每步观察</li>
+    <li>实现工具返回结果截断（2000 字符上限）</li>
+    <li>设计验证工具是否被真实调用的检测代码</li>
+    <li>完成 <code>demos/practice-06-production-pitfalls-lab/</code></li>
+  </ol>
+  <div class="demo-box"><h4 class="demo-box-title">Demo：生产坑排查</h4><p><code>demos/practice-06-production-pitfalls-lab/</code> — 填写 pitfall-fixes.md 修复方案。</p></div></div>
+
   <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-advanced-01-reliability">可靠性：重试、熔断与人工兜底</a></li>
+    <li><strong>下一章</strong>：<a href="#ch-advanced-01-reliability">可靠性工程</a></li>
+    <li><a href="https://arxiv.org/abs/2310.01461" target="_blank" rel="noopener">Chain-of-Thought 幻觉研究</a></li>
   </ul></div>
 </section>

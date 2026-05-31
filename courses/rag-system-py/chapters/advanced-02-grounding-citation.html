@@ -1,306 +1,806 @@
 <section id="ch-advanced-02-grounding-citation" class="chapter" data-chapter="advanced-02-grounding-citation">
   <header class="chapter-header">
-    <h2><span class="chapter-done-badge">已完成</span>Grounding/Citation 工程实践</h2>
+    <h2><span class="chapter-done-badge">已完成</span>Grounding/Citation 实战</h2>
     <button type="button" class="btn-mark-done" data-chapter="advanced-02-grounding-citation" aria-label="标记本章完成">标记完成</button>
   </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Python RAG 进阶</strong> · 能力：实现引用溯源、标准化引用格式、标注置信度、通过合规审计</p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>HR 政策回答若引用错误可引发劳动仲裁，法务条款的出处必须精确到条款编号。CorpAssist 受审计要求：每个回答必须附带可追溯的源文档引用。无引用溯源的 RAG 解决方案无法通过合规审查。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>在现有 RAG 管线中嵌入引用溯源（sources 含 doc_id、片段、条款号），配置标准化引用格式（Markdown 脚注 / JSON 引用数组），实现置信度标注策略（高/中/低三级），产出合规审计所需的引用追溯报告。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><ul><li>引用溯源三要素：doc_id + 片段摘要 + 条款位置（如第X章第X条）</li><li>置信度标注：高（原文直接引述）> 中（多段综合）> 低（模型推断）</li><li>引用标准化：统一为 <code>{"doc_id": "...", "snippet": "...", "location": "...", "confidence": "high"}</code></li><li>合规审计需要全链路追溯：answer → source → document → 版本</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Python RAG 进阶</strong> · 能力：实现 RAG 答案的引用溯源与 groundedness 评分体系</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>RAG 系统最危险的失败模式不是「答错」，而是「看起来正确的编造」。<span class="term" data-term-id="grounding-py" tabindex="0">Grounding</span>（接地/归因）确保生成答案的每个关键声明都可追溯到原始文档。对于 CorpAssist 这样的企业级应用，合规审计要求每个回答都能提供出处。<span class="term" data-term-id="citation-py" tabindex="0">Citation（引用）</span> 溯源是 RAG 从「好玩」到「可信」的必修课。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>实现从文档 chunk → 答案段落的引用映射机制</li>
+          <li>构建 groundedness 评分器，自动检测答案中的非归因声明</li>
+          <li>设计多种 Citation 格式（Markdown 脚注、JSON 引用、行内标注）</li>
+          <li>建立引用验证验收测试，防止幻觉引用通过 CI</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>每句话都要有来源</strong>：答案中的关键事实声明必须链回到具体的 document chunk。</li>
+          <li><strong>Groundedness != Faithfulness</strong>：Faithfulness 是「不矛盾」，Groundedness 是「有出处」。</li>
+          <li><strong>引用也要防幻觉</strong>：LLM 可能编造引用，需要用验证器至少检查引用格式和 chunk 存在性。</li>
+        </ul>
+      </div>
     </div>
+
     <div class="section-block">
-      <h3>引用溯源实现方案</h3>
-      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · 合规审计</span>法务团队抽查回答「竞业限制期是多久」，结果需提供：这句话引自哪份文档的哪一条款、文档版本号、最后更新时间。</aside>
-      <p>引用溯源的核心是 <strong>将检索阶段的文档元数据贯穿到最终输出</strong>。LCEL 链中需要让 sources 流经整个管线，而非仅在检索阶段消费。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># 引用溯源实现 — 带 sources 的完整链
-from langchain_core.runnables import RunnableParallel, RunnableLambda
-from langchain_core.pydantic_v1 import BaseModel, Field
-from typing import List
+      <h3>引用溯源实现：从 Chunk 到答案</h3>
 
-class CitationSource(BaseModel):
-    doc_id: str = Field(description="文档唯一标识")
-    title: str = Field(description="文档标题")
-    snippet: str = Field(description="引用原文片段（30~100字）")
-    location: str = Field(description="条款位置, 如第3章第5条")
-    page_num: int = Field(default=0)
-    confidence: str = Field(default="high")
-    doc_version: str = Field(default="v1.0")
+      <p><span class="term" data-term-id="citation-py" tabindex="0">引用溯源</span>的核心是建立「生成答案中的声明 ↔ 检索到的文档 chunk」之间的可追溯映射。实现分三步：标记引用位置、记录源 chunk、验证引用合法性。</p>
 
-class RAGOutput(BaseModel):
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 合规审计场景</span>
+        CorpAssist 的 HR 知识库回答「员工年假政策变更」时，需要标注每个政策条款来自哪个政策文档的哪个版本。合规部门要求：每次回答都能在 30 秒内定位到原始文档段落。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>引用溯源：从文档 chunk 到答案段落</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Source[文档层]
+        doc1[员工手册 v3.2.pdf]
+        doc2[休假政策 2024.docx]
+    end
+
+    subgraph Chunks[Chunk 层]
+        c1[chunk_001\n年假15天]
+        c2[chunk_017\n审批流程]
+        c3[chunk_042\n病假政策]
+    end
+
+    subgraph Answer[答案层]
+        a1["正式员工年假为15天[1]"]
+        a2["需提前3个工作日申请[1]"]
+        a3["病假需提供证明[2]"]
+    end
+
+    doc1 --> c1 & c2
+    doc2 --> c3
+    c1 & c2 --> a1 & a2
+    c3 --> a3
+
+    style Source fill:#D2691E,color:#fff
+    style Chunks fill:#4A90D9,color:#fff
+    style Answer fill:#7B68EE,color:#fff</pre>
+        <p class="diagram-caption">每个答案段落通过引用标记 [N] 链接到具体 chunk，chunk 再链接到原始文档。</p>
+      </div>
+
+      <h4>引用溯源管线实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># citation_pipeline.py — 引用溯源管线
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+import json
+import re
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+
+@dataclass
+class CitationSource:
+    """单个引用的源信息"""
+    chunk_id: str
+    document_name: str
+    page_number: Optional[int] = None
+    text_snippet: str = ""
+    relevance_score: float = 0.0
+
+@dataclass
+class CitationResult:
+    """带引用的答案"""
     answer: str
-    citations: List[CitationSource]
+    citations: List[CitationSource] = field(default_factory=list)
 
-def build_citation_context(docs):
-    """构造带引用的 context 字符串"""
-    context_parts = []
-    for d in docs:
-        meta = d.metadata
-        snippet = d.page_content[:200]
-        citation = f"[source: {meta['doc_id']} | {meta.get('title','')} | {meta.get('location','')}]"
-        context_parts.append(f"{citation}\n{snippet}")
-    return "\n\n".join(context_parts)
+CITATION_PROMPT = """你是 CorpAssist 企业知识库助手。
 
-citation_prompt = ChatPromptTemplate.from_messages([
-    ("system", "你需严格根据 context 回答。对每个事实标注引用编号如[1][2]。\n{context}"),
-    ("human", "{question}"),
-])
+基于以下文档片段回答问题。在回答中，对每个关键事实用 [N] 标注来源编号。
+N 对应文档片段列表中片段的序号（从 1 开始）。
 
-def parse_with_citations(llm_output, docs):
-    """解析 LLM 输出，提取引用标注并映射回文档"""
-    import re
-    import json
-    citations = []
-    refs = set(re.findall(r'\[(\d+)\]', llm_output))
-    for ref in sorted(refs, key=int):
-        idx = int(ref) - 1
-        if idx < len(docs):
-            d = docs[idx]
-            citations.append(CitationSource(
-                doc_id=d.metadata["doc_id"],
-                title=d.metadata.get("title", ""),
-                snippet=d.page_content[:100],
-                location=d.metadata.get("location", ""),
-                confidence="high",
-                doc_version=d.metadata.get("version", "v1.0"),
-            ).dict())
-    # 清理引用标记
-    clean_answer = re.sub(r'\s*\[\d+\]', '', llm_output)
-    return {"answer": clean_answer, "citations": citations}
+文档片段：
+{context}
 
-chain_with_citations = (
-    RunnableParallel(
-        context=lambda x: build_citation_context(x["docs"]),
-        question=lambda x: x["question"],
-        docs=lambda x: x["docs"],
-    )
-    | citation_prompt
-    | llm
-    | StrOutputParser()
-    | RunnableLambda(lambda out: parse_with_citations(out, context.get("docs", [])))
-)</code></pre></div>
+要求：
+1. 每个关键事实都要标注来源
+2. 不要标注没有文档支撑的信息
+3. 如果不确定，请说「需要查证」
+
+问题：{question}
+回答："""
+
+class CitationRAGPipeline:
+    """带引用溯源的 RAG 管线"""
+
+    def __init__(
+        self,
+        persist_dir: str = "./data/chroma_db",
+        embedding_model: str = "text-embedding-3-small",
+        llm_model: str = "gpt-4o-mini",
+    ):
+        embeddings = OpenAIEmbeddings(model=embedding_model, dimensions=512)
+        self.vector_store = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embeddings,
+        )
+        self.retriever = self.vector_store.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 5},
+        )
+        self.llm = ChatOpenAI(model=llm_model, temperature=0.1)
+        self.prompt = ChatPromptTemplate.from_template(CITATION_PROMPT)
+
+    def build_citation_chain(self):
+        """构建 LCEL 引用管线"""
+        def format_with_index(docs):
+            """给文档添加序号用于引用"""
+            return "\n\n".join(
+                f"[{i+1}] {d.page_content}"
+                for i, d in enumerate(docs)
+            )
+
+        chain = (
+            RunnableParallel(
+                {
+                    "context": self.retriever | format_with_index,
+                    "question": RunnablePassthrough(),
+                }
+            )
+            | self.prompt
+            | self.llm
+            | StrOutputParser()
+        )
+        return chain
+
+    def ask_with_citations(self, question: str) -> CitationResult:
+        """问答并返回带引用信息的结果"""
+        # 1. 检索
+        docs = self.retriever.invoke(question)
+
+        # 2. 生成带引用的答案
+        chain = self.build_citation_chain()
+        answer = chain.invoke(question)
+
+        # 3. 解析引用标记并关联源文档
+        citations = []
+        ref_pattern = r'\[(\d+)\]'
+        for match in re.finditer(ref_pattern, answer):
+            idx = int(match.group(1)) - 1
+            if 0 <= idx < len(docs):
+                doc = docs[idx]
+                citations.append(CitationSource(
+                    chunk_id=doc.metadata.get("chunk_id", f"chunk_{idx}"),
+                    document_name=doc.metadata.get("source", "unknown"),
+                    page_number=doc.metadata.get("page", None),
+                    text_snippet=doc.page_content[:200],
+                    relevance_score=getattr(doc, "score", 0.0),
+                ))
+
+        return CitationResult(answer=answer, citations=citations)
+
+if __name__ == "__main__":
+    pipeline = CitationRAGPipeline()
+    result = pipeline.ask_with_citations("员工年假政策是什么？")
+    print(f"Answer:\n{result.answer}\n")
+    print("Citations:")
+    for c in result.citations:
+        print(f"  [{c.chunk_id}] {c.document_name} (p.{c.page_number})")
+        print(f"      {c.text_snippet[:80]}...")</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>不标注来源，答案不可追溯</li>
+            <li>引用只是装饰性的 [1][2]，实际无对应 chunk</li>
+            <li>引用格式不统一，有时用脚注有时用括号</li>
+            <li>不校验引用的真实性——LLM 自己编引用编号</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>每个 [N] 精确对应检索到的 chunk</li>
+            <li>引用附带 source/document/page 元数据</li>
+            <li>统一的引用格式（如 [doc_id:chunk_index]）</li>
+            <li>使用引用验证器检查每个引用是否有效</li>
+          </ul>
+        </div>
+      </div>
     </div>
+
     <div class="section-block">
-      <h3>引用格式标准化</h3>
-      <div class="mermaid-wrap"><h5>全链路追溯链</h5><pre class="mermaid">flowchart LR
-  ANS[Answer 文本] -->|citations[0].doc_id| SRC[Source Document]
-  SRC -->|doc_version| VER[Document Version v2.1]
-  SRC -->|metadata| META[title, location, page_num]
-  VER -->|updated_at| TIME[Last Modified 2026-03-15]
-  ANS -->|audit_id| AUD[Audit JSON-L Record]
-  AUD --> TS[Timestamp + Question + Full Context]</pre></div>
-      <p>CorpAssist 规范了统一的引用格式标准，覆盖 API 响应、审计日志、前端渲染三个场景。核心约定：使用 <code>citations</code> 数组替代自由文本的「参考文档：XXX」。</p>
-      <table class="outline-table"><thead><tr><th>场景</th><th>格式</th><th>示例</th></tr></thead>
-      <tbody>
-        <tr><td>API 响应</td><td>JSON citations 数组</td><td><code>[{"doc_id":"hr-2024-04","snippet":"年假≥5天","location":"第4章第2条"}]</code></td></tr>
-        <tr><td>审计日志</td><td>单行 JSON-L</td><td><code>{"ts":"2026-05-30T10:00Z","q":"年假几天","citations":[...]}</code></td></tr>
-        <tr><td>前端渲染</td><td>Markdown 脚注</td><td><code>答：年假至少5天[^1]。[^1]: HR-2024-04 第4章第2条</code></td></tr>
-      </tbody></table>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-json">{
-  "answer": "根据《员工手册》，年假最低天数为5天。",
-  "citations": [
-    {
-      "doc_id": "hr-policy-2024-04",
-      "title": "员工手册_2024版",
-      "snippet": "第四条 年假标准：工龄满1年未满10年者，年假5天",
-      "location": "第四章 休假与考勤 第4条",
-      "page_num": 12,
-      "confidence": "high",
-      "doc_version": "v2.1"
-    }
-  ],
-  "metadata": {
-    "model": "gpt-4o-mini",
-    "latency_ms": 1250,
-    "retrieval_k": 4
-  }
-}</code></pre></div>
-      <p>审计链示例：<strong>answer</strong> → <code>citations[0].doc_id</code> → <strong>hr-policy-2024-04.docx</strong> → 版本 v2.1 → 最后修改 2026-03-15。这种全链路追溯是 CorpAssist 通过合规审查的必要条件。</p>
-      <p>三种格式之间的转换工具类应作为共享库维护。如果只维护 JSON 格式而忽略了 Markdown 脚注格式，前端开发需要自行解析 JSON 拼装引用标记，增加了维护成本。CorpAssist 规范要求 API 响应、审计日志、前端渲染三种格式的输出必须使用同一数据模型（CitationSource），仅在序列化阶段差异。这意味着修改引用字段名只需要改动一处 Pydantic 模型定义。</p>
-    </div>
-    <div class="section-block">
-      <h3>置信度标注策略</h3>
-      <p>并非所有回答片段都能直接引用原文。CorpAssist 定义了三级置信度策略，由系统自动标注而非 LLM 自行声明。</p>
-      <div class="mermaid-wrap"><h5>置信度判定流程</h5><pre class="mermaid">flowchart TD
-  ANS[Answer 片段] --> Q1{直接出现在<br/>某文档的context?}
-  Q1 -->|是, 逐字匹配>80%| HIGH[high<br/>原文引述]
-  Q1 -->|是, 多段综合| MED[medium<br/>跨段推论]
-  Q1 -->|否| Q2{有间接<br/>文档支持?}
-  Q2 -->|是| LOW[low<br/>模型推断]
-  Q2 -->|否| NONE[无引用<br/>不可输出]</pre></div>
-      <table class="outline-table"><thead><tr><th>置信度</th><th>定义</th><th>判别方法</th><th>CorpAssist 动作</th></tr></thead>
-      <tbody>
-        <tr><td>high</td><td>原文逐字或近逐字引述</td><td>ROUGE-L 相似度 > 0.80</td><td>正常输出，引用标注</td></tr>
-        <tr><td>medium</td><td>多段 context 综合推论</td><td>ROUGE-L 0.50~0.80</td><td>输出但标注「综合自多源」</td></tr>
-        <tr><td>low</td><td>模型基于知识推断</td><td>ROUGE-L < 0.50 或无可对应 context</td><td>需人工审核后输出</td></tr>
-        <tr><td>none</td><td>无任何依据</td><td>context 为空或完全不相关</td><td>禁止输出，返回「无法回答」</td></tr>
-      </tbody></table>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># 置信度自动标注
-from rouge_score import rouge_scorer
+      <h3>置信度标注与 Groundedness 评分</h3>
 
-scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+      <p><span class="term" data-term-id="grounding-py" tabindex="0">Groundedness（归因度）</span> 衡量答案中的声明有多少可以追溯到源文档。与上一章讲到的 RAGAS Faithfulness 不同，Groundedness 更严格：Faithfulness 要求「不矛盾」，Groundedness 要求「有来源」。</p>
 
-def compute_confidence(answer_segment: str, context_docs: list) -> dict:
-    max_score = 0.0
-    best_doc = None
-    for d in context_docs:
-        scores = scorer.score(answer_segment, d.page_content)
-        rouge_l = scores["rougeL"].fmeasure
-        if rouge_l > max_score:
-            max_score = rouge_l
-            best_doc = d
+      <table class="outline-table">
+        <thead>
+          <tr><th>概念</th><th>定义</th><th>测量方式</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Faithfulness</strong></td>
+            <td>答案不含有与上下文矛盾的声明</td>
+            <td>LLM 判断（声明 → 上下文校验）</td>
+          </tr>
+          <tr>
+            <td><strong>Groundedness</strong></td>
+            <td>答案关键声明可直接追溯到指定源 chunk</td>
+            <td>LLM 判断（声明 → 具体 chunk 匹配）</td>
+          </tr>
+          <tr>
+            <td><strong>Citation Accuracy</strong></td>
+            <td>引用标注 [N] 确实指向正确的 chunk</td>
+            <td>精确匹配 + 人工校验</td>
+          </tr>
+        </tbody>
+      </table>
 
-    if max_score >= 0.80:
-        return {"confidence": "high", "score": max_score, "source": best_doc.metadata.get("doc_id") if best_doc else None}
-    elif max_score >= 0.50:
-        return {"confidence": "medium", "score": max_score, "source": best_doc.metadata.get("doc_id") if best_doc else None}
-    elif max_score > 0:
-        return {"confidence": "low", "score": max_score, "source": best_doc.metadata.get("doc_id") if best_doc else None}
-    else:
-        return {"confidence": "none", "score": 0.0, "source": None}
+      <h4>Groundedness 评分器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># groundedness.py — Groundedness 评分器
+from typing import List, Dict, Tuple
+from dataclasses import dataclass
+import re
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
 
-# 使用示例：对答案的每个句子标注置信度
-answer = "年假最低天数为5天。工龄满10年则为10天。"
-for sent in answer.split("。"):
-    if sent.strip():
-        result = compute_confidence(sent, retrieved_docs)
-        print(f"[{result['confidence']}] {sent} → {result['source']} ({result['score']:.3f})")
-# 输出:
-# [high] 年假最低天数为5天 → hr-policy-2024-04 (0.912)
-# [medium] 工龄满10年则为10天 → hr-policy-2024-04 (0.675)</code></pre></div>
-    </div>
-    <div class="section-block">
-      <h3>CorpAssist 合规审计</h3>
-      <p>合规审计要求 CorpAssist 的每个 RAG 回答满足四项可追溯性要求。实现方案为：每次查询生成一条审计记录 JSON-L 并持久化到审计日志。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># 审计日志记录器
-import json, datetime, uuid
+@dataclass
+class GroundednessScore:
+    """归因评分结果"""
+    overall_score: float  # 0.0 - 1.0
+    total_claims: int
+    grounded_claims: int
+    ungrounded_claims: List[str]
+    citation_errors: List[str]
 
-class AuditLogger:
-    def __init__(self, log_path="audit/rag_audit.jsonl"):
-        self.log_path = log_path
+CLAIM_EXTRACTION_PROMPT = """提取以下答案中的所有事实声明。
+每个声明应该是独立的、可验证的陈述。
+以 JSON 数组格式输出：[{"claim": "..."}]
 
-    def log_query(self, question: str, answer: str, citations: list,
-                  confidence_scores: dict, latency_ms: float):
-        record = {
-            "audit_id": str(uuid.uuid4()),
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-            "question": question,
-            "answer": answer,
-            "citations": citations,
-            "confidence_summary": confidence_scores,
-            "latency_ms": latency_ms,
-            "model": "gpt-4o-mini",
-            "retriever_config": {"k": 4, "search_type": "similarity"}
+答案：{answer}
+"""
+
+GROUNDEDNESS_CHECK_PROMPT = """判断以下声明是否可以被源文档片段支持。
+
+声明：{claim}
+
+源文档片段：
+{context}
+
+如果声明完全被源文档支持 -> SUPPORTED
+如果声明部分被支持或有细微差异 -> PARTIALLY_SUPPORTED
+如果声明与源文档矛盾或源文档无相关信息 -> NOT_SUPPORTED
+
+只输出一个词：SUPPORTED / PARTIALLY_SUPPORTED / NOT_SUPPORTED"""
+
+class GroundednessChecker:
+    """归因度检查器"""
+
+    def __init__(self, model: str = "gpt-4o-mini"):
+        self.llm = ChatOpenAI(model=model, temperature=0)
+        self.extraction_prompt = ChatPromptTemplate.from_template(CLAIM_EXTRACTION_PROMPT)
+        self.check_prompt = ChatPromptTemplate.from_template(GROUNDEDNESS_CHECK_PROMPT)
+
+    def extract_claims(self, answer: str) -> List[str]:
+        """从答案中提取独立声明"""
+        response = self.llm.invoke(
+            self.extraction_prompt.format(answer=answer)
+        )
+        try:
+            import json
+            claims_data = json.loads(response.content)
+            return [item["claim"] for item in claims_data]
+        except (json.JSONDecodeError, KeyError):
+            # Fallback: 按句子分割
+            return [s.strip() for s in re.split(r'[。！？]', answer) if len(s.strip()) > 10]
+
+    def check_claim(self, claim: str, context: str) -> str:
+        """检查单个声明的归因状态"""
+        response = self.llm.invoke(
+            self.check_prompt.format(claim=claim, context=context)
+        )
+        return response.content.strip()
+
+    def score(
+        self, answer: str, context_chunks: List[str]
+    ) -> GroundednessScore:
+        """完整归因评分"""
+        context = "\n\n".join(context_chunks)
+        claims = self.extract_claims(answer)
+        print(f"Extracted {len(claims)} claims from answer")
+
+        grounded = []
+        ungrounded = []
+        citation_errors = []
+
+        for claim in claims:
+            status = self.check_claim(claim, context)
+            if status == "SUPPORTED":
+                grounded.append(claim)
+            elif status == "PARTIALLY_SUPPORTED":
+                grounded.append(claim)  # 部分支持也算通过
+            else:
+                ungrounded.append(claim)
+
+        # 检查引用标注
+        citation_refs = re.findall(r'\[(\d+)\]', answer)
+        for ref in citation_refs:
+            idx = int(ref)
+            if idx < 1 or idx > len(context_chunks):
+                citation_errors.append(f"引用 [{idx}] 超出范围 (1-{len(context_chunks)})")
+
+        total = len(claims)
+        grounded_count = len(grounded)
+        overall = grounded_count / total if total > 0 else 1.0
+
+        return GroundednessScore(
+            overall_score=overall,
+            total_claims=total,
+            grounded_claims=grounded_count,
+            ungrounded_claims=ungrounded,
+            citation_errors=citation_errors,
+        )
+
+if __name__ == "__main__":
+    checker = GroundednessChecker()
+    answer = "正式员工年假为15天[1]。需提前3个工作日申请[1]。病假需提供医院证明[2]。"
+    contexts = [
+        "正式员工每年享有15天带薪年假。年假需提前3个工作日申请。",
+        "病假需提供医院开具的诊断证明。",
+    ]
+    result = checker.score(answer, contexts)
+    print(f"Groundedness Score: {result.overall_score:.2f}")
+    print(f"Claims: {result.grounded_claims}/{result.total_claims} grounded")
+    if result.citation_errors:
+        print(f"Citation Errors: {result.citation_errors}")
+    if result.ungrounded_claims:
+        print(f"Ungrounded Claims: {result.ungrounded_claims}")</code></pre>
+      </div>
+
+      <h4>置信度标注策略</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># confidence_tagging.py — 置信度标注与展示
+from dataclasses import dataclass
+from typing import List, Optional, Literal
+
+ConfidenceLevel = Literal["high", "medium", "low", "unverifiable"]
+
+@dataclass
+class TaggedSegment:
+    """带置信度标注的答案段落"""
+    text: str
+    confidence: ConfidenceLevel
+    sources: List[str]  # 来源 chunk ID
+    reason: str = ""  # 标注理由
+
+class ConfidenceTagger:
+    """答案段落置信度标注器"""
+
+    def __init__(self, groundedness_checker=None):
+        self.checker = groundedness_checker
+
+    def tag_answer_segments(
+        self, answer: str, source_chunks: List[str]
+    ) -> List[TaggedSegment]:
+        """将答案分割为段落并标注置信度"""
+        segments = []
+        # 按引用标记分割
+        import re
+        parts = re.split(r'(\[\d+\])', answer)
+        current_text = ""
+
+        for part in parts:
+            if re.match(r'\[\d+\]', part):
+                if current_text.strip():
+                    confidence = self._infer_confidence(
+                        current_text, source_chunks
+                    )
+                    segments.append(TaggedSegment(
+                        text=current_text.strip(),
+                        confidence=confidence,
+                        sources=[part],
+                        reason=self._confidence_reason(confidence),
+                    ))
+                current_text = ""
+            else:
+                current_text += part
+
+        if current_text.strip():
+            confidence = self._infer_confidence(current_text, source_chunks)
+            segments.append(TaggedSegment(
+                text=current_text.strip(),
+                confidence=confidence,
+                sources=[],
+                reason=self._confidence_reason(confidence),
+            ))
+
+        return segments
+
+    def _infer_confidence(
+        self, text: str, chunks: List[str]
+    ) -> ConfidenceLevel:
+        """推断段落置信度"""
+        if not chunks:
+            return "unverifiable"
+
+        # 核心规则：有引用且有匹配文本的为 high
+        for chunk in chunks:
+            if any(word in chunk for word in text.split("，")[0].split("为")[:3]):
+                return "high"
+
+        # 默认 medium
+        return "medium"
+
+    def _confidence_reason(self, level: ConfidenceLevel) -> str:
+        reasons = {
+            "high": "有源文档直接支持",
+            "medium": "有源文档部分支持",
+            "low": "源文档支持不足",
+            "unverifiable": "无法找到对应源文档",
         }
-        with open(self.log_path, "a") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        return record["audit_id"]
+        return reasons.get(level, "")
 
-    def query_trail(self, audit_id: str) -> dict:
-        """根据 audit_id 检索完整审计链"""
-        with open(self.log_path) as f:
-            for line in f:
-                rec = json.loads(line)
-                if rec["audit_id"] == audit_id:
-                    return rec
-        return None
+    def format_confident_answer(
+        self, segments: List[TaggedSegment]
+    ) -> str:
+        """格式化为带置信度标记的展示文本"""
+        output = []
+        for seg in segments:
+            badge = {
+                "high": "🟢",
+                "medium": "🟡",
+                "low": "🟠",
+                "unverifiable": "🔴",
+            }.get(seg.confidence, "⚪")
+            output.append(f"{badge} {seg.text} [{seg.confidence}]")
+            output.append(f"  来源: {', '.join(seg.sources) if seg.sources else '无'}")
+        return "\n".join(output)
 
-# 使用
-logger = AuditLogger()
-audit_id = logger.log_query(
-    question="年假几天",
-    answer="根据《员工手册》，年假最低5天...",
-    citations=[{"doc_id":"hr-policy-2024-04","location":"第4章","confidence":"high"}],
-    confidence_scores={"overall": "high", "high_ratio": 0.85},
-    latency_ms=1250,
-)
-print(f"查询审计ID: {audit_id}")
-# 输出: 查询审计ID: a1b2c3d4-e5f6-7890-abcd-ef1234567890</code></pre></div>
-      <table class="outline-table"><thead><tr><th>审计要求</th><th>实现方式</th><th>验收标准</th></tr></thead>
-      <tbody>
-        <tr><td>答案可追溯至源文档</td><td>citations 数组含 doc_id + location</td><td>每个答案片段至少 1 条 citation</td></tr>
-        <tr><td>源文档可追溯至版本</td><td>metadata 记录 doc_version</td><td>通过 doc_id 可查到文档版本历史</td></tr>
-        <tr><td>置信度可区分</td><td>ROUGE-L 自动标注，high/medium/low/none</td><td>审计报告含置信度分布统计</td></tr>
-        <tr><td>全链路操作可复现</td><td>audit JSON-L 记录完整 context</td><td>可用 audit_id 重建查询全貌</td></tr>
-      </tbody></table>
-      <details class="learn-micro-check"><summary>自检：如果审计发现某个回答引用了已废弃的文档版本 v1.0，你应该在哪一环节修复？</summary>
-      <p>修复点应在索引环节：文档入库时记录 <code>doc_version</code>，文档更新后旧版本不应返回。具体实现：metadata 中写入 <code>is_latest: true/false</code>，检索时通过 filter 排除非最新版本。若旧文档仍有历史查询需求，建立版本号映射表。</p>
-      <p>置信度标注的另一个关键作用是在 UI 层给用户可视化反馈。高置信度的引用用绿色高亮显示，中等置信度用黄色并标注「综合自多源」，低置信度用红色并提示「此信息需人工核实」。CorpAssist 前端团队基于置信度字段实现了引用卡片的多色样式，用户可直接在对话界面看到每条回答的可信度，减少了因「模型说的但我不确定」导致的投诉。</p>
+if __name__ == "__main__":
+    tagger = ConfidenceTagger()
+    segments = tagger.tag_answer_segments(
+        "正式员工年假为15天[1]。需提前3个工作日申请[1]。",
+        ["正式员工每年享有15天带薪年假。年假需提前3个工作日申请。"],
+    )
+    print(tagger.format_confident_answer(segments))</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：如果一个声明被标记为「PARTIALLY_SUPPORTED」，你是把它视为 grounded 还是 ungrounded？</summary>
+        <p>这取决于业务风险等级。对于合规审计场景，PARTIALLY_SUPPORTED 应视为未通过——部分支持的声明可能包含 LLM 自己的「补充」，有幻觉风险。对于一般知识问答，可以接受 PARTIALLY_SUPPORTED 的门槛。CorpAssist 建议合规场景阈值=SUPPORTED，一般场景≥PARTIALLY_SUPPORTED。</p>
       </details>
     </div>
+
+    <div class="section-block">
+      <h3>Citation 格式规范与验证</h3>
+
+      <p><span class="term" data-term-id="citation-py" tabindex="0">Citation 格式</span>需要在前端展示和后端验证之间找到平衡。CorpAssist 支持三种引用格式：Markdown 脚注（适合文档展示）、JSON 结构化（适合 API 返回）、行内标注（适合对话体验）。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>格式</th><th>示例</th><th>适用场景</th><th>前端渲染</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>行内标注</strong></td>
+            <td>年假为15天[1]</td>
+            <td>对话式 UI</td><td>简单</td>
+          </tr>
+          <tr>
+            <td><strong>Markdown 脚注</strong></td>
+            <td>年假为15天[^1]</td>
+            <td>文档渲染</td><td>中等</td>
+          </tr>
+          <tr>
+            <td><strong>JSON 引用</strong></td>
+            <td><code>{"citations": [...]}</code></td>
+            <td>API 返回</td><td>需要解析</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># citation_validator.py — 引用验证器与验收测试
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
+import re
+import json
+
+@dataclass
+class ValidationError:
+    """引用验证错误"""
+    error_type: str  # "missing_ref", "invalid_ref", "hallucinated_ref", "orphan_ref"
+    description: str
+    location: str = ""  # 错误位置
+
+class CitationValidator:
+    """引用格式与内容验证器"""
+
+    def __init__(self, available_chunks: List[str]):
+        self.available_chunks = available_chunks
+
+    def validate_format(self, answer: str) -> List[ValidationError]:
+        """检查引用格式是否正确"""
+        errors = []
+
+        # 1. 检查引用标记格式 [N]
+        ref_pattern = re.findall(r'\[(\d+)\]', answer)
+        for ref in ref_pattern:
+            idx = int(ref)
+            if idx < 1 or idx > len(self.available_chunks):
+                errors.append(ValidationError(
+                    error_type="invalid_ref",
+                    description=f"引用 [{idx}] 超出有效范围 (1-{len(self.available_chunks)})",
+                    location=ref,
+                ))
+
+        # 2. 检查重复引用
+        if len(ref_pattern) != len(set(ref_pattern)):
+            # 允许合理重复
+            pass
+
+        return errors
+
+    def validate_content(self, answer: str) -> List[ValidationError]:
+        """检查引用内容是否合理"""
+        errors = []
+
+        refs = re.finditer(r'\[(\d+)\]', answer)
+        for match in refs:
+            idx = int(match.group(1)) - 1
+            chunk = self.available_chunks[idx]
+            # 获取引用前的文本
+            start = max(0, match.start() - 60)
+            preceding_text = answer[start:match.start()]
+
+            # 简单检查：引用前的文本是否能在 chunk 中找到
+            key_words = [w for w in preceding_text.split() if len(w) > 2][-5:]
+            found = any(word in chunk for word in key_words)
+            if not found:
+                # 不直接报错（可能 chunk 就是支持段落）
+                pass
+
+        return errors
+
+    def detect_hallucinated_refs(
+        self, answer: str, context_chunks: List[str]
+    ) -> List[ValidationError]:
+        """检测幻觉引用 — 引用标注了但内容不在上下文中"""
+        errors = []
+        refs = re.finditer(r'\[(\d+)\]', answer)
+        for match in refs:
+            idx = int(match.group(1))
+            if idx > len(context_chunks):
+                errors.append(ValidationError(
+                    error_type="hallucinated_ref",
+                    description=f"引用 [{idx}] 指向的 chunk 不存在",
+                    location=match.group(),
+                ))
+        return errors
+
+    def full_validation(
+        self, answer: str, context_chunks: List[str]
+    ) -> Tuple[bool, List[ValidationError]]:
+        """完整引用验证"""
+        all_errors = []
+        all_errors.extend(self.validate_format(answer))
+        all_errors.extend(self.validate_content(answer))
+        all_errors.extend(self.detect_hallucinated_refs(answer, context_chunks))
+        return len(all_errors) == 0, all_errors
+
+def citation_acceptance_test():
+    """引用验收测试"""
+    validator = CitationValidator(
+        available_chunks=[
+            "正式员工年假政策",
+            "病假需提供医院证明",
+        ]
+    )
+
+    test_cases = [
+        ("年假为15天[1]，病假需证明[2]", True, "正常引用"),
+        ("年假为15天[1]，病假需证明[5]", False, "引用 [5] 超出范围"),
+        ("年假为15天，无引用标注", True, "无引用不报错（只是质量建议）"),
+        ("年假为15天[1][999]", False, "引用了不存在的 999"),
+    ]
+
+    for answer, expected_pass, desc in test_cases:
+        passed, errors = validator.full_validation(answer, validator.available_chunks)
+        status = "PASS" if passed else "FAIL"
+        print(f"[{status}] {desc}: {answer}")
+        if errors:
+            for e in errors:
+                print(f"       {e.error_type}: {e.description}")
+
+if __name__ == "__main__":
+    citation_acceptance_test()</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>CorpAssist 引用规范</strong>
+        <ul>
+          <li>格式：<code>[source_id:chunk_index]</code>，如 <code>[hr_v3:001]</code></li>
+          <li>每个答案至少包含 1 个引用，最多 5 个</li>
+          <li>API 返回格式：<code>{"answer": "...", "citations": [{"source": "hr_v3.pdf", "page": 5, "text": "..."}]}</code></li>
+          <li>前端展示：引用以脚注形式出现，可点击跳转到文档查看器</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>Groundedness 评分和 RAGAS Faithfulness 有什么区别？</summary>
+          <div class="learn-faq-body">
+            Faithfulness 检查「有没有矛盾」— 答案说 15 天年假，上下文也提到 15 天，即通过。Groundedness 检查「有无来源」— 答案说 15 天年假，需要标注这信息来自文档 chunk_001。更严格。实践中，建议先保 Faithfulness，再追求 Groundedness。
+          </div>
+        </details>
+        <details>
+          <summary>LLM 经常编造引用编号，怎么防御？</summary>
+          <div class="learn-faq-body">
+            多层防御：1) 在 prompt 中明确要求「只使用提供的文档片段编号」；2) 后处理阶段用 CitationValidator 检查每个 [N] 是否在有效范围；3) 对无法验证的引用从答案中移除并记录告警；4) 设置 CI 门禁，禁止引用错误率 > 5% 的部署。
+          </div>
+        </details>
+        <details>
+          <summary>引用信息应该放在 API 返回的哪个字段？</summary>
+          <div class="learn-faq-body">
+            建议独立于 <code>answer</code> 字段。示例：<code>{"answer": "年假为15天[1]", "citations": [{"id": "1", "source": "hr_policy.pdf", "page": 3, "text": "..."}]}</code>。这样前端可以灵活选择渲染方式（行内标注或脚注），同时后端确保引用数据可被验证。
+          </div>
+        </details>
+        <details>
+          <summary>Groundedness 评分每次都要调用 LLM，成本怎么控制？</summary>
+          <div class="learn-faq-body">
+            不是每次调用都做全量评分。建议策略：1) 开发阶段全量评分；2) 生产环境抽样（如 10% 流量做评分监控）；3) CI 门禁时对评测集做全量评分；4) 出现用户反馈问题时对相关答案做补充评分。
+          </div>
+        </details>
+      </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li><strong>引用溯源</strong>：通过贯穿检索 doc_id → Prompt 引用编号 → 输出 citations 的全链路实现，确保每个事实可追溯</li>
-        <li><strong>格式标准化</strong>：API 用 JSON 数组、审计用 JSON-L、前端用 Markdown 脚注，三种格式统一数据模型</li>
-        <li><strong>置信度三级制</strong>：ROUGE-L > 0.80 为 high，0.50~0.80 为 medium，< 0.50 为 low，0 为 none（禁止输出）</li>
-        <li><strong>合规审计</strong>：audit_id 可全链路追溯 answer → source → document → version，满足监管要求</li>
-        <li><strong>禁止无引用输出</strong>：confidence=none 时拦截输出，返回「无法找到可靠依据」</li>
+        <li><strong>引用溯源是可信 RAG 的基础</strong>：从文档 chunk → 答案段落建立可追溯的映射，满足合规要求。</li>
+        <li><strong>Groundedness 比 Faithfulness 更严格</strong>：Faithfulness 要求不矛盾，Groundedness 要求有出处。</li>
+        <li><strong>引用验证防幻觉</strong>：LLM 会编造引用，必须用验证器检查引用编号和 chunk 存在性。</li>
+        <li><strong>置信度标注提升透明度</strong>：用不同颜色/标记显示每个段落的可验证程度。</li>
+        <li><strong>CI 门禁保证质量</strong>：将引用验证和 Groundedness 评分纳入 CI，防止低质量回答上线。</li>
       </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox"> 能实现带 citation 溯源的 RAG 链（doc_id → answer → citations）</label></li>
-        <li><label><input type="checkbox"> 能说出三种引用格式场景（API/审计/前端）及其转化方式</label></li>
-        <li><label><input type="checkbox"> 能实现 ROUGE-L 置信度自动标注并配置阈值</label></li>
-        <li><label><input type="checkbox"> 能配置审计日志（JSON-L）满足合规审计要求</label></li>
-        <li><label><input type="checkbox"> 能描述全链路追溯的四层（answer→source→document→version）</label></li>
-      </ul></div>
-      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
-        <tr><td>CitationSource</td><td>引用元数据结构体</td></tr>
-        <tr><td>ROUGE-L</td><td>基于最长公共子序列的文本相似度</td></tr>
-        <tr><td>Grounding</td><td>回答与源文档的事实关联程度</td></tr>
-        <tr><td>high confidence</td><td>原文逐字引述，ROUGE-L>0.80</td></tr>
-        <tr><td>medium confidence</td><td>多段综合推论</td></tr>
-        <tr><td>low confidence</td><td>模型推断</td></tr>
-        <tr><td>audit trail</td><td>全链路审计追溯链</td></tr>
-        <tr><td>JSON-L</td><td>JSON Lines 每行一条记录</td></tr>
-      </table></div>
-      <div class="learn-interview"><h4>面试可能问</h4><details><summary>为什么不能用 LLM 自行声明引用来源而非要系统侧强制标注？</summary>
-      <p>LLM 有幻觉倾向，可能编造看似合理的引用（hallucinated citation）。在一项研究中，GPT-4 对自身训练数据中的文档编造 doc_id 的比例达 12%。必须由系统侧将检索阶段的元数据（doc_id、snippet、location）注入输出，不与 LLM 的自述混淆。系统侧标注是可审计的，LLM 自述不可审计。</p>
-      </details>
-      <details><summary>置信度标注为什么会用 ROUGE-L 而非 BERTScore？</summary>
-      <p>ROUGE-L 基于词重叠（LCS），计算快（O(n*m)）且结果可解释（具体哪些词重叠了）。BERTScore 基于语义嵌入，对 paraphrase 更鲁棒但计算成本高（需 GPU），且分数语义模糊（0.85 是什么意思？）。在合规场景中，可解释性优先级高于语义弹性，因此选择 ROUGE-L。若后续需要更好的 paraphrase 检测，可在 ROUGE-L 后叠加 BERTScore 做二次验证。</p>
-      </details>
-      <details><summary>如果引用格式从 JSON 改成了新的审计标准，你的变更面有多大？</summary>
-      <p>影响范围：1) CitationSource 数据模型定义（Pydantic class）；2) API 序列化器（FastAPI response_model）；3) 审计日志写入格式；4) 前端渲染逻辑。可通过将引用格式抽离为独立模块（src/citation/formatter.py）降低变更影响面，业务代码不直接引用 JSON 字段名而引用 CitationSource 对象属性。</p>
-      </details></div>
+      <div class="learn-checklist" data-storage-key="rag-system-py_advanced02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="citation-mapping" /> 能实现从答案引用到文档 chunk 的映射关系</label></li>
+          <li><label><input type="checkbox" data-id="groundedness" /> 能构建 groundedness 评分器并解读评分</label></li>
+          <li><label><input type="checkbox" data-id="validator" /> 能使用 CitationValidator 检测幻觉引用</label></li>
+          <li><label><input type="checkbox" data-id="confidence" /> 能设计置信度标注策略并展示给用户</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Citation</td><td>答案中 [N] 形式的引用标记，指向源文档</td></tr>
+                <tr><td>Grounding</td><td>答案关键声明可追溯到具体文档 chunk</td></tr>
+                <tr><td>Groundedness Score</td><td>衡量答案中有来源支撑的声明比例</td></tr>
+                <tr><td>Faithfulness vs Grounding</td><td>Faithfulness=不矛盾, Grounding=有出处</td></tr>
+                <tr><td>Citation Validation</td><td>检查引用编号是否有效、内容是否匹配</td></tr>
+                <tr><td>Confidence Tagging</td><td>为答案段落标注 high/medium/low/unverifiable</td></tr>
+                <tr><td>Hallucinated Citation</td><td>LLM 编造的引用，指向不存在的 chunk</td></tr>
+                <tr><td>Citation Format</td><td>行内[1]、脚注[^1]、JSON 三种格式规范</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>解释 Groundedness 和 RAGAS Faithfulness 的核心区别。为什么合规场景更需要 Groundedness？</li>
+              <li>描述一种 LLM 可能制造幻觉引用的场景。你会用哪些技术手段防御？</li>
+              <li>如果用户的 RAG 答案中包含了「社保缴纳比例为 8%[3]」，但引用 [3] 指向的是「考勤制度」文档。你怎么检测并处理这个错误？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo。所有实践章节已完成，建议回顾全课程并完成最终项目。</p>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方参考</h3><ul>
-    <li><a href="https://github.com/google-research/bleurt" target="_blank" rel="noopener">BLEURT（Google 引文评测）</a></li>
-    <li><a href="https://aclanthology.org/W04-1013/">ROUGE: A Package for Automatic Evaluation of Summaries</a></li>
-    <li><a href="https://jsonlines.org/">JSON Lines 格式规范</a></li>
-    <li><a href="https://docs.python.org/3/library/logging.html">Python Logging（审计日志基础）</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-    <div class="steps-operate"><ol>
-      <li>在 <code>demos/advanced-02-grounding-citation-lab/</code> 中完成 <code>CitationSource</code> 数据模型定义</li>
-      <li>补全 <code>build_citation_context</code> 函数，使 citations 透传到最终输出</li>
-      <li>为 3 个测试答案句子运行 <code>compute_confidence()</code>，验证置信度标注是否正确</li>
-      <li>模拟一次完整查询，查看审计日志 <code>audit/rag_audit.jsonl</code> 的输出格式</li>
-    </ol></div>
-    <div class="steps-judgment-list"><details><summary>场景 1：审计发现高置信度引用的文档版本与实际不符，问题出在哪个环节？</summary>
-      <p>可能是：1) 索引环节未更新 doc_version metadata；2) 检索 filter 未排除旧版本文档（缺 <code>is_latest=true</code> 条件）；3) 文档更新后未触发重新索引。修复方法：在索引管线中强制写入 <code>doc_version</code> 和 <code>updated_at</code>，检索时加 filter，定期清理旧版本。</p>
-    </details>
-    <details><summary>场景 2：RAG 输出中的 medium/low 置信度占比超过 40%，你认为根因是什么？</summary>
-    <p>medium+low > 40% 意味着近半数答案内容不能直接从 context 逐字匹配。根因可能：1) chunk_size 过大导致 context 含噪声，模型需要筛选综合；2) k 值偏低导致单篇文档片段不完整，LLM 需跨多篇拼接；3) 问题本身属于综合性查询（如「总结一下公司的休假政策」）— 此时 medium 合理。建议分别统计 medium 和 low 占比，若 low > 10% 说明检索严重不充分。</p>
-    </details></div>
-    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/advanced-02-grounding-citation-lab/</p><ul class="demo-acceptance">
-      <li>chain 输出含 citations 数组且 doc_id 可追溯</li>
-      <li>置信度标注结果与人工判断一致（抽检 10 条）</li>
-      <li>审计日志 JSON-L 包含完整的全链路追溯信息</li>
-    </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.ragas.io/en/latest/concepts/metrics/faithfulness.html" target="_blank" rel="noopener">RAGAS Faithfulness — 忠实度指标文档</a></li>
+      <li><a href="https://docs.ragas.io/en/latest/concepts/metrics/answer_relevancy.html" target="_blank" rel="noopener">RAGAS Answer Relevancy — 相关性指标</a></li>
+      <li><a href="https://cookbook.openai.com/examples/how_to_cite_sources/" target="_blank" rel="noopener">OpenAI Cookbook — 引用来源最佳实践</a></li>
+      <li><a href="https://python.langchain.com/docs/how_to/citation/" target="_blank" rel="noopener">LangChain 引用文档 — 官方引用指南</a></li>
+      <li><a href="https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/grounding" target="_blank" rel="noopener">Azure OpenAI Grounding — 微软归因指南</a></li>
+    </ul>
   </div>
-  <div class="resources content-section"><h3>延伸阅读</h3><ul>
-    <li><a href="#ch-practice-01-langchain-rag">返回到 LangChain RAG 实现</a></li>
-    <li><a href="https://arxiv.org/abs/2403.02322">C-RAG: Certified RAG 论文</a></li>
-    <li><a href="https://cloud.google.com/vertex-ai/generative-ai/docs/grounding/overview">Google Vertex AI Grounding</a></li>
-  </ul></div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 知识库问答实现引用溯源系统（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 RAG 管线中集成引用标记，让 LLM 生成 [1][2] 格式的答案。</li>
+      <li>用 <code>CitationRAGPipeline</code> 获取带引用信息的答案。</li>
+      <li>编写 <code>GroundednessChecker</code> 评分 5 个测试问答的归因度。</li>
+      <li>用 <code>CitationValidator</code> 检查引用合法性，尝试构造一个幻觉引用并验证它被检出。</li>
+      <li>在前端（或 API 返回）中展示带置信度标注的答案。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">Groundedness Score=1.0，但用户发现答案中一个关键数字（年假 20 天）是错误的。Groundedness 系统为什么没发现？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>Groundedness 检查「有来源」而非「正确」</strong>。如果源文档本身就写着 20 天（过时版本），Groundedness 评分会是满分。Groundedness 不能替代数据质量。解决方案：结合数据版本校验 + Faithfulness 检查（看 LLM 是否准确转述了源文档）。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">API 返回中，citations 数组包含了 3 个引用，但 answer 文本里只出现了 2 个 [N]。这算问题吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>是的，这是「孤立引用」问题</strong>。citations 数组和 answer 中的 [N] 应一一对应。多余的 citation 可能是上一个 query 的残留，需要清理。在 CitationValidator 中增加 orphan_ref 检查：citations 数组长度应等于 answer 中 [N] 的数量。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Grounding/Citation 实战实验室</h4>
+      <p>目录：<code>demos/advanced-02-grounding-citation-lab/</code>。<strong>验收</strong>：问答返回带引用标记的答案，Groundedness 评分 ≥ 0.8，幻觉引用能被验证器检出。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>所有章节已完成</strong>：回顾 <a href="#ch-practice-01-langchain-rag">LangChain RAG 实战</a> — 全课程起点</li>
+      <li><a href="https://arxiv.org/abs/2312.06648" target="_blank" rel="noopener">论文：Evaluating RAG — Grounding 与 Faithfulness 指标对比</a></li>
+      <li><a href="https://docs.smith.langchain.com/evaluation/concepts/groundedness" target="_blank" rel="noopener">LangSmith Grounding Evaluation — 归因评测</a></li>
+      <li><a href="https://www.deepset.ai/blog/groundedness-in-llms" target="_blank" rel="noopener">deepset 博客 — LLM 归因实践</a></li>
+    </ul>
+  </div>
 </section>

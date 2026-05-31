@@ -3,39 +3,381 @@
   <button type="button" class="btn-mark-done" data-chapter="basics-04-memory-tools" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>业务与架构</strong> · 能力：短期/长期记忆、MCP、权限与工具契约</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>办公 Agent 连日历/邮件/工单；记忆要分层防溢出。</p></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>业务与架构</strong> · 能力：设计短期/长期记忆分层、通过 MCP 集成企业工具、配置权限与工具契约</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>办公 Agent 需要连接日历、邮件、工单等系统。记忆不分层会爆窗，工具无契约会乱调。本章用 CorpAssist 场景讲透 <span class="term" data-term-id="mcp-eco" tabindex="0">MCP 生态</span> 和 <span class="term" data-term-id="memory-tier" tabindex="0">记忆分层</span>。</p></div>
       <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S3 办公自动化场景端到端落地</li>
-        <li>贯通 LangGraph 与 Spring AI Alibaba 双栈 Agent</li>
-        <li>完成 Demo 与测验</li></ul></div>
+        <li>设计短期（会话级）和长期（用户偏好）记忆分层</li>
+        <li>配置 MCP Server 接入企业办公工具</li>
+        <li>设计工具权限模型和契约</li>
+        <li>防止记忆无限堆积问题</li>
+      </ul></div>
     </div>
-    <div class="section-block"><h3>记忆分层</h3><p>会话短期；用户偏好长期向量库。 关联：<span class="term" data-term-id="short-long-memory" tabindex="0">short long memory</span>、<span class="term" data-term-id="mcp-eco" tabindex="0">mcp eco</span>。</p></div>
-    <div class="section-block"><h3>MCP 与权限</h3><p>MCP 暴露 ERP/日历；按角色授权。 关联：<span class="term" data-term-id="tool-permission" tabindex="0">tool permission</span>、<span class="term" data-term-id="tool-contract" tabindex="0">tool contract</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="short-long-memory" tabindex="0">short long memory</span> · <span class="term" data-term-id="mcp-eco" tabindex="0">mcp eco</span> · <span class="term" data-term-id="tool-permission" tabindex="0">tool permission</span> · <span class="term" data-term-id="tool-contract" tabindex="0">tool contract</span> · <span class="term" data-term-id="memory-tier" tabindex="0">memory tier</span> · <span class="term" data-term-id="mcp-office" tabindex="0">mcp office</span> · <span class="term" data-term-id="tool-schema" tabindex="0">tool schema</span> · <span class="term" data-term-id="memory-overflow" tabindex="0">memory overflow</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-json">{"mcpServers":{"calendar":{"command":"corp-calendar-mcp"},"ticket":{"command":"corp-ticket-mcp"}}}</code></pre></div>
-      <div class="mermaid-wrap"><h5>记忆与工具生态</h5>
-      <pre class="mermaid">flowchart LR
-  User --> Agent[办公 Agent]
-  Agent --> Tools[MCP 工具]
-  Agent --> Human[人工审批]</pre></div>
+
+    <div class="section-block"><h3>短期与长期记忆分层</h3>
+    <p><span class="term" data-term-id="short-long-memory" tabindex="0">short long memory</span> 是 Agent 记忆系统的核心。短期记忆保存当前会话上下文，长期记忆存储用户偏好和跨会话知识。</p>
+
+    <div class="mermaid-wrap"><h5>Agent 记忆分层架构</h5>
+    <pre class="mermaid">flowchart TB
+      subgraph ShortTerm[短期记忆]
+        Session[(Redis Session\n滑动窗口 N 轮)]
+        Buffer[(上下文 Buffer\n当前 ReAct 循环)]
+      end
+      subgraph LongTerm[长期记忆]
+        Vector[(Vector DB\nMilvus/Pinecone)]
+        Profile[(用户画像\n偏好设置)]
+      end
+      Agent[Agent 执行] --> Session
+      Agent --> Buffer
+      Agent --> Vector
+      Agent --> Profile
+      Vector -.->|摘要归档| History[(历史对话摘要)]
+      Session -->|LRU 淘汰| Prune[超出窗口的丢弃]
+      Profile -->|持久化| PrefStore[(用户偏好库)]</pre>
+      <p class="diagram-caption"><span class="term" data-term-id="memory-tier" tabindex="0">memory tier</span> 设计：短期存会话上下文，长期存用户偏好和摘要。</p>
     </div>
+
+    <p><span class="term" data-term-id="memory-overflow" tabindex="0">memory overflow</span> 是常见问题：Agent 会话历史无限增长，最终撑爆上下文窗口。解决方案是分层 + 摘要 + 滑动窗口。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># memory_manager.py
+from collections import deque
+from typing import List, Dict
+import json
+
+class MemoryManager:
+    def __init__(self, window_size: int = 20):
+        self.short_term = deque(maxlen=window_size)  # 滑动窗口
+        self.long_term: Dict[str, str] = {}  # 用户偏好
+        self.summary: str = ""
+
+    def add_short(self, item: dict):
+        self.short_term.append(item)
+
+    def summarize_and_archive(self):
+        """将短期记忆摘要后归档到长期"""
+        if len(self.short_term) >= self.short_term.maxlen:
+            recent = list(self.short_term)[-5:]  # 保留最近 5 条
+            old = list(self.short_term)[:-5]
+            self.summary = self._generate_summary(old)
+            self.short_term = deque(recent, maxlen=20)
+
+    def get_context(self) -> str:
+        """组装最终上下文：摘要+短期+用户偏好"""
+        parts = []
+        if self.summary:
+            parts.append(f"[历史摘要] {self.summary}")
+        if self.short_term:
+            parts.append(f"[当前会话] {json.dumps(list(self.short_term))}")
+        if self.long_term:
+            parts.append(f"[用户偏好] {json.dumps(self.long_term)}")
+        return "\n".join(parts)
+
+    def _generate_summary(self, history: list) -> str:
+        # 调用轻量 LLM 生成摘要
+        return f"用户已完成 {len(history)} 轮交互"</pre></div>
+
+    <h4>Java：Redis 滑动窗口实现</h4>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// MemoryService.java
+@Service
+public class MemoryService {
+    private final StringRedisTemplate redis;
+    private final int WINDOW_SIZE = 20;
+    private final Duration TTL = Duration.ofHours(1);
+
+    public void addMessage(String sessionId, String message) {
+        String key = "session:" + sessionId;
+        redis.opsForList().rightPush(key, message);
+        redis.opsForList().trim(key, 0, WINDOW_SIZE - 1);
+        redis.expire(key, TTL);
+    }
+
+    public List&lt;String&gt; getContext(String sessionId) {
+        String key = "session:" + sessionId;
+        return redis.opsForList().range(key, 0, -1);
+    }
+
+    public void archiveSummary(String sessionId, String summary) {
+        // 将摘要写入长期存储（MySQL / Vector DB）
+        String archiveKey = "archive:" + sessionId;
+        redis.opsForValue().set(archiveKey, summary, Duration.ofDays(30));
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>MCP 工具生态与集成</h3>
+    <p><span class="term" data-term-id="mcp-eco" tabindex="0">mcp eco</span> 是 Anthropic 推出的模型上下文协议（Model Context Protocol），为企业工具集成提供了标准化接口。办公 Agent 通过 MCP Server 接入日历、邮件、工单等系统。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-json">{
+  "mcpServers": {
+    "calendar": {
+      "command": "corp-calendar-mcp",
+      "args": ["--config", "./calendar-config.json"],
+      "env": { "CALENDAR_API_KEY": "${CALENDAR_KEY}" }
+    },
+    "email": {
+      "command": "corp-email-mcp",
+      "args": ["--smtp", "smtp.company.com:587"]
+    },
+    "ticket": {
+      "command": "corp-ticket-mcp",
+      "args": ["--url", "https://jira.company.com"]
+    }
+  }
+}</pre></div>
+
+    <p><span class="term" data-term-id="mcp-office" tabindex="0">mcp office</span> 场景下，工具契约（<span class="term" data-term-id="tool-contract" tabindex="0">tool contract</span>）定义了工具的名称、参数、返回值和错误码。契约必须显式声明，Agent 才能正确调用：</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># mcp_tool_registry.py
+from dataclasses import dataclass, field
+from typing import Dict, Any, List
+
+@dataclass
+class ToolContract:
+    name: str
+    description: str
+    parameters: Dict[str, str]  # 参数名 -> 类型
+    required: List[str]
+    returns: str
+    permission: str  # read/write/admin
+    timeout_sec: int = 30
+
+class MCPToolRegistry:
+    def __init__(self):
+        self.tools: Dict[str, ToolContract] = {}
+
+    def register(self, contract: ToolContract):
+        self.tools[contract.name] = contract
+
+    def validate_call(self, tool_name: str, args: Dict[str, Any],
+                      user_role: str) -> bool:
+        contract = self.tools.get(tool_name)
+        if not contract:
+            return False
+        # 检查权限
+        if contract.permission == "admin" and user_role != "admin":
+            return False
+        # 检查必需参数
+        for param in contract.required:
+            if param not in args:
+                return False
+        return True
+
+# 注册办公工具
+registry = MCPToolRegistry()
+registry.register(ToolContract(
+    name="send_email",
+    description="发送邮件",
+    parameters={"to": "string", "subject": "string", "body": "string"},
+    required=["to", "subject"],
+    returns="message_id",
+    permission="write",
+    timeout_sec=30
+))</pre></div>
+
+    <p>Java 侧使用 <span class="term" data-term-id="tool-schema" tabindex="0">tool schema</span> 定义工具：</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// McpToolConfiguration.java
+@Configuration
+public class McpToolConfiguration {
+
+    @Bean
+    public ToolCallback emailTool() {
+        return ToolCallback.builder()
+            .name("send_email")
+            .description("发送邮件")
+            .inputSchema("""
+                {
+                  "type": "object",
+                  "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"}
+                  },
+                  "required": ["to", "subject"]
+                }""")
+            .tool((ToolCallback.ToolAction&lt;String, String&gt;) input -> {
+                EmailRequest req = JsonUtil.parse(input, EmailRequest.class);
+                return emailService.send(req);
+            })
+            .build();
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>工具结果缓存策略</h3>
+    <p>短期内重复调用同一工具会浪费 Token 和 API 配额。工具结果缓存（Tool Result Caching）有效减少重复调用：</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># tool_cache.py
+import hashlib
+import json
+import time
+from typing import Dict, Any, Optional
+
+class ToolResultCache:
+    def __init__(self, ttl_sec: int = 60):
+        self.cache: Dict[str, tuple] = {}
+        self.ttl = ttl_sec
+
+    def _make_key(self, tool_name: str, args: dict) -> str:
+        raw = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def get(self, tool_name: str, args: dict) -> Optional[str]:
+        key = self._make_key(tool_name, args)
+        if key in self.cache:
+            result, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return result
+            del self.cache[key]
+        return None
+
+    def set(self, tool_name: str, args: dict, result: str):
+        key = self._make_key(tool_name, args)
+        self.cache[key] = (result, time.time())
+
+    def invalidate(self, tool_name: str):
+        """工具数据变化时清除相关缓存"""
+        keys_to_delete = [k for k in self.cache if k.startswith(tool_name)]
+        for k in keys_to_delete:
+            del self.cache[k]
+
+# 使用示例
+tool_cache = ToolResultCache(ttl_sec=120)
+
+def cached_tool_call(tool_name: str, args: dict) -> str:
+    cached = tool_cache.get(tool_name, args)
+    if cached:
+        return cached  # 命中缓存
+    result = mcp_tools.call(tool_name, args)
+    if not result.get("error"):
+        tool_cache.set(tool_name, args, result)
+    return result</pre></div>
+
+    <p>Java 侧使用 Spring Cache 注解实现：</p>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// CachedToolService.java
+@Service
+public class CachedToolService {
+
+    @Cacheable(value = "toolResults", key = "#toolName + ':' + #args.hashCode()",
+               unless = "#result.contains('error')")
+    public String callTool(String toolName, String args) {
+        return mcpRegistry.call(toolName, args);
+    }
+
+    @CacheEvict(value = "toolResults", key = "#toolName + ':*'")
+    public void invalidateCache(String toolName) {
+        // 当数据变更时清除缓存
+    }
+}</pre></div>
+
+    <p>缓存策略的选择：只读工具（查余额、查日历）缓存 60-120s；写操作（创建、提交）不缓存；查询结果带「数据时间戳」标识。</p>
+    </div>
+
+    <div class="section-block"><h3>工具权限模型</h3>
+    <p><span class="term" data-term-id="tool-permission" tabindex="0">tool permission</span> 是防止 Agent 滥用工具的关键。每个工具按角色分层授权：</p>
+    <table class="outline-table">
+      <thead><tr><th>角色</th><th>可读</th><th>可写</th><th>审批</th></tr></thead>
+      <tbody>
+        <tr><td>普通员工</td><td>个人日历、个人邮箱</td><td>个人签名、个人请假</td><td>超 3 天请假</td></tr>
+        <tr><td>部门经理</td><td>部门日历、下属信息</td><td>审批请假、发送部门通知</td><td>超 1 万元付款</td></tr>
+        <tr><td>HR</td><td>全员考勤、组织架构</td><td>修改状态、发送全员通知</td><td>敏感操作</td></tr>
+      </tbody>
+    </table>
+
+    <div class="learn-compare">
+      <div class="learn-compare-col learn-compare-bad">
+        <span class="learn-compare-heading">不推荐 — 无权限控制</span>
+        <ul>
+          <li>所有工具对所有人开放</li>
+          <li>Agent 调用前不检查角色</li>
+          <li>权限逻辑散落在 Prompt 里</li>
+        </ul>
+      </div>
+      <div class="learn-compare-col learn-compare-good">
+        <span class="learn-compare-heading">推荐 — 分层授权</span>
+        <ul>
+          <li>每个工具标记 permission 等级</li>
+          <li>Agent 调用前校验角色</li>
+          <li>权限配置在 YAML 中集中管理</li>
+        </ul>
+      </div>
+    </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>短期/长期记忆、MCP、权限与工具契约</li>
-    <li>下一步：LangGraph 工作流实现</li></ul></div>
+    <ul class="chapter-conclusions-list">
+      <li>记忆分层：短期会话窗口 + 长期用户偏好 + 摘要归档</li>
+      <li>MCP 协议标准化企业工具接入，工具契约定义调用规范</li>
+      <li>工具权限按角色分层，防止越权操作</li>
+      <li>滑动窗口 + 摘要防止记忆无限堆积爆窗</li>
+      <li>工具契约需显式声明名称、参数、返回值和错误码</li>
+    </ul></div>
+
+    <div class="section-block"><h3>常见问题（FAQ）</h3>
+    <div class="learn-faq">
+      <details><summary>短期记忆和长期记忆的界限在哪里？</summary><div class="learn-faq-body">短期：当前会话上下文（通常 20 轮对话或 4096 tokens）。长期：跨会话的用户偏好、知识库、历史摘要。超过短期窗口的自动摘要归档到长期。</div></details>
+      <details><summary>MCP Server 和传统 API Gateway 有什么区别？</summary><div class="learn-faq-body">MCP 专门为 LLM Agent 设计：工具描述（Function Calling Schema）是 MCP Server 的一部分，Agent 可以动态发现工具。传统 API Gateway 面向人类开发者，没有工具发现机制。</div></details>
+      <details><summary>工具契约变了怎么办？</summary><div class="learn-faq-body">工具契约版本化。Agent 启动时从 MCP Server 拉取最新契约。契约不兼容时应有迁移期，期间新旧版本同时支持。</div></details>
+    </div></div>
+
+    <div class="section-block learn-review-block"><h3>复习与自检</h3>
+    <div class="learn-checklist" data-storage-key="scenario_basics04">
+      <p class="learn-checklist-lead">过关清单</p>
+      <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+      <ul>
+        <li><label><input type="checkbox" data-id="memory-tier" /> 能画出记忆分层架构图</label></li>
+        <li><label><input type="checkbox" data-id="mcp" /> 能解释 MCP 协议的作用</label></li>
+        <li><label><input type="checkbox" data-id="permission" /> 能设计工具权限矩阵</label></li>
+        <li><label><input type="checkbox" data-id="contract" /> 能写一个工具契约定义</label></li>
+        <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+      </ul>
+    </div>
+
+    <div class="learn-cheat-sheet"><details><summary>本章速查卡</summary><div class="learn-cheat-body"><table>
+      <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term" data-term-id="short-long-memory" tabindex="0">short long memory</span></td><td>短期会话 + 长期偏好</td></tr>
+        <tr><td><span class="term" data-term-id="mcp-eco" tabindex="0">mcp eco</span></td><td>模型上下文协议工具生态</td></tr>
+        <tr><td><span class="term" data-term-id="tool-permission" tabindex="0">tool permission</span></td><td>按角色分级的工具授权</td></tr>
+        <tr><td><span class="term" data-term-id="tool-contract" tabindex="0">tool contract</span></td><td>工具的名称/参数/返回契约</td></tr>
+        <tr><td><span class="term" data-term-id="memory-tier" tabindex="0">memory tier</span></td><td>记忆分层架构</td></tr>
+        <tr><td><span class="term" data-term-id="mcp-office" tabindex="0">mcp office</span></td><td>办公场景 MCP 集成</td></tr>
+        <tr><td><span class="term" data-term-id="tool-schema" tabindex="0">tool schema</span></td><td>工具 JSON Schema 定义</td></tr>
+        <tr><td><span class="term" data-term-id="memory-overflow" tabindex="0">memory overflow</span></td><td>记忆无限堆积导致爆窗</td></tr>
+      </tbody>
+    </table></div></details></div>
+
+    <div class="learn-interview"><details><summary>答辩 / 面试口述题</summary><div class="learn-interview-body"><ol>
+      <li>Agent 记忆满了怎么办？你会用什么策略防止爆窗？</li>
+      <li>如果 Agent 能同时访问日历和邮件，你怎么防止它乱发邮件？</li>
+      <li>MCP 协议和传统的 REST API 在 Agent 集成上有什么本质区别？</li>
+    </ol></div></details></div>
+    </div>
   </div>
+
   <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a></li>
-    <li><a href="https://java2ai.com/docs/dev/models/dashScope/" target="_blank" rel="noopener">Spring AI Alibaba</a></li>
+    <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">MCP 协议官方文档</a></li>
+    <li><a href="https://langchain-ai.github.io/langgraph/concepts/persistence/" target="_blank" rel="noopener">LangGraph — 持久化与 Checkpoint</a></li>
+    <li><a href="https://java2ai.com/docs/dev/tutorials/tool/" target="_blank" rel="noopener">Spring AI Alibaba — Tool 开发</a></li>
   </ul></div>
+
   <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/basics-04-memory-tools-lab/</code></li>
-  <li>写一条 S3 Agent 落地笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：记忆与工具生态</h4>
-  <p><code>demos/basics-04-memory-tools-lab/</code> — 列 2 个办公 MCP</p></div></div>
+  <ol class="steps steps-operate">
+    <li>用 Redis 实现一个滑动窗口短期记忆</li>
+    <li>配置一个办公日程 MCP Server 并测试连接</li>
+    <li>设计 3 个办公工具的契约 JSON Schema</li>
+    <li>完成 <code>demos/basics-04-memory-tools-lab/</code></li>
+  </ol>
+  <div class="demo-box"><h4 class="demo-box-title">Demo：记忆与工具实验室</h4><p><code>demos/basics-04-memory-tools-lab/</code> — 列 3 个办公 MCP 工具配置。</p></div></div>
+
   <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-01-langgraph">LangGraph 工作流实现</a></li>
+    <li><strong>下一章</strong>：<a href="#ch-practice-01-langgraph">LangGraph 工作流实现</a></li>
+    <li><a href="https://www.pinecone.io/learn/semantic-search/" target="_blank" rel="noopener">Pinecone — 向量语义搜索</a></li>
   </ul></div>
 </section>

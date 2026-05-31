@@ -1,43 +1,507 @@
 <section id="ch-practice-03-stream" class="chapter" data-chapter="practice-03-stream">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>流式与批处理</h2>
-  <button type="button" class="btn-mark-done" data-chapter="practice-03-stream" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>流式与批处理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-stream" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：流式吞吐、批处理并发与 S4 补全</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>代码补全要流式低延迟；离线批处理提吞吐。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S4 推理场景实践本章能力</li>
-        <li>说明 vLLM 私有化与双栈客户端接入</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：理解流式推理与批处理策略，优化 S4 补全的吞吐与延迟</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S4 的 IDE 补全需要<strong>低首 token 延迟 (TTFT)</strong>，用户等不了全量生成。而运营文案批量生成则需要<strong>高吞吐</strong>。两种场景分别对应 <span class="term" data-term-id="stream-throughput" tabindex="0">流式吞吐</span> 与 <span class="term" data-term-id="batch-infer" tabindex="0">批处理</span> 策略，vLLM 的 continuous batching 同时服务于它们。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>解释 <span class="term" data-term-id="ttft" tabindex="0">TTFT</span> 与 <span class="term" data-term-id="tokens-per-sec" tabindex="0">tokens/s</span> 的区别并分别优化</li>
+          <li>在 Python 和 Spring AI 中实现流式调用</li>
+          <li>为 S4 FIM 与批量任务各自选择最优的流式/批处理策略</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>流式不是魔法</strong>：首 token 仍需等预填充，流式只改善后续 token 的感知延迟。</li>
+          <li><strong>Continuous batching</strong>：vLLM 引擎内部将多个请求合并为一个 batch，提升 GPU 利用率。</li>
+          <li><strong>并发限流</strong>：<span class="term" data-term-id="concurrency" tabindex="0">并发控制 (concurrency)</span> 通过 <code>max-num-seqs</code> 防止 OOM。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>流式与吞吐</h3><p>stream=true；监控 TTFT。 关联：<span class="term" data-term-id="stream-throughput" tabindex="0">stream throughput</span>、<span class="term" data-term-id="batch-infer" tabindex="0">batch infer</span>。</p></div>
-    <div class="section-block"><h3>并发</h3><p>max-num-seqs 控制并发。 关联：<span class="term" data-term-id="concurrency" tabindex="0">concurrency</span>、<span class="term" data-term-id="s4-completion" tabindex="0">s4 completion</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="stream-throughput" tabindex="0">stream throughput</span> · <span class="term" data-term-id="batch-infer" tabindex="0">batch infer</span> · <span class="term" data-term-id="concurrency" tabindex="0">concurrency</span> · <span class="term" data-term-id="s4-completion" tabindex="0">s4 completion</span> · <span class="term" data-term-id="stream-token" tabindex="0">stream token</span> · <span class="term" data-term-id="batch-api" tabindex="0">batch api</span> · <span class="term" data-term-id="ttft" tabindex="0">ttft</span> · <span class="term" data-term-id="tokens-per-sec" tabindex="0">tokens per sec</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python">stream = client.chat.completions.create(..., stream=True)
-for chunk in stream:
-    if chunk.choices[0].delta.content:
-        yield chunk.choices[0].delta.content</code></pre></div>
-      <div class="mermaid-wrap"><h5>流式与批处理</h5>
-      <pre class="mermaid">flowchart LR
-  App[Spring/Python] --> vLLM
-  vLLM --> GPU[GPU 推理]</pre></div>
+
+    <div class="section-block">
+      <h3>流式推理原理</h3>
+      <p><span class="term" data-term-id="stream-throughput" tabindex="0">流式吞吐 (stream throughput)</span> 指服务端逐 token 返回 SSE（Server-Sent Events）数据流。客户端在首 token 到达后即可开始展示，不必等待全部生成完毕。</p>
+
+      <div class="mermaid-wrap">
+        <h5>流式 vs 非流式时序</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant C as 客户端
+    participant V as vLLM
+    participant G as GPU
+
+    Note over C,G: 非流式（等待全部生成）
+    C->>V: POST /v1/chat (stream=false)
+    V->>G: 预填充 + 自回归生成
+    G-->>V: ...
+    V-->>C: 200 OK (完整输出)
+
+    Note over C,G: 流式（逐 token 返回）
+    C->>V: POST /v1/chat (stream=true)
+    V->>G: 预填充
+    G-->>V: 首 token
+    V-->>C: SSE data: token1
+    G-->>V: token2
+    V-->>C: SSE data: token2
+    Note over C,V: TTFT = 首 token 到达时间
+    Note over C,V: TPOT = 后续每 token 时间</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="ttft" tabindex="0">TTFT (Time To First Token)</span> 对用户体验至关重要。流式将 TPOT 与 TTFT 解耦，用户感知延迟大幅降低。</p>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · IDE 内嵌 FIM 补全</span>
+        开发者每次按键触发 FIM 补全，期望 200ms 内看到首 token。非流式模式下生成 64 tokens 需约 2s → 用户等到全部生成完才能看到。流式模式下 200ms 首 token + 后续逐 token 渲染 → 体验大幅提升。
+      </aside>
+
+      <h4>Python 流式补全</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Python 流式调用 — 用于 IDE 补全后端
+from openai import OpenAI
+import time
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+def stream_fim_completion(prompt: str, max_tokens: int = 128):
+    """流式 FIM 补全，逐 token 产出"""
+    start = time.time()
+    first_token = True
+
+    response = client.completions.create(
+        model="corp-coder-7b",
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=0.1,
+        stream=True,  # 启用流式
+    )
+
+    for chunk in response:
+        if chunk.choices and chunk.choices[0].text:
+            token = chunk.choices[0].text
+            if first_token:
+                ttft = time.time() - start
+                print(f"[TTFT={ttft*1000:.0f}ms]")
+                first_token = False
+            yield token
+
+    elapsed = time.time() - start
+    print(f"\n[总耗时={elapsed*1000:.0f}ms]")
+
+
+# 使用示例
+prompt = "<fim_prefix>def calculate_sum(arr):\n    <fim_suffix>\n    return result<fim_middle>"
+print("流式补全输出:", end="", flush=True)
+for token in stream_fim_completion(prompt):
+    print(token, end="", flush=True)
+print()</code></pre>
+      </div>
+
+      <h4>Spring AI 流式调用</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import reactor.core.publisher.Flux;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.MediaType;
+
+@RestController
+@RequestMapping("/api/code")
+public class StreamCompletionController {
+
+    private final ChatClient chatClient;
+
+    public StreamCompletionController(ChatClient chatClient) {
+        this.chatClient = chatClient;
+    }
+
+    /**
+     * 流式代码补全 — 返回 SSE 流
+     */
+    @PostMapping(value = "/complete/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> streamComplete(@RequestBody CodeRequest request) {
+        return chatClient.prompt()
+            .user(u -> u.text("补全以下代码:\n```\n" + request.codeContext() + "\n```"))
+            .stream()
+            .content()
+            .filter(token -> token != null && !token.isEmpty());
+    }
+
+    /**
+     * 非流式代码补全 — 批量场景
+     */
+    @PostMapping("/complete")
+    public String complete(@RequestBody CodeRequest request) {
+        return chatClient.prompt()
+            .user(u -> u.text("补全以下代码:\n```\n" + request.codeContext() + "\n```"))
+            .call()
+            .content();
+    }
+
+    record CodeRequest(String codeContext, String language) {}
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>所有请求一律非流式</li>
+            <li>流式但不设 read timeout，连接可能中断</li>
+            <li>流式后在前端拼接完整结果再做二次处理</li>
+            <li>忽略 TTFT 监控</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>交互式场景 (IDE 补全) 用流式</li>
+            <li>后端批量任务 (夜间分析) 用非流式</li>
+            <li>SSE read timeout 设 300s</li>
+            <li>TTFT 作为核心 SLA 指标上 Grafana</li>
+          </ul>
+        </div>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>流式吞吐、批处理并发与 S4 补全</li>
-    <li>下一步：灰度与版本</li></ul></div>
+
+    <div class="section-block">
+      <h3>批处理策略</h3>
+      <p><span class="term" data-term-id="batch-infer" tabindex="0">批处理推理 (batch infer)</span> 有两种形态：</p>
+      <ol>
+        <li><strong>vLLM Continuous Batching</strong>：引擎内部自动将等待中的序列合并到当前 batch，动态调度。</li>
+        <li><strong>应用层显式批处理</strong>：客户端攒一批请求一次性发送，减少 GPU 切换开销。</li>
+      </ol>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>策略</th><th>适用场景</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>流式 SSE</td>
+            <td>交互式、低延迟</td>
+            <td>IDE FIM 补全、对话</td>
+          </tr>
+          <tr>
+            <td>Continuous Batching</td>
+            <td>高并发混合负载</td>
+            <td>多用户同时补全（vLLM 自动处理）</td>
+          </tr>
+          <tr>
+            <td>离线 Batch API</td>
+            <td>非实时、高吞吐</td>
+            <td>夜间代码审查、批量分析</td>
+          </tr>
+          <tr>
+            <td>应用层批处理</td>
+            <td>短请求高 QPS</td>
+            <td>批量评分配对（20 条 prompt 一次性提交）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>vLLM Batch API 调用</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 离线批处理 — 适合夜间代码审查等批量任务
+# vLLM 提供批量端点 /v1/completions（非流式）
+
+import json
+from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+def batch_code_review(code_snippets: list[str]) -> list[str]:
+    """批量代码审查：并发提交多个补全请求"""
+    results = [None] * len(code_snippets)
+
+    def single_review(idx: int, code: str) -> tuple[int, str]:
+        resp = client.chat.completions.create(
+            model="corp-coder-7b",
+            messages=[
+                {"role": "system", "content": "请审查以下代码的安全性。"},
+                {"role": "user", "content": f"```\n{code}\n```"}
+            ],
+            max_tokens=256,
+            temperature=0.1,
+        )
+        return idx, resp.choices[0].message.content
+
+    # 使用线程池并发提交（vLLM 内部 continuous batching 会合并）
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(single_review, i, code): i
+            for i, code in enumerate(code_snippets)
+        }
+        for future in as_completed(futures):
+            idx, content = future.result()
+            results[idx] = content
+
+    return results
+
+# 示例
+snippets = [
+    "def unsafe_function(user_input):\n    exec(user_input)",
+    "public class SecureClass {\n    private String secret;",
+]
+reviews = batch_code_review(snippets)
+for i, review in enumerate(reviews):
+    print(f"[Snippet {i+1}] {review[:100]}...")</code></pre>
+      </div>
+
+      <h4>并发数调优</h4>
+      <p><span class="term" data-term-id="concurrency" tabindex="0">并发控制 (concurrency)</span> 是吞吐和显存之间的杠杆：</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 并发压测：从低到高逐步上调，观察 TTFT 和显存
+
+def benchmark_concurrency(
+    max_concurrency: int = 32,
+    prompt: str = "def hello():\n",
+    tokens: int = 128
+):
+    """逐步增加并发，记录每个并发级别下的 TTFT p95"""
+    import time
+    import numpy as np
+
+    for concurrency in [1, 2, 4, 8, 16, max_concurrency]:
+        ttfts = []
+
+        def single_request():
+            t0 = time.time()
+            response = client.completions.create(
+                model="corp-coder-7b",
+                prompt=prompt,
+                max_tokens=tokens,
+                stream=True,
+            )
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].text:
+                    ttft = (time.time() - t0) * 1000
+                    ttfts.append(ttft)
+                    break  # 只需首 token
+            return ttfts[-1]
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(lambda _: single_request(), range(concurrency)))
+
+        p95 = np.percentile(ttfts, 95) if ttfts else 0
+        print(f"并发={concurrency:2d}, TTFT p95={p95:.0f}ms")
+
+if __name__ == "__main__":
+    benchmark_concurrency()</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：4 个并发请求各生成 64 tokens，vLLM 内部怎么调度？</summary>
+        <p>vLLM 的 continuous batching 会将 4 个请求合并为一个 batch。每步解码 4 个 token（各序列 1 个），直到某个序列生成完毕退出 batch。总吞吐 ≈ 4 × 64 tokens / 总时间，GPU 利用率更高。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 场景：流式 vs 批处理决策</h3>
+
+      <div class="mermaid-wrap">
+        <h5>S4 流量分类与策略</h5>
+        <pre class="mermaid">flowchart TD
+    Req[推理请求] --> Q{交互式?}
+    Q -->|是: IDE 补全/对话| Stream[流式 SSE]
+    Q -->|否: 后台任务| Q2{实时性要求?}
+    Q2 -->|分钟级| Batch[客户端批处理]
+    Q2 -->|小时级| Offline[离线 Batch API]
+
+    Stream --> M1[监控: TTFT, TPOT]
+    Batch --> M2[监控: 吞吐 tokens/s]
+    Offline --> M3[监控: 总耗时, 成功率]
+
+    style Stream fill:#d5f5e3
+    style Batch fill:#f9e79f
+    style Offline fill:#fadbd8</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="s4-completion" tabindex="0">S4 completion</span> 的主流路径是流式；批处理用于离线分析。</p>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 流量分布</span>
+        <p>日间峰值 70% 的推理请求是 IDE FIM（流式，短 completion），20% 是对话（流式，多轮），10% 是后台代码审查（批处理，长上下文）。理想架构：vLLM 实例专用于流式（低 max-num-seqs，低 max-model-len）或混合负载（调大 max-num-seqs）。</p>
+      </aside>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>流式一定比非流式快</strong> — TTFT 一致，总耗时可能更长（token 间有网络传输开销）。</li>
+          <li><strong>并发越高越好</strong> — 超过 vLLM max-num-seqs 的请求会排队，TTFT 雪崩。</li>
+          <li><strong>Continuous batching = 无限并发</strong> — 显存是物理上限，max-num-seqs 控制实际并发。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>流式场景下怎么算 Token 消耗？</summary>
+          <div class="learn-faq-body">
+            <span class="term" data-term-id="stream-token" tabindex="0">流式 token</span> 和非流式 token 一样按实际生成数量计费。监控上两者无区别。但流式场景需要更精细的 TTFT / TPOT 指标来评估用户体验。
+          </div>
+        </details>
+        <details>
+          <summary>vLLM 的 continuous batching 和客户端并发有什么区别？</summary>
+          <div class="learn-faq-body">
+            客户端并发是「同时发 N 个 HTTP 请求」。vLLM 收到后通过 continuous batching 将它们合并到 GPU batch 中，每次前向推理同时处理 N 个序列。客户端并发 32 个请求 ≠ vLLM 内部 batch size 32（受 max-num-seqs 限制）。
+          </div>
+        </details>
+        <details>
+          <summary>Batch API 怎么在 Spring AI 中实现？</summary>
+          <div class="learn-faq-body">
+            Spring AI 的 <code>ChatClient</code> 不支持原生批量端点。可以实现业务层批处理：在 Service 中 for 循环或使用 <code>@Async</code> 并发提交多个请求，由 vLLM 的 continuous batching 自动合并。
+          </div>
+        </details>
+        <details>
+          <summary>TTFT 过高如何优化？</summary>
+          <div class="learn-faq-body">
+            TTFT ≈ 预填充时间。降低 TTFT 的方法：① 降低 prompt 长度（减少预填充量）；② 启用 prefix caching（复用 KV）；③ 降低 max-num-seqs（减少排队）；④ 升级 GPU（内存带宽更大）。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>流式原理</strong>：<span class="term" data-term-id="stream-throughput" tabindex="0">流式吞吐</span> 通过 SSE 逐 token 返回，显著改善首 token 感知延迟。</li>
+        <li><strong>TTFT</strong>：<span class="term" data-term-id="ttft" tabindex="0">TTFT</span> 是交互式场景的核心 SLA，受预填充和排队影响。</li>
+        <li><strong>批处理</strong>：<span class="term" data-term-id="batch-infer" tabindex="0">批处理</span> 用于离线高吞吐任务；vLLM continuous batching 自动优化。</li>
+        <li><strong>并发控制</strong>：<span class="term" data-term-id="concurrency" tabindex="0">并发</span> 通过 max-num-seqs 限制，超过即排队导致 TTFT 劣化。</li>
+        <li><strong>场景匹配</strong>：S4 补全用流式，运营批量用非流式批处理。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="stream-vs-batch" /> 能区分流式与批处理各自适合的场景</label></li>
+          <li><label><input type="checkbox" data-id="ttft-explain" /> 能解释 TTFT 的组成与优化方法</label></li>
+          <li><label><input type="checkbox" data-id="stream-python" /> 能用 Python 实现流式补全</label></li>
+          <li><label><input type="checkbox" data-id="stream-spring" /> 能用 Spring AI 实现流式 SSE 端点</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="stream-throughput" tabindex="0">stream throughput</span></td><td>流式推理的吞吐能力，以 tokens/s 衡量</td></tr>
+                <tr><td><span class="term" data-term-id="batch-infer" tabindex="0">batch infer</span></td><td>批量推理，攒一批请求统一处理</td></tr>
+                <tr><td><span class="term" data-term-id="concurrency" tabindex="0">concurrency</span></td><td>并发控制，max-num-seqs 是物理上限</td></tr>
+                <tr><td><span class="term" data-term-id="s4-completion" tabindex="0">s4 completion</span></td><td>代码补全场景，以流式为主</td></tr>
+                <tr><td><span class="term" data-term-id="stream-token" tabindex="0">stream token</span></td><td>流式逐 token 输出</td></tr>
+                <tr><td><span class="term" data-term-id="batch-api" tabindex="0">batch api</span></td><td>批量 API 调用方式</td></tr>
+                <tr><td><span class="term" data-term-id="ttft" tabindex="0">TTFT</span></td><td>首 token 到达时间，交互式体验核心指标</td></tr>
+                <tr><td><span class="term" data-term-id="tokens-per-sec" tabindex="0">tokens per sec</span></td><td>每秒生成 token 数，衡量吞吐</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>流式推理为什么能改善用户体验？TTFT 和 TPOT 分别是什么？如何优化 TTFT？</li>
+              <li>Continuous batching 的原理是什么？它如何影响 vLLM 的并发行为？</li>
+              <li>S4 代码补全和运营文案批量生成分别应该使用流式还是批处理？为什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成下方 Demo 与测验；下一章 <a href="#ch-practice-04-gray">灰度与版本</a>：模型版本管理与灰度上线策略。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM</a></li>
-    <li><a href="https://docs.docker.com/compose/" target="_blank" rel="noopener">Docker Compose</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-03-stream-lab/</code></li>
-  <li>写一条推理部署或量化笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：流式与批处理</h4>
-  <p><code>demos/practice-03-stream-lab/</code> — 各举 1 个场景</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-04-gray">灰度与版本</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.vllm.ai/en/latest/features/sampling_params.html" target="_blank" rel="noopener">vLLM — 采样参数与流式</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/performance/performance_tips.html" target="_blank" rel="noopener">vLLM — 性能调优</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html#_streaming" target="_blank" rel="noopener">Spring AI — 流式调用</a></li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events" target="_blank" rel="noopener">SSE — Server-Sent Events 规范</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现流式补全并对比流式与非流式的 TTFT 差异。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>运行 Python 流式补全脚本，记录 TTFT 和总耗时。</li>
+      <li>运行相同 prompt 的非流式版本，对比 TTFT 差异。</li>
+      <li>修改 Spring AI 端点，将 /complete 改为流式 SSE 输出。</li>
+      <li>在 <code>demos/practice-03-stream-lab/stream-vs-batch.md</code> 记录两类场景的策略选择理由。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同一 prompt，流式 TTFT=300ms，非流式返回完整结果也是 300ms。可能吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不可能。非流式必须等全部生成结束才返回，总耗时 ≥ 预填充 + 逐 token 生成。流式在预填充完成后即可返回首 token。非流式 300ms 可能只包含预填充（生成极少 token），或测量位置不对。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">max-num-seqs=8，但客户端发来 16 个并发请求，会发生什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>vLLM 同时处理 8 个，其余 8 个在排队。排队的请求 TTFT 会增加等待时间。可以通过 vLLM metrics 中的 <code>vllm:num_requests_waiting</code> 指标观察排队情况。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：流式与批处理</h4>
+      <p>目录：<code>demos/practice-03-stream-lab/</code>（<code>stream-vs-batch.md</code>）。<strong>验收</strong>：为 S4 补全和运营文案各写一种策略，含 TTFT/吞吐目标。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-gray">灰度与版本</a></li>
+      <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">PagedAttention — vLLM 中 continuous batching 的实现</a></li>
+    </ul>
+  </div>
 </section>

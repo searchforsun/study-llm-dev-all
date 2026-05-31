@@ -1,0 +1,358 @@
+<section id="ch-advanced-05-cost-control" class="chapter" data-chapter="advanced-05-cost-control">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent 成本控制</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-05-cost-control" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产级 Agent</strong> · 能力：优化 Agent 运行成本</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 的成本远高于普通的 LLM 调用——每次 ReAct 循环可能产生 3-10 次 LLM 调用。如果不加控制，一个复杂的 Plan-Execute Agent 单次执行可能消耗数万 Tokens。<span class="term" data-term-id="cost-control" tabindex="0">cost control</span> 通过模型路由、步数预算、缓存和压缩策略，在保证质量的前提下将成本降低 50-80%。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>建立 Agent Token 成本模型和预算体系</li>
+          <li>实现模型路由：简单问题用小模型</li>
+          <li>配置步数预算和 Token 上限</li>
+          <li>使用缓存和压缩技术降低重复成本</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>80% 成本来自复杂模型</strong>：简单问题用小模型，成本降低 90%。</li>
+          <li><strong>步数 = 成本乘数</strong>：每次 ReAct 循环增加一次 LLM 调用，步数是最大成本杠杆。</li>
+          <li><strong>缓存避免重复计算</strong>：相同输入的结果可缓存，减少重复调用。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Agent 成本模型</h3>
+
+      <p>Agent 的执行成本由以下要素决定：</p>
+
+      <div class="mermaid-wrap">
+        <h5>Agent 成本构成</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Cost[总成本]
+        LLMCost[LLM 调用成本\nInput + Output Tokens]
+        ToolCost[工具调用成本\nAPI 调用费]
+        InfraCost[基础设施\n向量 DB/Redis/计算]
+    end
+    subgraph Lever[成本杠杆]
+        Model[模型选择\n大 vs 小]
+        Steps[步数控制\nmax_steps]
+        Cache[缓存策略\n命中率]
+    end
+    Model --> LLMCost
+    Steps --> LLMCost
+    Cache --> LLMCost</pre>
+        <p class="diagram-caption">Agent 成本主要由 LLM 调用决定，模型选择、步数控制和缓存是三个核心杠杆。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>成本项</th><th>典型价格</th><th>单次 Agent 执行</th><th>月成本（10 万次）</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>大模型（GPT-4/Qwen-Max）</td><td>¥30/百万 input Tokens</td><td>~3000 tokens → ¥0.09</td><td>¥9,000</td></tr>
+          <tr><td>小模型（GPT-4o-mini/Qwen-Turbo）</td><td>¥1.5/百万 input Tokens</td><td>~3000 tokens → ¥0.0045</td><td>¥450</td></tr>
+          <tr><td>工具 API 调用</td><td>¥0.001/次</td><td>3-5 次 → ¥0.005</td><td>¥500</td></tr>
+          <tr><td>基础设施</td><td>¥500/月</td><td>-</td><td>¥500</td></tr>
+        </tbody>
+      </table>
+
+      <p>从表中可见，模型选择是最大的成本杠杆——将 30% 的简单请求从小模型处理，可降低 70% 以上 LLM 成本。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>模型路由策略</h3>
+
+      <p><span class="term" data-term-id="model-routing" tabindex="0">model routing</span> 根据任务复杂度选择不同的模型。核心思路：简单任务用便宜的小模型，复杂任务用高性能的大模型。</p>
+
+      <div class="mermaid-wrap">
+        <h5>模型路由流程</h5>
+        <pre class="mermaid">flowchart TD
+    Input[用户输入] --> Classifier[复杂度分类器]
+    Classifier -->|简单: 查询/问候| Small[小模型\nGPT-4o-mini\n~¥0.004/次]
+    Classifier -->|中等: 工单创建| Medium[中模型\nQwen-Lite\n~¥0.01/次]
+    Classifier -->|复杂: 多步推理| Large[大模型\nGPT-4/Claude\n~¥0.09/次]
+    Small --> Result[最终回答]
+    Medium --> Result
+    Large --> Agent[ReAct/Plan-Execute]</pre>
+        <p class="diagram-caption">模型路由根据任务复杂度分配不同成本的模型。</p>
+      </div>
+
+      <h4>Python：模型路由器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class ModelRouter:
+    """模型路由器：根据任务复杂度选择模型"""
+
+    def __init__(self):
+        self.routes = {
+            "simple": {"model": "qwen-turbo",    "cost_per_1k": 0.0015},
+            "medium": {"model": "qwen-plus",     "cost_per_1k": 0.008},
+            "complex": {"model": "qwen-max",     "cost_per_1k": 0.03},
+        }
+
+    def classify(self, task: str) -> str:
+        """判断任务复杂度"""
+        prompt = f"""判断以下任务复杂度，只返回 simple/medium/complex：
+        简单：问候、查询订单状态、查询时间
+        中等：创建工单、修改设置、多步骤查询
+        复杂：数据分析、多步推理、生成报告
+        任务：{task}"""
+        level = classifier_llm.invoke(prompt).content.strip()
+        return level if level in self.routes else "medium"
+
+    def route(self, task: str) -> str:
+        level = self.classify(task)
+        return self.routes[level]["model"]
+
+    def estimate_cost(self, task: str, tokens: int) -> dict:
+        level = self.classify(task)
+        model_conf = self.routes[level]
+        cost = (tokens / 1000) * model_conf["cost_per_1k"]
+        return {"model": model_conf["model"], "cost": round(cost, 4)}
+
+router = ModelRouter()
+print(router.estimate_cost("你好", 500))  # ~¥0.00075
+print(router.estimate_cost("分析 Q2 销售趋势", 5000))  # ~¥0.15</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>所有请求都用最贵的大模型</li>
+            <li>不设步数上限，成本不可控</li>
+            <li>无缓存，相同问题重复计算</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>模型路由：简单用小模型</li>
+            <li>max_steps 设置合理上限</li>
+            <li>缓存常见问题结果</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>步数预算优化</h3>
+
+      <p>每步 ReAct 循环消耗一次 LLM 调用。步数预算优化是降低成本的直接手段。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class StepBudgetManager:
+    """步数预算管理器"""
+
+    def __init__(self):
+        self.metrics = {
+            "total_executions": 0,
+            "total_steps": 0,
+            "cost_by_tool": defaultdict(float)
+        }
+
+    def get_budget(self, task_type: str) -> int:
+        """根据任务类型返回建议的 max_steps"""
+        budgets = {
+            "query": 3,       # 简单查询，1-2 步
+            "ticket": 5,      # 工单处理，3-5 步
+            "refund": 8,      # 退款流程，5-8 步
+            "report": 15,     # 报告生成，10-15 步
+        }
+        return budgets.get(task_type, 10)
+
+    def record_execution(self, steps: int, model: str, tokens: int):
+        self.metrics["total_executions"] += 1
+        self.metrics["total_steps"] += steps
+        cost = self._calculate_cost(model, tokens)
+        logger.info(f"执行完成: {steps}步, {model}, {tokens}tokens, ¥{cost}")
+
+    def get_avg_cost(self) -> float:
+        if self.metrics["total_executions"] == 0:
+            return 0
+        return self._calculate_cost("avg", 0) / self.metrics["total_executions"]
+
+    def _calculate_cost(self, model: str, tokens: int) -> float:
+        rates = {"qwen-turbo": 0.0015, "qwen-plus": 0.008, "qwen-max": 0.03}
+        rate = rates.get(model, 0.03)
+        return (tokens / 1000) * rate</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>缓存与复用</h3>
+
+      <p>缓存减少重复的 LLM 调用。Agent 中可缓存的内容包括：工具调用结果、LLM 响应、推理链。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from functools import lru_cache
+import hashlib
+import redis
+
+class AgentCache:
+    """Agent 缓存"""
+
+    def __init__(self, redis_client=None):
+        self.cache = redis_client or redis.Redis(host="localhost", port=6379)
+        self.ttl = 300  # 5 分钟
+
+    def _make_key(self, prefix: str, *args, **kwargs) -> str:
+        raw = f"{prefix}:{args}:{json.dumps(kwargs, sort_keys=True)}"
+        return f"agent:{hashlib.md5(raw.encode()).hexdigest()}"
+
+    def get_tool_result(self, tool_name: str, **kwargs) -> str | None:
+        key = self._make_key("tool", tool_name, kwargs)
+        result = self.cache.get(key)
+        return result.decode() if result else None
+
+    def set_tool_result(self, tool_name: str, result: str, **kwargs):
+        key = self._make_key("tool", tool_name, kwargs)
+        self.cache.setex(key, self.ttl, result)
+
+    def get_llm_response(self, prompt: str) -> str | None:
+        key = self._make_key("llm", prompt)
+        result = self.cache.get(key)
+        return result.decode() if result else None
+
+    def set_llm_response(self, prompt: str, response: str):
+        key = self._make_key("llm", prompt)
+        self.cache.setex(key, self.ttl, response)
+
+# 使用缓存的工具
+@tool
+def query_order_cached(order_id: str) -> str:
+    cached = agent_cache.get_tool_result("query_order", order_id=order_id)
+    if cached:
+        return cached
+    result = order_service.query(order_id)
+    formatted = f"订单 {order_id}: {result.status}"
+    agent_cache.set_tool_result("query_order", formatted, order_id=order_id)
+    return formatted</pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>成本只看模型单价</strong>：步数才是真正的成本乘数，一个 5 步的 Agent 成本是单步的 5 倍。</li>
+          <li><strong>过度缓存</strong>：缓存过期的数据可能导致 Agent 提供过时信息。设置合理 TTL。</li>
+          <li><strong>忽略输出 Token</strong>：大模型的输出 Token 价格通常高于输入，复杂输出的成本不可忽略。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>模型路由增加了一次分类 LLM 调用，这是否增加了成本？</summary>
+          <div class="learn-faq-body">分类器本身可以使用最便宜的小模型（如 GPT-4o-mini），单次分类调用成本约 ¥0.001。如果分类器将请求路由到小模型，单次可节省 ¥0.05-0.08。路由的准确率通常在 90%+，净节省显著。建议用规则或关键词分类器代替 LLM 分类以进一步降低成本。</div>
+        </details>
+        <details>
+          <summary>缓存会导致 Agent 回复过时信息吗？</summary>
+          <div class="learn-faq-body">取决于缓存 TTL 设置。订单状态等易变数据的缓存 TTL 应缩短（2-5 分钟），知识库等静态数据的 TTL 可以延长（1 小时+）。关键是判断数据的时效性要求——实时性要求高的数据（如物流状态）不缓存或短缓存。</div>
+        </details>
+        <details>
+          <summary>除了模型选择和缓存，还有什么降本手段？</summary>
+          <div class="learn-faq-body">① 上下文压缩：减少历史对话的 Token 消耗（见 记忆与上下文管理）；② Prompt 精简：System Prompt 精简 20% 可以节省大量 Token；③ 小模型优先：先用小模型尝试，如果小模型置信度不足再升级到大模型；④ 批量处理：将多个工具调用合并为一次 LLM 调用。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>成本模型</strong>：LLM 调用是主要成本，步数是最大的成本乘数。</li>
+        <li><strong>模型路由</strong>：根据任务复杂度选择不同成本的模型，简单任务用小模型。</li>
+        <li><strong>步数预算</strong>：根据任务类型设置不同的 max_steps 上限。</li>
+        <li><strong>缓存策略</strong>：缓存工具结果和 LLM 响应，减少重复计算。</li>
+        <li><strong>持续监控</strong>：记录每次执行的 Token 和步数，设置日环比告警。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_advanced05">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cost-model" /> 能建立 Agent Token 成本模型</label></li>
+          <li><label><input type="checkbox" data-id="model-route" /> 能实现模型路由</label></li>
+          <li><label><input type="checkbox" data-id="step-budget" /> 能为不同任务设置步数预算</label></li>
+          <li><label><input type="checkbox" data-id="cache-strategy" /> 能实现工具结果缓存</label></li>
+          <li><label><input type="checkbox" data-id="cost-monitor" /> 能监控和优化 Agent 执行成本</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Token Cost</td><td>LLM 调用的 Token 消耗成本</td></tr>
+                <tr><td>Model Routing</td><td>任务复杂度匹配模型成本</td></tr>
+                <tr><td>Step Budget</td><td>最大步数控制成本乘数</td></tr>
+                <tr><td>Cache</td><td>缓存结果减少重复计算</td></tr>
+                <tr><td>Context Compression</td><td>压缩上下文减少 Token</td></tr>
+                <tr><td>Small Model First</td><td>小模型优先策略</td></tr>
+                <tr><td>Cost Monitor</td><td>成本监控和告警</td></tr>
+                <tr><td>TTL</td><td>缓存过期时间控制</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 运行成本主要由哪些因素决定？你会优先优化哪个因素？</li>
+              <li>设计一个模型路由系统，要求将 70% 的简单请求用小模型处理。</li>
+              <li>缓存在 Agent 中有什么风险和限制？如何设计合理的缓存策略？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-06-interview">面试：Agent 架构与排障</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://openai.com/api/pricing/" target="_blank" rel="noopener">OpenAI API Pricing</a></li>
+      <li><a href="https://help.aliyun.com/document_detail/2712195.html" target="_blank" rel="noopener">通义千问 API 定价</a></li>
+      <li><a href="https://docs.anthropic.com/en/docs/about-claude/pricing" target="_blank" rel="noopener">Anthropic Claude Pricing</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p>目录：<code>demos/advanced-05-cost-control-lab/</code>。<strong>验收</strong>：模型路由器正确分发，缓存命中率 > 30%，成本降低 > 50%。</p>
+  </div>
+</section>

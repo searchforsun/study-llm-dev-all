@@ -1,40 +1,500 @@
 <section id="ch-practice-03-sync-async" class="chapter" data-chapter="practice-03-sync-async">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>同步、异步与 MQ</h2>
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>同步/异步模式选择</h2>
   <button type="button" class="btn-mark-done" data-chapter="practice-03-sync-async" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>联调实战</strong> · 能力：长任务异步、回调与幂等</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>索引重建/批量评测不能阻塞 HTTP；需 MQ+回调。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist 双栈场景实践本章集成能力</li>
-        <li>说明 Spring 治理面与 Python 能力面分工</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>联调实战</strong> · 能力：长任务异步、MQ 回调与幂等设计</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong>
+        <p>索引重建、批量评测、知识库导入等<strong>长任务</strong>不能阻塞 HTTP 请求。CorpAssist 需要明确的同步/异步分界：实时问答走同步（SSE 流式），后台任务走异步（202 Accepted + MQ 回调）。<span class="term" data-term-id="async-task" tabindex="0">async task</span> 和 <span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span> 是本</p>章核心。
+      </div>
+      <div class="notice notice-outcome"><strong>学完你能</strong>
+        <ul>
+          <li>区分同步/异步场景并选择正确的通信模式</li>
+          <li>设计 <span class="term" data-term-id="long-running" tabindex="0">long running</span> 任务的 202 Accepted + Job Status 模式</li>
+          <li>使用 <span class="term" data-term-id="mq-callback" tabindex="0">mq callback</span> 实现 Spring-Python 异步回调</li>
+          <li>实现 <span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span> 幂等去重</li>
+          <li>选择 <span class="term" data-term-id="celery-rq" tabindex="0">celery rq</span> 或 <span class="term" data-term-id="spring-mq" tabindex="0">spring mq</span> 进行任务编排</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>长任务与回调</h3><p>202 Accepted + job_id；完成 webhook。 关联：<span class="term" data-term-id="async-task" tabindex="0">async task</span>、<span class="term" data-term-id="mq-callback" tabindex="0">mq callback</span>。</p></div>
-    <div class="section-block"><h3>幂等</h3><p>Idempotency-Key 防重复提交。 关联：<span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span>、<span class="term" data-term-id="long-running" tabindex="0">long running</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="async-task" tabindex="0">async task</span> · <span class="term" data-term-id="mq-callback" tabindex="0">mq callback</span> · <span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span> · <span class="term" data-term-id="long-running" tabindex="0">long running</span> · <span class="term" data-term-id="job-status" tabindex="0">job status</span> · <span class="term" data-term-id="webhook-callback" tabindex="0">webhook callback</span> · <span class="term" data-term-id="celery-rq" tabindex="0">celery rq</span> · <span class="term" data-term-id="spring-mq" tabindex="0">spring mq</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-json">{"job_id":"j1","status":"accepted"}
-// 完成后 POST /v1/callbacks/index-done</code></pre></div>
-      <div class="mermaid-wrap"><h5>同步、异步与 MQ</h5>
-      <pre class="mermaid">flowchart LR
-  Spring[Spring 治理面] <-->|OpenAPI| Python[Python 能力面]</pre></div>
+
+    <div class="section-block">
+      <h3>同步 vs 异步场景决策</h3>
+      <p>CorpAssist 中不同操作有不同的延迟和一致性要求，需要选择合适的通信模式。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>延迟要求</th><th>推荐模式</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>RAG 知识问答</td><td>< 5s</td><td>同步 HTTP</td><td>用户等待实时回答</td></tr>
+          <tr><td>Agent 多步推理</td><td>< 30s</td><td>同步 SSE</td><td>流式输出中间结果</td></tr>
+          <tr><td>文档索引（小文件）</td><td>< 10s</td><td>同步 HTTP</td><td>等待确认写入完成</td></tr>
+          <tr><td>文档索引（大批量）</td><td>分钟~小时</td><td>异步 MQ</td><td>202 Accepted + 回调</td></tr>
+          <tr><td>索引版本重建</td><td>小时级</td><td>异步 MQ</td><td>后台 Worker 异步执行</td></tr>
+          <tr><td>批量评测</td><td>分钟~小时</td><td>异步 MQ</td><td>执行完成后通知结果</td></tr>
+          <tr><td>模型配置更新</td><td>秒级</td><td>同步 HTTP</td><td>配置中心实时生效</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>同步 vs 异步决策流程</h5>
+        <pre class="mermaid">flowchart TB
+    START[请求到达] --> ASK{用户等待\n响应吗？}
+    ASK -->|是| QUICK{处理时间\n< 30秒？}
+    ASK -->|否| ASYNC[异步 202 Accepted]
+
+    QUICK -->|是| SYNC[同步 HTTP\n实时返回]
+    QUICK -->|否| STREAM[SSE 流式\n逐步输出]
+
+    ASYNC --> JOB[创建 Job Record\n状态: pending]
+    JOB --> MQ[发送 MQ 消息]
+    MQ --> WORKER[Worker 消费执行]
+    WORKER --> CALLBACK[回调通知完成]
+
+    SYNC --> DONE[完成]
+    STREAM --> DONE
+    CALLBACK --> DONE
+
+    style SYNC fill:#6DB33F,color:#fff
+    style STREAM fill:#4A90D9,color:#fff
+    style ASYNC fill:#D2691E,color:#fff</pre>
+        <p class="diagram-caption">同步 vs 异步决策流程：以用户等待时间和处理时间为依据选择通信模式。</p>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>长任务异步、回调与幂等</li>
-    <li>下一步：契约测试</li></ul></div>
+
+    <div class="section-block">
+      <h3>异步长任务模式：202 Accepted + Job Status</h3>
+      <p><span class="term" data-term-id="long-running" tabindex="0">long running</span> 任务使用 202 Accepted + Job Status 模式。请求立即返回 job_id，客户端通过 job_id 轮询或等待回调。</p>
+
+      <div class="mermaid-wrap">
+        <h5>异步长任务流程</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant C as 客户端
+    participant BFF as Spring BFF
+    participant DB as PostgreSQL
+    participant MQ as RabbitMQ
+    participant W as Python Worker
+
+    C->>BFF: POST /api/v1/index/batch\n{files: [...]}
+    BFF->>DB: INSERT job (status=pending)
+    DB-->>BFF: job_id
+    BFF->>MQ: Publish IndexJobCreated
+    BFF-->>C: 202 Accepted\n{job_id, status_url}
+
+    MQ->>W: Consume IndexJobCreated
+    W->>W: 执行索引（分钟级）
+    W->>DB: UPDATE job (status=completed)
+    W->>MQ: Publish IndexJobCompleted
+
+    MQ->>BFF: Consume IndexJobCompleted
+    BFF->>BFF: 更新缓存/通知
+
+    C->>BFF: GET {status_url}
+    BFF-->>C: 200 {status: "completed", stats}</pre>
+        <p class="diagram-caption">异步长任务模式：202 Accepted 立即返回，MQ 解耦执行过程，Job Status 查询结果。</p>
+      </div>
+
+      <h4>Spring 异步任务 API</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring 异步任务 API
+@RestController
+@RequestMapping("/api/v1/index")
+public class IndexController {
+
+    private final JobRepository jobRepository;
+    private final RabbitTemplate rabbitTemplate;
+
+    @PostMapping("/batch")
+    public ResponseEntity&lt;JobResponse&gt; submitBatch(
+            @RequestBody @Valid BatchIndexRequest request,
+            @RequestHeader("X-Tenant-Id") String tenantId) {
+
+        // 1. 创建任务记录
+        IndexJob job = IndexJob.builder()
+            .id(UUID.randomUUID().toString())
+            .tenantId(tenantId)
+            .type("index_batch")
+            .status(JobStatus.PENDING)
+            .params(objectMapper.writeValueAsString(request))
+            .createdAt(Instant.now())
+            .build();
+        jobRepository.save(job);
+
+        // 2. 发送 MQ 消息
+        rabbitTemplate.convertAndSend("corpassist.index",
+            "job.created",
+            new IndexJobEvent(job.getId(), tenantId, request));
+
+        // 3. 返回 202 Accepted
+        URI statusUrl = URI.create(
+            "/api/v1/index/jobs/" + job.getId());
+        return ResponseEntity.accepted()
+            .location(statusUrl)
+            .body(new JobResponse(job.getId(), "pending",
+                statusUrl.toString()));
+    }
+
+    @GetMapping("/jobs/{jobId}")
+    public ResponseEntity&lt;IndexJob&gt; getJobStatus(
+            @PathVariable String jobId) {
+        return jobRepository.findById(jobId)
+            .map(ResponseEntity::ok)
+            .orElse(ResponseEntity.notFound().build());
+    }
+}</code></pre>
+      </div>
+
+      <h4>Python 异步 Worker 消费</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python Celery Worker - 消费索引任务
+from celery import Celery
+import httpx
+
+celery = Celery("corpassist_index",
+    broker="redis://redis:6379/0",
+    backend="redis://redis:6379/1")
+
+@celery.task(bind=True, max_retries=3, acks_late=True)
+def process_index_job(self, job_id: str, tenant_id: str, files: list):
+    """处理索引任务"""
+    try:
+        # 1. 更新任务状态为 processing
+        update_job_status(job_id, "processing")
+
+        # 2. 执行索引
+        result = perform_indexing(files, tenant_id)
+
+        # 3. 更新完成状态
+        update_job_status(job_id, "completed", result=result)
+
+        # 4. 通过 Webhook 回调 BFF
+        callback_url = get_callback_url(job_id)
+        if callback_url:
+            httpx.post(callback_url, json={
+                "job_id": job_id,
+                "status": "completed",
+                "result": result,
+            })
+
+    except Exception as exc:
+        update_job_status(job_id, "failed", error=str(exc))
+        self.retry(exc=exc)
+
+def update_job_status(job_id: str, status: str, **extra):
+    """通过 DB API 更新任务状态"""
+    httpx.patch(
+        f"http://spring-bff:8081/api/v1/index/jobs/{job_id}",
+        json={"status": status, **extra},
+        timeout=5,
+    )</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>MQ 事件驱动：Spring + RabbitMQ</h3>
+      <p><span class="term" data-term-id="spring-mq" tabindex="0">spring mq</span> 是 CorpAssist 中 Spring 治理面到 Python 能力面的异步事件通道。使用 RabbitMQ 作为消息中间件。</p>
+
+      <h4>Spring MQ 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># Spring RabbitMQ 配置
+spring:
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: 5672
+    username: ${RABBITMQ_USER:corpassist}
+    password: ${RABBITMQ_PASS:corpassist_dev}
+    listener:
+      simple:
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 5s
+        acknowledge-mode: auto
+
+corpassist:
+  mq:
+    exchanges:
+      index-exchange: corpassist.index
+      agent-exchange: corpassist.agent
+    queues:
+      index-job-queue: corpassist.index.job
+      index-callback-queue: corpassist.index.callback
+      agent-event-queue: corpassist.agent.event</code></pre>
+      </div>
+
+      <h4>Spring 事件发布与消费</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring 异步事件监听
+@Component
+public class IndexJobEventListener {
+
+    private final JobRepository jobRepository;
+
+    @RabbitListener(queues = "corpassist.index.callback")
+    public void handleIndexCompleted(IndexCompletedEvent event) {
+        // 1. 更新数据库中任务状态
+        jobRepository.findById(event.jobId()).ifPresent(job -> {
+            job.setStatus(JobStatus.COMPLETED);
+            job.setCompletedAt(Instant.now());
+            job.setResult(event.result());
+            jobRepository.save(job);
+        });
+
+        // 2. 触发后续操作（如更新索引版本）
+        log.info("Index job completed: jobId={}, stats={}",
+            event.jobId(), event.result());
+    }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>长任务用同步 HTTP 等待数分钟</li>
+            <li>超时后盲目重试，没有幂等</li>
+            <li>没有 Job Status 查询端点</li>
+            <li>MQ 消息丢失无补偿机制</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>长任务使用 202 Accepted + Job Status</li>
+            <li><span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span> 防重复提交</li>
+            <li>提供任务状态查询和列表端点</li>
+            <li>MQ 消息使用 acks_late + retry</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>幂等设计</h3>
+      <p><span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span> 用于防止重复提交。客户端在请求中携带唯一的幂等键，服务端检测到重复键时返回已处理的结</p>果而不是重新执行。
+
+      <h4>Spring Idempotency 过滤器</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring 幂等过滤器
+@Component
+public class IdempotencyFilter implements WebFilter {
+
+    private final StringRedisTemplate redis;
+
+    @Override
+    public Mono&lt;Void&gt; filter(ServerWebExchange exchange, WebFilterChain chain) {
+        String idempotencyKey = exchange.getRequest()
+            .getHeaders().getFirst("Idempotency-Key");
+
+        if (idempotencyKey == null) {
+            return chain.filter(exchange);
+        }
+
+        String cacheKey = "idempotency:" + idempotencyKey;
+
+        return redis.opsForValue().get(cacheKey)
+            .flatMap(cached -> {
+                // 已处理过，返回上次结果
+                ServerHttpResponse response = exchange.getResponse();
+                response.setStatusCode(HttpStatus.OK);
+                return response.writeWith(
+                    Mono.just(response.bufferFactory()
+                        .wrap(cached.getBytes(StandardCharsets.UTF_8))));
+            })
+            .switchIfEmpty(
+                chain.filter(exchange).then(
+                    // 缓存响应结果
+                    Mono.defer(() -> cacheResponse(exchange, cacheKey))
+                )
+            );
+    }
+}</code></pre>
+      </div>
+
+      <h4>Python Idempotency 装饰器</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python 幂等装饰器
+from functools import wraps
+from redis import Redis
+import json
+
+redis_client = Redis(host="redis", port=6379, db=0)
+
+def idempotent(ttl_seconds: int = 86400):
+    """幂等装饰器：Idempotency-Key 去重"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(request: Request, *args, **kwargs):
+            idempotency_key = request.headers.get("Idempotency-Key")
+            if not idempotency_key:
+                return await func(request, *args, **kwargs)
+
+            cache_key = f"idempotency:{idempotency_key}"
+            cached = redis_client.get(cache_key)
+            if cached:
+                return JSONResponse(
+                    content=json.loads(cached),
+                    status_code=200,
+                )
+
+            response = await func(request, *args, **kwargs)
+            if response.status_code == 200:
+                redis_client.setex(
+                    cache_key,
+                    ttl_seconds,
+                    json.dumps(response.body, ensure_ascii=False),
+                )
+            return response
+        return wrapper
+    return decorator</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>202 Accepted 返回后，如果 Worker 挂了，任务会丢失吗？</summary>
+          <div class="learn-faq-body">
+            不会。如果 Worker 在处理过程中崩溃，MQ 消息会重新入队（ack_late 模式）并重新投递到其他 Worker。如果 MQ 本身不可用，消息会持久化到磁盘，恢复后重新消费。如果任务已经提交到 Worker 但结果未持久化，BFF 的任务状态会保持 processing，可以设置超时检测并自动重置为 pending。
+          </div>
+        </details>
+        <details>
+          <summary>Idempotency-Key 存储多久？</summary>
+          <div class="learn-faq-body">
+            CorpAssist 默认存储 24 小时（TTL=86400s），这与大多数业务场景的重复请求时间窗口一致。幂等键存储太久会占用 Redis 空间，太短则可能在 TTL 过期后用户重试导致重复。建议根据业务特性调整 TTL：索引任务 7 天，查询类任务 1 小时。
+          </div>
+        </details>
+        <details>
+          <summary>Python Worker 如何回传结果给 Spring BFF？</summary>
+          <div class="learn-faq-body">
+            三种方式：1) <strong>MQ 回调</strong>：Python Worker 完成后通过 MQ 发送事件，Spring 监听消费；2) <strong>Webhook 回调</strong>：Python Worker 直接调用 BFF 的 /api/v1/index/callback；3) <strong>DB 共享</strong>：Worker 写入共享数据库，BFF 查询。推荐 MQ 方式，松耦合且支持重试。
+          </div>
+        </details>
+        <details>
+          <summary>同步和异步可以混用吗？</summary>
+          <div class="learn-faq-body">
+            可以。CorpAssist 中 RAG 问答使用同步 SSE，索引任务使用异步 MQ。一个请求可以拆分为同步部分（立即返回初步结果）和异步部分（后台继续处理）。例如文档上传：同步 202 返回 job_id，异步索引完成后通知。关键的决策因素是「用户是否在等待该结果」。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>模式选择</strong>：< 30s 用同步/SSE，> 30s 用异步 202 + Job Status</li>
+        <li><strong>MQ 解耦</strong>：RabbitMQ 作为 Spring-Python 异步通道，事件驱动业务编排</li>
+        <li><strong>幂等</strong>：Idempotency-Key 防重复提交，Redis 缓存已处理结果</li>
+        <li><strong>状态管理</strong>：Job 状态机（pending→processing→completed/failed）支持追踪</li>
+        <li><strong>下一步</strong>：在 <a href="#ch-practice-04-contract-test">契约测试</a> 中学习如何测试双栈之间的接口兼容性</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-composite-integration_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="async-decision" /> 能根据延迟要求正确选择同步/异步模式</label></li>
+          <li><label><input type="checkbox" data-id="202-pattern" /> 能实现 202 Accepted + Job Status 模式</label></li>
+          <li><label><input type="checkbox" data-id="mq-callback" /> 能配置 RabbitMQ 实现 Spring-Python 回调</label></li>
+          <li><label><input type="checkbox" data-id="idempotency" /> 能实现 Idempotency-Key 幂等去重</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="async-task" tabindex="0">async task</span></td><td>202 Accepted 立即返回 + 异步执行</td></tr>
+                <tr><td><span class="term" data-term-id="mq-callback" tabindex="0">mq callback</span></td><td>通过 MQ 事件回传任务完成通知</td></tr>
+                <tr><td><span class="term" data-term-id="idempotency-key" tabindex="0">idempotency key</span></td><td>唯一请求键，防重复提交</td></tr>
+                <tr><td><span class="term" data-term-id="long-running" tabindex="0">long running</span></td><td>分钟~小时级的后台任务</td></tr>
+                <tr><td><span class="term" data-term-id="job-status" tabindex="0">job status</span></td><td>Penging→Processing→Completed/Failed</td></tr>
+                <tr><td><span class="term" data-term-id="webhook-callback" tabindex="0">webhook callback</span></td><td>HTTP POST 回调通知结果</td></tr>
+                <tr><td><span class="term" data-term-id="celery-rq" tabindex="0">celery rq</span></td><td>Python 异步任务队列</td></tr>
+                <tr><td><span class="term" data-term-id="spring-mq" tabindex="0">spring mq</span></td><td>Spring 消息队列集成</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如果一个同步请求需要 3 分钟才能完成，应该怎么处理？请列出至少 3 种方案并对比优劣。</li>
+              <li>幂等键在哪些场景下是必须的？如果索引批次请求没有幂等键，会发生什么问题？</li>
+              <li>202 Accepted 返回后，客户端应该如何查询任务状态？轮询 vs Webhook 各有什么优劣？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-practice-04-contract-test">契约测试</a> 将学习如何通过契约测试保障双栈接口兼容性。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://swagger.io/specification/" target="_blank" rel="noopener">OpenAPI</a></li>
-    <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank" rel="noopener">Spring Cloud Gateway</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-03-sync-async-lab/</code></li>
-  <li>写一条双栈分工或契约对照笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：同步、异步与 MQ</h4>
-  <p><code>demos/practice-03-sync-async-lab/</code> — 画异步三态</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-04-contract-test">契约测试</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.rabbitmq.com/tutorials/tutorial-one-spring-amqp.html" target="_blank" rel="noopener">RabbitMQ + Spring AMQP — 入门教程</a></li>
+      <li><a href="https://docs.celeryq.dev/en/stable/userguide/tasks.html" target="_blank" rel="noopener">Celery Task — 任务定义与重试</a></li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/202" target="_blank" rel="noopener">HTTP 202 Accepted — 标准定义</a></li>
+      <li><a href="https://stripe.com/docs/api/idempotent_requests" target="_blank" rel="noopener">Stripe Idempotency — 幂等请求设计模式</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现一个异步索引任务流程（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>实现 Spring BFF 的 202 Accepted + Job Status API</li>
+      <li>配置 RabbitMQ 交换器/队列，发布索引任务事件</li>
+      <li>实现 Python Celery Worker 消费索引任务并回调</li>
+      <li>为索引 API 添加 Idempotency-Key 支持</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">索引任务执行了 5 分钟，但客户端 1 分钟后断开了连接。任务还会继续执行吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>会继续执行。异步模式中客户端断开不影响 Worker 的执行。Worker 完成后通过 MQ 回调通知 BFF，BFF 更新数据库中的任务状态。用户重新连接后可以通过 job_id 查询到已完成的结果。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：同步、异步与 MQ</h4>
+      <p>目录：<code>demos/practice-03-sync-async-lab/</code>。<strong>验收</strong>：画出异步任务的三态（pending/processing/completed），并实现一个 202 Accepted 接口。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-contract-test">契约测试与集成测试</a></li>
+      <li><a href="https://www.rabbitmq.com/getstarted.html" target="_blank" rel="noopener">RabbitMQ 入门指南</a></li>
+      <li><a href="https://docs.celeryq.dev/en/stable/userguide/configuration.html" target="_blank" rel="noopener">Celery 配置参考</a></li>
+      <li><a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/async-request-reply" target="_blank" rel="noopener">Microsoft — 异步请求-回复模式</a></li>
+    </ul>
+  </div>
 </section>

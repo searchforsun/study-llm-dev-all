@@ -3,41 +3,468 @@
   <button type="button" class="btn-mark-done" data-chapter="practice-05-debug" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>联调实战</strong> · 能力：日志关联、Trace 与常见问题</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>双栈 bug 一半在 Header/契约；需统一 request_id 排障。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist 双栈场景实践本章集成能力</li>
-        <li>说明 Spring 治理面与 Python 能力面分工</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>联调实战</strong> · 能力：日志关联、Trace 与常见问题排障</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong>
+        <p>双栈 bug 一半出在 Header 和契约上：request_id 未透传导致两边日志对不上、JWT 租户信息丢失导致 401、SSE 断流导致 Agent 输出不完整。本章提供系统化的 <span class="term" data-term-id="debug-playbook" tabindex="0">debug playbook</span>，覆盖 <span class="term" data-term-id="log-correlation" tabindex="0">log correlation</span>、<span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span> 和常见问题排查。</p>
+      </div>
+      <div class="notice notice-outcome"><strong>学完你能</strong>
+        <ul>
+          <li>设计 <span class="term" data-term-id="request-id" tabindex="0">request id</span> 全链路透传方案</li>
+          <li>使用 <span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span> 追踪跨服务调用</li>
+          <li>排查 <span class="term" data-term-id="header-mismatch" tabindex="0">header mismatch</span> 导致的认证失败</li>
+          <li>解决 <span class="term" data-term-id="timeout-debug" tabindex="0">timeout debug</span> 超时问题</li>
+          <li>编写 <span class="term" data-term-id="runbook" tabindex="0">runbook</span> 排障手册</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>日志与 Trace</h3><p>X-Request-Id 全链路透传。 关联：<span class="term" data-term-id="debug-playbook" tabindex="0">debug playbook</span>、<span class="term" data-term-id="log-correlation" tabindex="0">log correlation</span>。</p></div>
-    <div class="section-block"><h3>常见问题</h3><p>401 租户错、404 版本错、SSE 断流。 关联：<span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span>、<span class="term" data-term-id="request-id" tabindex="0">request id</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="debug-playbook" tabindex="0">debug playbook</span> · <span class="term" data-term-id="log-correlation" tabindex="0">log correlation</span> · <span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span> · <span class="term" data-term-id="request-id" tabindex="0">request id</span> · <span class="term" data-term-id="common-issues" tabindex="0">common issues</span> · <span class="term" data-term-id="header-mismatch" tabindex="0">header mismatch</span> · <span class="term" data-term-id="timeout-debug" tabindex="0">timeout debug</span> · <span class="term" data-term-id="runbook" tabindex="0">runbook</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-markdown">## 排障清单
-1. 对齐 request_id 查两边日志
-2. 核对 OpenAPI 版本
-3. 检查 JWT 租户 claim
-4. curl Python 直连 vs 经 BFF</code></pre></div>
-      <div class="mermaid-wrap"><h5>联调排障手册</h5>
-      <pre class="mermaid">flowchart LR
-  Spring[Spring 治理面] <-->|OpenAPI| Python[Python 能力面]</pre></div>
+
+    <div class="section-block">
+      <h3>排障基础设施：全链路 Trace</h3>
+      <p><span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span> 是双栈排障的基础。每一次用户请求生成唯一的 tracing_id，贯穿 Spring Gateway → BFF → Python → LLM 的完整链路。</p>
+
+      <div class="mermaid-wrap">
+        <h5>全链路 Trace 透传</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant GW as Gateway
+    participant BFF as BFF
+    participant PY as Python AI
+    participant LLM as LLM API
+
+    Note over GW,LLM: trace_id: tr-abc-001\nspan_id 逐跳变化
+
+    GW->>BFF: X-Request-Id: tr-abc-001\nX-Span-Id: span-1
+    BFF->>BFF: 创建子 span (span-2)
+    BFF->>PY: X-Request-Id: tr-abc-001\nX-Span-Id: span-2
+    PY->>PY: 创建子 span (span-3)
+    PY->>LLM: X-Request-Id: tr-abc-001
+    LLM-->>PY: response
+    PY-->>BFF: response
+    BFF-->>GW: response</pre>
+        <p class="diagram-caption">全链路 Trace：trace_id 跨服务不变，span_id 每跳变化，实现调用链追踪。</p>
+      </div>
+
+      <h4>Spring Trace 过滤器</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring Trace 过滤器
+@Component
+public class TraceFilter implements WebFilter {
+
+    private static final String TRACE_HEADER = "X-Request-Id";
+    private static final String SPAN_HEADER = "X-Span-Id";
+
+    @Override
+    public Mono&lt;Void&gt; filter(ServerWebExchange exchange, WebFilterChain chain) {
+        String traceId = exchange.getRequest().getHeaders()
+            .getFirst(TRACE_HEADER);
+        if (traceId == null || traceId.isBlank()) {
+            traceId = UUID.randomUUID().toString();
+        }
+
+        String spanId = UUID.randomUUID().toString().substring(0, 8);
+
+        // 注入 MDC（日志上下文）
+        MDC.put("trace_id", traceId);
+        MDC.put("span_id", spanId);
+
+        // 追加到响应 Header
+        exchange.getResponse().getHeaders()
+            .add(TRACE_HEADER, traceId);
+
+        return chain.filter(
+            exchange.mutate()
+                .request(exchange.getRequest().mutate()
+                    .header(TRACE_HEADER, traceId)
+                    .header(SPAN_HEADER, spanId)
+                    .build())
+                .build())
+            .doFinally(signalType -> {
+                MDC.clear();
+            });
+    }
+}</code></pre>
+      </div>
+
+      <h4>Python Trace 中间件</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python Trace 中间件
+import structlog
+from fastapi import Request
+import uuid
+
+logger = structlog.get_logger()
+
+@app.middleware("http")
+async def trace_middleware(request: Request, call_next):
+    # 1. 获取透传的 trace_id
+    trace_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    span_id = str(uuid.uuid4())[:8]
+
+    # 2. 注入日志上下文
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        trace_id=trace_id,
+        span_id=span_id,
+        service="python-rag",
+        path=request.url.path,
+    )
+
+    # 3. 记录请求开始
+    logger.info("request_start",
+        method=request.method,
+        query_params=dict(request.query_params))
+
+    # 4. 执行请求
+    start = time.time()
+    response = await call_next(request)
+    elapsed = time.time() - start
+
+    # 5. 记录请求结束
+    logger.info("request_end",
+        status_code=response.status_code,
+        elapsed_ms=round(elapsed * 1000, 2))
+
+    # 6. 注入响应 Header
+    response.headers["X-Request-Id"] = trace_id
+    response.headers["X-Span-Id"] = span_id
+
+    return response</code></pre>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>日志关联、Trace 与常见问题</li>
-    <li>下一步：灰度与双栈切换</li></ul></div>
+
+    <div class="section-block">
+      <h3>日志关联与查询</h3>
+      <p><span class="term" data-term-id="log-correlation" tabindex="0">log correlation</span> 通过 trace_id 关联双栈日志。Spring 和 Python 的日志统一格式后，可以在日志平台（ELK/Loki）中按 trace_id 一次查询到完整的调用链。</p>
+
+      <h4>统一日志格式</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># Spring logback-spring.xml 配置
+<appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+        <includeCallerData>true</includeCallerData>
+        <fieldNames>
+            <timestamp>@timestamp</timestamp>
+            <version>[ignore]</version>
+            <levelValue>[ignore]</levelValue>
+        </fieldNames>
+        <includeContext>false</includeContext>
+    </encoder>
+</appender>
+
+<!-- 日志示例输出 -->
+<!-- {"@timestamp":"2026-05-31T10:30:00.123Z",
+     "level":"INFO",
+     "trace_id":"tr-abc-001",
+     "span_id":"a1b2c3d4",
+     "service":"spring-bff",
+     "message":"RAG query completed",
+     "elapsed_ms":1520} --></code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python structlog 配置
+import structlog
+import structlog.processors
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+# 日志示例输出（JSON 格式）
+# {"event": "vector_search_completed",
+#  "level": "info",
+#  "timestamp": "2026-05-31T10:30:01.456Z",
+#  "trace_id": "tr-abc-001",
+#  "span_id": "e5f6g7h8",
+#  "service": "python-rag",
+#  "top_k": 5,
+#  "elapsed_ms": 234}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题排障手册</h3>
+      <p><span class="term" data-term-id="common-issues" tabindex="0">common issues</span> 是双栈联调中最常见的问题及排查步骤。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>问题</th><th>现象</th><th>排查步骤</th><th>根因</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>401 租户错</strong></td>
+            <td>Python 返回 401 "tenant mismatch"</td>
+            <td>1) 查 Gateway 日志中 X-Tenant-Id 值<br>2) 查 Python 日志中收到的 tenant_id</td>
+            <td>Gateway 未正确注入或清除客户端传的 X-Tenant-Id</td>
+          </tr>
+          <tr>
+            <td><strong>404 版本错</strong></td>
+            <td>Python 返回 404 路径不存在</td>
+            <td>1) 核对 Spring 调用的 URL<br>2) 核对 Python 的路由定义</td>
+            <td>Spring 调 /v1/rag/query 但 Python 定义在 /v2/rag/query</td>
+          </tr>
+          <tr>
+            <td><strong>SSE 断流</strong></td>
+            <td>Agent 输出到一半客户端断开</td>
+            <td>1) 检查 BFF 的 read-timeout<br>2) 检查 Python Agent 的超时配置</td>
+            <td>BFF 的 read-timeout 太短或客户端连接不稳定</td>
+          </tr>
+          <tr>
+            <td><strong>500 反序列化</strong></td>
+            <td>Spring 调用 Python 时 JSON 解析失败</td>
+            <td>1) 用 curl 直接调 Python 看响应格式<br>2) 对比 OpenAPI 契约</td>
+            <td>Python 返回的字段名/类型与 Spring DTO 不匹配</td>
+          </tr>
+          <tr>
+            <td><strong>超时</strong></td>
+            <td>Spring 调用 Python 经常超时</td>
+            <td>1) 检查 Python 服务的响应时间<br>2) 检查 LLM 调用的延迟</td>
+            <td>LLM 响应慢 / Python Worker 线程耗尽</td>
+          </tr>
+          <tr>
+            <td><strong>幂等重复</strong></td>
+            <td>索引任务被重复执行</td>
+            <td>1) 检查 Idempotency-Key 是否正确传递<br>2) 检查 Redis 中的幂等缓存</td>
+            <td>客户端未传 Idempotency-Key 或 Gateway 清除了该 Header</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐：无系统排障</span>
+          <ul>
+            <li>出问题先重启服务</li>
+            <li>两边各自查日志，手动比对时间戳</li>
+            <li>没有 trace_id，只能用用户 ID 和时间大致关联</li>
+            <li>排障过程不文档化</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐：系统排障流程</span>
+          <ul>
+            <li>第一步：按 trace_id 关联所有服务的日志</li>
+            <li>第二步：用 curl 绕过 BFF 直连 Python 隔离问题</li>
+            <li>第三步：检查 OpenAPI 契约是否一致</li>
+            <li>第四步：将排障过程写入 Runbook</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Runbook：系统化排障流程</h3>
+      <p><span class="term" data-term-id="runbook" tabindex="0">runbook</span> 是双栈排障的标准化操作手册。以下是 CorpAssist 的核心排障 Runbook。</p>
+
+      <div class="mermaid-wrap">
+        <h5>排障决策树</h5>
+        <pre class="mermaid">flowchart TB
+    A[用户报错] --> B{有 trace_id 吗？}
+    B -->|有| C[按 trace_id 查日志]
+    B -->|没有| D[从请求日志找 trace_id]
+
+    C --> E{Spring 端报错？}
+    E -->|是| F{Spring 还是 Python 的错？}
+    E -->|否| G[Python 端排查]
+
+    F -->|Spring| H[查 OpenAPI 契约\n检查 DTO 对齐]
+    F -->|Python| I[curl 直连 Python\n检查响应格式]
+
+    G --> J[查 LLM 调用日志]
+    J --> K{LLM 超时？}
+    K -->|是| L[检查模型状态\n或降级模型]
+    K -->|否| M[查向量库状态]
+
+    H --> N[修复后更新契约测试]
+    I --> N
+    L --> N
+    M --> N
+    N --> O[验证通过 → 关闭]</pre>
+        <p class="diagram-caption">排障决策树：按 trace_id 关联日志，逐层定位问题根因。</p>
+      </div>
+
+      <h4>Runbook 模板</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown"># CorpAssist 排障 Runbook
+
+## 问题：Python RAG API 返回 500
+
+### 排查步骤
+1. 从 BFF 日志中找到出错的 trace_id
+2. 按 trace_id 在 Python 日志中定位对应请求
+3. curl 直连 Python 复现问题：
+   ```bash
+   curl -X POST http://localhost:8001/v1/rag/query \
+     -H "X-User-Id: user-001" \
+     -H "X-Tenant-Id: corp-001" \
+     -d '{"query": "测试", "top_k": 5}'
+   ```
+4. 检查 Python 日志中的异常栈
+5. 修复后添加契约测试防止再次发生
+
+### 常见根因
+- Milvus 连接超时 → 检查 Milvus 健康状态
+- OpenAI API 速率限制 → 检查 API Key 配额
+- 租户向量 collection 不存在 → 确认是否已创建索引
+
+### 验证
+- [ ] curl 直连 Python 返回 200
+- [ ] Spring BFF 调用成功
+- [ ] 用户侧确认正常</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>两边日志的 trace_id 对不上怎么办？</summary>
+          <div class="learn-faq-body">
+            可能原因：1) Spring Gateway 没有生成 trace_id（检查 TraceFilter 是否配置正确）；2) Python 端的 X-Request-Id Header 被错误地赋值（检查中间件处理顺序）；3) BFF 到 Python 的 HTTP Client 没有透传 trace_id（检查 WebClient 配置）。排查方法：在 Gateway 打印收到的请求 Header，然后在 BFF 和 Python 逐跳打印收到的 X-Request-Id。
+          </div>
+        </details>
+        <details>
+          <summary>SSE 流式输出的 Agent 如何排障？</summary>
+          <div class="learn-faq-body">
+            SSE 排障的核心是逐段检查：1) 先用 curl 直连 Python Agent，确认 SSE 流正常输出；2) 通过 BFF 代理调用，确认 BFF 正确转发 SSE 事件；3) 通过 Gateway 调用，确认 Gateway 没有截断 SSE 流；4) 最终从客户端验证。关键指标是每段 SSE 的 timing：如果 BFF 和 Python 之间的 SSE 有间隔但客户端没有收到，说明 BFF 缓存了 SSE。
+          </div>
+        </details>
+        <details>
+          <summary>如何排查「Python 返回正确但 Spring 解析失败」？</summary>
+          <div class="learn-faq-body">
+            这是典型的<strong>DTO 不匹配</strong>。排查步骤：1) 用 curl 直连 Python 获取完整响应 JSON；2) 将 JSON 与 Spring 的 DTO 类字段逐一比对；3) 检查字段名大小写（JSON 是 camelCase 还是 snake_case）；4) 检查类型（Java Integer vs Python int，Java OffsetDateTime vs Python datetime）；5) 检查 OpenAPI 规范与两端的实现是否一致。参见 <a href="#ch-basics-02-contracts">OpenAPI 与契约</a>。
+          </div>
+        </details>
+        <details>
+          <summary>已经上线的系统出现偶发超时，如何定位？</summary>
+          <div class="learn-faq-body">
+            偶发超时是最难排查的问题之一。建议：1) 在 BFF 添加 retry + 熔断，避免偶发超时影响用户体验；2) 在日志中记录每次调用的 P50/P95/P99 延迟；3) 对比 Python 服务本身的处理时间与网络传输时间（通过 timing Header 记录）；4) 使用 APM（如 SkyWalking、Datadog）分析慢调用的调用链。常见原因是 LLM API 偶发延迟、Milvus 向量检索排队、JVM GC 暂停。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Trace 先行</strong>：trace_id 全链路透传是双栈排障的基础设施</li>
+        <li><strong>日志关联</strong>：统一 JSON 日志格式，按 trace_id 跨服务关联</li>
+        <li><strong>系统排障</strong>：按 Runbook 标准化排查，curl 直连隔离问题</li>
+        <li><strong>常见问题</strong>：Header 传递、DTO 对齐、SSE 断流、超时 / 幂等重复</li>
+        <li><strong>下一步</strong>：在 <a href="#ch-advanced-01-gray">灰度发布与模型切换</a> 中学习如何在生产环境中灰度发布和回滚</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-composite-integration_practice05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="trace-design" /> 能设计全链路 trace_id 透传方案</label></li>
+          <li><label><input type="checkbox" data-id="log-format" /> 能配置 Spring 和 Python 的统一 JSON 日志格式</label></li>
+          <li><label><input type="checkbox" data-id="runbook" /> 能编写一个排障 Runbook</label></li>
+          <li><label><input type="checkbox" data-id="common-issues" /> 能说出至少 3 个双栈排障的常见根因</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="debug-playbook" tabindex="0">debug playbook</span></td><td>系统化双栈排障流程</td></tr>
+                <tr><td><span class="term" data-term-id="log-correlation" tabindex="0">log correlation</span></td><td>trace_id 关联双栈日志</td></tr>
+                <tr><td><span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span></td><td>trace_id + span_id 跨服务追踪</td></tr>
+                <tr><td><span class="term" data-term-id="request-id" tabindex="0">request id</span></td><td>X-Request-Id 全链路唯一标识</td></tr>
+                <tr><td><span class="term" data-term-id="common-issues" tabindex="0">common issues</span></td><td>401/404/500/超时/SSE断流</td></tr>
+                <tr><td><span class="term" data-term-id="header-mismatch" tabindex="0">header mismatch</span></td><td>Header 未正确透传/清除</td></tr>
+                <tr><td><span class="term" data-term-id="timeout-debug" tabindex="0">timeout debug</span></td><td>偶发超时排查方法论</td></tr>
+                <tr><td><span class="term" data-term-id="runbook" tabindex="0">runbook</span></td><td>标准化排障操作手册</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>用户反馈 CorpAssist 的 RAG 问答返回错误，但你无法复现。请列出完整的排障步骤。</li>
+              <li>Spring BFF 报告「Read timed out」但 Python 日志显示请求只处理了 200ms。可能是什么原因？</li>
+              <li>如何通过日志判断一个请求的端到端延迟分布？（Gateway→BFF→Python→LLM 各阶段耗时）</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-advanced-01-gray">灰度发布与模型切换</a> 进入上线与演进阶段。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://swagger.io/specification/" target="_blank" rel="noopener">OpenAPI</a></li>
-    <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank" rel="noopener">Spring Cloud Gateway</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-05-debug-lab/</code></li>
-  <li>写一条双栈分工或契约对照笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：联调排障手册</h4>
-  <p><code>demos/practice-05-debug-lab/</code> — 勾选 debug-checklist</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-advanced-01-gray">灰度与双栈切换</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://opentelemetry.io/docs/" target="_blank" rel="noopener">OpenTelemetry — 可观测性标准</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-sleuth/docs/current/reference/html/" target="_blank" rel="noopener">Spring Cloud Sleuth — 分布式追踪（旧版）</a></li>
+      <li><a href="https://micrometer.io/" target="_blank" rel="noopener">Micrometer — 应用指标采集</a></li>
+      <li><a href="https://www.structlog.org/en/stable/" target="_blank" rel="noopener">structlog — Python 结构化日志</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 CorpAssist 双栈中实现全链路 Trace 和排障 Runbook（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>实现 Spring TraceFilter：从请求获取或生成 trace_id 并注入 MDC</li>
+      <li>实现 Python Trace 中间件：从 Header 解析 trace_id 并关联日志</li>
+      <li>配置统一 JSON 日志格式（Logstash / structlog）</li>
+      <li>基于本章的排障决策树编写一份 Runbook</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">你发现 Python 日志中没有 trace_id 字段，但 Spring 端有。可能的原因是什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>1) Spring BFF 的 WebClient 没有配置透传 X-Request-Id Header；2) Python 端的 TraceMiddleware 位置不对（在路由之后才执行）；3) Python 端的 structlog 没有正确绑定 trace_id 上下文变量。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：联调排障手册</h4>
+      <p>目录：<code>demos/practice-05-debug-lab/</code>。<strong>验收</strong>：勾选 debug-checklist 中所有项，演示一次从 trace_id 到定位根因的完整排障过程。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-01-gray">灰度发布与模型切换</a></li>
+      <li><a href="https://opentelemetry.io/docs/instrumentation/java/getting-started/" target="_blank" rel="noopener">OpenTelemetry Java — 快速开始</a></li>
+      <li><a href="https://opentelemetry.io/docs/instrumentation/python/getting-started/" target="_blank" rel="noopener">OpenTelemetry Python — 快速开始</a></li>
+      <li><a href="https://grafana.com/oss/loki/" target="_blank" rel="noopener">Grafana Loki — 日志聚合系统</a></li>
+    </ul>
+  </div>
 </section>

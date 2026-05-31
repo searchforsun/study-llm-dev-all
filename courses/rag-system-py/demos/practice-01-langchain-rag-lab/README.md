@@ -2,67 +2,40 @@
 
 对应章节：[LangChain RAG 实战](../../index.html#ch-practice-01-langchain-rag)
 
+## 概述
+
+本 Demo 实现 CorpAssist 知识库的 LangChain RAG 管线。核心组件包括文档加载（PyPDFLoader/DirectoryLoader）、递归字符切分（RecursiveCharacterTextSplitter）、向量存储（Chroma + text-embedding-3-small）、LCEL 声明式管线组装以及 FastAPI + SSE 流式输出。覆盖 Similarity/MMR/Ensemble/MultiQuery 四种 Retriever 类型对比。
+
 ## 前置
 
 - Python 3.10+
 - `pip install uv`（推荐）或 pip
-- OpenAI API Key 或 DashScope API Key（通义千问）
-- Docker Desktop（可选，用于 Milvus/Qdrant 等基础设施）
+- OpenAI API Key 或 DashScope API Key
+- Docker Desktop（可选，用于 Milvus/Qdrant）
 
 ## 文件
 
 | 文件 | 说明 |
 |------|------|
-| `app.py` | FastAPI 问答服务 |
-| `pipeline.py` | LCEL 管线定义 |
+| `app.py` | FastAPI 问答服务，支持流式 SSE |
+| `pipeline.py` | LCEL 管线定义（RunnableParallel + prompt + llm） |
+| `documents.py` | 文档加载与切分 |
+| `vector_store.py` | Chroma 向量存储与检索器 |
+| `retrievers.py` | 多类型 Retriever 对比 |
 | `config.py` | 配置项 |
 | `requirements.txt` | Python 依赖 |
 | `.env.example` | 环境变量模板 |
 
-## 快速开始
-
-### Windows PowerShell
-```powershell
-cd courses/rag-system-py/demos/practice-01-langchain-rag-lab
-uv venv
-uv pip install -r requirements.txt
-copy .env.example .env
-notepad .env
-```
-
-### macOS / Linux
-```bash
-cd courses/rag-system-py/demos/practice-01-langchain-rag-lab
-uv venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
-cp .env.example .env
-vim .env
-```
-
 ## 练习
 
-### 练习 1：LCEL 管线构建
-使用 LangChain LCEL 语法构建 retriever -> prompt -> llm -> output_parser 管线。
-```bash
-python app.py
-# 访问 http://localhost:8000/docs 测试 /ask 端点
-```
-**验收标准**：POST `/ask` 返回非空答案，包含引用文档片段。
+### 练习 1：构建 LCEL 管线
+放置 PDF 文档到 `docs/`，运行文档加载与索引构建，测试 `/ask` 端点。**验收**：POST `/ask` 返回含引用片段的答案。
 
 ### 练习 2：流式输出
-改造端点支持 Server-Sent Events 流式响应。
-```bash
-curl -N http://localhost:8000/ask/stream -d '{"question":"什么是 RAG？"}'
-```
-**验收标准**：响应以 `data:` 前缀逐块输出，客户端可逐步展示。
+测试 `/ask/stream` 端点，验证 SSE 逐 token 输出。**验收**：curl -N 可看到逐块推送的 `data:` 消息，首 token 延迟 < 500ms。
 
-### 练习 3：引用溯源
-在答案中嵌入引用标记，返回对应的源文档块列表。
-```bash
-python -c "from app import ask; print(ask('RAG 原理'))"
-```
-**验收标准**：答案包含 `[1]` `[2]` 等引用标记，响应 JSON 含 `citations` 数组。
+### 练习 3：Retriever 对比
+切换 Similarity/MMR/Ensemble 三种 Retriever，对同一问题对比召回差异。**验收**：MMR 检索结果多样性高于 Similarity。
 
 ## 验收
 

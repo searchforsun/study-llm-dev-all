@@ -1,0 +1,503 @@
+<section id="ch-basics-03-planning-reasoning" class="chapter" data-chapter="basics-03-planning-reasoning">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>规划与推理模式</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-planning-reasoning" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Agent 基础认知</strong> · 能力：设计 Agent 的规划与推理引擎</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 与普通 LLM 对话的核心区别在于 <span class="term" data-term-id="chain-of-thought" tabindex="0">Chain-of-Thought</span> 推理和 <span class="term" data-term-id="task-decomposition" tabindex="0">task decomposition</span> 能力。没有规划能力的 Agent 只能做单步问答，无法完成「写一个季度报告」这样的复杂任务。本章深入 Agent 的「大脑」——规划与推理机制。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>理解 CoT、ToT、ReAct 三者的推理层次差异</li>
+          <li>设计任务分解器将复杂目标拆解为可执行子任务</li>
+          <li>实现动态重规划机制应对执行过程中的变化</li>
+          <li>用 Python 和 Java 实现 Plan-Execute 引擎</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>CoT 让模型展示推理过程</strong>：显式的推理链比直接答案准确率提高 20-40%。</li>
+          <li><strong>任务分解是规划的核心</strong>：将「写报告」拆为「查数据→分析→生成→排版」是可执行的前提。</li>
+          <li><strong>动态重规划是兜底</strong>：现实世界的信息不完美，Agent 需要随时调整计划。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Chain-of-Thought 推理</h3>
+
+      <p><span class="term" data-term-id="chain-of-thought" tabindex="0">Chain-of-Thought</span>（CoT）通过在 prompt 中注入「一步一步思考」的指令，引导模型在给出最终答案前展示推理过程。在 Agent 中，CoT 不仅是推理策略，更是一种内置的 System Prompt 设计模式。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CoT 推理与直接回答对比</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant LLM as LLM
+
+    Note over U,LLM: 直接回答模式
+    U->>LLM: 我的订单 T001 现在到哪了？
+    LLM-->>U: 已发货，预计明天到达。
+    Note over U,LLM: 缺少推理过程，可能出错
+
+    Note over U,LLM: CoT 推理模式
+    U->>LLM: 我的订单 T001 现在到哪了？
+    Note over LLM: 推理：用户想知道物流状态\n我需要查订单 API\n传入参数 order_id=T001
+    LLM-->>U: 我已查询订单 T001，\n当前状态：运输中，\n物流单号：SF123456，\n预计明天 18:00 前送达。</pre>
+        <p class="diagram-caption">CoT 让 Agent 显式展示推理链，既提高准确率又便于调试。</p>
+      </div>
+
+      <h4>CoT 在工具调用中的融合</h4>
+      <p>在 Agent 设计中，CoT 不是独立步骤——它融入 ReAct 循环的"思考"阶段。System Prompt 中应明确指示模型先推理再行动：</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-text">你是 CorpAssist S2 客服 Agent。
+调用工具前，请先思考：
+1. 用户的核心需求是什么？
+2. 需要调用哪些工具？参数是什么？
+3. 工具返回后如何解读结果？
+4. 最终回答应该包含哪些信息？
+
+请用"思考："开头展示你的推理过程，
+然后用"行动："指示要调用的工具。</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>System Prompt 无 CoT 引导</li>
+            <li>要求模型直接输出答案，跳过推理</li>
+            <li>不区分思考和行动阶段</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>显式要求「请先思考后回答」</li>
+            <li>提供思考框架模板</li>
+            <li>工具调用前后都有推理步骤</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：如果用户说「直接给我答案，别废话推理过程」，还能用 CoT 吗？</summary>
+        <p>可以。推理过程对模型是必要的内部步骤，但最终回答可以只展示结论。在 System Prompt 中说明「推理过程仅供内部使用，最终回答简洁直接」。Agent 框架可以在最终输出前过滤掉推理轨迹。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>任务分解与子目标</h3>
+
+      <p><span class="term" data-term-id="task-decomposition" tabindex="0">task decomposition</span> 是将复杂目标递归拆解为可执行子任务的能力。它位于规划层的核心——没有分解，Agent 就无法处理超出单步推理的复杂请求。</p>
+
+      <div class="mermaid-wrap">
+        <h5>任务分解示例：生成季度销售报告</h5>
+        <pre class="mermaid">flowchart TD
+    Root[生成 Q2 销售报告] --> Sub1[1. 检索各区域销售数据]
+    Root --> Sub2[2. 数据分析与趋势计算]
+    Root --> Sub3[3. 生成报告文本]
+    Root --> Sub4[4. 格式化输出]
+
+    Sub1 --> Sub1a[华东区数据]
+    Sub1 --> Sub1b[华南区数据]
+    Sub1 --> Sub1c[华北区数据]
+
+    Sub2 --> Sub2a[计算环比增长率]
+    Sub2 --> Sub2b[识别 Top 3 产品]
+    Sub2 --> Sub2c[生成趋势结论]
+
+    Sub3 --> Sub3a[写执行摘要]
+    Sub3 --> Sub3b[写区域分析]
+    Sub3 --> Sub3c[写建议部分]</pre>
+        <p class="diagram-caption">任务分解将「生成报告」拆为 4 个主步骤和 9 个叶子子任务，每个都可独立执行。</p>
+      </div>
+
+      <h4>Python：任务分解器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pydantic import BaseModel
+from typing import List
+
+class SubTask(BaseModel):
+    """子任务定义"""
+    id: str
+    description: str
+    depends_on: List[str] = []  # 前置依赖的任务 ID
+    tool: str = ""              # 需要用到的工具
+    status: str = "pending"     # pending/running/done/failed
+
+class TaskDecomposer:
+    """将复杂任务拆解为可执行的子任务列表"""
+
+    def __init__(self, llm):
+        self.llm = llm
+
+    def decompose(self, task: str, context: dict = None) -> List[SubTask]:
+        prompt = f"""将以下复杂任务拆解为可执行的子任务列表。
+每个子任务应该：
+- 独立可执行
+- 有明确的输入输出
+- 标明前置依赖
+
+任务：{task}
+上下文：{context or '无'}
+
+输出格式：
+1. 子任务描述 | 依赖 | 工具
+2. 子任务描述 | 依赖 | 工具
+..."""
+        response = self.llm.invoke(prompt)
+        return self._parse_subtasks(response.content)
+
+    def _parse_subtasks(self, text: str) -> List[SubTask]:
+        subtasks = []
+        for i, line in enumerate(text.strip().split("\n")):
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 1:
+                subtasks.append(SubTask(
+                    id=f"step_{i+1}",
+                    description=parts[0],
+                    depends_on=parts[1].split(",") if len(parts) > 1 and parts[1] != "无" else [],
+                    tool=parts[2] if len(parts) > 2 else ""
+                ))
+        return subtasks</pre>
+      </div>
+
+      <h4>Java：任务分解实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public record SubTask(
+    String id,
+    String description,
+    List&lt;String&gt; dependsOn,
+    String tool,
+    String status
+) {
+    public SubTask(String id, String description) {
+        this(id, description, List.of(), "", "pending");
+    }
+}
+
+@Service
+public class TaskDecomposer {
+    private final ChatModel chatModel;
+
+    public TaskDecomposer(ChatModel chatModel) {
+        this.chatModel = chatModel;
+    }
+
+    public List&lt;SubTask&gt; decompose(String task) {
+        String prompt = """
+            将以下任务拆解为可执行的子任务列表。
+            每个子任务一行，格式：描述 | 依赖步骤ID（逗号分隔） | 所需工具
+            任务：%s
+            """.formatted(task);
+
+        String response = chatModel.call(prompt);
+        return parseSubtasks(response);
+    }
+
+    private List&lt;SubTask&gt; parseSubtasks(String text) {
+        List&lt;SubTask&gt; tasks = new ArrayList&lt;&gt;();
+        int i = 1;
+        for (String line : text.split("\n")) {
+            line = line.trim();
+            if (line.isEmpty()) continue;
+            String[] parts = line.split("\\|");
+            String desc = parts[0].trim();
+            SubTask task = new SubTask("step_" + i, desc);
+            tasks.add(task);
+            i++;
+        }
+        return tasks;
+    }
+}</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>动态重规划</h3>
+
+      <p>Agent 执行过程中，外部环境可能变化——API 返回空数据、某个步骤失败、用户中途改变需求。静态的初始计划无法应对这些变化，Agent 需要具备 <strong>动态重规划</strong> 能力。</p>
+
+      <div class="mermaid-wrap">
+        <h5>动态重规划流程</h5>
+        <pre class="mermaid">flowchart LR
+    Start[初始计划] --> Execute[执行步骤]
+    Execute --> Check[检查结果]
+    Check -->|正常| Next[下一步骤]
+    Check -->|异常| Replan[重规划]
+    Next -->|全部完成| Done[完成]
+    Next --> Execute
+    Replan -->|调整计划| Execute
+    Replan -->|无法完成| Escalate[升级到人工]</pre>
+        <p class="diagram-caption">动态重规划在每一步执行后检查结果，异常时触发计划调整或人工升级。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>触发条件</th><th>重规划策略</th><th>示例场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>工具返回空</td><td>调整参数重试或换工具</td><td>查订单无结果→尝试按手机号查询</td></tr>
+          <tr><td>步骤失败</td><td>标记失败、跳过或重试</td><td>数据源 A 超时→切到数据源 B</td></tr>
+          <tr><td>用户插入新需求</td><td>暂停当前计划，合并新需求</td><td>用户说「顺便查一下退款进度」</td></tr>
+          <tr><td>上下文溢出风险</td><td>压缩历史、触发摘要</td><td>超过 20 轮对话需压缩</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>Plan-Execute 引擎设计</h3>
+
+      <p>将规划与执行分离的 Plan-Execute 引擎是 Agent 架构中最常见的实现。它包含三个核心组件：<strong>Planner</strong>（规划器）、<strong>Executor</strong>（执行器）、<strong>Monitor</strong>（监控器）。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class PlanExecuteEngine:
+    """规划-执行引擎"""
+    def __init__(self, planner_llm, executor_llm, tools: dict):
+        self.planner = planner_llm
+        self.executor = executor_llm
+        self.tools = tools
+        self.max_retries = 2
+        self.max_steps = 20
+
+    def run(self, task: str) -> dict:
+        context = {"task": task, "results": {}, "step": 0}
+        # 阶段 1：规划
+        plan = self.planner.plan(task)
+        context["plan"] = plan
+
+        # 阶段 2：循环执行
+        while context["step"] < self.max_steps:
+            current = self._get_next_step(plan, context)
+            if current is None:
+                break
+
+            success, result = self._execute_step(current, context)
+            if not success:
+                plan = self.planner.replan(task, context, current)
+                continue
+
+            context["results"][current.id] = result
+            context["step"] += 1
+
+        return context
+
+    def _execute_step(self, step, context):
+        for attempt in range(self.max_retries):
+            try:
+                if step.tool:
+                    result = self.tools[step.tool](**context.get("params", {}))
+                else:
+                    result = self.executor.invoke(step.description)
+                return True, result
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    return False, str(e)
+        return False, "max retries exceeded"</pre>
+      </div>
+
+      <h4>Java Plan-Execute 引擎</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class PlanExecuteEngine {
+    private final Planner planner;
+    private final ToolExecutor toolExecutor;
+    private final ChatModel executorModel;
+    private static final int MAX_STEPS = 20;
+    private static final int MAX_RETRIES = 2;
+
+    public ExecutionContext execute(String task) {
+        ExecutionContext ctx = new ExecutionContext(task);
+
+        // Phase 1: Plan
+        List&lt;Step&gt; plan = planner.createPlan(task);
+        ctx.setPlan(plan);
+
+        // Phase 2: Execute with dynamic replanning
+        while (ctx.getCurrentStepIndex() &lt; plan.size()
+               && ctx.getTotalSteps() &lt; MAX_STEPS) {
+
+            Step step = plan.get(ctx.getCurrentStepIndex());
+            ExecutionResult result = executeWithRetry(step, ctx);
+
+            if (!result.isSuccess()) {
+                // Trigger replanning
+                List&lt;Step&gt; newPlan = planner.replan(ctx, step);
+                ctx.setPlan(newPlan);
+                continue;
+            }
+
+            ctx.addResult(step.id(), result.getOutput());
+            ctx.incrementStep();
+        }
+        return ctx;
+    }
+
+    private ExecutionResult executeWithRetry(Step step, ExecutionContext ctx) {
+        for (int i = 0; i &lt; MAX_RETRIES; i++) {
+            try {
+                String output = step.tool() != null
+                    ? toolExecutor.execute(step.tool(), step.params())
+                    : executorModel.call(step.description());
+                return new ExecutionResult(true, output);
+            } catch (Exception e) {
+                log.warn("Step {} failed, attempt {}/{}",
+                    step.id(), i + 1, MAX_RETRIES);
+            }
+        }
+        return new ExecutionResult(false, "Max retries exceeded");
+    }
+}</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>CoT 一定会提高准确率吗？</summary>
+          <div class="learn-faq-body">
+            研究表明 CoT 对需要多步推理的任务（数学、逻辑、规划）提升显著，但对常识性问题反而可能增加 token 消耗无实质改善。建议根据任务类型决定是否启用 CoT——简单问答用直接模式，复杂推理用 CoT。
+          </div>
+        </details>
+        <details>
+          <summary>任务分解到什么粒度合适？</summary>
+          <div class="learn-faq-body">
+            每个子任务应该在 1-2 次工具调用或 LLM 调用内完成。如果一个子任务本身需要再分解 3 层，说明粒度太粗。通常一个复杂任务的叶子节点数控制在 5-15 个之间。太多则管理成本高，太少则子任务本身过于复杂。
+          </div>
+        </details>
+        <details>
+          <summary>动态重规划会不会无限循环？</summary>
+          <div class="learn-faq-body">
+            会。必须设置最大重规划次数（通常 3-5 次）。超过上限后触发人工升级或返回当前已收集的所有信息。在 Plan-Execute 引擎中，重规划计数器和步骤计数器应该独立追踪，任何一个达到上限都终止执行。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>CoT 推理</strong>：显式推理链提高准确率，融入 System Prompt 作为 Agent 的思考模板。</li>
+        <li><strong>任务分解</strong>：将复杂目标拆为独立子任务是规划的核心，粒度控制在 5-15 个叶子节点。</li>
+        <li><strong>动态重规划</strong>：执行结果异常时触发计划调整，设置最大重规划次数防止无限循环。</li>
+        <li><strong>Plan-Execute</strong>：Planner + Executor + Monitor 三层架构，Python 和 Java 实现模式一致。</li>
+        <li><strong>实际应用</strong>：CorpAssist S3 办公自动化场景中，Plan-Execute 引擎处理报告生成、数据分析等复杂任务。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_basics03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cot-explain" /> 能用例子说明 CoT 提高推理准确率的原因</label></li>
+          <li><label><input type="checkbox" data-id="decompose" /> 能将一个复杂任务拆解为子任务列表</label></li>
+          <li><label><input type="checkbox" data-id="replan" /> 理解动态重规划触发条件和循环防护</label></li>
+          <li><label><input type="checkbox" data-id="pe-engine" /> 能画出 Plan-Execute 引擎的三层架构</label></li>
+          <li><label><input type="checkbox" data-id="dual-impl" /> 能用 Python 或 Java 实现 Plan-Execute 骨架</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Chain-of-Thought</td><td>显式推理链，提高多步推理准确率</td></tr>
+                <tr><td>Task Decomposition</td><td>复杂目标拆解为独立子任务</td></tr>
+                <tr><td>Dynamic Replanning</td><td>执行异常时动态调整剩余计划</td></tr>
+                <tr><td>Planner</td><td>负责制定执行步骤的组件</td></tr>
+                <tr><td>Executor</td><td>按计划依次执行子任务的组件</td></tr>
+                <tr><td>SubTask</td><td>带依赖关系的可执行单元</td></tr>
+                <tr><td>Dependency Graph</td><td>子任务间的依赖关系图</td></tr>
+                <tr><td>Escalation</td><td>无法完成时升级到人工处理</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CoT 为什么能提高推理准确率？在 Agent 的 System Prompt 中如何设计 CoT 模板？</li>
+              <li>任务分解到子任务后，如何处理子任务间的依赖关系？请画 DAG 说明。</li>
+              <li>你的 Agent 在执行到第 5 步时发现第 3 步的结果是错的，这时候应该怎么做？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：下一章 <a href="#ch-basics-04-memory-context">Agent 记忆与上下文管理</a> 学习 Agent 的短期/长期记忆和上下文预算控制。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2201.11903" target="_blank" rel="noopener">Chain-of-Thought Prompting Elicits Reasoning in LLMs — 原论文</a></li>
+      <li><a href="https://arxiv.org/abs/2205.11916" target="_blank" rel="noopener">Tree of Thoughts: Deliberate Problem Solving with LLMs</a></li>
+      <li><a href="https://python.langchain.com/docs/modules/agents/agent_types/plan_and_execute/" target="_blank" rel="noopener">LangChain Plan and Execute Agent</a></li>
+      <li><a href="https://java2ai.com/docs/dev/agents/graph/" target="_blank" rel="noopener">Spring AI Alibaba Graph 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现一个 Plan-Execute 引擎并测试任务分解与重规划（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>设计一个任务分解器，将「生成月度销售报告」拆解为 5-8 个子任务。</li>
+      <li>实现 Plan-Execute 引擎的 Planner 和 Executor 组件。</li>
+      <li>模拟一个子任务执行失败，观察重规划是否被触发。</li>
+      <li>添加最大重规划次数限制，验证循环防护机制。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：规划与推理实验室</h4>
+      <p>目录：<code>demos/basics-03-planning-reasoning-lab/</code>。<strong>验收</strong>：引擎能正确分解任务、依次执行、异常时重规划、达到上限时终止。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-memory-context">Agent 记忆与上下文管理</a></li>
+      <li><a href="https://github.com/princeton-nlp/tree-of-thought-llm" target="_blank" rel="noopener">Tree of Thoughts 官方实现</a></li>
+      <li><a href="https://arxiv.org/abs/2305.10601" target="_blank" rel="noopener">Tree-of-Thoughts 论文精读</a></li>
+    </ul>
+  </div>
+</section>

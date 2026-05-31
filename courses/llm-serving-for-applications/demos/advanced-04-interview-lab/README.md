@@ -1,5 +1,12 @@
-# Demo：面试：私有化部署题
+# Demo: 面试：私有化部署题
 
-[章节](../../index.html#ch-advanced-04-interview)
+关联章节: [面试：私有化部署题](../chapters/advanced-04-interview.html)
 
-写 60 秒口述稿
+## 场景
+模拟面试白板练习。
+
+## 文件
+- `interview-outline.md` — 面试大纲
+
+## 验收
+含 5 层架构图口述和 5 个高频坑。

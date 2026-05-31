@@ -1,43 +1,490 @@
 <section id="ch-basics-05-kv-cache-app" class="chapter" data-chapter="basics-05-kv-cache-app">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>KV 缓存与性能（应用层）</h2>
-  <button type="button" class="btn-mark-done" data-chapter="basics-05-kv-cache-app" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>KV 缓存与性能（应用层）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05-kv-cache-app" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Serving 基础</strong> · 能力：KV Cache 直觉、vLLM 参数与延迟显存权衡</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>长上下文 S4 补全占 KV 显存；应用层调参不做算子开发。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S4 推理场景实践本章能力</li>
-        <li>说明 vLLM 私有化与双栈客户端接入</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Serving 基础</strong> · 能力：从应用层理解 KV Cache 对显存/延迟的影响，调优 vLLM 相关参数</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S4 的代码补全场景中，<span class="term" data-term-id="kv-cache" tabindex="0">KV cache</span> 占推理显存的大头（超过权重）。不懂 KV 与 <span class="term" data-term-id="vllm-kv-param" tabindex="0">vLLM KV 参数</span> 的关系，调 <code>max-model-len</code> 和并发数就像碰运气。本章定位<strong>应用层</strong>，不写 CUDA kernel。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用「序列长度 × 层数 × 头数 × 精度」公式估算 KV cache 显存</li>
+          <li>为 S4 补全与运营文案分别配置 <code>max-model-len</code></li>
+          <li>说明 <span class="term" data-term-id="prefix-cache" tabindex="0">prefix cache</span> 如何降低首个请求的延迟</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>KV cache 不是权重</strong>：它是推理过程中生成的 Key/Value 中间结果，随序列线性增长。</li>
+          <li><strong>参数调优杠杆</strong>：<code>max-model-len</code> 设得越大，每序列 KV 越贵；<code>max-num-seqs</code> 控制并发。</li>
+          <li><strong>不做算子开发</strong>：<span class="term" data-term-id="no-kernel-dev" tabindex="0">应用层不写 kernel</span>，只调框架参数。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>KV 直觉</h3><p>每 token 存 K/V；越长占显存越多。 关联：<span class="term" data-term-id="kv-cache" tabindex="0">kv cache</span>、<span class="term" data-term-id="vllm-kv-param" tabindex="0">vllm kv param</span>。</p></div>
-    <div class="section-block"><h3>vLLM 参数</h3><p>max-model-len、gpu-memory-utilization。 关联：<span class="term" data-term-id="latency-vram" tabindex="0">latency vram</span>、<span class="term" data-term-id="max-seq-len" tabindex="0">max seq len</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="kv-cache" tabindex="0">kv cache</span> · <span class="term" data-term-id="vllm-kv-param" tabindex="0">vllm kv param</span> · <span class="term" data-term-id="latency-vram" tabindex="0">latency vram</span> · <span class="term" data-term-id="max-seq-len" tabindex="0">max seq len</span> · <span class="term" data-term-id="app-layer-perf" tabindex="0">app layer perf</span> · <span class="term" data-term-id="prefix-cache" tabindex="0">prefix cache</span> · <span class="term" data-term-id="no-kernel-dev" tabindex="0">no kernel dev</span> · <span class="term" data-term-id="context-memory" tabindex="0">context memory</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-yaml">vllm:
-  max_model_len: 8192
-  gpu_memory_utilization: 0.9
-  enable_prefix_caching: true</code></pre></div>
-      <div class="mermaid-wrap"><h5>KV 缓存与性能（应用层）</h5>
-      <pre class="mermaid">flowchart LR
-  App[Spring/Python] --> vLLM
-  vLLM --> GPU[GPU 推理]</pre></div>
+
+    <div class="section-block">
+      <h3>KV Cache 直觉</h3>
+      <p><span class="term" data-term-id="kv-cache" tabindex="0">KV cache</span> 是 Transformer 推理中每层 attention 模块缓存的 Key 矩阵和 Value 矩阵。自回归生成的每一步，模型只需计算最新 token 的 query，并读取之前所有 token 的 K/V——避免重复计算。</p>
+
+      <div class="mermaid-wrap">
+        <h5>KV Cache 增长过程</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant GPU as GPU 显存
+    participant Attn as Attention 层
+    participant Token as 生成循环
+
+    Token->>Attn: Step1: 生成 token1
+    Attn->>GPU: 存储 K1/V1
+    Token->>Attn: Step2: 生成 token2
+    Attn->>GPU: 追加 K2/V2 (cache 变长)
+    Token->>Attn: Step3: 生成 token3
+    Attn->>GPU: 追加 K3/V3
+    Note over GPU: 序列越长，KV cache 越大</pre>
+        <p class="diagram-caption">每生成一个 token，KV cache 长度增加 1；最终大小 = 序列长度 × 层数 × 注意力头数 × (K+V) × 精度字节。</p>
+      </div>
+
+      <p><span class="term" data-term-id="context-memory" tabindex="0">上下文显存 (context memory)</span> 就是 KV cache 占用的空间。一个粗略公式：</p>
+      <p class="formula-block"><code>KV cache ≈ 2 × 层数 × 头数 × 序列长度 × 精度字节</code></p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · KV cache 显存估算</span>
+        <p>7B 模型：32 层、32 头、head_dim=128、FP16(2bytes)。单序列 8K tokens 的 KV cache：</p>
+        <p><code>2 × 32 × 32 × 128 × 8192 × 2 ≈ 4 GB</code>（实际 vLLM 有 PagedAttention 节省碎片，此处为理论估算）</p>
+        <p>若 8 并发 → 32 GB 仅 KV 就吃掉。这就是为什么要量化、要限制 max-model-len。</p>
+      </aside>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">KV cache 开销场景</span>
+          <p class="role-card-desc">长文档摘要（32K+ tokens）、多轮对话（历史积累）——KV 可能大于权重。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">KV cache 节省场景</span>
+          <p class="role-card-desc">S4 FIM 补全（64-256 completion tokens）、短问答——KV 开销小。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">应用层调优范围</span>
+          <p class="role-card-desc"><code>max-model-len</code>、<code>max-num-seqs</code>、<code>enable-prefix-caching</code>。</p>
+        </article>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：序列长度翻倍，KV cache 增长多少？</summary>
+        <p>线性增长——2倍序列 = 2倍 KV cache。但实际 vLLM 使用 PagedAttention，不会一次性分配全部显存，而是按 page 分配，碎片更少。<span class="term" data-term-id="latency-vram" tabindex="0">延迟与显存权衡</span> 的核心就是控制序列长度。</p>
+      </details>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>KV Cache 直觉、vLLM 参数与延迟显存权衡</li>
-    <li>下一步：Python 指向推理集群</li></ul></div>
+
+    <div class="section-block">
+      <h3>vLLM 相关参数</h3>
+      <p><span class="term" data-term-id="vllm-kv-param" tabindex="0">vLLM KV 参数</span> 直接决定 KV cache 的分配策略与上限：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>参数</th><th>作用</th><th>S4 推荐值</th><th>影响</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="term" data-term-id="max-model-len" tabindex="0"><code>--max-model-len</code></span></td>
+            <td>单序列最大 token 数（prompt + completion）</td>
+            <td>8K～16K</td>
+            <td>越大 KV 上限越高；FIM 短补全用 8K 就够</td>
+          </tr>
+          <tr>
+            <td><code>--max-num-seqs</code></td>
+            <td>最大并发序列数</td>
+            <td>16～32</td>
+            <td>越高吞吐越大，但 KV 显存线性增</td>
+          </tr>
+          <tr>
+            <td><code>--gpu-memory-utilization</code></td>
+            <td>vLLM 预占显存比例</td>
+            <td>0.85～0.92</td>
+            <td>留一部分给 kernel 与临时 tensor</td>
+          </tr>
+          <tr>
+            <td><code>--enable-prefix-caching</code></td>
+            <td>复用相同前缀的 KV</td>
+            <td>开启</td>
+            <td>相同 system prompt 或代码上下文减少预填充</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无脑设 max-model-len=32K 导致 OOM</li>
+            <li>max-num-seqs 设 256 不调显存</li>
+            <li>从不开 prefix caching</li>
+            <li>把 vLLM 的 KV metrics 当黑盒不看</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>max-model-len 匹配实际场景：S4 8K、长文档 32K</li>
+            <li>max-num-seqs 从 8 逐步上调观察显存</li>
+            <li>相同 system prompt 场景开启 prefix caching</li>
+            <li>用 vLLM 的 <code>/metrics</code> 端点观察 KV 使用率</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>启动参数示例：S4 FIM 优化配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># S4 代码补全专用配置——低延迟、中并发
+python -m vllm.entrypoints.openai.api_server \
+  --model /models/Qwen2.5-Coder-7B-Instruct-AWQ \
+  --quantization awq \
+  --served-model-name corp-coder-7b \
+  --max-model-len 8192 \
+  --max-num-seqs 16 \
+  --gpu-memory-utilization 0.9 \
+  --enable-prefix-caching \
+  --host 0.0.0.0 --port 8000</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># Docker Compose 版本
+services:
+  vllm-s4:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model /models/Qwen2.5-Coder-7B-Instruct-AWQ
+      --quantization awq
+      --served-model-name corp-coder-7b
+      --max-model-len 8192
+      --max-num-seqs 16
+      --gpu-memory-utilization 0.9
+      --enable-prefix-caching
+    volumes:
+      - ./models:/models:ro
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "2gb"</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>延迟与显存权衡</h3>
+      <p><span class="term" data-term-id="latency-vram" tabindex="0">延迟 vs 显存权衡 (latency vram tradeoff)</span> 是推理集群调优的主线：</p>
+
+      <div class="mermaid-wrap">
+        <h5>参数联动效应</h5>
+        <pre class="mermaid">flowchart LR
+    A[max-model-len ↑] --> B[KV cache ↑]
+    B --> C[并发槽位 ↓]
+    A --> D[TTFT ↑]
+    E[max-num-seqs ↑] --> F[并发 ↑]
+    F --> G[KV 总和 ↑]
+    G --> H[显存不足 OOM]
+    I[prefix-caching ↑] --> J[预填充阶段提速]
+    J --> K[TTFT ↓]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="app-layer-perf" tabindex="0">应用层性能调优 (app layer perf)</span> 就是在这个图上找到平衡点。</p>
+      </div>
+
+      <h4>Python 监控 KV 使用率</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import requests
+import json
+
+# 从 vLLM metrics 端点获取 KV cache 使用情况
+def check_kv_usage(base_url="http://localhost:8000"):
+    # vLLM 暴露 Prometheus metrics
+    metrics_resp = requests.get(f"{base_url}/metrics")
+    for line in metrics_resp.text.split("\n"):
+        # 查找 KV cache 相关指标
+        if "vllm:kv_cache_usage" in line and not line.startswith("#"):
+            print(f"KV Cache: {line}")
+
+    # 监控模型加载状态
+    models_resp = requests.get(f"{base_url}/v1/models")
+    models = models_resp.json()
+    print(f"可用模型: {[m['id'] for m in models['data']]}")
+
+if __name__ == "__main__":
+    check_kv_usage()
+    """
+    输出示例:
+    vllm:kv_cache_usage 0.45  # 已使用 45% 的 KV cache 预算
+    可用模型: ['corp-coder-7b']
+    """</code></pre>
+      </div>
+
+      <h4>Java Spring AI 配置推理超时</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// Spring AI 配置 — 针对长上下文推理调整超时与重试
+import org.springframework.ai.openai.OpenAiChatModel;
+import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.client.RestClient;
+
+import java.time.Duration;
+
+@Configuration
+public class InferTimeoutConfig {
+
+    @Bean
+    public OpenAiChatModel kvOptimizedChatModel() {
+        // 针对长上下文场景：更长的超时 + 更小的 max_tokens
+        return OpenAiChatModel.builder()
+            .baseUrl("http://vllm:8000/v1")
+            .apiKey("EMPTY")
+            .defaultOptions(OpenAiChatOptions.builder()
+                .model("corp-coder-7b")
+                .maxTokens(512)          // S4 代码补全通常不需要长生成
+                .temperature(0.1)
+                .build())
+            .restClientBuilder(RestClient.builder()
+                .requestInterceptor((request, body, execution) -> {
+                    // 记录请求/响应耗时用于 KV 分析
+                    long start = System.currentTimeMillis();
+                    var response = execution.execute(request, body);
+                    long elapsed = System.currentTimeMillis() - start;
+                    System.out.printf("推理耗时: %dms (序列越长耗时越高)%n", elapsed);
+                    return response;
+                }))
+            .build();
+    }
+}</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>KV cache 是权重的「缓存」</strong> — 不对，它是在推理中动态生成的中间结果，不是权重的副本。</li>
+          <li><strong>长上下文 = 好质量</strong> — S4 代码补全场景 <code>max-model-len=8K</code> 通常够用，32K 徒增 KV 开销。</li>
+          <li><strong>Prefix caching 总有效</strong> — 仅当请求前缀高度重复（如固定 system prompt）时才有用；随机 prompt 无收益。</li>
+          <li><strong>只看 GPU 利用率</strong> — KV cache 使用率是更直接的瓶颈指标，应加入 Grafana 面板。</li>
+        </ul>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：你的 S4 补全 max-model-len=8K 但用户经常发 10K 的 prompt，会怎样？</summary>
+        <p>vLLM 会拒绝超过 max-model-len 的请求，返回 400 错误。客户端应截断 prompt 或分片发送，而不是盲目调高 max-model-len。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist S4 场景：KV 预算分配</h3>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>max-model-len</th><th>max-num-seqs</th><th>KV 预算占比</th><th>理由</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>S4 FIM 补全</td>
+            <td>8K</td>
+            <td>16</td>
+            <td>~30%</td>
+            <td>短 completion，高并发</td>
+          </tr>
+          <tr>
+            <td>S4 代码审查</td>
+            <td>16K</td>
+            <td>8</td>
+            <td>~40%</td>
+            <td>需要看完整函数体</td>
+          </tr>
+          <tr>
+            <td>运营文案生成</td>
+            <td>8K</td>
+            <td>4</td>
+            <td>~15%</td>
+            <td>低并发、短文本</td>
+          </tr>
+          <tr>
+            <td>长文档分析</td>
+            <td>32K</td>
+            <td>2</td>
+            <td>~60%</td>
+            <td>长上下文但极低并发</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>通过为每个场景分配独立的 vLLM 实例（或使用 K8s 多副本），可以隔离 KV 预算，避免 FIM 补全被长文档任务饿死。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>Prefix caching 到底怎么工作？</summary>
+          <div class="learn-faq-body">
+            <span class="term" data-term-id="prefix-cache" tabindex="0">prefix cache</span> 对请求的初始 tokens 计算哈希。当新请求的前缀与缓存中的前缀匹配时，直接复用已计算的 KV，跳过预填充阶段。CorpAssist 场景中，相同 system prompt（如「你是代码助手」）被所有用户共享时收益显著。
+          </div>
+        </details>
+        <details>
+          <summary>为什么说 TTFT 与 KV cache 相关？</summary>
+          <div class="learn-faq-body">
+            TTFT（time to first token） = 预填充时间。预填充阶段计算整个 prompt 的 KV cache，prompt 越长 TTFT 越高。优化 TTFT 的关键之一就是控制 prompt 长度以降低预填充开销。
+          </div>
+        </details>
+        <details>
+          <summary>vLLM 的 KV cache 是每个请求独占还是共享？</summary>
+          <div class="learn-faq-body">
+            <span class="term" data-term-id="paged-attention" tabindex="0">PagedAttention</span> 按 page 管理，请求之间不共享 KV，但同一请求的不同 beam 可以共享部分 KV。Prefix caching 开启了跨请求共享前缀的 KV。
+          </div>
+        </details>
+        <details>
+          <summary>KV cache 用 INT8 能省多少显存？</summary>
+          <div class="learn-faq-body">
+            vLLM 支持 KV cache 量化（<code>--kv-cache-dtype fp8</code> 等）。从 FP16 到 FP8 省一半，质量影响极小。但需要 GPU kernel 支持，A100/H100 原生支持 FP8。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>KV 直觉</strong>：<span class="term" data-term-id="kv-cache" tabindex="0">KV cache</span> 是中间结果而非权重，占显存大头；序列越长开销越大。</li>
+        <li><strong>vLLM 参数</strong>：<span class="term" data-term-id="vllm-kv-param" tabindex="0">vLLM KV 参数</span>（max-model-len、max-num-seqs）是应用层最直接的杠杆。</li>
+        <li><strong>延迟权衡</strong>：<span class="term" data-term-id="latency-vram" tabindex="0">latency vs vram</span> 跷跷板的平衡点由场景决定，S4 短补全偏压低延迟。</li>
+        <li><strong>prefix caching</strong>：<span class="term" data-term-id="prefix-cache" tabindex="0">prefix cache</span> 在固定 system prompt 场景能显著降低 TTFT。</li>
+        <li><strong>应用层边界</strong>：<span class="term" data-term-id="no-kernel-dev" tabindex="0">不做 kernel 开发</span>，通过参数与架构隔离各场景的 KV 预算。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_basics05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="kv-formula" /> 能估算 7B 模型 8K 序列的 KV cache 显存</label></li>
+          <li><label><input type="checkbox" data-id="param-effect" /> 能解释 max-model-len 与 max-num-seqs 对 KV 的联动影响</label></li>
+          <li><label><input type="checkbox" data-id="prefix-when" /> 能说明 prefix caching 的有效场景与无效场景</label></li>
+          <li><label><input type="checkbox" data-id="scene-budget" /> 能为 S4 FIM / 长文档分别写 KV 预算配置</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="kv-cache" tabindex="0">KV cache</span></td><td>推理生成的 Key/Value 中间缓存，随序列长度线性增长</td></tr>
+                <tr><td><span class="term" data-term-id="vllm-kv-param" tabindex="0">vLLM KV 参数</span></td><td>max-model-len、max-num-seqs 控制 KV 上限</td></tr>
+                <tr><td><span class="term" data-term-id="latency-vram" tabindex="0">latency-vram tradeoff</span></td><td>序列长度与并发数之间用显存换延迟</td></tr>
+                <tr><td><span class="term" data-term-id="max-seq-len" tabindex="0">max seq len</span></td><td>单序列最大 token 数，决定 KV 上限</td></tr>
+                <tr><td><span class="term" data-term-id="app-layer-perf" tabindex="0">app layer perf</span></td><td>应用层调优，不做 kernel 开发</td></tr>
+                <tr><td><span class="term" data-term-id="prefix-cache" tabindex="0">prefix cache</span></td><td>重复 prompt 前缀复用 KV，降低 TTFT</td></tr>
+                <tr><td><span class="term" data-term-id="no-kernel-dev" tabindex="0">no kernel dev</span></td><td>本章不涉及 CUDA 算子，只调框架参数</td></tr>
+                <tr><td><span class="term" data-term-id="context-memory" tabindex="0">context memory</span></td><td>上下文占用的显存，主要指 KV cache</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>KV cache 为什么是推理集群的显存瓶颈？请用 CorpAssist S4 的场景说明。</li>
+              <li>max-model-len 设 8K 和 32K 对显存和延迟各有什么影响？如何根据场景选择？</li>
+              <li>Prefix caching 在什么场景有用？什么场景没用？如何验证它的效果？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成下方 Demo 与测验；下一章 <a href="#ch-practice-01-python-client">Python 指向推理集群</a>：进入双栈接入阶段，用 Python client 调用量化推理服务。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM</a></li>
-    <li><a href="https://docs.docker.com/compose/" target="_blank" rel="noopener">Docker Compose</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/basics-05-kv-cache-app-lab/</code></li>
-  <li>写一条推理部署或量化笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：KV 缓存与性能（应用层）</h4>
-  <p><code>demos/basics-05-kv-cache-app-lab/</code> — 写 1 条降显存措施</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-01-python-client">Python 指向推理集群</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.vllm.ai/en/latest/features/kv_caching.html" target="_blank" rel="noopener">vLLM — KV Cache 管理</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html" target="_blank" rel="noopener">vLLM — Automatic Prefix Caching</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/performance/performance_tips.html" target="_blank" rel="noopener">vLLM — 性能调优指南</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html" target="_blank" rel="noopener">Spring AI — OpenAI Chat 配置</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为你司 S4 场景估算 KV cache 显存，并调优 vLLM KV 相关参数。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>估算你用的模型（假设 7B/32 层/FP16）在 max-model-len=8K 时的单序列 KV cache 显存。</li>
+      <li>用 Python 脚本从 vLLM <code>/metrics</code> 端读取 KV cache 使用率。</li>
+      <li>在 Compose 配置中为 S4 FIM 场景设置推荐的 KV 参数并说明理由。</li>
+      <li>记录 <code>demos/basics-05-kv-cache-app-lab/kv-notes.md</code>：你的参数值与压测前后的 KV usage 对比。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">你在 vLLM 日志看到 <code>KV cache usage: 95%</code>，但 GPU 利用率只有 30%。应优先调整哪个参数？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>KV 爆满但 GPU 空闲 → 序列太长或并发太高导致显存瓶颈，请求在排队等 KV 槽位。应降低 max-num-seqs 或 max-model-len，或启用 KV cache 量化。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">开启 prefix caching 后 TTFT 没有明显改善，可能的原因是什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>原因可能是：① 请求前缀不一致（每次不同 system prompt）；② 缓存命中率低；③ 开启后首次请求没有缓存可用。应先确认缓存命中指标。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：KV cache 参数调优</h4>
+      <p>目录：<code>demos/basics-05-kv-cache-app-lab/kv-notes.md</code>。<strong>验收</strong>：写清单序列显存估算 + 调参前后 KV usage 对比 + prefix caching 是否开启的理由。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-python-client">Python 指向推理集群</a></li>
+      <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">PagedAttention 论文</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/performance/performance_tips.html" target="_blank" rel="noopener">vLLM 性能优化手册</a></li>
+    </ul>
+  </div>
 </section>

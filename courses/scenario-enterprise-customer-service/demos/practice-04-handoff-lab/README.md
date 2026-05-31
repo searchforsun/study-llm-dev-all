@@ -1,5 +1,15 @@
 # Demo：降级与人工转接
 
-[章节](../../index.html#ch-practice-04-handoff)
+## 目标
+设计转人工触发策略与上下文移交。
 
-列移交字段
+## 操作步骤
+1. 写 3 条转人工触发规则
+2. 设计移交 payload JSON 结构
+3. 配置排队 SLA
+4. 实现 warm transfer 的上下文摘要
+
+## 验收标准
+- [ ] 触发规则覆盖主要场景
+- [ ] payload 含 DST + 摘要
+- [ ] SLA 配置合理

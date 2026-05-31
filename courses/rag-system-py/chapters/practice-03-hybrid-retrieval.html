@@ -1,249 +1,719 @@
 <section id="ch-practice-03-hybrid-retrieval" class="chapter" data-chapter="practice-03-hybrid-retrieval">
   <header class="chapter-header">
-    <h2><span class="chapter-done-badge">已完成</span>混合检索接入</h2>
+    <h2><span class="chapter-done-badge">已完成</span>混合检索实现</h2>
     <button type="button" class="btn-mark-done" data-chapter="practice-03-hybrid-retrieval" aria-label="标记本章完成">标记完成</button>
   </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Python RAG 实践</strong> · 能力：实现 BM25 + 向量混合检索，调优融合权重并将召回率提升至 90%+</p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>纯向量检索在专有名词（「竞业限制补偿金」）、短查询（「年假」）、中英文混合场景下召回率仅 60~75%。CorpAssist 的知识库包含大量 HR 政策专有名词和内部缩写（如 EHS、PIP），BM25 的精确词匹配能补足向量语义检索的盲区。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>部署带 BM25 + 向量融合的混合检索管线，通过网格搜索调优融合权重 alpha，在 CorpAssist 内部评测集上将 recall@10 从 74% 提升至 93%，并量化延迟与成本增量。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><ul><li>混合检索 = 向量语义 + BM25 精确匹配，互补召回盲区</li><li>融合策略：倒数排序融合（RRF） vs 加权和（alpha 调剂）</li><li>alpha=0.3（向量占比）在 CorpAssist 场景最优，recall@10=93%</li><li>延迟增加 35~60ms（因需执行两次检索），成本增加约 8% 存储</li></ul></div>
-    </div>
-    <div class="section-block">
-      <h3>BM25 + 向量融合策略</h3>
-      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · HR 政策专名检索</span>用户输入「PIP 流程多久」，纯向量检索将「PIP」匹配到「pipe」「pipeline」相关片段的概率较高，而 BM25 能精确命中含「PIP（绩效改善计划）」的文档。</aside>
-      <p>混合检索典型方案有两种：<strong>倒数排序融合（RRF）</strong>和<strong>加权和（Weighted Sum）</strong>。RRF 不依赖分数绝对值（适合跨模型融合），加权和更直观但要求两路分数尺度一致。CorpAssist 使用 RRF 作为默认策略。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># 混合检索核心实现 — RRF 融合
-import math
-from rank_bm25 import BM25Okapi
-from langchain_community.vectorstores import Chroma
-
-class HybridRetriever:
-    def __init__(self, vectorstore, bm25_corpus, alpha=0.3, k=10):
-        self.vectorstore = vectorstore
-        self.bm25 = BM25Okapi([doc.split() for doc in bm25_corpus])
-        self.bm25_docs = bm25_corpus
-        self.alpha = alpha  # 向量权重，BM25权重 = 1-alpha
-        self.k = k
-
-    def retrieve(self, query: str):
-        # 向量检索
-        vector_docs = self.vectorstore.similarity_search_with_score(query, k=self.k*2)
-        vec_scores = {d.metadata["doc_id"]: 1-s for d,s in vector_docs}
-
-        # BM25 检索
-        bm25_scores_raw = self.bm25.get_scores(query.split())
-        bm25_top_indices = sorted(
-            range(len(bm25_scores_raw)), key=lambda i: bm25_scores_raw[i], reverse=True
-        )[:self.k*2]
-        bm25_scores = {}
-        for idx in bm25_top_indices:
-            bm25_scores[f"doc_{idx}"] = bm25_scores_raw[idx]
-
-        # RRF 融合
-        all_ids = set(vec_scores.keys()) | set(bm25_scores.keys())
-        combined = {}
-        for doc_id in all_ids:
-            rank_vec = self._get_rank(doc_id, vec_scores, order="desc")
-            rank_bm25 = self._get_rank(doc_id, bm25_scores, order="desc")
-            rrf_vec = 1 / (60 + rank_vec) if rank_vec else 0
-            rrf_bm25 = 1 / (60 + rank_bm25) if rank_bm25 else 0
-            combined[doc_id] = self.alpha * rrf_vec + (1 - self.alpha) * rrf_bm25
-
-        sorted_docs = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:self.k]
-        return sorted_docs
-
-    @staticmethod
-    def _get_rank(doc_id, scores, order="desc"):
-        if doc_id not in scores:
-            return None
-        sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=(order=="desc"))
-        return sorted_ids.index(doc_id) + 1</code></pre></div>
-      <div class="mermaid-wrap"><h5>混合检索融合流程</h5><pre class="mermaid">flowchart LR
-  Q[Query] --> VEC[Vector Search<br/>k=2k0]
-  Q --> BM[BM25 Search<br/>k=2k0]
-  VEC --> RRF[RRF Fusion<br/>alpha=0.3]
-  BM --> RRF
-  RRF --> FINAL[Top-k Results<br/>recall@10=93%]
-  RRF --> RERANK[BGE-Reranker<br/>optional re-rank]</pre></div>
-    </div>
-    <div class="section-block">
-      <h3>权重调优实验</h3>
-      <p>在 CorpAssist 内部评测集（500 条 HR + Legal 查询，每标注 3~5 条相关文档）上对 alpha 进行网格搜索。搜索空间 [0.0, 0.1, 0.2, ..., 1.0]，k=10，指标为 recall@10 和 MRR。</p>
-      <table class="outline-table"><thead><tr><th>alpha（向量权重）</th><th>recall@10</th><th>MRR</th><th>备注</th></tr></thead>
-      <tbody>
-        <tr><td>0.0（纯 BM25）</td><td>68.2%</td><td>0.421</td><td>专有名词好，语义差</td></tr>
-        <tr><td>0.3</td><td>93.1%</td><td>0.672</td><td><strong>最优</strong></td></tr>
-        <tr><td>0.5</td><td>91.5%</td><td>0.654</td><td>均衡</td></tr>
-        <tr><td>0.7</td><td>87.3%</td><td>0.601</td><td>向量主导</td></tr>
-        <tr><td>1.0（纯向量）</td><td>74.6%</td><td>0.512</td><td>语义好，专名差</td></tr>
-      </tbody></table>
-      <p>实验结论：<strong>alpha=0.3 在 CorpAssist 场景下最优</strong>，BM25 贡献了约 24% 的额外召回（对比纯向量的 +18.5%）。专有名词查询（PIP、EHS、KPI）BM25 贡献高达 35%；语义查询（「怎样提离职」）向量贡献占主导。进一步细分查询类型：对于含数字的查询（「第18条」「3个月试用期」），BM25 的精确匹配带来 +28% 的召回提升；对于含缩写词的查询（「VPN」「SSO」「PIP」），BM25 贡献 +32%；对于含中英文混写的查询（「Bug 修复流程」「L3 支持」），BM25 贡献 +22%。而纯短语义查询（「为什么我的工资少了」），BM25 几乎没有贡献（+3%），完全依赖向量语义匹配。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># 网格搜索 alpha
-from tqdm import tqdm
-import json
-
-def grid_search_alpha(test_queries: list, alpha_range: list):
-    results = []
-    for alpha in tqdm(alpha_range):
-        retriever = HybridRetriever(vectorstore, bm25_corpus, alpha=alpha, k=10)
-        recalls = []
-        for q in test_queries:
-            retrieved_ids = [doc_id for doc_id, _ in retriever.retrieve(q["query"])]
-            relevant = set(q["relevant_doc_ids"])
-            hits = len(set(retrieved_ids) & relevant)
-            recalls.append(hits / len(relevant))
-        avg_recall = sum(recalls) / len(recalls)
-        results.append({"alpha": alpha, "recall@10": avg_recall})
-        print(f"alpha={alpha:.1f}, recall@10={avg_recall:.3f}")
-    return results
-
-# 运行搜索
-with open("test_data/hybrid_eval_500.jsonl") as f:
-    queries = [json.loads(line) for line in f]
-grid_search_alpha(queries, [i/10 for i in range(0, 11)])
-# 输出: alpha=0.3, recall@10=0.931</code></pre></div>
-    </div>
-    <div class="section-block">
-      <h3>召回率对比</h3>
-      <p>在 CorpAssist 三个知识库上分别测试纯向量 vs 混合检索的召回率。测试集：HR 200 条、Legal 150 条、IT 150 条。混合检索统一使用 alpha=0.3，k=10。</p>
-      <div class="mermaid-wrap"><h5>召回率对比柱状图</h5><pre class="mermaid">flowchart LR
-  subgraph recall_A[纯向量 recall@10]
-    HR_VEC[HR 76.2%]
-    LEG_VEC[Legal 71.8%]
-    IT_VEC[IT 80.1%]
-  end
-  subgraph recall_B[混合检索 recall@10]
-    HR_HYB[HR 94.3%]
-    LEG_HYB[Legal 91.2%]
-    IT_HYB[IT 95.7%]
-  end
-  HR_VEC -.-> HR_HYB
-  LEG_VEC -.-> LEG_HYB
-  IT_VEC -.-> IT_HYB</pre></div>
-      <table class="outline-table"><thead><tr><th>知识库</th><th>纯向量 recall@10</th><th>混合 recall@10</th><th>提升</th><th>主要受益查询类型</th></tr></thead>
-      <tbody>
-        <tr><td>HR 政策</td><td>76.2%</td><td>94.3%</td><td>+18.1%</td><td>专有名词（PIP、EHS、KPI）</td></tr>
-        <tr><td>法务合规</td><td>71.8%</td><td>91.2%</td><td>+19.4%</td><td>条款编号（第X条、Section 4.2）</td></tr>
-        <tr><td>IT 运维</td><td>80.1%</td><td>95.7%</td><td>+15.6%</td><td>中英文混合、缩写（VPN、SSO、LDAP）</td></tr>
-      </tbody></table>
-      <div class="learn-compare">
-        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">混合检索代价</span><ul><li>单次检索延迟 +35~60ms（从 45ms 到 95ms）</li><li>内存占用 +BM25 索引（约 30MB/万篇文档）</li><li>召回后多路归并需额外 CPU 计算</li></ul></div>
-        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">混合检索收益</span><ul><li>平均 recall@10 从 75% 升至 93%</li><li>专有名词场景 recall 提升 25~35%</li><li>MRR 从 0.51 升至 0.67</li><li>最终 answer faithfulness 提升 12%</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Python RAG 实践</strong> · 能力：实现 BM25 + 语义向量混合检索并调优权重</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>纯向量检索对术语精确匹配天生弱势——「工单编号 WK-2024-001」在语义空间里没有意义。纯 <span class="term" data-term-id="bm25" tabindex="0">BM25</span> 关键词检索又无法理解「报销流程」和「费用申请」是同义表达。混合检索通过 <span class="term" data-term-id="hybrid-retrieval" tabindex="0">RRF（Reciprocal Rank Fusion）</span> 融合两者分数，实现 1+1 &gt; 2 的召回效果。本章从 CorpAssist 工单与知识库场景出发，实现生产级混合检索。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>实现 BM25 + 向量检索的双通道混合检索管线</li>
+          <li>使用 RRF 和加权融合两种策略合并排序结果</li>
+          <li>集成 <span class="term" data-term-id="rerank-py" tabindex="0">BGE-Reranker</span> 提升 top-k 排序精度</li>
+          <li>设计权重调优实验，在延迟与召回之间做出工程权衡</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>稀疏 + 密集 = 互补</strong>：BM25 做精确匹配，向量做语义扩展，两者融合覆盖更多查询。</li>
+          <li><strong><span class="term" data-term-id="hybrid-retrieval" tabindex="0">RRF 是简单有效的融合</span></strong>：用排名倒数加权，不需要归一化分数尺度。</li>
+          <li><strong>Rerank 是最后的精度保障</strong>：交叉编码器重新排序 top-N，精度最高但延迟也最高。</li>
+        </ul>
       </div>
     </div>
+
     <div class="section-block">
-      <h3>延迟与成本权衡</h3>
-      <p>混合检索需要同时查询向量库和 BM25 索引，增加了系统复杂度。CorpAssist 生产环境记录的实际指标（2026 年 Q2，日均 12K 查询）：</p>
-      <table class="outline-table"><thead><tr><th>部署模式</th><th>P50 延迟</th><th>P95 延迟</th><th>存储成本</th><th>召回率@10</th></tr></thead>
-      <tbody>
-        <tr><td>纯向量（Chroma）</td><td>42ms</td><td>78ms</td><td>1x（向量+元数据）</td><td>74.6%</td></tr>
-        <tr><td>纯 BM25</td><td>8ms</td><td>15ms</td><td>1.1x（倒排索引）</td><td>68.2%</td></tr>
-        <tr><td>混合（RRF, alpha=0.3）</td><td>68ms</td><td>135ms</td><td>1.1x</td><td>93.1%</td></tr>
-        <tr><td>混合 + Rerank（BGE）</td><td>320ms</td><td>580ms</td><td>1.1x + GPU</td><td>96.5%</td></tr>
-      </tbody></table>
-      <p>延迟分布分析：向量检索占 ~60ms（含 Embedding 查询向量生成），BM25 占 ~8ms，RRF 归并占 ~2ms。P95 波动主要受向量库查询排队影响。CorpAssist 对 HR 知识库要求 P95 < 200ms，混合检索模式满足该 SLA。若超过阈值，可通过以下策略降级：1) 对查询长度 < 5 个字（如「年假」「VPN」）仅在向量库检索，跳过 BM25——因为短查询的 BM25 召回提升有限；2) 将 RRF 的扩展倍数从 2k 降至 1.2k，减少排序数据量；3) 将向量检索和 BM25 改为异步并行（asyncio.gather），让归并等待时间从两路串行的 (60+8)ms 降至 max(60,8)ms。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-bash"># 延迟基准测试
-cd demos/practice-03-hybrid-retrieval-lab
+      <h3>BM25 + 向量：双通道检索原理</h3>
 
-# 运行延迟对比测试（500 次采样）
-python latency_benchmark.py \
-  --n 500 \
-  --k 10 \
-  --alpha 0.3 \
-  --output results/latency_comparison.json
+      <p>混合检索的两条通道各有优劣。BM25 基于词频-逆文档频率，擅长精确关键词匹配；向量检索基于语义嵌入，擅长同义扩展和概念检索。两者融合的关键是如何对齐分数尺度并合并排序。</p>
 
-# 查看结果
-python -c "
-import json
-d = json.load(open('results/latency_comparison.json'))
-for mode, metrics in d.items():
-    print(f'{mode}: P50={metrics[\"p50_ms\"]}ms P95={metrics[\"p95_ms\"]}ms')
-"
-# 输出:
-# vector_only: P50=42ms P95=78ms
-# bm25_only: P50=8ms P95=15ms
-# hybrid_rrf: P50=68ms P95=135ms</code></pre></div>
-      <details class="learn-micro-check"><summary>自检：如果 P95 延迟从 135ms 升至 300ms，你从哪几个维度排查？</summary>
-      <p>1) 向量库负载：检查 Chroma 连接池是否打满，查询排队时间；2) BM25 索引是否每次重建而非持久化；3) Embedding 接口延迟（调用 OpenAI API 的网络延迟是否增加）；4) RRF 归并时是否对全部文档排序（应提前截断 top-2k）。</p>
-      </details>
-      <details class="learn-faq"><summary>FAQ：为什么不在向量库层面做混合检索（如 Elasticsearch 的 hybrid query）？</summary>
-      <p>Elasticsearch 8.12+ 支持 hybrid query（kNN + BM25 自动融合），若公司已有 ES 集群可考虑。CorpAssist 选择独立 BM25 实现的原因：1) 与向量库解耦，可随时切换存储后端；2) RRF alpha 可针对不同知识库独立调优；3) 避免 ES 许可成本。</p>
-      </details>
-      <p>RRF 融合的边界情况处理：当某一路检索结果为空时（如 BM25 对所有文档评分均为 0），RRF 仅依赖另一路的结果，score 归一化后仍能输出 Top-K。当某一路的 Top-K 中存在大量低分文档（score < 0.1）时，RRF 常数 k=60 会将这些低分文档的排名权重压制到极低（约 0.016），避免了低质量结果干扰。当两路检索的结果集完全不重叠时（这在跨语言查询中常见），RRF 自动对每路的前几名给予公平的 rank 权重，不需要分数归一化。</p>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 工单与知识库混合检索</span>
+        员工可能用精确工单号「INC-2024-0513」查询，也可能用模糊描述「上周的网络故障」提问。混合检索需要同时处理两种查询风格。BM25 命中工单号，向量检索匹配语义相关文档，RRF 融合后给出最优排序。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>双通道混合检索流程</h5>
+        <pre class="mermaid">flowchart LR
+    Query[用户查询] --> BM25[BM25 检索\n关键词精确匹配]
+    Query --> Vector[向量检索\n语义相似匹配]
+
+    BM25 -->|ranking A| Normalize[分数归一化]
+    Vector -->|ranking B| Normalize
+
+    Normalize -->|归一化分数| RRF[RRF 融合\n加权合并]
+    RRF -->|top-N| Rerank[BGE-Reranker\n交叉编码器重排]
+    Rerank -->|final top-k| Result[最终结果]
+
+    style BM25 fill:#D2691E,color:#fff
+    style Vector fill:#4A90D9,color:#fff
+    style RRF fill:#7B68EE,color:#fff
+    style Rerank fill:#2E8B57,color:#fff</pre>
+        <p class="diagram-caption">BM25 和向量检索并行执行，分数归一化后 RRF 融合，可选 Reranker 精排。</p>
+      </div>
+
+      <h4>BM25 + 向量双通道实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># hybrid_retriever.py — BM25 + 向量混合检索器
+from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass
+import numpy as np
+
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain.retrievers import BM25Retriever, EnsembleRetriever
+from langchain.schema import Document
+
+@dataclass
+class RetrievalResult:
+    """检索结果带分数信息"""
+    document: Document
+    bm25_score: float = 0.0
+    vector_score: float = 0.0
+    hybrid_score: float = 0.0
+    rerank_score: float = 0.0
+
+class HybridRetriever:
+    """BM25 + 向量双通道混合检索器"""
+
+    def __init__(
+        self,
+        vector_store: Chroma,
+        bm25_retriever: BM25Retriever,
+        alpha: float = 0.5,
+    ):
+        self.vector_store = vector_store
+        self.bm25_retriever = bm25_retriever
+        self.alpha = alpha  # BM25 权重: alpha, 向量权重: 1-alpha
+
+    def retrieve(
+        self,
+        query: str,
+        k: int = 10,
+        bm25_k: int = 20,
+        vector_k: int = 20,
+    ) -> List[RetrievalResult]:
+        """双通道检索 → RRF 融合"""
+        # 通道 1: BM25 检索
+        bm25_docs = self.bm25_retriever.invoke(query)
+        bm25_scores_map = {}
+        for rank, doc in enumerate(bm25_docs):
+            doc_id = doc.metadata.get("doc_id", doc.page_content[:50])
+            bm25_scores_map[doc_id] = 1.0 / (rank + 1)
+
+        # 通道 2: 向量检索
+        vector_results = self.vector_store.similarity_search_with_score(
+            query, k=vector_k
+        )
+        vector_scores_map = {}
+        for doc, score in vector_results:
+            doc_id = doc.metadata.get("doc_id", doc.page_content[:50])
+            vector_scores_map[doc_id] = float(score)
+
+        # RRF 融合
+        all_doc_ids = set(bm25_scores_map.keys()) | set(vector_scores_map.keys())
+        results = []
+
+        for doc_id in all_doc_ids:
+            bm25_score = bm25_scores_map.get(doc_id, 0.0)
+            vector_score = vector_scores_map.get(doc_id, 0.0)
+            # 加权融合
+            hybrid_score = self.alpha * bm25_score + (1 - self.alpha) * vector_score
+            # 找到对应的文档对象
+            doc = self._find_doc(doc_id, bm25_docs, vector_results)
+            if doc:
+                results.append(RetrievalResult(
+                    document=doc,
+                    bm25_score=bm25_score,
+                    vector_score=vector_score,
+                    hybrid_score=hybrid_score,
+                ))
+
+        # 按混合分数排序
+        results.sort(key=lambda r: r.hybrid_score, reverse=True)
+        return results[:k]
+
+    def _find_doc(
+        self,
+        doc_id: str,
+        bm25_docs: List[Document],
+        vector_results: List[Tuple[Document, float]],
+    ) -> Optional[Document]:
+        for doc in bm25_docs:
+            if doc.metadata.get("doc_id", doc.page_content[:50]) == doc_id:
+                return doc
+        for doc, _ in vector_results:
+            if doc.metadata.get("doc_id", doc.page_content[:50]) == doc_id:
+                return doc
+        return None
+
+if __name__ == "__main__":
+    # 初始化
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", dimensions=512)
+    store = Chroma(persist_directory="./data/chroma_db", embedding_function=embeddings)
+    all_texts = [doc.page_content for doc in store.get()["documents"]]
+    bm25 = BM25Retriever.from_texts(all_texts, k=20)
+
+    hybrid = HybridRetriever(store, bm25, alpha=0.5)
+    results = hybrid.retrieve("工单 INC-2024-0513 状态", k=5)
+    for r in results:
+        print(f"hybrid={r.hybrid_score:.4f} bm25={r.bm25_score:.4f} vec={r.vector_score:.4f}")
+        print(f"  {r.document.page_content[:80]}...")</code></pre>
+      </div>
+
+      <h4>RRF 算法实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># rrf_fusion.py — RRF 融合算法与对比
+from typing import List, Dict, Tuple
+from collections import defaultdict
+import math
+
+def rrf_fusion(
+    rankings: List[List[str]],
+    k: int = 60,
+    weights: List[float] = None,
+) -> List[Tuple[str, float]]:
+    """
+    Reciprocal Rank Fusion 融合多个排序结果。
+
+    Args:
+        rankings: 多个排序列表，每个列表为文档 ID 序列
+        k: RRF 常数，通常 60
+        weights: 每个排序通道的权重，默认等权重
+
+    Returns:
+        (doc_id, score) 按分数降序排列
+    """
+    if weights is None:
+        weights = [1.0] * len(rankings)
+    assert len(rankings) == len(weights), "rankings 和 weights 长度必须相同"
+
+    scores = defaultdict(float)
+    for rank_list, weight in zip(rankings, weights):
+        for rank, doc_id in enumerate(rank_list):
+            # RRF 分数: weight / (k + rank)
+            scores[doc_id] += weight / (k + rank + 1)
+
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+def linear_fusion(
+    rankings: List[List[str]],
+    scores_per_rank: List[List[float]],
+    weights: List[float] = None,
+) -> List[Tuple[str, float]]:
+    """线性归一化融合（需要原始分数）"""
+    if weights is None:
+        weights = [1.0] * len(rankings)
+
+    fused = defaultdict(float)
+    for rank_list, score_list, weight in zip(rankings, scores_per_rank, weights):
+        if not score_list:
+            continue
+        min_s, max_s = min(score_list), max(score_list)
+        if max_s - min_s < 1e-6:
+            norm_scores = [0.5] * len(score_list)
+        else:
+            norm_scores = [(s - min_s) / (max_s - min_s) for s in score_list]
+        for doc_id, ns in zip(rank_list, norm_scores):
+            fused[doc_id] += weight * ns
+
+    return sorted(fused.items(), key=lambda x: x[1], reverse=True)
+
+# 对比测试
+if __name__ == "__main__":
+    bm25_ranking = ["doc_3", "doc_1", "doc_5", "doc_2"]
+    vec_ranking = ["doc_1", "doc_4", "doc_3", "doc_6"]
+
+    rrf_result = rrf_fusion([bm25_ranking, vec_ranking], k=60)
+    print("RRF 融合结果:")
+    for doc_id, score in rrf_result[:5]:
+        print(f"  {doc_id}: {score:.4f}")
+
+    # 线性融合需要原始分数
+    bm25_scores = [0.85, 0.72, 0.68, 0.55]
+    vec_scores = [0.92, 0.78, 0.65, 0.50]
+    linear_result = linear_fusion(
+        [bm25_ranking, vec_ranking],
+        [bm25_scores, vec_scores],
+        weights=[0.4, 0.6],
+    )
+    print("线性融合结果:")
+    for doc_id, score in linear_result[:5]:
+        print(f"  {doc_id}: {score:.4f}")</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>直接拼接 BM25 和向量结果而不去重</li>
+            <li>用原始 L2 距离和 BM25 分数直接相加</li>
+            <li>固定 alpha=0.5 不做场景调整</li>
+            <li>不设置 score_threshold，低质量结果全部保留</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>RRF 融合用排名倒数加权，免去分数归一化</li>
+            <li>线性融合前做 min-max 归一化对齐尺度</li>
+            <li>按场景调优 alpha（精确查询 alpha 高，模糊查询 alpha 低）</li>
+            <li>设置 score_threshold 过滤明显不相关结果</li>
+          </ul>
+        </div>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>融合策略</th><th>优点</th><th>缺点</th><th>适用场景</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>RRF (k=60)</td>
+            <td>无需分数归一化，鲁棒</td>
+            <td>忽略分数绝对值信息</td>
+            <td>多通道融合、分数不可比场景</td>
+          </tr>
+          <tr>
+            <td>加权线性</td>
+            <td>保留分数信息，可解释</td>
+            <td>需归一化到同一尺度</td>
+            <td>分数分布已知的可比场景</td>
+          </tr>
+          <tr>
+            <td>学习排序 (LTR)</td>
+            <td>可学出最优权重组合</td>
+            <td>需要标注数据</td>
+            <td>有历史点击/反馈数据</td>
+          </tr>
+        </tbody>
+      </div>
     </div>
+
+    <div class="section-block">
+      <h3>权重调优与延迟权衡</h3>
+
+      <p><span class="term" data-term-id="hybrid-retrieval" tabindex="0">alpha 参数</span>控制 BM25 和向量检索的权重比例。alpha=1 是纯关键词，alpha=0 是纯语义。最优 alpha 取决于查询分布和文档特性。同时，双通道检索意味着双倍延迟，需要工程权衡。</p>
+
+      <h4>Alpha 扫描实验</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># alpha_sweep.py — 权重扫描实验
+from typing import List, Dict
+import time
+import json
+from hybrid_retriever import HybridRetriever
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain.retrievers import BM25Retriever
+from langchain.schema import Document
+
+def evaluate_recall(
+    retriever: HybridRetriever,
+    test_queries: List[Dict[str, List[str]]],
+    k: int = 10,
+) -> Dict[str, float]:
+    """评估检索召回率"""
+    total_relevant = 0
+    retrieved_relevant = 0
+
+    for item in test_queries:
+        query = item["query"]
+        expected_docs = set(item["expected_doc_ids"])
+        results = retriever.retrieve(query, k=k)
+        retrieved_ids = {r.document.metadata.get("doc_id", "") for r in results}
+        matches = retrieved_ids & expected_docs
+        retrieved_relevant += len(matches)
+        total_relevant += len(expected_docs)
+
+    recall = retrieved_relevant / total_relevant if total_relevant > 0 else 0
+    return {"recall@k": recall, "relevant": retrieved_relevant, "total": total_relevant}
+
+def run_alpha_sweep(
+    vector_store: Chroma,
+    bm25_retriever: BM25Retriever,
+    test_queries: List[Dict[str, List[str]]],
+) -> Dict[float, Dict]:
+    """扫描 alpha 值并记录 Recall@K 和延迟"""
+    results = {}
+
+    for alpha in [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]:
+        retriever = HybridRetriever(vector_store, bm25_retriever, alpha=alpha)
+
+        # 计时
+        start = time.perf_counter()
+        metrics = evaluate_recall(retriever, test_queries, k=10)
+        elapsed = time.perf_counter() - start
+
+        metrics["avg_latency_ms"] = (elapsed / len(test_queries)) * 1000
+        results[alpha] = metrics
+        print(f"alpha={alpha:.1f}: recall@10={metrics['recall@k']:.4f}, "
+              f"latency={metrics['avg_latency_ms']:.1f}ms")
+
+    return results
+
+if __name__ == "__main__":
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", dimensions=512)
+    store = Chroma(persist_directory="./data/chroma_db", embedding_function=embeddings)
+    all_docs = [doc.page_content for doc in store.get()["documents"]]
+    bm25 = BM25Retriever.from_texts(all_docs, k=20)
+
+    # 示例测试集
+    test_queries = [
+        {"query": "年假政策", "expected_doc_ids": ["doc_1", "doc_5"]},
+        {"query": "工单 INC-2024-0513", "expected_doc_ids": ["doc_12"]},
+        {"query": "如何申请加班费", "expected_doc_ids": ["doc_3", "doc_7", "doc_9"]},
+    ]
+    results = run_alpha_sweep(store, bm25, test_queries)
+    best_alpha = max(results, key=lambda a: results[a]["recall@k"])
+    print(f"\n推荐 alpha={best_alpha} (recall@10={results[best_alpha]['recall@k']:.4f})")</code></pre>
+      </div>
+
+      <h4>延迟优化策略</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>策略</th><th>效果</th><th>代价</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>降低 recall 的 fetch_k</td>
+            <td>减少 BM25 和向量检索规模</td>
+            <td>可能丢失相关文档</td>
+          </tr>
+          <tr>
+            <td>并行执行双通道</td>
+            <td>总延迟 = max(bm25, vec) 而非 sum</td>
+            <td>需 ThreadPoolExecutor</td>
+          </tr>
+          <tr>
+            <td>向量量化 (PQ)</td>
+            <td>向量检索提速 3-5x</td>
+            <td>召回下降 1-3%</td>
+          </tr>
+          <tr>
+            <td>异步检索</td>
+            <td>释放线程处理其他请求</td>
+            <td>框架支持复杂度</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：双通道检索中如果 BM25 返回了 100 个结果，向量返回 100 个，RRF 融合后你取 top-10。那么 BM25 的 k 值应该设为多少？</summary>
+        <p>建议 BM25 的 k 设为最终 top-k 的 2-4 倍（即 20-40）。k 太小可能提前截断本应出现在最终结果中的文档；k 太大徒增 RRF 计算开销。原则：各通道的候选集应覆盖足够多的候选，再由融合排序决定 top-k。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Rerank 集成：BGE-Reranker 精排</h3>
+
+      <p><span class="term" data-term-id="rerank-py" tabindex="0">Rerank</span> 是混合检索的最后一道精度保障。BM25 和向量检索都使用双编码器（bi-encoder）做近似搜索，速度高但精度有限。Reranker 使用交叉编码器（cross-encoder）对 query 和候选文档逐对计算相关性分数，精度更高但延迟更高。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># reranker.py — BGE-Reranker 集成
+from typing import List, Tuple
+from dataclasses import dataclass
+import numpy as np
+from sentence_transformers import CrossEncoder
+from hybrid_retriever import HybridRetriever, RetrievalResult
+
+class BGERReranker:
+    """BGE Reranker 交叉编码器精排"""
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-reranker-v2-m3",
+        batch_size: int = 16,
+        device: str = "cpu",
+    ):
+        self.model = CrossEncoder(
+            model_name,
+            max_length=512,
+            device=device,
+        )
+        self.batch_size = batch_size
+
+    def rerank(
+        self,
+        query: str,
+        candidates: List[RetrievalResult],
+        top_k: int = 5,
+    ) -> List[RetrievalResult]:
+        """对候选结果重新排序"""
+        if not candidates:
+            return []
+
+        pairs = [(query, r.document.page_content) for r in candidates]
+        scores = self.model.predict(pairs, batch_size=self.batch_size)
+
+        for result, score in zip(candidates, scores):
+            result.rerank_score = float(score)
+
+        candidates.sort(key=lambda r: r.rerank_score, reverse=True)
+        return candidates[:top_k]
+
+class PipelineWithRerank:
+    """完整管线：混合检索 → Rerank"""
+
+    def __init__(
+        self,
+        hybrid_retriever: HybridRetriever,
+        reranker: BGERReranker,
+        hybrid_k: int = 20,   # 混合检索取 top-20
+        rerank_k: int = 5,    # Rerank 后取 top-5
+    ):
+        self.hybrid_retriever = hybrid_retriever
+        self.reranker = reranker
+        self.hybrid_k = hybrid_k
+        self.rerank_k = rerank_k
+
+    def retrieve(self, query: str) -> List[RetrievalResult]:
+        """完整检索管线"""
+        # 阶段 1: 混合检索 (快速)
+        candidates = self.hybrid_retriever.retrieve(query, k=self.hybrid_k)
+        # 阶段 2: Rerank (慢速但精准)
+        reranked = self.reranker.rerank(query, candidates, top_k=self.rerank_k)
+        return reranked
+
+if __name__ == "__main__":
+    from langchain_chroma import Chroma
+    from langchain_openai import OpenAIEmbeddings
+    from langchain.retrievers import BM25Retriever
+    import time
+
+    # 初始化
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", dimensions=512)
+    store = Chroma(persist_directory="./data/chroma_db", embedding_function=embeddings)
+    all_texts = [s for s in store.get()["documents"]]
+    bm25 = BM25Retriever.from_texts(all_texts, k=20)
+
+    hybrid = HybridRetriever(store, bm25, alpha=0.5)
+    reranker = BGERReranker(model_name="BAAI/bge-reranker-v2-m3")
+    pipeline = PipelineWithRerank(hybrid, reranker, hybrid_k=20, rerank_k=5)
+
+    # 对比测试
+    query = "如何申请加班费和调休"
+    print(f"Query: {query}")
+
+    t0 = time.perf_counter()
+    hybrid_only = hybrid.retrieve(query, k=5)
+    t1 = time.perf_counter()
+    print(f"\n[Hybrid Only] {len(hybrid_only)} results in {(t1-t0)*1000:.1f}ms")
+    for r in hybrid_only:
+        print(f"  score={r.hybrid_score:.4f} | {r.document.page_content[:60]}")
+
+    t2 = time.perf_counter()
+    reranked = pipeline.retrieve(query)
+    t3 = time.perf_counter()
+    print(f"\n[Hybrid + Rerank] {len(reranked)} results in {(t3-t2)*1000:.1f}ms")
+    for r in reranked:
+        print(f"  score={r.rerank_score:.4f} | {r.document.page_content[:60]}")</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>CorpAssist 延迟预算</strong>
+        <p>混合检索预算约 <strong>200-500ms</strong>（含 BM25 + 向量并行）：<br />
+        BM25 检索 ~20ms，向量检索 ~80ms，RRF 融合 ~5ms，Rerank（top-20）~200ms。<br />
+        如果延迟敏感（如工单实时查询），考虑跳过 Rerank 或降低候选集大小。</p>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>延迟瀑布图：混合检索各环节耗时</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph BM25[BM25 Channel ~20ms]
+        TF[关键词匹配] --> Rank[排序]
+    end
+    subgraph Vector[Vector Channel ~80ms]
+        Embed[查询编码] --> Search[ANN 搜索]
+    end
+    subgraph Fusion[Fusion ~5ms]
+        RRF[RRF 融合]
+    end
+    subgraph Rerank_Stage[Rerank ~200ms]
+        Cross[Cross-Encoder] --> Sort[重新排序]
+    end
+
+    BM25 --> RRF
+    Vector --> RRF
+    RRF -->|top-20| Rerank_Stage
+    Rerank_Stage -->|top-5| Result
+
+    style BM25 fill:#D2691E,color:#fff
+    style Vector fill:#4A90D9,color:#fff
+    style Fusion fill:#7B68EE,color:#fff
+    style Rerank_Stage fill:#2E8B57,color:#fff</pre>
+        <p class="diagram-caption">BM25 和向量检索可并行，总延迟 max(BM25, Vector) + RRF + Rerank。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 场景：Elasticsearch + Milvus 双后端</h3>
+
+      <p>生产环境中，BM25 由 Elasticsearch 提供，向量检索由 Milvus 提供。双后端架构的挑战在于：如何保持两端数据一致、如何统一查询接口、如何处理一端故障。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>后端</th><th>引擎</th><th>擅长</th><th>索引结构</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>稀疏检索</td><td>Elasticsearch 8.x</td><td>精确关键词、通配符、短语匹配</td><td>倒排索引 (Inverted Index)</td></tr>
+          <tr><td>密集检索</td><td>Milvus 2.x</td><td>语义相似、同义扩展、模糊概念</td><td>IVF_FLAT / HNSW</td></tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>双后端注意点</strong>
+        <ul>
+          <li>文档 ID 在两系统间保持一致，用全局唯一 doc_id 关联</li>
+          <li>写操作双写：ES 和 Milvus 都要写入，使用事务性消息队列保证最终一致</li>
+          <li>读操作优先读 Milvus（向量检索）降级到 ES（仅 BM25），反过来亦可</li>
+          <li>监控两端延迟 P50/P99，设置熔断阈值</li>
+        </ul>
+      </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li><strong>RRF 融合</strong>：倒数排序融合适用于跨模型分数不可比场景，CorpAssist 默认 alpha=0.3</li>
-        <li><strong>召回率提升</strong>：混合检索将 recall@10 从 74.6% 提升至 93.1%，专有名词场景提升 25~35%</li>
-        <li><strong>延迟增量可控</strong>：P50 增加 +26ms（42→68ms），P95 增加 +57ms（78→135ms），满足 200ms SLA</li>
-        <li><strong>权重调优</strong>：alpha=0.3 在 CorpAssist 评测集最优，不同知识库可独立调优</li>
-        <li><strong>选择性使用</strong>：简单语义查询（如「怎么请假」）纯向量已足够，不必走混合检索</li>
+        <li><strong>BM25 + 向量互补</strong>：精确匹配与语义扩展结合，覆盖更多查询类型。</li>
+        <li><strong>RRF 融合简单有效</strong>：无参数、免归一化、多通道排序可解释。</li>
+        <li><strong>Alpha 需要场景调优</strong>：精确查询 alpha 偏高，语义查询 alpha 偏低。</li>
+        <li><strong>Rerank 是精度兜底</strong>：交叉编码器重排 top-N，精度最高但延迟最高。</li>
+        <li><strong>双后端架构</strong>：Elasticsearch + Milvus 各自服务不同检索类型，通过 doc_id 关联。</li>
       </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox"> 能写出 RRF 融合的核心 Python 实现</label></li>
-        <li><label><input type="checkbox"> 能解释 alpha 参数的物理含义和调优方向</label></li>
-        <li><label><input type="checkbox"> 能说出 CorpAssist 哪些查询类型受益于混合检索</label></li>
-        <li><label><input type="checkbox"> 能估算混合检索增加的延迟和成本</label></li>
-        <li><label><input type="checkbox"> 能在生产环境设置中按知识库独立配置 alpha</label></li>
-      </ul></div>
-      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
-        <tr><td>RRF</td><td>Reciprocal Rank Fusion，倒数排名融合</td></tr>
-        <tr><td>BM25</td><td>Okapi BM25 概率检索模型</td></tr>
-        <tr><td>alpha</td><td>混合权重，向量占比（0~1）</td></tr>
-        <tr><td>recall@k</td><td>Top-k 召回中相关文档占比</td></tr>
-        <tr><td>MRR</td><td>Mean Reciprocal Rank，首个相关文档平均倒数排名</td></tr>
-        <tr><td>k0（扩招倍数）</td><td>融合前各路先检索 2k 再归并</td></tr>
-        <tr><td>BGE-Reranker</td><td>BAAI 交叉编码重排模型</td></tr>
-        <tr><td>网格搜索</td><td>穷举参数组合的调优方法</td></tr>
-      </table></div>
-      <div class="learn-interview"><h4>面试可能问</h4><details><summary>为什么 RRF 比加权和更适合跨模型融合？</summary>
-      <p>RRF 基于排名而非分数绝对值，不受不同检索模型分数分布差异影响（如向量相似度 0~1 vs BM25 分数 0~20+）。加权和需要先归一化两路分数到同一尺度（min-max 或 z-score），引入额外偏差。RRF 的常数 k（通常 60）控制排名权重衰减速度。</p>
-      </details>
-      <details><summary>混合检索后 answer faithfulness 为什么提升 12%？</summary>
-      <p>纯向量检索在专有名词查询中可能遗漏关键文档，导致 LLM 无依据可引用，产生幻觉。混合检索提高了准确文档出现在 context 中的概率，LLM 获得足够依据，faithfulness（是否与 context 一致）自然从 0.81 升至 0.91。</p>
-      </details>
-      <details><summary>如何为不同知识库选择不同的 alpha？</summary>
-      <p>方法：对每个知识库构建独立评测集（至少 100 条查询+标注），各自运行网格搜索。CorpAssist 实测：IT 知识库 alpha=0.5（BM25 对代码术语贡献大），HR 知识库 alpha=0.3，Legal 知识库 alpha=0.4（条款编号 BM25 优势明显）。</p>
-      </details></div>
+      <div class="learn-checklist" data-storage-key="rag-system-py_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="bm25-vector" /> 能解释 BM25 和向量检索的工作原理差异及互补关系</label></li>
+          <li><label><input type="checkbox" data-id="rrf-fusion" /> 能实现 RRF 融合并理解 k 参数的作用</label></li>
+          <li><label><input type="checkbox" data-id="alpha-tuning" /> 能设计 alpha 扫描实验找到最优权重</label></li>
+          <li><label><input type="checkbox" data-id="reranker" /> 能集成 BGE-Reranker 并评估精度-延迟权衡</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>BM25</td><td>基于词频-逆文档频率的关键词检索算法</td></tr>
+                <tr><td>向量检索</td><td>将查询编码为向量后做 ANN 近似最近邻搜索</td></tr>
+                <tr><td>RRF</td><td>倒数排名融合，score = sum(1/(k+rank))</td></tr>
+                <tr><td>Alpha 参数</td><td>BM25 权重，alpha=1 纯关键词，alpha=0 纯语义</td></tr>
+                <tr><td>Cross-Encoder</td><td>query-doc 对输入，输出相关性分数</td></tr>
+                <tr><td>Bi-Encoder</td><td>query 和 doc 独立编码，余弦相似度</td></tr>
+                <tr><td>BGE-Reranker</td><td>BAAI 开源的交叉编码器重排模型</td></tr>
+                <tr><td>MMR</td><td>最大边际相关性，平衡相关性与多样性</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>BM25 和向量检索各有什么不可替代的优势？请用一个具体查询示例说明为什么需要两者融合。</li>
+              <li>RRF 比加权线性融合好在哪？什么场景下线性融合反而更好？</li>
+              <li>Rerank 增加了 200ms 延迟，你觉得值吗？什么场景下应该跳过 Rerank？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-practice-04-rag-eval">RAG 评测实践</a> 将用 RAGAS 评测本章的混合检索质量。</p>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方参考</h3><ul>
-    <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/hybrid-search.html" target="_blank" rel="noopener">Elasticsearch Hybrid Search</a></li>
-    <li><a href="https://pypi.org/project/rank-bm25/" target="_blank" rel="noopener">rank-bm25 Python 库</a></li>
-    <li><a href="https://www.baeldung.com/cs/reciprocal-rank-fusion" target="_blank" rel="noopener">RRF 算法详解</a></li>
-    <li><a href="https://www.sbert.net/examples/applications/cross-encoder/README.html" target="_blank" rel="noopener">SBERT Cross-Encoder Reranker</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-    <div class="steps-operate"><ol>
-      <li>在 <code>demos/practice-03-hybrid-retrieval-lab/</code> 中完成 <code>HybridRetriever</code> 类的 RRF 融合方法</li>
-      <li>运行 <code>python grid_search.py</code> 对 alpha 进行网格搜索 [0, 0.2, 0.4, 0.6, 0.8, 1.0]，记录最优值</li>
-      <li>运行 <code>python recall_comparison.py</code> 对比纯向量 vs 混合检索在 HR、Legal、IT 三个库的 recall@10</li>
-      <li>完成 <code>latency_benchmark.py</code> 的延迟测试，确认 P95 < 200ms</li>
-    </ol></div>
-    <div class="steps-judgment-list"><details><summary>场景 1：用户查「VPN 配置步骤」返回不相关结果，你认为混合检索能解决吗？</summary>
-      <p>能。纯向量检索将「VPN」与「VPC」「VNet」混淆的概率较高，BM25 精确匹配「VPN」词汇可以显著提高含「VPN」文档的排名。建议 alpha 调至 0.4~0.5，给 BM25 更高权重。若仍不理想，在 BM25 中对 IT 缩写做自定义 tokenizer。</p>
-    </details>
-    <details><summary>场景 2：生产环境报混合检索延迟 P95=350ms 超出 SLA，你如何降低？</summary>
-      <p>1) 降低每路扩展检索倍数（2k → 1.2k）；2) 对简单查询（长度<5 字）跳过 BM25 直接走向量；3) 将 BM25 索引加载到 Redis 缓存替代每次重建；4) 合并向量检索和 BM25 为并行调用（asyncio.gather）；5) 若仍不足，降级为纯向量并监控 recall 衰减。</p>
-    </details></div>
-    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/practice-03-hybrid-retrieval-lab/</p><ul class="demo-acceptance">
-      <li>HybridRetriever 在测试集上 recall@10 > 90%</li>
-      <li>网格搜索输出 alpha 调优曲线图</li>
-      <li>延迟测试报告显示 P95 < 200ms</li>
-    </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html" target="_blank" rel="noopener">Elasticsearch 官方文档 — BM25 实现</a></li>
+      <li><a href="https://milvus.io/docs/" target="_blank" rel="noopener">Milvus 文档 — 向量数据库配置</a></li>
+      <li><a href="https://www.sbert.net/docs/cross_encoder/usage.html" target="_blank" rel="noopener">SBERT Cross-Encoder 使用指南</a></li>
+      <li><a href="https://huggingface.co/BAAI/bge-reranker-v2-m3" target="_blank" rel="noopener">BGE-Reranker-v2-m3 — HuggingFace 模型页</a></li>
+      <li><a href="https://plg.uwaterloo.ca/~gvcormack/cormack.pdf" target="_blank" rel="noopener">RRF 原始论文 — Cormack 等提出的融合算法</a></li>
+    </ul>
   </div>
-  <div class="resources content-section"><h3>延伸阅读</h3><ul>
-    <li><a href="#ch-practice-04-rag-eval">下一章：RAG 评测闭环（RAGAS）</a></li>
-    <li><a href="https://weaviate.io/blog/hybrid-search-explained">Weaviate Hybrid Search 原理</a></li>
-    <li><a href="https://arxiv.org/abs/2404.14491">Google: How to Hybrid Search</a></li>
-  </ul></div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 CorpAssist 场景上实现混合检索并调优权重（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>从 Chroma 中导出文档集，构建 BM25Retriever。</li>
+      <li>运行 <code>hybrid_retriever.py</code> 测试双通道检索，分别查看 BM25 和向量的召回差异。</li>
+      <li>运行 <code>alpha_sweep.py</code> 扫描 alpha，观察不同权重下 Recall@10 的变化曲线。</li>
+      <li>集成 BGE-Reranker，对比「仅混合」和「混合+Rerank」的精度和延迟。</li>
+      <li>设计一组包含精确查询和模糊查询的混合测试集，评估系统整体召回。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">alpha=0.5 时查询「INC-2024-0513 工单状态」，BM25 将该工单排第 1 但向量检索未收录。RRF 融合后该工单掉到了第 3。为什么？如何解决？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>RRF 融合后 BM25 第 1 的 doc 被向量通道的「不相关」doc 拉低</strong>。向量通道返回了其他文档的较高分数，RFF 叠加后 BM25 第 1 的权重被稀释。解决：对精确查询动态提高 alpha（如检测到工单号模式时 alpha=0.8），或对向量通道设置 score_threshold 过滤不相关结果。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">P999 延迟从 500ms 飙升到 2s，经排查是 Reranker 模型显存瓶颈。你会怎么优化？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>1) 减少 Rerank 候选数</strong>：从 top-20 降到 top-10；2) 使用更轻量的 Reranker 模型（如 bge-reranker-v2-minicpm-layer）；3) 异步 Rerank，不阻塞主线程；4) 缓存高频 query 的 Rerank 结果；5) 对低延迟敏感的场景（如工单查询）跳过 Rerank 阶段。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：混合检索实现实验室</h4>
+      <p>目录：<code>demos/practice-03-hybrid-retrieval-lab/</code>。<strong>验收</strong>：双通道检索同时命中关键词和语义结果，Rerank 后 NDCG@3 提升 >= 5%。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-rag-eval">RAG 评测实践</a> — 用 RAGAS 评估本章的混合检索管线</li>
+      <li><a href="https://arxiv.org/abs/2104.05762" target="_blank" rel="noopener">论文：Hybrid Retrieval — Sparse + Dense 融合综述</a></li>
+      <li><a href="https://github.com/castorini/pyserini" target="_blank" rel="noopener">Pyserini — Python BM25 检索工具包</a></li>
+      <li><a href="https://github.com/FlagOpen/FlagEmbedding" target="_blank" rel="noopener">BGE Embedding & Reranker 官方库</a></li>
+    </ul>
+  </div>
 </section>

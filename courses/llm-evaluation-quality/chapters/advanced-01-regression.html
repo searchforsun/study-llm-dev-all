@@ -6,57 +6,403 @@
   <div class="concept">
     <div class="chapter-intro content-section">
       <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>质量治理</strong> · 能力：CI 卡点、版本对比与阻塞策略</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>没有 regression gate，每次 merge 都可能悄悄降低 faithfulness。生产级必须 block。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul><li>ci block 策略</li><li>version diff 报告</li><li>baseline pin</li><li>merge queue 集成</li></ul></div>
-      <div class="notice"><strong>本章先记住 3 件事</strong><ul><li>MR 必跑 eval</li><li>对比 baseline</li><li>metric regression 定义</li><li>hold deploy</li></ul></div>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>没有 regression gate，每次 merge 都可能悄悄降低 faithfulness。生产级 LLM 应用必须用自动化门禁防止质量退化。回归门禁是 NS1 飞轮中「自动评测 → 阻塞 → 改进」的工程保障。</p></div>
+      <div class="notice notice-outcome"><strong>学完你能</strong><ul><li>配置 CI block 策略防止低质量合并</li><li>实现 version diff 报告对比 baseline</li><li>管理 baseline pin 防止基准漂移</li><li>集成 merge queue 自动排队评测</li><li>定义 release candidate 的门禁条件</li></ul></div>
+      <div class="notice"><strong>本章先记住 4 件事</strong><ul><li><strong>MR 必跑 eval</strong>：required check 要求每次 MR 通过评测</li><li><strong>对比 baseline</strong>：不是看绝对分数，而是看 delta vs baseline</li><li><strong>metric regression 定义</strong>：faithfulness delta ≤ -0.02 即为回归</li><li><strong>deploy hold</strong>：回归触发时自动 hold 发布流水线</li></ul></div>
     </div>
-<div class="section-block"><h3>CI 卡点</h3>
-<p><span class="term" data-term-id="regression-gate" tabindex="0">regression gate</span> + <span class="term" data-term-id="ci-block" tabindex="0">ci block</span>：required check 未绿禁止合并。</p>
-<h4>代码示例</h4>
-<div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-<pre><code class="language-yaml">required_checks:
-  - ragas-eval
-  - spring-eval-subset</code></pre></div>
-</div>
-<div class="section-block"><h3>版本对比</h3>
-<p><span class="term" data-term-id="version-diff" tabindex="0">version diff</span>：新 report vs <span class="term" data-term-id="baseline-pin" tabindex="0">baseline pin</span>。</p>
-<h4>代码示例</h4>
-<div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-<pre><code class="language-json">{"delta":{"faithfulness":-0.03,"context_recall":0.01},"verdict":"BLOCK"}</code></pre></div>
-</div>
-<div class="section-block"><h3>阻塞策略</h3>
-<p><span class="term" data-term-id="metric-regression" tabindex="0">metric regression</span> 超 -0.02 或 hard case 失败 → <span class="term" data-term-id="deploy-hold" tabindex="0">deploy hold</span>。</p>
-<div class="learn-compare"><div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不推荐</span><ul><li>warn only</li></ul></div>
-<div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐</span><ul><li>block + notify owner</li></ul></div></div>
-</div>
+
+    <div class="section-block">
+      <h3>CI 卡点：Required Check 配置</h3>
+      <p><span class="term" data-term-id="regression-gate" tabindex="0">regression gate</span> + <span class="term" data-term-id="ci-block" tabindex="0">ci block</span>：required check 未绿禁止合并。CorpAssist 设置两个 required check：ragas-eval（Python）和 spring-eval-subset（Spring）。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · MR 门禁失败</span>
+        工程师改了检索 top_k 从 5 到 3。CI 触发 ragas-eval，context_recall 从 0.85 降到 0.79。GitHub required check 变红，MR 无法合并。系统自动在 MR 评论：「Regression detected: context_recall -0.06. Recommended: revert top_k change or adjust chunk_size。」
+      </aside>
+
+      <h4>代码：GitHub 分支保护规则配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># .github/branch-protection.yml — 分支保护规则
+branch_protection:
+  pattern: main
+  required_status_checks:
+    - ragas-eval
+    - spring-eval-subset
+    - lint-and-test
+  required_pull_request_reviews:
+    required_approving_review_count: 1
+  required_merge_queue: true
+
+# merge queue 配置
+merge_queue:
+  max_entries_per_build: 5
+  merge_method: squash
+  status_checks:
+    - ragas-eval
+    - spring-eval-subset</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>回归门禁流程</h5>
+        <pre class="mermaid">flowchart LR
+  MR[Open PR] --> EVAL[Trigger eval CI]
+  EVAL --> COMPARE{比 baseline}
+  COMPARE -->|all delta ≥ -0.02| PASS[Required check pass]
+  COMPARE -->|any delta < -0.02| FAIL[Required check fail]
+  FAIL --> COMMENT[MR comment: regression]
+  FAIL --> BLOCK[Block merge]
+  PASS --> MERGE[Allow merge]</pre>
+        <p class="diagram-caption">每次 MR 自动触发的回归门禁：计算 delta vs baseline，任何指标退化超 -0.02 则阻塞合并。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>版本对比：Baseline Pin 与 Delta 计算</h3>
+      <p><span class="term" data-term-id="version-diff" tabindex="0">version diff</span>：新 report vs <span class="term" data-term-id="baseline-pin" tabindex="0">baseline pin</span>。baseline 是上次通过的评测报告，每次 MR 计算指标 delta。</p>
+
+      <h4>代码：Baseline 管理与 Delta 计算</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># regression_gate.py — 回归门禁引擎
+import json
+from typing import Dict, Optional, List
+
+class BaselineManager:
+    """Baseline 管理"""
+
+    def __init__(self, baseline_path: str = "./data/baseline_report.json"):
+        self.baseline_path = baseline_path
+
+    def get_baseline(self) -> Optional[Dict]:
+        try:
+            with open(self.baseline_path, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+
+    def update_baseline(self, report: Dict):
+        """通过 MR 后更新 baseline"""
+        with open(self.baseline_path, "w") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+
+class RegressionGate:
+    """回归门禁"""
+
+    def __init__(self, max_delta: float = -0.02,
+                 hard_case_max_delta: float = -0.01):
+        self.max_delta = max_delta
+        self.hard_case_max_delta = hard_case_max_delta
+        self.baseline_mgr = BaselineManager()
+
+    def check(self, current_report: Dict) -> Dict:
+        """检查是否存在回归"""
+        baseline = self.baseline_mgr.get_baseline()
+        if not baseline:
+            return {"gate_passed": True, "reason": "No baseline yet"}
+
+        deltas = {}
+        regressions = []
+
+        for metric in ["faithfulness", "context_recall", "answer_relevancy"]:
+            if metric in current_report.get("aggregate", {}) and \
+               metric in baseline.get("aggregate", {}):
+                delta = (current_report["aggregate"][metric] -
+                         baseline["aggregate"][metric])
+                deltas[metric] = round(delta, 4)
+                if delta < self.max_delta:
+                    regressions.append({
+                        "metric": metric,
+                        "delta": delta,
+                        "threshold": self.max_delta,
+                    })
+
+        gate_passed = len(regressions) == 0
+        return {
+            "gate_passed": gate_passed,
+            "deltas": deltas,
+            "regressions": regressions,
+            "reason": "All metrics passed" if gate_passed else
+                      f"Regression in: {', '.join(r['metric'] for r in regressions)}",
+        }
+
+    def generate_comment(self, result: Dict) -> str:
+        """生成 MR 评论"""
+        lines = ["## Eval Gate Report", ""]
+        for metric, delta in result.get("deltas", {}).items():
+            emoji = "✅" if delta >= self.max_delta else "❌"
+            lines.append(f"{emoji} {metric}: {delta:+.4f}")
+        if not result["gate_passed"]:
+            lines.append("")
+            lines.append("Regression detected. Please fix before merge.")
+        return "\n".join(lines)</code></pre>
+      </div>
+
+      <h4>Delta 报告示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "gate_passed": false,
+  "deltas": {
+    "faithfulness": -0.03,
+    "context_recall": 0.01,
+    "answer_relevancy": -0.02
+  },
+  "regressions": [
+    {"metric": "faithfulness", "delta": -0.03, "threshold": -0.02}
+  ],
+  "reason": "Regression in: faithfulness"
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>阻塞策略：Deploy Hold 与通知</h3>
+      <p><span class="term" data-term-id="metric-regression" tabindex="0">metric regression</span> 超 -0.02 或 hard case 失败 → <span class="term" data-term-id="deploy-hold" tabindex="0">deploy hold</span>。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>warn only，不阻塞发布流水线</li>
+            <li>手工审批 bypass 门禁</li>
+            <li>不看 baseline delta，只看绝对分</li>
+            <li>无通知机制，owner 不知情</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>block CI + 通知 quality owner</li>
+            <li>bypass 需要 quality owner 审批并记录</li>
+            <li>对比 baseline delta + 难例子集</li>
+            <li>Slack/钉钉通知 regression 详情</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Deploy Hold 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># deploy-hold.yaml — 发布门禁配置
+deploy_gate:
+  required_checks:
+    - ragas-eval
+    - spring-eval-subset
+
+  regression:
+    enabled: true
+    max_delta: -0.02
+    hard_case_max_delta: -0.01
+    baseline_source: last_passed_report
+
+  bypass:
+    allowed: true
+    approver: quality_owner
+    require_comment: true
+    audit_log: true
+
+  notification:
+    slack_channel: "#corpassist-quality"
+    on_block: true
+    on_bypass: true</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Merge Queue 与 Release Candidate</h3>
+      <p><span class="term" data-term-id="merge-queue" tabindex="0">merge queue</span> 确保多个 MR 按序排队评测，避免并发冲突。<span class="term" data-term-id="release-candidate" tabindex="0">release candidate</span> 是标记为可发布的版本，必须通过全量回归集（含难例库）。</p>
+
+      <h4>代码：Merge Queue 状态检查脚本</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># merge_queue_check.py — Merge Queue 状态检查
+import subprocess
+import json
+
+class MergeQueueCheck:
+    """Merge Queue 状态检查"""
+
+    @staticmethod
+    def get_pending_checks() -> list:
+        """获取待执行的状态检查"""
+        result = subprocess.run(
+            ["gh", "pr", "list", "--json", "headRefName,statusCheckRollup"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return []
+        prs = json.loads(result.stdout)
+        pending = []
+        for pr in prs:
+            for check in pr.get("statusCheckRollup", []):
+                if check.get("conclusion") == "PENDING" and \
+                   check.get("name") in ["ragas-eval", "spring-eval-subset"]:
+                    pending.append({
+                        "pr": pr["headRefName"],
+                        "check": check["name"],
+                    })
+        return pending
+
+    @staticmethod
+    def is_merge_queue_healthy() -> dict:
+        """检查 merge queue 是否健康"""
+        pending = MergeQueueCheck.get_pending_checks()
+        return {
+            "healthy": len(pending) == 0,
+            "pending_checks": pending,
+            "queue_depth": len(pending),
+        }</code></pre>
+      </div>
+
+      <h4>Release Candidate 检查清单</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead><tr><th>检查项</th><th>要求</th><th>通过条件</th></tr></thead>
+          <tbody>
+            <tr><td>RAGAS 回归集</td><td>200 条全量</td><td>faithfulness ≥ 0.90, context_recall ≥ 0.85</td></tr>
+            <tr><td>Hard Case 子集</td><td>全量难例</td><td>faithfulness ≥ 0.85, 无退化</td></tr>
+            <tr><td>Spring Parity</td><td>50 条子集</td><td>delta ≤ 0.02</td></tr>
+            <tr><td>A/B Guardrail</td><td>线上 10% canary</td><td>thumbs_up 不下降, P95 不超标</td></tr>
+            <tr><td>人工抽检</td><td>50 条抽检</td><td>通过率 ≥ 95%</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>发布流程：从 MR 到 Release</h5>
+        <pre class="mermaid">flowchart TB
+  MR1[MR-1] --> Q[Merge Queue]
+  MR2[MR-2] --> Q
+  Q --> EVAL[Regression Gate]
+  EVAL --> PASS{通过?}
+  PASS -->|是| MERGE[合并]
+  PASS -->|否| BLOCK[阻塞]
+  MERGE --> RC[Release Candidate]
+  RC --> FULL[全量回归集]
+  FULL --> GATE{全部通过?}
+  GATE -->|是| RELEASE[发布]
+  GATE -->|否| HOLD[Deploy Hold]</pre>
+        <p class="diagram-caption">merge queue 顺序执行 MR 的 regression gate。所有通过后生成 RC，触发全量回归集（含难例）。全量通过才允许发布。</p>
+      </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
-      <p class="chapter-conclusions-lead">本章能力将接入 CorpAssist NS1 评测飞轮与双栈 CI。</p>
-      <ul class="chapter-conclusions-list"><li><strong>CI 卡点</strong>：<span class="term" data-term-id="regression-gate" tabindex="0">regression gate</</li>
-<li><strong>版本对比</strong>：<span class="term" data-term-id="version-diff" tabindex="0">version diff</span>：</li>
-<li><strong>阻塞策略</strong>：<span class="term" data-term-id="metric-regression" tabindex="0">metric regressi</li></ul>
+      <p class="chapter-conclusions-lead">回归门禁是质量治理的自动化防线。baseline pin + delta 计算 + merge queue 确保每次变更不降低质量。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>CI 卡点</strong>：ragas-eval + spring-eval-subset 作为 required check。</li>
+        <li><strong>版本对比</strong>：delta vs baseline，任何退化超 -0.02 触发回归。</li>
+        <li><strong>阻塞策略</strong>：block + notify quality owner，bypass 需审批留痕。</li>
+        <li><strong>Merge Queue</strong>：排队评测，RC 触发全量回归。</li>
+      </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="llm-evaluation-quality_advanced_01_regression">
         <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
         <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
-        <ul><li><label><input type="checkbox" data-id="c0" /> 能复述本章 4 条核心 takeaway</label></li><li><label><input type="checkbox" data-id="c1" /> 完成正文对照表或代码示例阅读</label></li><li><label><input type="checkbox" data-id="c2" /> 完成判断练习</label></li><li><label><input type="checkbox" data-id="c3" /> 完成 Demo 或等价笔记</label></li><li><label><input type="checkbox" data-id="c4" /> 已完成章节测验</label></li></ul>
+        <ul>
+          <li><label><input type="checkbox" data-id="ci-block" /> 能配置 required status checks</label></li>
+          <li><label><input type="checkbox" data-id="baseline" /> 能解释 baseline pin 和 delta 计算</label></li>
+          <li><label><input type="checkbox" data-id="block" /> 能描述 deploy hold 的触发条件</label></li>
+          <li><label><input type="checkbox" data-id="merge-queue" /> 能解释 merge queue 的作用</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
       </div>
-      
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>regression gate</td><td>required check，指标退化超阈值阻塞合并</td></tr>
+                <tr><td>baseline pin</td><td>上次通过的评测报告作为对比基准</td></tr>
+                <tr><td>version diff</td><td>新报告 vs baseline 的指标 delta</td></tr>
+                <tr><td>merge queue</td><td>MR 排队评测，顺序合并</td></tr>
+                <tr><td>deploy hold</td><td>回归触发时自动 hold 发布</td></tr>
+                <tr><td>metric regression</td><td>faithfulness delta ≤ -0.02</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么看 delta vs baseline 比看绝对分数更合理？</li>
+              <li>merge queue 解决了什么问题？</li>
+              <li>工程师要求 bypass regression gate，你如何处理？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-advanced-02-governance">质量治理流程</a>。</p>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul><li><a href="https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/about-status-checks" target="_blank" rel="noopener">GitHub — Required status checks</a></li></ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/about-status-checks" target="_blank" rel="noopener">GitHub — Required status checks</a></li>
+      <li><a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue" target="_blank" rel="noopener">GitHub — Merge queue</a></li>
+    </ul>
+  </div>
+
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <p class="steps-intro">阅读 ci-gate.yaml，写出 BLOCK 条件。</p>
+    <p class="steps-intro">配置 ci-gate.yaml 并写出 BLOCK 条件。</p>
     <h4 class="practice-section-title">操作步骤</h4>
-    <ol class="steps steps-operate"><li>打开 demos/advanced-01-regression-lab/ci-gate.yaml</li><li>列出 2 个 required job</li><li>解释 baseline pin 存在哪</li><li>写出 deploy hold 解除条件</li></ol>
+    <ol class="steps steps-operate">
+      <li>打开 demos/advanced-01-regression-lab/ci-gate.yaml</li>
+      <li>列出 2 个 required job</li>
+      <li>解释 baseline pin 存在哪</li>
+      <li>写出 deploy hold 解除条件</li>
+    </ol>
     <h4 class="practice-section-title">判断练习</h4>
-    <ol class="steps-judgment-list"><li><p class="judgment-stem">发版前只跑 10 条样例手工点检，不做回归集与 CI 门禁。在 CorpAssist 质量治理 场景下风险是什么？</p>
-    <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>无法发现 Prompt/索引变更导致的回归；难例与拒答边界未覆盖；不符合 NS1 飞轮。应固定 dataset_version + 阈值门禁。</p></div></details></div></li></ol>
-    <div class="demo-box"><h4 class="demo-box-title">Demo：回归门禁与发布</h4><p>目录：<code>demos/advanced-01-regression-lab/</code> — <strong>验收</strong>：yaml 含 block 条件。</p></div>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">MR 通过了 regression gate，但发版前全量回归发现 context_recall 下降了 0.03。这是什么原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>regression gate 只跑了 quick subset（50 条），全量回归跑 200 条 + 难例。可能是 quick subset 无法覆盖某些边场景，或 baseline 使用的评测集版本不一致。建议：确保 regression 子集能代表全量分布，且 baseline 与当前使用同一 dataset_version。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：回归门禁与发布</h4>
+      <p>目录：<code>demos/advanced-01-regression-lab/</code> — <strong>验收</strong>：yaml 含 required_checks + regression config，delta 计算代码可运行。</p>
+    </div>
   </div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul><li><strong>下一章</strong>：<a href="#ch-advanced-02-governance">质量治理流程</a></li></ul></div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-02-governance">质量治理流程</a></li>
+    </ul>
+  </div>
 </section>

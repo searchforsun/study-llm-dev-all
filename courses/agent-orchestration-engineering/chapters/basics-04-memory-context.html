@@ -1,0 +1,510 @@
+<section id="ch-basics-04-memory-context" class="chapter" data-chapter="basics-04-memory-context">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent 记忆与上下文管理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-memory-context" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Agent 基础认知</strong> · 能力：设计分层记忆系统与上下文预算控制</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>没有记忆的 Agent 每次对话都是「初次见面」。短期记忆管理对话流程，长期记忆沉淀用户偏好，<span class="term" data-term-id="checkpoint" tabindex="0">checkpoint</span> 机制保证任务可恢复。本章覆盖从 LangGraph Checkpoint 到 Redis 持久化的完整记忆体系，以及防止上下文窗口溢出的预算控制策略。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 Agent 的三层记忆架构：短期、长期、持久化状态</li>
+          <li>使用 LangGraph Checkpoint 实现状态快照与恢复</li>
+          <li>用 Redis 实现跨会话的记忆共享</li>
+          <li>分配上下文预算防止窗口溢出</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>短期记忆 = 对话历史</strong>：当前会话内的消息序列，用滑动窗口控制长度。</li>
+          <li><strong>长期记忆 = 外部存储</strong>：用户偏好、历史事实存到 Vector DB 或 Redis。</li>
+          <li><strong>Checkpoint = 状态快照</strong>：Agent 的每一步执行状态都可保存和恢复，支撑人机协作。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>三层记忆架构</h3>
+
+      <p>Agent 的记忆系统分为三层：<span class="term" data-term-id="short-term-memory" tabindex="0">短期记忆</span>（对话上下文）、<span class="term" data-term-id="long-term-memory" tabindex="0">长期记忆</span>（外部持久化）、执行状态（Checkpoint）。每层有不同的存储介质、访问频率和生命周期。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Agent 三层记忆架构</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph ShortTerm[短期记忆 · 会话内]
+        SH[对话历史\n滑动窗口 5-20 轮]
+        ST[工具调用记录\n当前执行轨迹]
+    end
+    subgraph LongTerm[长期记忆 · 跨会话]
+        LM[用户偏好\nVector DB]
+        LF[事实知识\n企业知识库]
+    end
+    subgraph State[执行状态 · 步骤级]
+        CP[Checkpoint\n状态快照]
+        RS[Redis Store\n分布式共享]
+    end
+    ShortTerm -->|摘要压缩| LongTerm
+    State -->|中断恢复| ShortTerm</pre>
+        <p class="diagram-caption">三层记忆架构覆盖从毫秒级会话到天级知识沉淀的不同生命周期。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>存储介质</th><th>生命周期</th><th>容量</th><th>典型数据</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>短期记忆</td><td>内存 / 消息列表</td><td>会话内</td><td>5-20 轮</td><td>对话历史、工具结果</td></tr>
+          <tr><td>长期记忆</td><td>Vector DB / Redis</td><td>跨会话</td><td>无上限</td><td>用户偏好、历史摘要</td></tr>
+          <tr><td>执行状态</td><td>Checkpoint / SQLite</td><td>任务级</td><td>步骤级</td><td>状态快照、中间变量</td></tr>
+        </tbody>
+      </table>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 跨会话记忆</span>
+        用户在周一询问「我的订单 T001 怎么还没到？」Agent 回复了物流信息。周三用户又说「上次那个订单退款吧」。Agent 需要从长期记忆中检索到 T001 的上下文，理解「上次那个订单」指什么，不需要用户重复提供订单号。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>短期记忆：对话历史管理</h3>
+
+      <p>短期记忆是 LLM 上下文窗口中的对话历史部分。如果无限累积，历史会挤占 System Prompt 和工具输出的空间。常见的控制策略包括滑动窗口和滚动摘要。</p>
+
+      <div class="mermaid-wrap">
+        <h5>滑动窗口 vs 滚动摘要</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Sliding[滑动窗口]
+        direction LR
+        H1[第 1 轮] -->|丢弃| H2[第 2-11 轮]
+    end
+    subgraph Summary[滚动摘要]
+        direction LR
+        S1[1-5 轮摘要] --> S2[+6-10 轮]
+        S2 --> S3[更新摘要]
+    end</pre>
+        <p class="diagram-caption">滑动窗口简单高效但丢失信息；滚动摘要保留关键信息但增加一轮 LLM 调用。</p>
+      </div>
+
+      <h4>Python：滑动窗口实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from collections import deque
+from typing import List
+
+class SlidingWindowMemory:
+    """滑动窗口短期记忆"""
+
+    def __init__(self, max_turns: int = 10, max_tokens: int = 6000):
+        self.history = deque(maxlen=max_turns)
+        self.max_tokens = max_tokens
+
+    def add_turn(self, user_msg: str, assistant_msg: str):
+        self.history.append({
+            "user": user_msg,
+            "assistant": assistant_msg,
+            "timestamp": time.time()
+        })
+
+    def get_context(self) -> List[dict]:
+        """获取当前可用的对话历史"""
+        # 当历史超出最大轮次时，从最早开始丢弃
+        context = []
+        token_count = 0
+        for turn in reversed(self.history):
+            turn_tokens = count_tokens(turn["user"]) + count_tokens(turn["assistant"])
+            if token_count + turn_tokens > self.max_tokens:
+                break
+            context.insert(0, turn)
+            token_count += turn_tokens
+        return context
+
+    def summarize(self, llm) -> str:
+        """对旧的历史生成摘要"""
+        if len(self.history) < 3:
+            return ""
+        text = "\n".join(
+            f"用户：{t['user']}\n助手：{t['assistant']}"
+            for t in list(self.history)[:-2]
+        )
+        summary = llm.invoke(f"请总结以下对话的关键信息：\n{text}")
+        return summary.content</pre>
+      </div>
+
+      <h4>Java：Spring AI ChatMemory</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Configuration
+public class MemoryConfig {
+
+    @Bean
+    public ChatMemory corpAssistMemory() {
+        // 基于消息数量的滑动窗口
+        return MessageChatMemory.builder()
+            .maxMessages(20)        // 最多保留 20 条消息
+            .build();
+    }
+
+    @Bean
+    public ChatMemory summaryMemory(ChatModel chatModel) {
+        // 基于 token 数的摘要记忆
+        return TokenWindowChatMemory.builder()
+            .maxTokens(6000)
+            .chatModel(chatModel)
+            .build();
+    }
+}
+
+// 使用示例
+@Service
+public class ChatService {
+    private final ChatMemory memory;
+    private final ChatModel chatModel;
+
+    public ChatService(@Qualifier("corpAssistMemory") ChatMemory memory,
+                       ChatModel chatModel) {
+        this.memory = memory;
+        this.chatModel = chatModel;
+    }
+
+    public String chat(String sessionId, String message) {
+        // 记录用户消息
+        memory.add(sessionId, new UserMessage(message));
+        // 获取历史
+        List&lt;Message&gt; history = memory.get(sessionId);
+        // 构建 prompt
+        Prompt prompt = new Prompt(history);
+        ChatResponse response = chatModel.call(prompt);
+        // 记录助手回复
+        memory.add(sessionId, response.getResult().getOutput());
+        return response.getResult().getOutput().getContent();
+    }
+}</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>长期记忆：外部持久化存储</h3>
+
+      <p><span class="term" data-term-id="long-term-memory" tabindex="0">长期记忆</span> 存储跨会话的关键信息：用户偏好、历史事实、学习到的模式。常用的存储方案包括 Vector DB（语义检索）和 Redis（键值存储）。</p>
+
+      <div class="mermaid-wrap">
+        <h5>长期记忆写入与检索流程</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant Agent as Agent
+    participant Store as 记忆存储
+    participant Vector as Vector DB
+    participant Redis as Redis
+
+    Agent->>Store: 写入记忆\n用户偏好：夜间模式
+    Store->>Vector: 向量化存储
+    Store->>Redis: 键值缓存
+
+    Note over Agent,Redis: 新会话开始时
+    Agent->>Store: 检索相关记忆
+    Store->>Vector: 语义相似度查询
+    Store->>Redis: 快速键值查询
+    Vector-->>Store: Top-3 相关记忆
+    Redis-->>Store: 用户基本信息
+    Store-->>Agent: 注入 System Prompt</pre>
+        <p class="diagram-caption">长期记忆的写入和检索流程：Vector DB 做语义检索，Redis 做快速存取。</p>
+      </div>
+
+      <h4>Python：长期记忆存储</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import redis
+import json
+from langchain.embeddings import OpenAIEmbeddings
+
+class LongTermMemory:
+    """长期记忆：Vector DB + Redis 双层存储"""
+
+    def __init__(self, vector_store, redis_client):
+        self.vector_store = vector_store  # Chroma/Pinecone/Milvus
+        self.redis = redis_client or redis.Redis(host="localhost", port=6379)
+
+    def remember(self, user_id: str, key: str, value: str, metadata: dict = None):
+        """存储一条记忆"""
+        # Redis 快速存储
+        memory_key = f"memory:{user_id}:{key}"
+        self.redis.set(memory_key, json.dumps({
+            "value": value,
+            "metadata": metadata or {},
+            "timestamp": time.time()
+        }))
+        self.redis.expire(memory_key, 86400 * 30)  # 30 天 TTL
+
+        # Vector DB 语义存储
+        doc_text = f"{key}: {value}"
+        self.vector_store.add_texts(
+            texts=[doc_text],
+            metadatas=[{"user_id": user_id, "key": key, **(metadata or {})}]
+        )
+
+    def recall(self, user_id: str, query: str, top_k: int = 3) -> list:
+        """检索相关记忆"""
+        # 语义检索
+        docs = self.vector_store.similarity_search(
+            query, k=top_k,
+            filter={"user_id": user_id}
+        )
+        return [doc.page_content for doc in docs]
+
+    def forget(self, user_id: str, key: str):
+        """删除记忆"""
+        self.redis.delete(f"memory:{user_id}:{key}")</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Checkpoint 与状态持久化</h3>
+
+      <p><span class="term" data-term-id="checkpoint" tabindex="0">checkpoint</span> 是 LangGraph 的核心机制，它在 Agent 的每一步执行后保存完整的状态快照。这使得 Agent 可以在异常中断后恢复，也支撑了人工审批（Human-in-the-Loop）等高级模式。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>Checkpoint 作用</th><th>恢复方式</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>系统崩溃</td><td>从最后 checkpoint 恢复</td><td>自动恢复</td></tr>
+          <tr><td>人工审批</td><td>中断后保存状态等待确认</td><td>手动恢复</td></tr>
+          <tr><td>调试回放</td><td>逐步骤回放执行轨迹</td><td>调试模式</td></tr>
+          <tr><td>审计追踪</td><td>完整记录 Agent 决策过程</td><td>只读查询</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from langgraph.checkpoint import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+
+# 内存 Checkpoint（开发环境）
+memory_checkpointer = MemorySaver()
+
+# SQLite Checkpoint（生产环境）
+conn = sqlite3.connect("agent_state.db", check_same_thread=False)
+sqlite_checkpointer = SqliteSaver(conn)
+
+# 编译图时注入 Checkpointer
+graph = graph_builder.compile(checkpointer=sqlite_checkpointer)
+
+# 带 thread_id 的执行（支持跨会话恢复）
+config = {"configurable": {"thread_id": "user_session_123"}}
+result = graph.invoke({"messages": [user_msg]}, config)
+
+# 从历史 checkpoint 恢复
+state = graph.get_state(config)
+print(f"当前步骤：{state.values.get('step', 0)}")
+
+# 恢复到指定 checkpoint
+graph.update_state(config, {"messages": corrected_msg})</pre>
+      </div>
+
+      <h4>Java：状态持久化</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class AgentStateService {
+    private final JdbcTemplate jdbcTemplate;
+
+    public AgentStateService(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    public void saveCheckpoint(String threadId, int step, String stateJson) {
+        jdbcTemplate.update(
+            "INSERT INTO agent_checkpoints (thread_id, step, state_json, created_at) "
+            + "VALUES (?, ?, ?, NOW()) "
+            + "ON DUPLICATE KEY UPDATE state_json = ?, step = ?",
+            threadId, step, stateJson, stateJson, step);
+    }
+
+    public String getCheckpoint(String threadId) {
+        return jdbcTemplate.queryForObject(
+            "SELECT state_json FROM agent_checkpoints "
+            + "WHERE thread_id = ? ORDER BY step DESC LIMIT 1",
+            String.class, threadId);
+    }
+}</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无状态 Agent，每次对话从零开始</li>
+            <li>历史消息无限累积，最终爆窗</li>
+            <li>不使用 Checkpointer，崩溃后无法恢复</li>
+            <li>所有会话共享同一个上下文</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>三层记忆架构：短期 + 长期 + Checkpoint</li>
+            <li>滑动窗口或摘要控制历史长度</li>
+            <li>使用 Checkpointer 实现状态持久化</li>
+            <li>每个 session/thread 独立隔离</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文预算分配</h3>
+
+      <p>即使有滑动窗口和摘要，上下文窗口仍然是有限资源。显式的 <strong>上下文预算分配</strong> 确保 System Prompt、检索结果、对话历史和工具输出各占合理比例。</p>
+
+      <p>典型的 32K 窗口分配方案：System Prompt 15%（~4.8K）、Retrieval 40%（~12.8K）、History 20%（~6.4K）、Tool Output 15%（~4.8K）、Reserve 10%（~3.2K）。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：如果历史对话占了 80% 的上下文窗口，会发生什么？</summary>
+        <p>System Prompt 和检索结果会被挤出可用窗口。LLM 失去角色约束和行为规范，回答变得不可控。这是最常见的 Agent「失忆」原因——不是模型忘了，而是 System Prompt 被历史挤出了窗口。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>短期记忆和长期记忆怎么配合使用？</summary>
+          <div class="learn-faq-body">
+            典型的配合模式：每次读取用户消息时，先从长期记忆（Vector DB）检索相关用户偏好和历史事实，注入到 System Prompt 中。当前轮对话的结果写入短期记忆（滑动窗口）。会话结束时（或达到窗口上限时），将旧的历史摘要后写入长期记忆。
+          </div>
+        </details>
+        <details>
+          <summary>Checkpoint 存储会不会太慢？</summary>
+          <div class="learn-faq-body">
+            Checkpoint 是异步写入的，不会阻塞 Agent 执行。LangGraph 的 MemorySaver 和 SqliteSaver 都支持批量写入。对于高并发场景，建议使用 RedisSaver 或 PostgresSaver，写入延迟在毫秒级。
+          </div>
+        </details>
+        <details>
+          <summary>长期记忆可以跨用户共享吗？</summary>
+          <div class="learn-faq-body">
+            可以，但需要严格权限控制。企业知识库（如产品手册、政策文档）可以跨用户检索。个人偏好（如用户喜欢简短回答）应隔离。建议在 Vector DB 中使用 metadata 字段标注权限范围，检索时按权限过滤。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>三层记忆</strong>：短期（会话内）、长期（跨会话）、Checkpoint（执行状态），各司其职。</li>
+        <li><strong>滑动窗口</strong>：控制对话历史长度，防止上下文溢出。</li>
+        <li><strong>长期记忆</strong>：Vector DB 做语义检索，Redis 做快速键值存取。</li>
+        <li><strong>Checkpoint</strong>：LangGraph 核心机制，支撑中断恢复和人工审批。</li>
+        <li><strong>预算分配</strong>：显式规划每层内存用量，防止资源争抢。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="three-layers" /> 能画出三层记忆架构并说明每层的用途</label></li>
+          <li><label><input type="checkbox" data-id="window-impl" /> 能实现滑动窗口或滚动摘要的短期记忆</label></li>
+          <li><label><input type="checkbox" data-id="checkpoint-use" /> 理解 Checkpoint 的保存和恢复机制</label></li>
+          <li><label><input type="checkbox" data-id="budget-plan" /> 能为 32K 窗口设计预算分配方案</label></li>
+          <li><label><input type="checkbox" data-id="dual-memory" /> 能用 Python 和 Java 各实现至少一种记忆方案</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>短期记忆</td><td>会话内的对话历史，滑动窗口控制</td></tr>
+                <tr><td>长期记忆</td><td>跨会话持久化，Vector DB 语义检索</td></tr>
+                <tr><td>Checkpoint</td><td>Agent 状态快照，支持恢复与审计</td></tr>
+                <tr><td>Sliding Window</td><td>保留最近 N 轮丢弃最早的历史</td></tr>
+                <tr><td>Rolling Summary</td><td>对旧历史生成摘要保留关键信息</td></tr>
+                <tr><td>Token Budget</td><td>为每层上下文分配内存预算</td></tr>
+                <tr><td>Thread ID</td><td>会话唯一标识，隔离不同用户状态</td></tr>
+                <tr><td>Memory Saver</td><td>LangGraph 检查点存储接口</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 的短期记忆和长期记忆分别解决什么问题？各自的技术实现方案是什么？</li>
+              <li>如果 Agent 在长对话中逐渐「忘记」了最初的 System Prompt，可能是什么原因？如何解决？</li>
+              <li>LangGraph 的 Checkpoint 机制在工作原理是什么？如何支撑人工审批场景？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：进入 <a href="#ch-practice-01-react-loop">实践阶段：ReAct 循环实现</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://langchain-ai.github.io/langgraph/concepts/memory/" target="_blank" rel="noopener">LangGraph Memory — 图状态记忆管理</a></li>
+      <li><a href="https://python.langchain.com/docs/modules/memory/" target="_blank" rel="noopener">LangChain Memory — Python 记忆模块</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat-memory.html" target="_blank" rel="noopener">Spring AI Chat Memory — 会话记忆 API</a></li>
+      <li><a href="https://redis.io/docs/stack/search/" target="_blank" rel="noopener">Redis Stack — 向量检索与记忆存储</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist Agent 实现三层记忆系统（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>使用滑动窗口实现短期记忆组件，限制最大 10 轮对话。</li>
+      <li>将短期记忆连接到 Redis 或 Vector DB 实现长期记忆持久化。</li>
+      <li>使用 LangGraph Checkpointer 保存 Agent 执行状态。</li>
+      <li>测试跨会话恢复：用户第一天问订单，第二天能回忆上下文。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：记忆与上下文实验室</h4>
+      <p>目录：<code>demos/basics-04-memory-context-lab/</code>。<strong>验收</strong>：Agent 能在跨会话中正确回忆之前的对话信息。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-react-loop">ReAct 循环实现</a></li>
+      <li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">Lost in the Middle — 上下文位置影响注意力</a></li>
+      <li><a href="https://github.com/openai/tiktoken" target="_blank" rel="noopener">tiktoken — OpenAI Token 计数库</a></li>
+    </ul>
+  </div>
+</section>

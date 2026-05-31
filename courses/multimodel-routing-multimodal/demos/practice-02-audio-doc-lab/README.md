@@ -1,5 +1,12 @@
-# Demo：音视频与文档扩展
+# Demo: 音视频与文档扩展
 
-[章节](../../index.html#ch-practice-02-audio-doc)
+关联章节: [音视频与文档扩展](../chapters/practice-02-audio-doc.html)
 
-列 1 条不支持时的降级
+## 场景
+ASR 转文字 + 视频帧采样。
+
+## 文件
+- `boundaries.md` — 模态边界笔记
+
+## 验证
+列出系统支持和不支持的模态, 以及降级策略。

@@ -1,0 +1,394 @@
+<section id="ch-practice-01-react-loop" class="chapter" data-chapter="practice-01-react-loop">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>ReAct 循环实现</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-react-loop" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>多 Agent 编排</strong> · 能力：实现完整的 ReAct 循环</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>ReAct 循环是 Agent 编排最基础的实现模式。前面学了理论，本章用 <span class="term" data-term-id="state-graph" tabindex="0">StateGraph</span> 和条件边从零构建一个生产级的 ReAct Agent。你将理解 LangGraph 的状态图如何驱动思考-行动-观察循环，并实现 CorpAssist S2 客服 Agent 的核心逻辑。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 LangGraph StateGraph 实现 ReAct 循环</li>
+          <li>设计条件边实现思考-工具调用-结束的流程切换</li>
+          <li>配置步数控制和终止条件防止死循环</li>
+          <li>实现 CorpAssist S2 客服 Agent 的完整 ReAct 逻辑</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>节点 = 处理单元</strong>：agent_node（思考）和 tool_node（行动）是两个核心节点。</li>
+          <li><strong>条件边 = 路由器</strong>：根据模型是否调用工具决定走工具节点还是直接结束。</li>
+          <li><strong>状态循环</strong>：LangGraph 在节点间传递 State 对象，每个节点读取和更新状态。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>LangGraph 中的 ReAct 实现</h3>
+
+      <p>LangGraph 的 <span class="term" data-term-id="state-graph" tabindex="0">StateGraph</span> 是实现 ReAct 循环的容器。它定义了三个要素：<strong>State</strong>（在节点间传递的数据结构）、<strong>Node</strong>（处理逻辑的单元）、<strong>Edge</strong>（控制节点间的流转路径）。</p>
+
+      <div class="mermaid-wrap">
+        <h5>LangGraph ReAct 状态图</h5>
+        <pre class="mermaid">flowchart LR
+    START([开始]) --> AgentNode[Agent 节点\n思考+推理]
+    AgentNode -->|有工具调用| ToolNode[工具节点\n执行工具]
+    AgentNode -->|无工具调用| END([结束])
+    ToolNode --> AgentNode</pre>
+        <p class="diagram-caption">ReAct 循环在 Agent 节点和 Tool 节点之间交替，直到 Agent 决定直接回答。</p>
+      </div>
+
+      <h4>Python：StateGraph ReAct 完整实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from typing import TypedDict, Literal, Sequence
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolExecutor
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+import json
+
+class AgentState(TypedDict):
+    messages: Sequence[BaseMessage]
+    step: int
+    max_steps: int
+
+def agent_node(state: AgentState, llm, tools) -> AgentState:
+    messages = state["messages"]
+    response = llm.invoke(messages, tools=tools)
+    state["messages"].append(response)
+    state["step"] = state.get("step", 0) + 1
+    return state
+
+def tool_node(state: AgentState, tool_executor: ToolExecutor) -> AgentState:
+    last_message = state["messages"][-1]
+    for tool_call in last_message.tool_calls:
+        try:
+            result = tool_executor.invoke(tool_call)
+            state["messages"].append({
+                "role": "tool", "content": str(result),
+                "tool_call_id": tool_call["id"]
+            })
+        except Exception as e:
+            state["messages"].append({
+                "role": "tool", "content": f"工具调用失败：{str(e)}",
+                "tool_call_id": tool_call["id"]
+            })
+    return state
+
+def should_continue(state: AgentState) -> Literal["tools", "end"]:
+    if state.get("step", 0) >= state.get("max_steps", 15):
+        return "end"
+    last_message = state["messages"][-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    return "end"
+
+def build_react_agent(llm, tools):
+    tool_executor = ToolExecutor(tools)
+    graph = StateGraph(AgentState)
+    graph.add_node("agent", lambda s: agent_node(s, llm, tools))
+    graph.add_node("tools", lambda s: tool_node(s, tool_executor))
+    graph.set_entry_point("agent")
+    graph.add_conditional_edges(
+        "agent", should_continue,
+        {"tools": "tools", "end": END}
+    )
+    graph.add_edge("tools", "agent")
+    return graph.compile()
+
+react_agent = build_react_agent(llm, [query_order_tool, get_user_tool])
+result = react_agent.invoke({
+    "messages": [HumanMessage(content="我的订单 T001 到哪了？")],
+    "step": 0, "max_steps": 15
+})</pre>
+      </div>
+
+      <h4>Java：Spring AI Alibaba Graph 实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Configuration
+public class ReactGraphConfig {
+    @Bean
+    public Graph reactGraph(ChatModel chatModel, List&lt;ToolCallback&gt; tools) {
+        return Graph.builder()
+            .addNode("agent", context -> {
+                List&lt;Message&gt; messages = context.getState("messages");
+                ChatResponse response = chatModel.call(
+                    new Prompt(messages, tools));
+                context.setState("messages",
+                    append(context.getState("messages"), response.getResult()));
+                context.setState("step",
+                    (int)context.getStateOrDefault("step", 0) + 1);
+                return context;
+            })
+            .addNode("tools", context -> {
+                Message last = lastMessage(context.getState("messages"));
+                for (ToolCall tc : last.getToolCalls()) {
+                    String result = executeTool(tc, tools);
+                    context.setState("messages",
+                        append(context.getState("messages"),
+                            new ToolResponseMessage(result, tc.id())));
+                }
+                return context;
+            })
+            .setEntryPoint("agent")
+            .addConditionalEdge("agent", context -> {
+                int step = (int)context.getStateOrDefault("step", 0);
+                if (step &gt;= (int)context.getStateOrDefault("maxSteps", 15))
+                    return "end";
+                return lastMessage(context.getState("messages")).hasToolCalls()
+                    ? "tools" : "end";
+            }, Map.of("tools", "tools", "end", "__END__"))
+            .addEdge("tools", "agent")
+            .build();
+    }
+}</pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：如果 Agent 节点连续调用同一个工具 5 次，会发生什么？</summary>
+        <p>要么是工具返回结果有问题导致模型无法推进，要么是工具副作用导致模型反复调用。should_continue 的步数检测会在此类场景中终止。步数上限是 ReAct 的核心安全带。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>步数控制与终止条件</h3>
+
+      <p>ReAct 循环可能因为多种原因需要终止。除了 max_steps，还需要考虑重复调用、连续失败等检测。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>终止条件</th><th>实现方式</th><th>推荐值</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>最大步数</td><td><code>step &gt;= max_steps</code></td><td>10-15</td></tr>
+          <tr><td>最大执行时间</td><td>计时器超时</td><td>30-60 秒</td></tr>
+          <tr><td>重复工具检测</td><td>相同工具相同参数连续 N 次</td><td>3 次</td></tr>
+          <tr><td>无意义循环</td><td>消息内容相似度 > 90%</td><td>2 次</td></tr>
+          <tr><td>工具全部失败</td><td>连续失败次数超限</td><td>3 次</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def should_continue_advanced(state: AgentState) -> str:
+    """增强的终止条件检测"""
+    if state.get("step", 0) >= state.get("max_steps", 15):
+        return "end"
+    messages = state["messages"]
+    # 重复工具调用检测
+    tool_msgs = [m for m in messages
+                 if m.get("role") == "assistant" and m.get("tool_calls")]
+    if len(tool_msgs) >= 3:
+        recent_calls = []
+        for m in tool_msgs[-3:]:
+            calls = [(tc["name"], json.dumps(tc["args"], sort_keys=True))
+                     for tc in m["tool_calls"]]
+            recent_calls.append(calls)
+        if recent_calls[0] == recent_calls[1] == recent_calls[2]:
+            return "end"  # 连续 3 次相同调用，终止
+    # 连续失败检测
+    tool_results = [m for m in messages if m.get("role") == "tool"]
+    recent_fails = [m for m in tool_results[-3:]
+                    if "失败" in m.get("content", "")]
+    if len(recent_fails) >= 3:
+        return "end"
+    # 正常判断
+    last = messages[-1]
+    if hasattr(last, "tool_calls") and last.tool_calls:
+        return "tools"
+    return "end"</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist S2 客服 Agent 完整实现</h3>
+
+      <p>S2 客服 Agent 需要处理订单查询、退款处理和人工转接三种核心场景。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from langchain_core.tools import tool
+
+@tool
+def query_customer_order(order_id: str) -> str:
+    """查询客户订单状态。输入订单号返回物流、预计送达。"""
+    order = order_service.query(order_id)
+    return f"订单 {order_id}: {order.status}, 物流: {order.logistics}, 预计: {order.eta}"
+
+@tool
+def process_refund(order_id: str, reason: str) -> str:
+    """发起退款申请。需要订单号和退款原因，提交后等待审批。"""
+    refund_id = refund_service.create(order_id, reason)
+    return f"退款已提交，编号 {refund_id}，等待审批"
+
+@tool
+def transfer_to_human(issue: str) -> str:
+    """转接人工客服。Agent 无法处理或用户要求时调用。"""
+    ticket_id = ticket_service.create_escalation(issue)
+    return f"已转接人工客服，工单号 {ticket_id}，请稍候"
+
+s2_agent = build_react_agent(llm, [query_customer_order, process_refund, transfer_to_human])
+
+response = s2_agent.invoke({
+    "messages": [HumanMessage(content="我想查一下订单 T001，还没收到")],
+    "step": 0, "max_steps": 10
+})
+print(response["messages"][-1].content)</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Agent 和工具节点混在一个函数</li>
+            <li>不设 max_steps</li>
+            <li>无重复检测</li>
+            <li>工具异常抛到外层</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Agent 和 Tool 独立节点</li>
+            <li>多维度终止条件</li>
+            <li>异常捕获返回友好信息</li>
+            <li>每步记录状态用于回放</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>LangGraph StateGraph 和普通 DAG 有什么不同？</summary>
+          <div class="learn-faq-body">关键区别在于循环。DAG 不支持循环，ReAct 的核心是思考->行动->再思考的循环。StateGraph 通过条件边支持这种循环，且 State 对象持久化支持中断恢复。</div>
+        </details>
+        <details>
+          <summary>多个工具可以并行调用吗？</summary>
+          <div class="learn-faq-body">LangGraph 支持并行工具调用。模型可在一次响应中请求多个 tool_call，Tool 节点串行或并行执行。见 <a href="#ch-practice-02-multi-agent-patterns">多 Agent 协作</a>。</div>
+        </details>
+        <details>
+          <summary>ReAct 循环如何插入人工审批？</summary>
+          <div class="learn-faq-body">使用 interrupt_before 在指定节点前中断。详见 <a href="#ch-advanced-03-human-in-loop">人机协作</a>。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>StateGraph</strong>：Agent 节点和 Tool 节点通过条件边构成循环。</li>
+        <li><strong>条件边</strong>：根据模型是否调用工具判断走向，步数上限是强制终止条件。</li>
+        <li><strong>多维度终止</strong>：步数、时间、重复调用、连续失败联合保护。</li>
+        <li><strong>S2 客服</strong>：订单查询、退款处理、转人工三种工具覆盖常见场景。</li>
+        <li><strong>双栈一致</strong>：Python StateGraph 和 Java Graph API 概念一一对应。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="state-graph" /> 能画出 ReAct 状态图（节点+条件边）</label></li>
+          <li><label><input type="checkbox" data-id="terminate" /> 能列出至少 4 种终止条件</label></li>
+          <li><label><input type="checkbox" data-id="s2-tools" /> 能为 S2 客服设计工具集</label></li>
+          <li><label><input type="checkbox" data-id="loop-detect" /> 能实现重复调用检测</label></li>
+          <li><label><input type="checkbox" data-id="graph-code" /> 能用双栈写出 StateGraph</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>StateGraph</td><td>状态图：节点+边定义 Agent 流程</td></tr>
+                <tr><td>Agent Node</td><td>LLM 推理节点，决定下一步</td></tr>
+                <tr><td>Tool Node</td><td>执行工具调用返回结果</td></tr>
+                <tr><td>Conditional Edge</td><td>根据条件选择路径</td></tr>
+                <tr><td>Max Steps</td><td>最大推理步数防死循环</td></tr>
+                <tr><td>重复检测</td><td>相同工具连续调用 N 次终止</td></tr>
+                <tr><td>Tool Call</td><td>模型声明需要调用的工具</td></tr>
+                <tr><td>S2 Agent</td><td>CorpAssist 客服 Agent 标准</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>ReAct 循环中如何检测和防止死循环？列举至少 3 种策略。</li>
+              <li>如果 Agent 在第 5 步调用工具时超时，StateGraph 如何保证状态一致？</li>
+              <li>解释 StateGraph 中条件边的工作原理，画图说明。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-02-multi-agent-patterns">多 Agent 协作模式</a> 学习 Sequential/Routing/Swarm 三种协作模式。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://langchain-ai.github.io/langgraph/tutorials/introduction/" target="_blank" rel="noopener">LangGraph 入门教程</a></li>
+      <li><a href="https://java2ai.com/docs/dev/agents/graph/" target="_blank" rel="noopener">Spring AI Alibaba Graph API</a></li>
+      <li><a href="https://langchain-ai.github.io/langgraph/concepts/agentic_concepts/" target="_blank" rel="noopener">LangGraph Agentic Concepts</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现一个带终止条件检测的 ReAct Agent（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>用 Python LangGraph 或 Java Graph 构建包含 Agent 和 Tool 节点的状态图。</li>
+      <li>添加条件边实现 should_continue 逻辑。</li>
+      <li>实现重复工具调用检测和连续失败检测。</li>
+      <li>用 S2 客服场景测试：订单查询、退款、转人工三种流程。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：ReAct 循环实验室</h4>
+      <p>目录：<code>demos/practice-01-react-loop-lab/</code>。<strong>验收</strong>：Agent 能正常运行 S2 客服场景，终止条件在所有异常情况下正确触发。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-multi-agent-patterns">多 Agent 协作模式</a></li>
+      <li><a href="https://www.deeplearning.ai/short-courses/ai-agents-in-langgraph/" target="_blank" rel="noopener">DeepLearning.AI — Agents in LangGraph</a></li>
+    </ul>
+  </div>
+</section>

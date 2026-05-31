@@ -1,221 +1,681 @@
 <section id="ch-advanced-01-graphrag-hands-on" class="chapter" data-chapter="advanced-01-graphrag-hands-on">
   <header class="chapter-header">
-    <h2><span class="chapter-done-badge">已完成</span>GraphRAG 实操</h2>
+    <h2><span class="chapter-done-badge">已完成</span>GraphRAG 动手实践</h2>
     <button type="button" class="btn-mark-done" data-chapter="advanced-01-graphrag-hands-on" aria-label="标记本章完成">标记完成</button>
   </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>Python RAG 进阶</strong> · 能力：部署微软 GraphRAG、理解实体关系抽取管线、评估成本与效果</p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>CorpAssist 在处理跨文档推理问题（如「A 部门员工去 B 部门轮岗半年，期间年假怎么算？」）时，Naive RAG 因缺乏跨 chunk 关系理解而回答片面。GraphRAG 通过构建实体-关系知识图谱显式建模文档间的关联，能将这类跨文档问答的准确率提升 30%+。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>部署微软 GraphRAG 索引管线（文档 → entity extraction → community detection → summary），运行实体关系抽取流程，量化 GraphRAG 的 Token/时间成本，并在 CorpAssist 数据集上与 Naive RAG 做效果对比。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><ul><li>GraphRAG 索引成本是 Naive RAG 的 50~100 倍（以 Token 计），主要耗在实体抽取</li><li>实体抽取阶段使用 GPT-4o 以 gpt-4o-mini 的 6 倍成本换取 +12% 准确率</li><li>Local Search 模式对单文档查询 vs Global Search 模式对跨文档总结适用不同</li><li>CorpAssist HR 知识库（500 文档）GraphRAG 索引成本约 $15，纯 RAG 约 $0.30</li></ul></div>
-    </div>
-    <div class="section-block">
-      <h3>微软 GraphRAG 部署</h3>
-      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · 跨文档推理</span>员工问「如果我从工程部轮岗到产品部半年，年假和绩效怎么算？」——答案需要关联 HR 政策（年假折算）、部门轮岗条例、绩效评估办法三份文档，Naive RAG 通常只检到其中 1~2 份。</aside>
-      <p>微软 GraphRAG 是学术的 GraphRAG 概念的一个工业化实现。其核心创新在于 <strong>自动化的实体-关系-社区抽取</strong>：将文档分块后，使用 LLM 抽取实体（Entity）、关系（Relation）、声明（Claim），然后通过层次化社区检测（Leiden 算法）组织社区摘要。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-bash"># GraphRAG 部署与索引
-cd demos/advanced-01-graphrag-hands-on-lab
-
-# Step 1: 安装 graphrag
-pip install graphrag
-
-# Step 2: 初始化工作区
-mkdir -p graphrag_input graphrag_output
-# 将 CorpAssist HR 文档放入 graphrag_input/
-cp ../../datasets/hr_policies/*.md graphrag_input/
-
-# Step 3: 初始化配置
-python -m graphrag.index --init --root .
-# 生成 settings.yaml，需配置 LLM 和 Embedding 的 API key
-
-# Step 4: 运行索引（耗时约 5~10 分钟/100 文档）
-python -m graphrag.index --root . --resume graphrag_output
-
-# 索引完成后输出结构:
-# graphrag_output/artifacts/
-#   - entities.parquet  (实体表)
-#   - relationships.parquet  (关系表)
-#   - communities.parquet  (社区表)
-#   - text_units.parquet  (文本单元)</code></pre></div>
-      <p>配置文件关键参数（<code>settings.yaml</code>）：</p>
-      <table class="outline-table"><thead><tr><th>参数</th><th>建议值</th><th>影响</th></tr></thead>
-      <tbody>
-        <tr><td>chunk_size</td><td>1200 tokens</td><td>太小实体抽取不全；太大超出 LLM 上下文</td></tr>
-        <tr><td>chunk_overlap</td><td>200 tokens</td><td>避免边界实体被截断</td></tr>
-        <tr><td>entity_extraction_max_gleanings</td><td>2</td><td>每篇文档抽取后 LLM 二次验证</td></tr>
-        <tr><td>community_level</td><td>2</td><td>层次化社区，2 级在粒度与性能间平衡</td></tr>
-        <tr><td>claim_extraction_enabled</td><td>true</td><td>抽取声明（如「年假≥5 天」）</td></tr>
-        <tr><td>encoding_model</td><td>text-embedding-3-small</td><td>社区摘要的向量化</td></tr>
-      </tbody></table>
-    </div>
-    <div class="section-block">
-      <h3>实体关系抽取流程</h3>
-      <p>GraphRAG 索引的核心是 <strong>LLM 驱动的实体关系抽取</strong>。每个文本块被送入 LLM 并结构化输出 JSON 格式的实体与关系。抽取 prompt 示例及输出如下：</p>
-      <div class="mermaid-wrap"><h5>GraphRAG 索引管线</h5><pre class="mermaid">flowchart LR
-  DOC[Documents] --> CHUNK[Chunk & Clean]
-  CHUNK --> ENT[Entity Extraction<br/>LLM per chunk]
-  ENT --> MERGE[Merge Entities<br/>resolve duplicates]
-  MERGE --> LEIDEN[Leiden Community Detection]
-  LEIDEN --> SUM[Community Summarization]
-  SUM --> STORE[Knowledge Graph<br/>+ Vector Index]
-  STORE --> QLOCAL[Local Search]
-  STORE --> QGLOBAL[Global Search]</pre></div>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># 查看抽取结果
-import pandas as pd
-
-entities = pd.read_parquet("graphrag_output/artifacts/entities.parquet")
-relationships = pd.read_parquet("graphrag_output/artifacts/relationships.parquet")
-
-print(f"实体数: {len(entities)}, 关系数: {len(relationships)}")
-print("\n=== 实体样例 ===")
-print(entities[["name", "type", "description"]].head(5).to_dict(orient="records"))
-# 输出: [{"name": "年假", "type": "policy", "description": "员工年度带薪休假"},
-#        {"name": "绩效改善计划", "type": "program", "description": "PIP 30-90天"},
-#        {"name": "工程部", "type": "department", "description": "软件开发核心部门"}]
-
-print("\n=== 关系样例 ===")
-print(relationships[["source", "target", "description"]].head(5).to_dict(orient="records"))
-# 输出: [{"source": "年假", "target": "工程部", "description": "工程部员工适用标准年假政策"},
-#        {"source": "绩效改善计划", "target": "年假", "description": "PIP期间年假累计暂停"}]</code></pre></div>
-      <div class="learn-compare">
-        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">Naive RAG 的局限</span><ul><li>每个 chunk 独立检索，无跨 chunk 关系建模</li><li>「PIP 期间年假怎么算」此类跨主题查询需手动拼接</li><li>每个 chunk 内容碎片化，LLM 难以综合推理</li></ul></div>
-        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">GraphRAG 的优势</span><ul><li>实体-关系图显式建模跨文档关联</li><li>社区摘要在检索前已综合多个文档要点</li><li>Local Search 返回实体+关联关系+声明</li></ul></div>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>Python RAG 进阶</strong> · 能力：用 Microsoft GraphRAG 从文档构建知识图谱并实现图增强检索</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>传统 RAG 将文档切分成独立片段，丢失了实体间的关联关系。当用户问「A 部门和 B 部门的人员流动」「某项目的上下游协作」这类需要多跳推理的问题时，朴素 RAG 表现很差。<span class="term" data-term-id="graphrag-py" tabindex="0">GraphRAG</span> 通过从文档中提取实体和关系构建知识图谱，用社区检测聚合信息，实现全局 + 局部两种检索模式。本章使用 Microsoft GraphRAG 开源框架，在 CorpAssist 场景中落地。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>使用 GraphRAG 从文档中提取实体、关系和协变量</li>
+          <li>理解社区检测（Leiden 算法）如何聚合信息生成社区摘要</li>
+          <li>实现全局搜索（Global Search）和局部搜索（Local Search）两种查询模式</li>
+          <li>评估 GraphRAG 的适用场景和额外成本，与朴素 RAG 对比</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>GraphRAG ≠ 知识图谱 + 向量</strong>：它是先构建实体关系图，再做社区检测和摘要，最后基于社区级信息回答。</li>
+          <li><strong>全局搜索 vs 局部搜索</strong>：全局回答「整体趋势」，局部回答「具体实体」，两者用不同的 prompt 模板。</li>
+          <li><strong>成本是朴素 RAG 的 5-10 倍</strong>：实体提取、社区摘要都需要 LLM 调用。适用于高价值场景：合规分析、战略报告。</li>
+        </ul>
       </div>
     </div>
-    <div class="section-block">
-      <h3>成本实测（Token/时间）</h3>
-      <div class="mermaid-wrap"><h5>GraphRAG vs Naive RAG 索引成本对比（对数尺度）</h5><pre class="mermaid">flowchart LR
-    subgraph GRAPH[GraphRAG Index $12.45]
-      EEE[Entity Extraction 70%] --> CCS[Community Summaries 29%]
-      CCS --> OTH[Other 1%]
-    end
-    subgraph NAIVE[Naive RAG Index $0.28]
-      CHK[Chunk & Embed 98%] --> STO[Store 2%]
-    end
-    GRAPH -.->|44x cost| NAIVE</pre></div>
-      <p>GraphRAG 的最大权衡是成本。在 CorpAssist HR 知识库（500 篇文档，约 450K tokens）上的实测数据：</p>
-      <table class="outline-table"><thead><tr><th>阶段</th><th>输入 Token（K）</th><th>输出 Token（K）</th><th>模型</th><th>估计成本</th><th>耗时</th></tr></thead>
-      <tbody>
-        <tr><td>文本分块清洗</td><td>0</td><td>0</td><td>—</td><td>$0</td><td>2s</td></tr>
-        <tr><td>实体抽取（每块）</td><td>450K</td><td>120K</td><td>gpt-4o</td><td>$8.70</td><td>12min</td></tr>
-        <tr><td>实体合并（去重）</td><td>25K</td><td>8K</td><td>gpt-4o-mini</td><td>$0.15</td><td>1min</td></tr>
-        <tr><td>社区检测（Leiden）</td><td>0</td><td>0</td><td>—</td><td>$0</td><td>0.5s</td></tr>
-        <tr><td>社区摘要</td><td>180K</td><td>45K</td><td>gpt-4o</td><td>$3.60</td><td>5min</td></tr>
-        <tr><td>向量化嵌入</td><td>30K</td><td>0</td><td>text-embedding-3-small</td><td>$0.005</td><td>10s</td></tr>
-        <tr><td><strong>总计</strong></td><td>685K</td><td>173K</td><td>—</td><td><strong>$12.45</strong></td><td><strong>~18min</strong></td></tr>
-      </tbody></table>
-      <p>对比 Naive RAG 索引：相同 500 篇文档，仅需 $0.28（chunk + embed + store）。GraphRAG 成本约 44 倍。查询阶段：GraphRAG Local Search 每次约 1850 输入 token + 350 输出 token（约 $0.005/次），Naive RAG 约 1200+200 token（$0.002/次）。</p>
-      <p>成本节省策略：若使用 gpt-4o-mini 替代 gpt-4o 做实体抽取，索引成本可从 $12.45 降至 $3.20，但实体准确率从 89% 降至 77%。CorpAssist 的折中方案为：首次使用 gpt-4o 全量建索引，增量更新使用 gpt-4o-mini 并做实体合并去重。若关闭 claim_extraction（声明抽取），索引成本再降 $1.80。查询阶段也可优化：对于简单单文档查询直接走 Naive RAG 避免 GraphRAG 的推理开销。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-bash"># GraphRAG 查询（Local Search — 面向具体问题）
-python -m graphrag.query \
-  --root . \
-  --method local \
-  "我从工程部轮岗到产品部半年，年假怎么算？"
 
-# 输出摘要示例:
-# 根据公司政策，跨部门轮岗期间年假按原部门标准计算，
-# 轮岗期超过3个月需在目标部门重新注册假期额度。
-# 具体条款参考: 员工手册第四章第2条、轮岗管理办法第8条。
-
-# GraphRAG 查询（Global Search — 面向全局总结）
-python -m graphrag.query \
-  --root . \
-  --method global \
-  "公司有哪些与休假相关的政策？"</code></pre></div>
-    </div>
     <div class="section-block">
-      <h3>与 Naive RAG 效果对比</h3>
-      <p>在 CorpAssist 跨文档 QA 测试集（100 条需要 2+ 文档才能回答的问题）上对比：</p>
-      <table class="outline-table"><thead><tr><th>指标</th><th>Naive RAG</th><th>GraphRAG Local</th><th>GraphRAG Global</th></tr></thead>
-      <tbody>
-        <tr><td>准确率（人工评估）</td><td>52.3%</td><td>84.7%</td><td>78.2%</td></tr>
-        <tr><td>faithfulness（RAGAS）</td><td>0.87</td><td>0.91</td><td>0.88</td></tr>
-        <tr><td>答案完整性（1~5）</td><td>2.4</td><td>4.1</td><td>3.8</td></tr>
-        <tr><td>P95 查询延迟</td><td>1.3s</td><td>2.1s</td><td>3.5s</td></tr>
-        <tr><td>单次查询成本</td><td>$0.002</td><td>$0.005</td><td>$0.008</td></tr>
-        <tr><td>索引成本（500 文档）</td><td>$0.28</td><td colspan="2">$12.45</td></tr>
-      </tbody></table>
-      <p>结论：对于单文档问答（占 CorpAssist 总查询的 65%），Naive RAG 已足够，准确率 87% vs GraphRAG 91% 差异不大。对于跨文档推理（占 35%），GraphRAG Local Search 准确率 84.7% 显著优于 Naive RAG 的 52.3%。建议 CorpAssist 采用 <strong>Hybrid 策略</strong>：先用 RAGAS 评测自动判断问题是否需要跨文档推理，再选择性路由到 GraphRAG。</p>
-      <p>Hybrid 路由的具体实现：在 RAGAS 评测管线中增加一个「cross_doc_score」分类器，基于问题中出现的实体数量（如问题中的命名实体 ≥ 3 个则大概率需要跨文档推理）。CorpAssist 日志分析显示：问题中含 1~2 个实体时仅 18% 需要跨文档，含 3~4 个实体时 62% 需要跨文档，含 5+ 实体时 89% 需要跨文档。基于该规则可实现一个零成本的路由器，无需额外 LLM 调用。</p>
-      <details class="learn-faq"><summary>FAQ：什么时候不应该用 GraphRAG？</summary>
-      <p>1) 知识库 < 100 篇文档或文档间无交叉引用关系 — 图结构信息量低；2) 查询主要是单文档事实问答（「今年的年假天数」）— Naive RAG 成本更低且延迟更短；3) 对索引成本敏感且更新频率高（每周更新）— 每次索引重新运行成本 $10+；4) 对 P95 延迟要求 < 1.5s — GraphRAG Local Search P95=2.1s 超出。</p>
-      </details>
-      <details class="learn-micro-check"><summary>自检：GraphRAG 索引中最耗时的环节是哪个？如何优化？</summary>
-      <p>最耗时的是实体抽取环节（占总时间的 ~67%），因为每个 chunk 需调用 LLM 提取实体+关系+声明。优化方向：1) 使用 gpt-4o-mini 替代 gpt-4o（成本降 6 倍，但实体准确率从 89% 降至 77%）；2) 增大 chunk_size 减少调用次数；3) 使用模型并行（多个 chunk 同时抽取）。</p>
+      <h3>知识图谱构建：实体提取与关系识别</h3>
+
+      <p><span class="term" data-term-id="graphrag-py" tabindex="0">GraphRAG</span> 的构建流程分三步：实体提取 → 关系识别 → 社区检测。前两步依赖 LLM 从文本中抽取结构化信息，第三步用图算法自动发现社区结构。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 组织架构分析</span>
+        CorpAssist 需要从公司组织架构文档、项目报告和邮件提取实体（人员、部门、项目）和关系（汇报、协作、转岗）。然后回答「技术部与产品部的协作项目有哪些」「近半年管理层变动情况」这类多跳问题。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>GraphRAG 构建与查询流程</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph Build[索引构建阶段]
+        Doc[原始文档] -->|LLM 提取| Entities[实体\n人员/部门/项目]
+        Doc -->|LLM 提取| Relations[关系\n汇报/协作/转岗]
+        Doc -->|LLM 提取| Covariates[协变量\n属性/时间/状态]
+        Entities -->|Leiden 算法| Communities[社区检测]
+        Communities -->|LLM 摘要| Summaries[社区摘要]
+    end
+
+    subgraph Query[查询阶段]
+        Q[用户问题] -->|全局查询| Global[Global Search\n社区摘要聚合]
+        Q -->|局部查询| Local[Local Search\n实体邻域检索]
+        Global --> Answer[最终答案]
+        Local --> Answer
+    end
+
+    Summaries --> Global
+    Entities --> Local
+    Relations --> Local
+
+    style Build fill:#2E8B57,color:#fff
+    style Query fill:#4A90D9,color:#fff
+    style Communities fill:#7B68EE,color:#fff</pre>
+        <p class="diagram-caption">GraphRAG 索引阶段构建知识图谱和社区摘要，查询阶段使用不同策略。</p>
+      </div>
+
+      <h4>初始化 GraphRAG 索引</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># graphrag_init.py — GraphRAG 索引初始化与配置
+import os
+import yaml
+from pathlib import Path
+
+# GraphRAG 使用 settings.yaml 配置文件
+# 安装: pip install graphrag
+
+GRAPH_CONFIG = {
+    "root_dir": "./data/graphrag_index",
+    "input_dir": "./data/docs",
+    "output_dir": "./data/graphrag_output",
+    "llm": {
+        "model": "gpt-4o-mini",
+        "max_tokens": 4000,
+        "temperature": 0.0,
+        "api_key": "${GRAPHRAG_API_KEY}",
+        "model_supports_json": True,
+    },
+    "embeddings": {
+        "model": "text-embedding-3-small",
+        "dimensions": 512,
+    },
+    "chunks": {
+        "size": 1200,
+        "overlap": 100,
+        "group_by_columns": ["id"],
+    },
+    "entity_extraction": {
+        "prompt_template": "graphrag/prompts/entity_extraction.txt",
+        "max_gleanings": 2,
+    },
+    "summarize_descriptions": {
+        "max_length": 500,
+        "prompt_template": "graphrag/prompts/summarize.txt",
+    },
+    "community_reports": {
+        "max_length": 2000,
+        "prompt_template": "graphrag/prompts/community_report.txt",
+    },
+}
+
+def initialize_graphrag_index(root_dir: str = "./data/graphrag_index"):
+    """初始化 GraphRAG 索引目录"""
+    root = Path(root_dir)
+    (root / "input").mkdir(parents=True, exist_ok=True)
+    (root / "output").mkdir(parents=True, exist_ok=True)
+    (root / "prompts").mkdir(parents=True, exist_ok=True)
+
+    # 写入 settings.yaml
+    config_path = root / "settings.yaml"
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(GRAPH_CONFIG, f, allow_unicode=True, default_flow_style=False)
+
+    print(f"GraphRAG 索引目录已初始化: {root}")
+    print(f"配置文件: {config_path}")
+
+    # 创建默认 prompt 模板
+    prompts = {
+        "entity_extraction.txt": (
+            "-Goal-\n从文本中提取实体和关系。\n"
+            "-Entities-\nperson, organization, project, department\n\n"
+            "输出 CSV 格式: entity,type,description"
+        ),
+        "summarize.txt": (
+            "用一段话总结以下实体的描述信息。\n{entity_name}\n{description}"
+        ),
+        "community_report.txt": (
+            "基于以下社区信息生成报告。\n{community_info}\n"
+            "包含：社区概述、关键实体、关键关系、洞察"
+        ),
+    }
+    prompt_dir = root / "prompts"
+    for name, content in prompts.items():
+        (prompt_dir / name).write_text(content, encoding="utf-8")
+
+if __name__ == "__main__":
+    initialize_graphrag_index()
+    print("准备完成。运行索引: python -m graphrag.index --root ./data/graphrag_index")</code></pre>
+      </div>
+
+      <h4>GraphRAG 索引构建（命令行）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 安装 GraphRAG
+pip install graphrag
+
+# 初始化索引目录
+python graphrag_init.py
+
+# 复制文档到输入目录
+cp ./data/docs/*.pdf ./data/graphrag_index/input/
+
+# 运行索引构建（耗时较长，取决于文档量和 LLM 调用频率）
+python -m graphrag.index --root ./data/graphrag_index
+
+# 索引完成后，查看输出
+ls -la ./data/graphrag_index/output/
+# 输出包括:
+#   - entities.parquet    # 实体表
+#   - relationships.parquet  # 关系表
+#   - communities.parquet   # 社区信息
+#   - community_reports.parquet  # 社区报告</code></pre>
+      </div>
+
+      <h4>Python SDK 方式运行索引</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># run_index.py — 编程方式运行 GraphRAG 索引
+from graphrag.index import run_pipeline
+from graphrag.index.config import PipelineConfig
+import pandas as pd
+from pathlib import Path
+
+def build_graphrag_index(root_dir: str = "./data/graphrag_index") -> dict:
+    """编程方式构建 GraphRAG 索引"""
+    config_path = Path(root_dir) / "settings.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")
+
+    config = PipelineConfig.from_yaml(config_path)
+
+    # 运行索引管线（实际运行时取消注释）
+    # results = run_pipeline(config)
+    # df_entities = results["entities"]
+    # df_relations = results["relationships"]
+    # df_communities = results["communities"]
+
+    # 模拟输出
+    print("正在运行 GraphRAG 索引管线...")
+    print("阶段 1/4: 文档切分 - 完成")
+    print("阶段 2/4: 实体提取 - 完成")
+    print("阶段 3/4: 关系识别 - 完成")
+    print("阶段 4/4: 社区检测与摘要 - 完成")
+
+    stats = {
+        "documents": 50,
+        "entities": 320,
+        "relationships": 580,
+        "communities": 24,
+        "community_reports": 24,
+    }
+    print(f"\n索引统计: {stats}")
+    return stats
+
+def load_kg_data(root_dir: str = "./data/graphrag_index") -> dict:
+    """加载索引生成的图谱数据"""
+    output_dir = Path(root_dir) / "output"
+    data = {}
+    for f in ["entities.parquet", "relationships.parquet",
+              "communities.parquet", "community_reports.parquet"]:
+        filepath = output_dir / f
+        if filepath.exists():
+            data[f] = pd.read_parquet(filepath)
+    return data
+
+if __name__ == "__main__":
+    stats = build_graphrag_index()
+    print(f"\n实体数: {stats['entities']}")
+    print(f"关系数: {stats['relationships']}")
+    print(f"社区数: {stats['communities']}")</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>手动维护实体关系表，每次更新需人工修改</li>
+            <li>不使用社区摘要，直接检索实体邻域</li>
+            <li>实体提取用关键词规则，漏报率高</li>
+            <li>LLM 提取时不设 max_gleanings，遗漏关系</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>GraphRAG 自动提取实体/关系/社区</li>
+            <li>社区摘要提供全局视角</li>
+            <li>LLM 驱动提取 + 人工校验关键实体</li>
+            <li>设置 max_gleanings=2，迭代完善提取</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：GraphRAG 的实体提取阶段为什么要设 max_gleanings？</summary>
+        <p>LLM 一次提取可能遗漏部分实体。max_gleanings 让 LLM 检查已提取结果并补充遗漏。每轮 gleaning 增加一次 LLM 调用。设 2 表示「提取→检查→补充」三轮，在质量和成本间平衡。</p>
       </details>
     </div>
+
+    <div class="section-block">
+      <h3>社区检测与全局/局部搜索</h3>
+
+      <p>GraphRAG 使用 <strong>Leiden 算法</strong> 对实体图进行社区检测。社区是高内聚的实体子图，使得同一个社区内的实体关联紧密。GraphRAG 为每个社区生成一份自然语言摘要，用于支持全局搜索。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>搜索模式</th><th>输入</th><th>检索策略</th><th>适用问题</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Local Search</strong></td>
+            <td>具体实体或关键词</td>
+            <td>提取实体邻域 → 向量相似扩展 → LLM 生成</td>
+            <td>「张三的汇报关系」「A 项目的负责人」</td>
+          </tr>
+          <tr>
+            <td><strong>Global Search</strong></td>
+            <td>抽象问题或趋势</td>
+            <td>匹配相关社区摘要 → 聚合多社区观点 → LLM 综合</td>
+            <td>「各部门协作效率」「今年组织架构变化」</td>
+          </tr>
+        </tbody>
+      </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># graphrag_query.py — 全局与局部搜索示例
+from graphrag.query import GlobalSearch, LocalSearch
+from graphrag.query.context_builder import GlobalContextBuilder, LocalContextBuilder
+from graphrag.query.llm import LLMClient
+from langchain_openai import ChatOpenAI
+import pandas as pd
+from pathlib import Path
+
+class GraphRAGQueryEngine:
+    """GraphRAG 查询引擎封装"""
+
+    def __init__(
+        self,
+        root_dir: str = "./data/graphrag_index",
+        llm_model: str = "gpt-4o-mini",
+    ):
+        self.root_dir = Path(root_dir)
+        self.llm = ChatOpenAI(model=llm_model, temperature=0)
+        self.llm_client = LLMClient(self.llm)
+
+        # 加载索引数据
+        output_dir = self.root_dir / "output"
+        self.entities = pd.read_parquet(output_dir / "entities.parquet") if (output_dir / "entities.parquet").exists() else pd.DataFrame()
+        self.relationships = pd.read_parquet(output_dir / "relationships.parquet") if (output_dir / "relationships.parquet").exists() else pd.DataFrame()
+        self.community_reports = pd.read_parquet(output_dir / "community_reports.parquet") if (output_dir / "community_reports.parquet").exists() else pd.DataFrame()
+
+    def global_search(self, query: str) -> str:
+        """全局搜索：基于社区摘要回答抽象问题"""
+        # 1. 构建全局上下文（模拟）
+        context_builder = GlobalContextBuilder(
+            community_reports=self.community_reports,
+            llm_client=self.llm_client,
+        )
+        # context = context_builder.build_context(query)
+
+        # 模拟检索到的社区摘要
+        mock_context = """社区: 技术研发体系 (ID: comm_01)
+关键实体: 技术部(18人)、产品部(12人)、研发中心、测试组
+关键关系: 技术部汇报CTO、产品部汇报CEO、技术-产品协作
+摘要: 技术部和产品部在2024年有3个联合项目...
+
+社区: 人力资源体系 (ID: comm_02)
+关键实体: HR部(5人)、培训中心、员工关系组
+关键关系: HR部汇报CEO、培训中心属HR管辖
+摘要: 2024年完成全员培训计划，覆盖85%员工..."""
+
+        mock_global_prompt = f"""你是一个组织分析专家。
+基于以下社区信息回答问题。
+
+{query}
+
+社区信息：
+{mock_context}
+
+请综合各社区信息给出全面回答。"""
+
+        response = self.llm.invoke(mock_global_prompt)
+        return str(response.content)
+
+    def local_search(self, query: str) -> str:
+        """局部搜索：基于具体实体邻域回答"""
+        # 模拟实体检索
+        mock_local_context = """实体: 张三
+类型: person
+部门: 技术部
+职位: 高级工程师
+汇报对象: 李四 (技术总监)
+
+实体: 李四
+类型: person
+部门: 技术部
+职位: 技术总监
+汇报对象: 王五 (CTO)
+
+关系: 张三 --[汇报给]--> 李四
+关系: 李四 --[汇报给]--> 王五
+关系: 张三 --[参与]--> 项目Alpha"""
+
+        mock_local_prompt = f"""基于以下知识图谱信息回答问题。
+
+{query}
+
+图谱信息：
+{mock_local_context}"""
+
+        response = self.llm.invoke(mock_local_prompt)
+        return str(response.content)
+
+def demo_graphrag_search():
+    """演示 GraphRAG 两种搜索模式"""
+    engine = GraphRAGQueryEngine()
+
+    print("=" * 50)
+    print("GraphRAG 全局搜索演示")
+    print("=" * 50)
+    global_answer = engine.global_search("今年公司各部门的组织架构有哪些调整？")
+    print(f"全局答案:\n{global_answer}\n")
+
+    print("=" * 50)
+    print("GraphRAG 局部搜索演示")
+    print("=" * 50)
+    local_answer = engine.local_search("张三的直接汇报上级是谁？")
+    print(f"局部答案:\n{local_answer}")
+
+if __name__ == "__main__":
+    demo_graphrag_search()</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>全局搜索 vs 局部搜索决策流程</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant Router as 查询分类器
+    participant Global as Global Search
+    participant Local as Local Search
+
+    U->>Router: 提问
+    Router->>Router: 判断查询类型
+
+    alt 抽象/全局问题
+        Router->>Global: 「公司今年战略方向？」
+        Global->>Global: 匹配社区摘要
+        Global->>Global: 多社区聚合
+        Global-->>U: 综合答案
+    else 具体/局部问题
+        Router->>Local: 「张三的职位？」
+        Local->>Local: 实体提取 + 邻域扩展
+        Local->>Local: 图谱子图检索
+        Local-->>U: 精确答案
+    end</pre>
+        <p class="diagram-caption">查询分类器根据问题类型路由到 Global 或 Local 搜索。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>成本评估与场景选择</h3>
+
+      <p><span class="term" data-term-id="graphrag-py" tabindex="0">GraphRAG</span> 的核心成本在索引构建阶段。每篇文档需要多次 LLM 调用（实体提取 + 关系识别 + gleaning + 社区摘要）。对于 50 篇文档约 200 页，索引构建成本约 $10-30，而朴素 RAG 的索引成本几乎为零。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>朴素 RAG</th><th>GraphRAG</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>索引成本</td><td>~$0.01（仅 embedding）</td><td>$10-30（LLM 提取 + 摘要）</td></tr>
+          <tr><td>查询成本</td><td>$0.01-0.05/次</td><td>$0.05-0.20/次</td></tr>
+          <tr><td>索引时间</td><td>分钟级</td><td>小时级（取决于文档量）</td></tr>
+          <tr><td>事实问答</td><td>优</td><td>优（两者差不多）</td></tr>
+          <tr><td>多跳推理</td><td>差（片段无关联）</td><td>优（实体关系图）</td></tr>
+          <tr><td>全局总结</td><td>差（需额外 prompt）</td><td>优（社区摘要内置）</td></tr>
+          <tr><td>更新灵活性</td><td>增量更新容易</td><td>需重新提取实体关系</td></tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>CorpAssist 选型建议</strong>
+        <ul>
+          <li><strong>日常 Q&A</strong>（"今年年假几天？"）→ 朴素 RAG，成本低响应快</li>
+          <li><strong>组织分析</strong>（"技术部和产品部之间的人员流动"）→ GraphRAG Local Search</li>
+          <li><strong>战略报告</strong>（"公司各部门的核心能力分布"）→ GraphRAG Global Search</li>
+          <li><strong>合规审计</strong>（"所有涉及数据外泄的相关方"）→ GraphRAG + 图遍历</li>
+        </ul>
+      </div>
+
+      <h4>何时 GraphRAG 明显优于朴素 RAG</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># compare_scenarios.py — GraphRAG vs 朴素 RAG 场景对比
+from langchain_openai import ChatOpenAI
+from typing import Dict, List
+
+class ComparisonDemo:
+    """GraphRAG 与朴素 RAG 对比示例"""
+
+    def __init__(self):
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    def naive_rag_answer(self, question: str, chunks: List[str]) -> str:
+        """模拟朴素 RAG 回答"""
+        context = "\n\n".join(chunks[:3])
+        prompt = f"基于上下文：\n{context}\n\n回答问题：{question}"
+        return str(self.llm.invoke(prompt).content)
+
+    def graphrag_local_answer(self, question: str, kg_info: str) -> str:
+        """模拟 GraphRAG local search 回答"""
+        prompt = f"基于知识图谱信息：\n{kg_info}\n\n回答问题：{question}"
+        return str(self.llm.invoke(prompt).content)
+
+    def demo(self):
+        questions = [
+            "张三和李四是什么关系？",
+            "技术部有哪些项目是跟产品部合作的？",
+            "去年以来公司核心管理层发生了哪些变动？",
+        ]
+        for q in questions:
+            print(f"\n问题: {q}")
+            # 朴素 RAG — 只能看到片段，缺乏全局关联
+            mock_chunks = [
+                "张三在2024年1月入职技术部，担任高级工程师。",
+                "技术部与产品部的协作项目包括 Alpha 和 Beta。",
+                "2024年3月，原CTO王五离职，由赵六接任。",
+            ]
+            naive = self.naive_rag_answer(q, mock_chunks)
+            print(f"[朴素RAG] {naive[:100]}...")
+
+            # GraphRAG — 全局关联
+            mock_kg = (
+                "实体: 张三, type: person, 部门: 技术部\n"
+                "实体: 李四, type: person, 部门: 技术部, 角色: 技术总监\n"
+                "关系: 张三 --汇报给--> 李四\n"
+                "实体: 项目Alpha, 参与方: 技术部+产品部\n"
+                "实体: 王五, 原CTO, 2024-03 离职\n"
+                "实体: 赵六, 现任CTO, 2024-04 入职"
+            )
+            graph = self.graphrag_local_answer(q, mock_kg)
+            print(f"[GraphRAG] {graph[:100]}...")
+
+if __name__ == "__main__":
+    demo = ComparisonDemo()
+    demo.demo()</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>GraphRAG 必须使用 Microsoft 的那个开源实现吗？</summary>
+          <div class="learn-faq-body">
+            不是必须的。Microsoft GraphRAG 是目前最成熟的方案，但不是唯一选择。你也可以用 Neo4j + LangChain 手动构建图谱，或者使用 LlamaIndex 的 KnowledgeGraphIndex。Microsoft 方案的优点是社区检测和摘要生成开箱即用。
+          </div>
+        </details>
+        <details>
+          <summary>GraphRAG 索引构建太慢了，能增量更新吗？</summary>
+          <div class="learn-faq-body">
+            GraphRAG 目前不支持真正的增量索引。新增文档需要重新运行完整索引管线。社区中有一些 workaround：为不同时间段的文档构建独立索引，查询时合并结果。长期来看，GraphRAG 的增量索引是个活跃开发方向。
+          </div>
+        </details>
+        <details>
+          <summary>我的文档量很小（10 篇），有必要用 GraphRAG 吗？</summary>
+          <div class="learn-faq-body">
+            文档量小的情况下，朴素 RAG 加上一些手写的关系映射可能就够用了。但如果实体关联密集（如组织架构、项目依赖），GraphRAG 的社区摘要仍然能提供更好的全局视角。建议 50+ 篇文档时考虑 GraphRAG。
+          </div>
+        </details>
+        <details>
+          <summary>GraphRAG 的社区摘要是怎么保证质量的？</summary>
+          <div class="learn-faq-body">
+            社区摘要的质量取决于 1) 实体提取的完整性；2) 社区检测的粒度（Leiden 算法的分辨率参数）；3) 摘要 prompt 的设计。可以通过调整 resolution 参数控制社区数量（resolution 越高社区越多越细），在精度和召回间平衡。
+          </div>
+        </details>
+      </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li><strong>GraphRAG 部署</strong>：微软 GraphRAG 索引管线分四步：chunk → entity extraction → community detection → summary，500 文档约 18 分钟完成</li>
-        <li><strong>实体抽取成本</strong>：索引阶段 Token 消耗约 858K（输入+输出），成本 $12.45（Naive RAG 仅 $0.28）</li>
-        <li><strong>查询效果</strong>：跨文档推理准确率 84.7% vs Naive RAG 52.3%，单文档查询差距不大</li>
-        <li><strong>Hybrid 策略</strong>：CorpAssist 应选择性路由跨文档问题到 GraphRAG，其余走 Naive RAG</li>
-        <li><strong>适用场景</strong>：文档间关联密集、跨文档推理频繁的知识库才值得 GraphRAG 的索引成本</li>
+        <li><strong>实体提取是基础</strong>：LLM 驱动的实体/关系/协变量提取质量直接决定图谱质量。</li>
+        <li><strong>社区检测自动聚合</strong>：Leiden 算法发现实体高内聚子图，支持全局视角的问答。</li>
+        <li><strong>全局搜索 vs 局部搜索</strong>：抽象问题用 Global（社区摘要聚合），具体问题用 Local（实体邻域）。</li>
+        <li><strong>成本较高但适合高价值场景</strong>：索引成本在 $10-30 级别，适用于多跳推理和全局总结场景。</li>
+        <li><strong>不是朴素 RAG 的替代品</strong>：两者互补——日常 Q&A 用朴素 RAG，分析推理用 GraphRAG。</li>
       </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox"> 能独立部署微软 GraphRAG 并完成索引管线</label></li>
-        <li><label><input type="checkbox"> 能解释实体抽取、社区检测、社区摘要各环节的作用</label></li>
-        <li><label><input type="checkbox"> 能估算 GraphRAG 索引和查询阶段的 Token/成本</label></li>
-        <li><label><input type="checkbox"> 能区分 Local Search 与 Global Search 的适用场景</label></li>
-        <li><label><input type="checkbox"> 能基于查询类型决策走 GraphRAG 还是 Naive RAG</label></li>
-      </ul></div>
-      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
-        <tr><td>GraphRAG</td><td>微软基于图的 RAG 实现</td></tr>
-        <tr><td>Entity Extraction</td><td>LLM 从 chunk 提取实体名称+类型+描述</td></tr>
-        <tr><td>Leiden 算法</td><td>层次化社区检测，自动发现实体聚类</td></tr>
-        <tr><td>Community Summary</td><td>LLM 对每个社区的关联文档做摘要</td></tr>
-        <tr><td>Local Search</td><td>以实体为中心检索关联信息</td></tr>
-        <tr><td>Global Search</td><td>以社区摘要为中心全局总结</td></tr>
-        <tr><td>gleanings</td><td>实体抽取后 LLM 二次验证次数</td></tr>
-        <tr><td>Naive RAG</td><td>标准向量检索+生成</td></tr>
-      </table></div>
-      <div class="learn-interview"><h4>面试可能问</h4><details><summary>GraphRAG 的社区检测是如何实现的？为什么用了 Leiden 算法而非 Louvain？</summary>
-      <p>Leiden 算法在 Louvain 基础上增加了 refine 阶段，保证社区连通性，避免 Louvain 可能产生的断连社区。GraphRAG 层次化社区检测：先构建实体图（节点=实体，边=关系强度），然后逐层应用 Leiden 算法形成多尺度社区，上层社区包含下层社区，形成金字塔结构。层次化使得 Local Search 和 Global Search 可在不同粒度检索。</p>
-      </details>
-      <details><summary>List 出 3 个你可能在 CorpAssist 考虑使用 GraphRAG 的信号？</summary>
-      <p>1) 用户频繁问「A 政策对 B 流程有什么影响」类问题（跨文档推理占查询 > 30%）；2) 知识库超过 500 篇且文档间有密集引用关系（如「详见第四章」）；3) Bad case 分析显示 Naive RAG 因 chunk 碎片化导致答案不完整（context_recall < 0.70）。</p>
-      </details>
-      <details><summary>如何降低 GraphRAG 索引成本？</summary>
-      <p>1) 实体抽取使用 gpt-4o-mini 替代 gpt-4o（成本降 6 倍，准确率从 89%→77%）；2) 增加 chunk_size 从 1200 到 2400 减少调用次数（但可能漏掉细粒度实体）；3) 关闭 claim_extraction（占 15% 成本）；4) 对更新文档使用增量索引（目前 graphrag 不支持，需自研 diff 策略）。</p>
-      </details></div>
+      <div class="learn-checklist" data-storage-key="rag-system-py_advanced01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="entity-extraction" /> 理解 GraphRAG 中实体提取、关系识别、协变量提取的流程</label></li>
+          <li><label><input type="checkbox" data-id="community-detection" /> 理解社区检测（Leiden）的作用和社区摘要的意义</label></li>
+          <li><label><input type="checkbox" data-id="global-local" /> 能区分 Global Search 和 Local Search 的适用场景</label></li>
+          <li><label><input type="checkbox" data-id="cost-tradeoff" /> 能评估 GraphRAG 的成本和收益，判断适合场景</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>GraphRAG</td><td>基于知识图谱的检索增强生成，Microsoft 开源</td></tr>
+                <tr><td>实体提取</td><td>LLM 从文本中抽取人物/组织/项目等实体</td></tr>
+                <tr><td>社区检测</td><td>Leiden 算法自动发现高内聚实体子图</td></tr>
+                <tr><td>社区摘要</td><td>LLM 为每个社区生成的自然语言总结</td></tr>
+                <tr><td>Global Search</td><td>基于社区摘要回答抽象/全局问题</td></tr>
+                <tr><td>Local Search</td><td>基于实体邻域回答具体/局部问题</td></tr>
+                <tr><td>Leiden 算法</td><td>图社区检测算法，比 Louvain 更快更稳</td></tr>
+                <tr><td>多跳推理</td><td>需要多步实体关系遍历才能回答的问题</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>GraphRAG 相比朴素 RAG 在什么场景下有明显优势？什么场景下不建议使用？</li>
+              <li>解释 GraphRAG 的索引构建流程：从文档到社区摘要经历了哪些步骤？每一步的成本占比大概多少？</li>
+              <li>Global Search 和 Local Search 的实现原理是什么？为什么 Global Search 可以回答「公司今年的整体战略方向」这类问题，而朴素 RAG 不能？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-advanced-02-grounding-citation">Grounding 与引用溯源</a> 将学习如何确保 RAG 答案可追溯、可验证。</p>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方参考</h3><ul>
-    <li><a href="https://microsoft.github.io/graphrag/" target="_blank" rel="noopener">微软 GraphRAG 官方文档</a></li>
-    <li><a href="https://github.com/microsoft/graphrag" target="_blank" rel="noopener">GitHub: microsoft/graphrag</a></li>
-    <li><a href="https://arxiv.org/abs/2404.16130">GraphRAG 论文（微软）</a></li>
-    <li><a href="https://en.wikipedia.org/wiki/Leiden_algorithm">Leiden 算法详解</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-    <div class="steps-operate"><ol>
-      <li>在 <code>demos/advanced-01-graphrag-hands-on-lab/</code> 初始化 GraphRAG 工作区</li>
-      <li>将 <code>hr_policies/</code> 目录的 50 篇文档放入输入目录，运行索引</li>
-      <li>查询「工程部轮岗到产品部年假计算」，记录完整回答</li>
-      <li>在相同查询上对比 Naive RAG 的回答，分析差异</li>
-    </ol></div>
-    <div class="steps-judgment-list"><details><summary>场景 1：知识库 200 篇文档，月更新 2 次，GraphRAG 索引成本月均 $50，ROI 怎么看？</summary>
-      <p>先评估跨文档查询占比：如果 < 20%，建议维持 Naive RAG。如果 > 50%，$50/月的成本在 CorpAssist 场景中可接受（对比工程师人工处理跨文档查询的人力成本）。建议先对 1 个月的用户 query 做日志分析，统计需要跨文档推理的 query 比例再决策。</p>
-    </details>
-    <details><summary>场景 2：索引运行中遇到 rate limit（429），如何配置重试策略？</summary>
-      <p>在 settings.yaml 中设置 <code>max_retries: 10</code> 和 <code>retry_delay: 30</code>（秒）。若仍频繁触发，降低 parallelism 参数（默认 25→10）。GraphRAG 内部使用 tenacity 库进行指数退避重试，可在日志中观察 retry 次数。</p>
-    </details></div>
-    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/advanced-01-graphrag-hands-on-lab/</p><ul class="demo-acceptance">
-      <li>GraphRAG 索引成功完成并输出 .parquet 工件</li>
-      <li>Local Search 查询返回跨文档推理的完整答案</li>
-      <li>与 Naive RAG 的对比分析文档（graph-vs-hybrid.md）</li>
-    </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://microsoft.github.io/graphrag/" target="_blank" rel="noopener">Microsoft GraphRAG 官方文档</a></li>
+      <li><a href="https://github.com/microsoft/graphrag" target="_blank" rel="noopener">GraphRAG GitHub 仓库 — 源码与示例</a></li>
+      <li><a href="https://arxiv.org/abs/2404.16130" target="_blank" rel="noopener">论文：GraphRAG — Unlocking LLM Discovery on Narrative Private Data</a></li>
+      <li><a href="https://neo4j.com/docs/cypher-manual/current/" target="_blank" rel="noopener">Neo4j Cypher 查询语言 — 图数据库查询</a></li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/query_engine/knowledge_graph_query_engine/" target="_blank" rel="noopener">LlamaIndex KnowledgeGraphIndex — 图索引示例</a></li>
+    </ul>
   </div>
-  <div class="resources content-section"><h3>延伸阅读</h3><ul>
-    <li><a href="#ch-advanced-02-grounding-citation">下一章：Grounding/Citation 工程实践</a></li>
-    <li><a href="https://medium.com/data-science-at-microsoft/graphrag-results-3-research-insights-9d0e0a0b6e8a">GraphRAG 效果分析博客</a></li>
-    <li><a href="https://neo4j.com/developer-blog/graphrag-patterns/">Neo4j GraphRAG 模式对比</a></li>
-  </ul></div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 GraphRAG 构建组织架构知识图谱并进行查询（约 40 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>准备 5-10 篇组织架构相关文档（组织结构、岗位职责、项目报告）。</li>
+      <li>初始化 GraphRAG 索引目录并配置 settings.yaml。</li>
+      <li>运行 <code>python -m graphrag.index</code> 构建索引（注意：首次运行需大量 LLM 调用）。</li>
+      <li>使用 <code>graphrag_query.py</code> 分别测试 Global Search 和 Local Search。</li>
+      <li>对比同一问题在朴素 RAG 和 GraphRAG 下的答案差异。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">索引构建后，社区报告显示所有实体都在一个社区里。这是什么原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>Leiden 分辨率参数太低</strong>，导致图被过度合并为一个大社区。解决方法：在 settings.yaml 中降低 <code>community_resolution</code> 或对 <code>community_reports</code> 设置更高的 <code>max_length</code>。也可以检查实体提取的质量——如果实体太少或关系太稀疏，社区检测也会失效。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Global Search 的答案过于泛泛，缺乏具体数据支撑。怎么改进？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>1) 改进社区摘要参数</strong>：增加 max_length（如 from 2000 to 3000），让摘要包含更多具体数字和实例；2) 在 Global Search prompt 中加入「请引用具体实体和关系」的指令；3) 考虑 Hybrid 模式：先用 Global 找相关社区，再对社区内关键实体做 Local Search。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：GraphRAG 动手实践实验室</h4>
+      <p>目录：<code>demos/advanced-01-graphrag-hands-on-lab/</code>。<strong>验收</strong>：成功构建知识图谱索引，Global Search 和 Local Search 均可回答组织架构相关问题。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-02-grounding-citation">Grounding 与引用溯源</a> — RAG 答案的归因与可信度</li>
+      <li><a href="https://neo4j.com/developer-blog/knowledge-graphs-llms/" target="_blank" rel="noopener">Neo4j 博客 — 知识图谱与 LLM 集成</a></li>
+      <li><a href="https://bratanic-tomaz.medium.com/constructing-knowledge-graphs-from-text-using-llms-9d0c8aa6c4b0" target="_blank" rel="noopener">使用 LLM 从文本构建知识图谱 — 实践指南</a></li>
+      <li><a href="https://arxiv.org/abs/2306.06102" target="_blank" rel="noopener">论文：Knowledge Graphs + LLMs — 机遇与挑战</a></li>
+    </ul>
+  </div>
 </section>

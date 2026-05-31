@@ -6,7 +6,7 @@
 
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Serving 基础</strong> · 能力：启动 vLLM OpenAI 服务、配置关键参数并验证兼容 API</p>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Serving 基础</strong> · 能力：启动 vLLM OpenAI 服务、配置关键参数并验证兼容 API</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
         <p>CorpAssist 双栈（Python / Spring AI）都假设<strong>OpenAI 兼容 HTTP</strong>。<span class="term" data-term-id="vllm-server" tabindex="0">vLLM server</span> 是私有化路径的默认引擎；不懂 <code>--max-model-len</code> 与 <span class="term" data-term-id="tensor-parallel" tabindex="0">tensor parallel</span>，S4 补全会要么 OOM 要么 latency 失控。</p>
@@ -30,47 +30,119 @@
     </div>
 
     <div class="section-block">
-      <h3>启动</h3>
+      <h3>vLLM 启动</h3>
+      <p><span class="term" data-term-id="vllm-server" tabindex="0">vLLM server</span> 提供了 OpenAI 兼容的 HTTP API。启动方式有两种：直接使用 Python CLI 或通过 Docker 容器。</p>
+
+      <div class="mermaid-wrap">
+        <h5>vLLM 请求处理路径</h5>
+        <pre class="mermaid">sequenceDiagram
+          participant C as Client
+          participant A as OpenAI API 层
+          participant E as vLLM Engine
+          participant G as GPU
+          C->>A: POST /v1/chat/completions
+          A->>E: 调度 batch
+          E->>G: forward + PagedAttention
+          G-->>E: logits
+          E-->>A: stream tokens
+          A-->>C: SSE chunks</pre>
+        <p class="diagram-caption">应用工程师关注 API 层契约与超时；内核细节见 <a href="#ch-basics-05-kv-cache-app">KV 缓存与性能</a>。</p>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 启动 vLLM 推理服务</span>
+        运维拿到 AWQ 量化权重，需要在一台 24GB GPU 上启动 vLLM 供双栈调用。要求：模型名用 <code>corp-coder-7b</code>，上下文 8K，启用 prefix caching 加速相同 system prompt。
+      </aside>
+
       <div class="code-block">
         <div class="code-toolbar">
           <span class="lang-tag">bash</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-bash">python -m vllm.entrypoints.openai.api_server \
+        <pre><code class="language-bash"># 方式一：直接 CLI 启动（推荐开发调试）
+python -m vllm.entrypoints.openai.api_server \
   --model /models/Qwen2.5-Coder-7B-Instruct-AWQ \
   --quantization awq \
   --served-model-name corp-coder-7b \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.9 \
+  --enable-prefix-caching \
   --host 0.0.0.0 \
-  --port 8000</code></pre>
-      </div>
-      <p>健康检查：<code>curl -s http://localhost:8000/v1/models | jq .data[0].id</code> 应返回 <code>corp-coder-7b</code>。Spring AI 与 Python client 的 <code>model</code> 字段须与此一致。</p>
+  --port 8000
 
-      <div class="mermaid-wrap">
-        <h5>vLLM 请求路径</h5>
-        <pre class="mermaid">sequenceDiagram
-  participant C as Client
-  participant A as OpenAI API 层
-  participant E as vLLM Engine
-  participant G as GPU
-  C->>A: POST /v1/chat/completions
-  A->>E: 调度 batch
-  E->>G: forward + PagedAttention
-  G-->>E: logits
-  E-->>A: stream tokens
-  A-->>C: SSE chunks</pre>
-        <p class="diagram-caption">应用工程师关注 API 层契约与超时；内核细节见 <a href="#ch-basics-05-kv-cache-app">KV 缓存与性能</a>。</p>
+# 方式二：Docker 启动（推荐生产）
+docker run --gpus all \
+  -v /models:/models:ro \
+  -p 8000:8000 \
+  --shm-size 2gb \
+  vllm/vllm-openai:latest \
+  --model /models/Qwen2.5-Coder-7B-Instruct-AWQ \
+  --quantization awq \
+  --served-model-name corp-coder-7b \
+  --max-model-len 8192</code></pre>
       </div>
+
+      <h4>验证启动成功</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 健康检查：列出模型
+curl -s http://localhost:8000/v1/models | jq .
+# 期望输出：{"data":[{"id":"corp-coder-7b","object":"model",...}]}
+
+# 确认 model id
+curl -s http://localhost:8000/v1/models | jq .data[0].id
+# "corp-coder-7b"  # 必须与 Spring/Python 的 model 字段一致</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>不设 served-model-name，使用混乱的 HuggingFace 模型 ID</li>
+            <li>跳过健康检查直接对接客户端</li>
+            <li>用 root 用户运行容器</li>
+            <li>启动后不确认 GPU 显存占用</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>显式设置 served-model-name 与产品别名一致</li>
+            <li>healthcheck 打 <code>/v1/models</code> 端点</li>
+            <li>容器使用非 root 用户运行</li>
+            <li>启动后用 nvidia-smi 核实显存</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么 Python CLI 启动时 <code>--model</code> 参数要用绝对路径？</summary>
+        <p>vLLM 需要准确知道权重文件位置。相对路径可能因工作目录不同而解析失败。Docker 场景下权重挂载在固定路径如 <code>/models/...</code>。</p>
+      </details>
     </div>
 
     <div class="section-block">
-      <h3>参数</h3>
+      <h3>核心参数详解</h3>
       <table class="outline-table">
         <thead>
           <tr><th>参数</th><th>作用</th><th>S4 提示</th></tr>
         </thead>
         <tbody>
           <tr>
-            <td><code>--max-model-len</code> / <span class="term" data-term-id="max-model-len" tabindex="0">max model len</span></td>
+            <td><code>--model</code></td>
+            <td>权重路径或 HuggingFace 模型名</td>
+            <td>本地路径优先，避免启动时下载</td>
+          </tr>
+          <tr>
+            <td><code>--served-model-name</code></td>
+            <td>API 中暴露的模型名</td>
+            <td>客户端 model 字段必须一致</td>
+          </tr>
+          <tr>
+            <td><code>--max-model-len</code></td>
             <td>单序列最大 token（prompt+生成）</td>
             <td>FIM 上下文 8K 常见；过大吃 KV 显存</td>
           </tr>
@@ -89,8 +161,31 @@
             <td>相同 system prompt 复用 KV</td>
             <td>多用户共享代码规范 prompt 时有效</td>
           </tr>
+          <tr>
+            <td><code>--quantization</code></td>
+            <td>量化格式（awq/gptq）</td>
+            <td>与权重文件格式匹配</td>
+          </tr>
         </tbody>
       </table>
+
+      <p><span class="term" data-term-id="paged-attention" tabindex="0">PagedAttention</span> 是 vLLM 的核心技术：它将 KV cache 分页管理，按需分配显存，避免传统方法中的碎片和预分配浪费。对应用层的直接影响：<strong>同等显存下可支撑更多并发序列</strong>。</p>
+
+      <p><span class="term" data-term-id="tensor-parallel" tabindex="0">Tensor Parallel</span> 将模型权重切分到多张 GPU。14B 模型单张 24GB 卡放不下时，设置 <code>--tensor-parallel-size 2</code> 跨两张卡推理。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 14B 模型 + 张量并行 2 卡
+python -m vllm.entrypoints.openai.api_server \
+  --model /models/Qwen2.5-Coder-14B-Instruct-AWQ \
+  --quantization awq \
+  --tensor-parallel-size 2 \
+  --served-model-name corp-coder-14b \
+  --gpu-memory-utilization 0.9</code></pre>
+      </div>
 
       <details class="learn-micro-check">
         <summary>先想 10 秒：把 max-model-len 从 8K 调到 32K，QPS 不变，显存会怎样？</summary>
@@ -99,12 +194,30 @@
     </div>
 
     <div class="section-block">
-      <h3>OpenAI 兼容</h3>
-      <p>客户端只需切换 <code>base_url</code> 与 <code>api_key</code>（vLLM 常填 <code>EMPTY</code>）：</p>
+      <h3>OpenAI 兼容 API</h3>
+      <p>客户端只需切换 <code>base_url</code> 与 <code>api_key</code>（vLLM 常填 <code>EMPTY</code>）。支持的核心端点：</p>
 
+      <h4>Chat Completions</h4>
       <div class="learn-code-compare">
         <div>
-          <span class="learn-code-compare-label is-good">Chat Completions</span>
+          <span class="learn-code-compare-label is-good">非流式</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">bash</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-bash">curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "corp-coder-7b",
+    "messages": [{"role":"user","content":"解释 quicksort"}],
+    "max_tokens": 256,
+    "temperature": 0.1
+  }'</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">流式</span>
           <div class="code-block">
             <div class="code-toolbar">
               <span class="lang-tag">bash</span>
@@ -120,21 +233,92 @@
   }'</code></pre>
           </div>
         </div>
-        <div>
-          <span class="learn-code-compare-label is-good">FIM Completions（S4）</span>
-          <div class="code-block">
-            <div class="code-toolbar">
-              <span class="lang-tag">bash</span>
-              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
-            </div>
-            <pre><code class="language-bash">curl http://localhost:8000/v1/completions \
+      </div>
+
+      <h4>FIM Completions（S4 补全核心）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># FIM（Fill-in-the-Middle）补全 — S4 IDE 插件的核心 API
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
   -d '{
     "model": "corp-coder-7b",
-    "prompt": "&lt;fim_prefix&gt;def foo():&lt;fim_suffix&gt;&lt;fim_middle&gt;",
-    "max_tokens": 64
+    "prompt": "<|fim_prefix|>def hello():\n    print(\"<|fim_suffix|>\")<|fim_middle|>",
+    "max_tokens": 64,
+    "temperature": 0.1
   }'</code></pre>
-          </div>
+      </div>
+
+      <h4>Python 调用 vLLM</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
+        <pre><code class="language-python">from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY",
+)
+
+# FIM 补全（S4 场景）
+fim_resp = client.completions.create(
+    model="corp-coder-7b",
+    prompt="<|fim_prefix|>def add(a, b):<|fim_suffix|><|fim_middle|>",
+    max_tokens=64,
+    temperature=0.1,
+)
+print("FIM:", fim_resp.choices[0].text)
+
+# Chat
+chat_resp = client.chat.completions.create(
+    model="corp-coder-7b",
+    messages=[{"role": "user", "content": "Python 列表推导式示例"}],
+)
+print("Chat:", chat_resp.choices[0].message.content)</code></pre>
+      </div>
+
+      <h4>Spring AI 调用 vLLM</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// Spring AI 配置指向 vLLM
+import org.springframework.ai.autoconfigure.openai.OpenAiAutoConfiguration;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.openai.OpenAiChatModel;
+import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class VllmClientConfig {
+
+    @Bean
+    public OpenAiChatModel vllmChatModel() {
+        return OpenAiChatModel.builder()
+            .baseUrl("http://vllm:8000/v1")
+            .apiKey("EMPTY")
+            .defaultOptions(OpenAiChatOptions.builder()
+                .model("corp-coder-7b")
+                .temperature(0.1)
+                .maxTokens(512)
+                .build())
+            .build();
+    }
+
+    @Bean
+    public ChatClient vllmChatClient(OpenAiChatModel model) {
+        return ChatClient.builder(model)
+            .defaultSystem("你是 CorpAssist 代码助手，帮助开发者完成代码。")
+            .build();
+    }
+}</code></pre>
       </div>
 
       <div class="notice">
@@ -142,21 +326,99 @@
         <ul>
           <li><strong>model 名不一致</strong> — 客户端写 <code>Qwen2.5-7B</code> 但 served 名是 <code>corp-coder-7b</code> → 404。</li>
           <li><strong>忽略 stream 超时</strong> — 网关 read timeout 必须大于最长生成时间。</li>
+          <li><strong>遗忘 <code>/v1</code> 路径</strong> — base_url 不加 <code>/v1</code> 导致请求路径错误。</li>
+          <li><strong>FIM 格式错误</strong> — 不同模型使用不同的 FIM token 格式（如 <code>&lt;|fim_prefix|&gt;</code> 与 <code>&lt;fim_prefix&gt;</code>）。</li>
         </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>vLLM 启动后 <code>/v1/models</code> 返回空列表，可能是什么原因？</summary>
+          <div class="learn-faq-body">
+            可能是权重路径错误或加载失败。检查 vLLM 启动日志中是否有模型加载错误。运行 <code>docker logs</code> 或 CLI 控制台输出。常见原因：量化格式不匹配（指定 <code>--quantization awq</code>但权重是 GPTQ）。
+          </div>
+        </details>
+        <details>
+          <summary>Served model name 设置后可以修改吗？</summary>
+          <div class="learn-faq-body">
+            需要重启 vLLM。运行时不能修改。如果有多个模型名需求，可以启动多个 vLLM 实例或使用 <code>--served-model-name</code> 指定一个稳定别名，客户端统一用这个别名。
+          </div>
+        </details>
+        <details>
+          <summary>vLLM 支持哪些量化格式？</summary>
+          <div class="learn-faq-body">
+            vLLM 原生支持 AWQ、GPTQ、SqueezeLLM、FP8（H100 适用）。加载时需要 <code>--quantization</code> 参数指定格式。详见 <a href="#ch-basics-04-quant">量化选型</a>。
+          </div>
+        </details>
+        <details>
+          <summary>vLLM 和 Ollama 用同样的模型，性能差多少？</summary>
+          <div class="learn-faq-body">
+            vLLM 的 PagedAttention 和 continuous batching 在高并发场景吞吐远超 Ollama。CorpAssist 生产场景用 vLLM，开发者本机 Demo 可用 Ollama。详见 <a href="#ch-advanced-01-tgi-alt">TGI 与其他引擎</a>。
+          </div>
+        </details>
       </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li><strong>启动</strong>：OpenAI API server 模块 + 明确 served-model-name 与健康检查。</li>
-        <li><strong>参数</strong>：max-model-len 与 gpu-memory-utilization 决定 S4 并发上限。</li>
-        <li><strong>OpenAI 兼容</strong>：chat 与 FIM completions 共用同一 base_url，双栈零改造接入。</li>
+        <li><strong>启动</strong>：<span class="term" data-term-id="vllm-start" tabindex="0">vLLM start</span> 通过 CLI 或 Docker；OpenAI API server 模块 + 明确 served-model-name。</li>
+        <li><strong>参数</strong>：<code>max-model-len</code> 与 <code>gpu-memory-utilization</code> 决定 S4 并发上限。</li>
+        <li><strong>OpenAI 兼容</strong>：<span class="term" data-term-id="openai-compatible" tabindex="0">OpenAI compatible</span> 确保 chat 与 FIM completions 共用同一 base_url。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_basics03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cli-start" /> 能用 CLI 或 Docker 启动 vLLM 并指定 served-model-name</label></li>
+          <li><label><input type="checkbox" data-id="param-understand" /> 能解释 max-model-len、gpu-memory-utilization 的作用</label></li>
+          <li><label><input type="checkbox" data-id="fim-call" /> 能用 curl 调用 FIM 补全端点</label></li>
+          <li><label><input type="checkbox" data-id="client-config" /> 能写出 Python 和 Spring 的 vLLM 客户端配置</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="vllm-server" tabindex="0">vllm server</span></td><td>vLLM 的 OpenAI 兼容 HTTP 服务</td></tr>
+                <tr><td><span class="term" data-term-id="openai-compatible" tabindex="0">openai compatible</span></td><td>兼容 OpenAI API 格式</td></tr>
+                <tr><td><span class="term" data-term-id="max-model-len" tabindex="0">max model len</span></td><td>最大序列长度，控制 KV cache 上限</td></tr>
+                <tr><td><span class="term" data-term-id="tensor-parallel" tabindex="0">tensor parallel</span></td><td>模型权重跨 GPU 切分推理</td></tr>
+                <tr><td><span class="term" data-term-id="vllm-start" tabindex="0">vllm start</span></td><td>启动 vLLM 服务</td></tr>
+                <tr><td><span class="term" data-term-id="served-model-name" tabindex="0">served model name</span></td><td>API 中暴露的模型别名</td></tr>
+                <tr><td><span class="term" data-term-id="api-port-8000" tabindex="0">api port 8000</span></td><td>vLLM 默认端口</td></tr>
+                <tr><td><span class="term" data-term-id="paged-attention" tabindex="0">paged attention</span></td><td>分页 KV 缓存管理，减少显存碎片</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>vLLM 的核心优势是什么？PagedAttention 解决什么问题？</li>
+              <li>启动 vLLM 时需要配置哪些关键参数？如何为 S4 代码补全场景做最优配置？</li>
+              <li>为什么客户端报 404 model not found？solved-model-name 和客户端 model 字段的关系是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一章 <a href="#ch-basics-04-quant">量化选型</a>：在显存约束下选 AWQ/GPTQ。</p>
     </div>
   </div>
@@ -164,8 +426,10 @@
   <div class="official-links content-section">
     <h3>官方文档</h3>
     <ul>
-      <li><a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener">vLLM OpenAI Compatible Server</a></li>
-      <li><a href="https://docs.vllm.ai/en/latest/models/engine_args.html" target="_blank" rel="noopener">Engine Arguments</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener">vLLM — OpenAI Compatible Server</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/models/engine_args.html" target="_blank" rel="noopener">vLLM — Engine Arguments</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html" target="_blank" rel="noopener">vLLM — Prefix Caching</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html" target="_blank" rel="noopener">Spring AI — OpenAI Chat</a></li>
     </ul>
   </div>
 
@@ -174,10 +438,11 @@
     <p class="steps-intro">启动 vLLM 并分别验证 models 列表与非 stream / stream 补全各一次。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>修改正文启动命令中的 <code>--served-model-name</code> 为你本地模型别名，写出对应 curl <code>/v1/models</code> 期望 JSON 字段。</li>
-      <li>对照参数表：若 GPU 24GB、7B AWQ，写出你会设的 <code>max-model-len</code> 与理由。</li>
-      <li>用 stream=true 发一条 chat 请求，说明网关 read timeout 应如何设（相对 max_tokens）。</li>
-      <li>（可选）执行 <code>demos/basics-03-vllm-lab/curl-test.sh</code>。</li>
+      <li>启动 vLLM，设置 <code>--served-model-name corp-coder-7b</code>。</li>
+      <li>用 curl 验证 <code>/v1/models</code> 返回正确的模型 ID。</li>
+      <li>分别发送非流式和流式 chat completions 请求。</li>
+      <li>用 Python SDK 调用 FIM completions 端点。</li>
+      <li>执行 <code>demos/basics-03-vllm-lab/curl-test.sh</code> 验证所有端点正常。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
@@ -187,6 +452,15 @@
           <details>
             <summary>参考答案</summary>
             <div class="learn-practice-answer-body"><p>请求返回 model not found / 404。应统一为 <code>corp-coder-7b</code> 或使用 vLLM 返回的 id。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">vLLM 启动后显存占用比预期的 AWQ 7B（约 5GB）高很多，可能的原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>可能原因：① 未启用 <code>--quantization awq</code> 导致加载 FP16；② <code>--gpu-memory-utilization</code> 设置过高预占了余量；③ KV cache 预分配较多；④ 加载了错误的大模型版本。</p></div>
           </details>
         </div>
       </li>
@@ -200,8 +474,9 @@
   <div class="resources content-section">
     <h3>延伸学习</h3>
     <ul>
-      <li><a href="#ch-basics-04-quant">量化选型</a></li>
-      <li><a href="#ch-practice-01-python-client">Python 指向推理集群</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-quant">量化选型</a></li>
+      <li><strong>实践</strong>：<a href="#ch-practice-01-python-client">Python 指向推理集群</a></li>
+      <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">PagedAttention 论文</a></li>
     </ul>
   </div>
 </section>

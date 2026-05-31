@@ -1,43 +1,404 @@
 <section id="ch-basics-03-metadata" class="chapter" data-chapter="basics-03-metadata">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>元数据过滤与多租户</h2>
-  <button type="button" class="btn-mark-done" data-chapter="basics-03-metadata" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>元数据过滤与多租户</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-metadata" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>向量库基础</strong> · 能力：filter 表达式、租户隔离与配额</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>检索层 ACL 是安全底线；filter 必须在向量搜索前应用。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist 检索平台落地本章能力</li>
-        <li>说明 Python 索引与 Spring 只读查询分工</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>向量库基础</strong> · 能力：Filter 表达式、多租户隔离与配额管理</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>检索层 ACL 是数据安全底线——没有 <span class="term" data-term-id="metadata-filter" tabindex="0">metadata filter</span>，HR 部门的机密制度文档可能被研发人员搜到。<span class="term" data-term-id="filter-expression" tabindex="0">filter expression</span> 必须在向量搜索前应用，而非在应用层做后过滤。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 Milvus/ES filter 表达式实现部门级 ACL</li>
+          <li>设计 <span class="term" data-term-id="multi-tenant" tabindex="0">multi tenant</span> 隔离方案（collection-per-tenant vs shared+filter）</li>
+          <li>配置 <span class="term" data-term-id="quota" tabindex="0">quota</span> 限制单个租户的 QPS 和存储量</li>
+          <li>避免「后过滤」导致的检索精度损失</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Filter 在向量搜索前生效</strong>：Milvus 是先 filter 再向量检索，不是搜完再过滤。这决定了 ACL 不会漏数据。</li>
+          <li><strong>标量索引加速 filter</strong>：对 tenant_id 等高频过滤字段建 inverted index，否则全量扫描拖慢搜索。</li>
+          <li><strong>共享 collection + filter 隔离优于 per-tenant collection</strong>：管理简单，一条 filter 就够了。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>filter 表达式</h3><p>dept == "HR" && classification <= 2。 关联：<span class="term" data-term-id="metadata-filter" tabindex="0">metadata filter</span>、<span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span>。</p></div>
-    <div class="section-block"><h3>隔离与配额</h3><p>collection  per tenant 或 partition；QPS/存储配额。 关联：<span class="term" data-term-id="acl-filter" tabindex="0">acl filter</span>、<span class="term" data-term-id="quota" tabindex="0">quota</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="metadata-filter" tabindex="0">metadata filter</span> · <span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span> · <span class="term" data-term-id="acl-filter" tabindex="0">acl filter</span> · <span class="term" data-term-id="quota" tabindex="0">quota</span> · <span class="term" data-term-id="filter-expression" tabindex="0">filter expression</span> · <span class="term" data-term-id="multi-tenant" tabindex="0">multi tenant</span> · <span class="term" data-term-id="dept-scope" tabindex="0">dept scope</span> · <span class="term" data-term-id="scalar-filter" tabindex="0">scalar filter</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python">expr = 'dept == "HR" and doc_type == "policy"'
+
+    <div class="section-block">
+      <h3>Filter 表达式：语法与执行模式</h3>
+
+      <p><span class="term" data-term-id="metadata-filter" tabindex="0">metadata filter</span> 使用类似 SQL 的 <span class="term" data-term-id="filter-expression" tabindex="0">filter expression</span> 语法。Milvus 支持关系运算符（==, !=, >, <, >=, <=）、逻辑运算符（and, or, not）和范围运算符（in, like）。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度文档 ACL</span>
+        员工查询「年假政策」时，系统必须在向量搜索中就限定：<code>tenant_id == 用户.tenant AND department == 用户.dept AND classification <= 用户.clearance</code>。如果 filter 写错，制度文档就漏出去了。
+      </aside>
+
+      <h4>Milvus Filter 表达式示例</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>Filter 表达式</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>部门隔离</td><td><code>dept == "HR"</code></td><td>仅返回 HR 部门的文档</td></tr>
+          <tr><td>多条件</td><td><code>dept == "HR" and classification <= 2</code></td><td>HR 部门且密级 <= 2</td></tr>
+          <tr><td>范围</td><td><code>created_at > 1700000000</code></td><td>只搜近期文档</td></tr>
+          <tr><td>IN 子句</td><td><code>source in ["wiki", "manual"]</code></td><td>限来源为 wiki 或手册</td></tr>
+          <tr><td>排除</td><td><code>doc_type != "draft"</code></td><td>排除草稿文档</td></tr>
+        </tbody>
+      </tbody>
+      </table>
+
+      <h4>Python：带 Filter 的向量搜索</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pymilvus import Collection
+import numpy as np
+
+collection = Collection("corpassist_kb")
+collection.load()
+
+query_vec = np.random.rand(768).tolist()
+
+# 带 ACL filter 的搜索
+expr = 'tenant_id == 1 and dept in ["HR", "Finance"] and classification <= 2'
 results = collection.search(
-    data=[q_vec], limit=10, expr=expr)</code></pre></div>
-      <div class="mermaid-wrap"><h5>元数据过滤与多租户</h5>
-      <pre class="mermaid">flowchart LR
-  PY[Python 索引] --> VS[(Milvus/ES)]
-  SP[Spring 查询] --> VS
-  VS --> RAG[RAG 生成]</pre></div>
+    data=[query_vec],
+    anns_field="embedding",
+    param={"metric_type": "COSINE", "params": {"ef": 64}},
+    limit=5,
+    expr=expr,  # filter 在向量搜索前执行
+    output_fields=["id", "chunk_text", "dept", "classification"],
+)
+
+for hits in results:
+    for hit in hits:
+        print(f"score={hit.score:.4f} dept={hit.entity.get('dept')} "
+              f"class={hit.entity.get('classification')}")
+collection.release()</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>Pre-filter vs Post-filter 执行流程</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Pre["Pre-filter（推荐）"]
+        A1["查询 + Filter"] --> B1["标量索引筛选\n候选向量范围"]
+        B1 --> C1["仅在候选集中\n执行 ANN 搜索"]
+        C1 --> D1["Top-K 结果"]
+    end
+
+    subgraph Post["Post-filter（不推荐）"]
+        A2["查询（无 filter）"] --> B2["全量 ANN 搜索"]
+        B2 --> C2["Top-K 结果中\n应用 filter"]
+        C2 --> D2["可能不足 K 条"]
+    end
+
+    style Pre fill:#4A90D9,color:#fff
+    style Post fill:#FF6B6B,color:#fff</pre>
+        <p class="diagram-caption">Pre-filter 先缩小搜索范围再 ANN，保证结果数量。Post-filter 先搜全量再过滤，可能返回不足 K 条。</p>
+      </div>
+
+      <h4>Java：Spring 中的 Filter 构建</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.milvus.v2.service.vector.request.SearchReq;
+import io.milvus.v2.service.vector.request.data.FloatVec;
+
+@Service
+public class AclSearchService {
+    private final MilvusClientV2 client;
+
+    public SearchResp searchWithAcl(float[] queryVec, long tenantId,
+            List<String> depts, int maxClassification) {
+        String expr = String.format(
+            "tenant_id == %d and dept in %s and classification <= %d",
+            tenantId, depts.toString(), maxClassification
+        );
+        return client.search(SearchReq.builder()
+            .collectionName("corpassist_kb")
+            .data(List.of(new FloatVec(queryVec)))
+            .annsField("embedding")
+            .topK(5)
+            .expr(expr)
+            .searchParams(Map.of("ef", 64, "metric_type", "COSINE"))
+            .outputFields(List.of("id", "chunk_text", "dept"))
+            .build());
+    }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>后过滤：搜完 top-100 再过滤，filter 后可能只剩 2 条</li>
+            <li>filter 字段不建标量索引，每次全量扫描</li>
+            <li>filter 表达式拼错语法，M ilvus 报错</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Pre-filter：filter 在 ANN 前执行，保证结果数量</li>
+            <li>高频过滤字段建 inverted index</li>
+            <li>用参数化表达式构建 filter，避免拼接错误</li>
+          </ul>
+        </div>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>filter 表达式、租户隔离与配额</li>
-    <li>下一步：Elasticsearch 混合检索</li></ul></div>
+
+    <div class="section-block">
+      <h3>多租户隔离方案设计</h3>
+
+      <p><span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span> 是检索平台安全架构的核心。CorpAssist 采用 <strong>共享 Collection + Filter</strong> 模式，所有租户数据存储在同一 collection 中，通过 <code>tenant_id</code> 字段做 ACL。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>方案</th><th>优点</th><th>缺点</th><th>CorpAssist 选择</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Collection-per-tenant</td><td>物理隔离，资源独立</td><td>管理 N 个 collection，跨租户查询难</td><td>不推荐</td></tr>
+          <tr><td>Partition-per-tenant</td><td>Milvus 分区级隔离</td><td>分区数有限制</td><td>大租户可选</td></tr>
+          <tr><td><strong>Shared + Filter</strong></td><td>管理简单，一条 filter 隔离</td><td>filter 性能依赖标量索引</td><td><strong>推荐</strong></td></tr>
+        </tbody>
+      </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>共享 Collection + Filter 隔离架构</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph Collection["共享 Collection corpassist_kb"]
+        D1["doc: tenant=1, dept=HR"]
+        D2["doc: tenant=1, dept=Eng"]
+        D3["doc: tenant=2, dept=HR"]
+        D4["doc: tenant=2, dept=Finance"]
+    end
+
+    U1["用户: tenant=1, dept=HR"] -->|filter tenant=1 AND dept=HR| Collection
+    U2["用户: tenant=2, dept=Finance"] -->|filter tenant=2 AND dept=Finance| Collection
+
+    D1 -.->|仅可见| U1
+    D3 -.->|仅可见| U2</pre>
+        <p class="diagram-caption">共享 Collection 通过 filter 表达式实现逻辑隔离，管理开销最低。</p>
+      </div>
+
+      <h4>标量索引加速 Filter</h4>
+      <p>Milvus 支持为标量字段创建 inverted index。对 <code>tenant_id</code> 等高频过滤字段建索引后，filter 耗时从几十 ms 降至 1-2ms。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pymilvus import Collection, IndexType
+
+collection = Collection("corpassist_kb")
+
+# 为高频过滤字段建标量索引
+collection.create_index("tenant_id", {
+    "index_type": "INVERTED",
+    "params": {}
+})
+collection.create_index("dept", {
+    "index_type": "INVERTED",
+    "params": {}
+})
+print("Scalar indexes created for tenant_id and dept")</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：如果 100 个租户，其中 1 个大租户占了 80% 数据，filter 会影响搜索延迟吗？</summary>
+        <p>会。大租户 filter 后候选集占 80%，ANN 搜索范围大，延迟可能翻倍。这种情况下应考虑用 Partition-per-tenant 将大租户数据单独分区。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>配额管理与资源限制</h3>
+
+      <p><span class="term" data-term-id="quota" tabindex="0">quota</span> 机制防止单个租户消费过量资源。Milvus 支持在 Collection 和 Partition 级别配置配额。</p>
+
+      <h4>CorpAssist 配额策略</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>配额项</th><th>默认值</th><th>超限处理</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>QPS per tenant</td><td>100</td><td>429 Too Many Requests</td></tr>
+          <tr><td>存储容量 per tenant</td><td>10 GB</td><td>拒绝写入</td></tr>
+          <tr><td>Concurrent queries</td><td>20</td><td>排队等待</td></tr>
+          <tr><td>Top-K 上限</td><td>100</td><td>截断至 100</td></tr>
+        </tbody>
+      </tbody>
+      </table>
+
+      <h4>Python：应用层配额检查</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import time
+from collections import defaultdict
+
+class TenantQuotaManager:
+    def __init__(self, max_qps: int = 100):
+        self.max_qps = max_qps
+        self._counters = defaultdict(lambda: [0, 0.0])  # {tenant: [count, window_start]}
+
+    def check_and_consume(self, tenant_id: int) -> bool:
+        now = time.time()
+        count, window_start = self._counters[tenant_id]
+        if now - window_start > 1.0:  # new window
+            self._counters[tenant_id] = [1, now]
+            return True
+        if count >= self.max_qps:
+            return False
+        self._counters[tenant_id][0] += 1
+        return True
+
+quota = TenantQuotaManager(max_qps=100)
+if quota.check_and_consume(tenant_id=1):
+    # execute search
+    pass
+else:
+    raise Exception("429 Too Many Requests")</code></pre>
+      </div>
+
+      <h4>Java：Spring 配额拦截器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import com.google.common.util.concurrent.RateLimiter;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Component
+public class QuotaInterceptor {
+    private final ConcurrentHashMap<Long, RateLimiter> limiters = new ConcurrentHashMap<>();
+
+    public void checkQuota(long tenantId) {
+        RateLimiter limiter = limiters.computeIfAbsent(tenantId,
+            id -> RateLimiter.create(100.0)); // 100 QPS
+        if (!limiter.tryAcquire()) {
+            throw new RuntimeException("429 Too Many Requests - tenant " + tenantId);
+        }
+    }
+}</code></pre>
+      </div>
+
+      <h4>常见问题（FAQ）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>Pre-filter 会不会漏掉相关结果？</summary>
+          <div class="learn-faq-body">理论上会——如果 filter 后候选集太小，ANN 在这部分候选集中找 top-k，可能漏掉 filter 范围外的更相似结果。但这是业务需求决定的：ACL 过滤后的结果才是「应该看到的」。不是漏，是安全约束。</div>
+        </details>
+        <details>
+          <summary>标量索引和向量索引有什么区别？</summary>
+          <div class="learn-faq-body">标量索引（inverted index）用于加速 filter 条件过滤，类似 Elasticsearch 的倒排索引。向量索引（HNSW/IVF）用于加速 ANN 搜索。两者在 Milvus 中独立管理，互不干扰。</div>
+        </details>
+        <details>
+          <summary>Quota 超限时应该报错还是降级？</summary>
+          <div class="learn-faq-body">优先降级。CorpAssist 的做法是：返回缓存的热门结果，同时返回 429 的响应头。让调用方知道被限流但仍能获得部分服务。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Pre-filter 先行</strong>：Filter 在向量搜索前执行，保证结果数量和 ACL 安全。</li>
+        <li><strong>标量索引加速</strong>：高频过滤字段建 inverted index，避免全量扫描。</li>
+        <li><strong>共享 + Filter 隔离</strong>：一条 filter 实现多租户隔离，管理复杂度最低。</li>
+        <li><strong>Quota 保护</strong>：QPS、存储、并发三重配额防止单个租户影响全局。</li>
+        <li><strong>ACL 一致性</strong>：Python 写入时标注 tenant/dept，Java 查询时自动注入 filter。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="retrieval-vector-platform_basics03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="prefilter" /> 能解释 Pre-filter 和 Post-filter 的区别</label></li>
+          <li><label><input type="checkbox" data-id="expr" /> 能写出部门+密级组合的 filter 表达式</label></li>
+          <li><label><input type="checkbox" data-id="scalar-index" /> 知道如何为 tenant_id 创建标量索引</label></li>
+          <li><label><input type="checkbox" data-id="quota" /> 能设计应用层 QPS 配额方案</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Metadata Filter</td><td>在向量搜索前执行的标量条件</td></tr>
+                <tr><td>Pre-filter</td><td>先 filter 缩小范围再 ANN</td></tr>
+                <tr><td>Post-filter</td><td>先 ANN 搜再 filter，可能不足 K 条</td></tr>
+                <tr><td>标量索引</td><td>Inverted index，加速 filter 字段</td></tr>
+                <tr><td>Tenant Isolation</td><td>多租户数据隔离</td></tr>
+                <tr><td>Shared + Filter</td><td>推荐的多租户方案</td></tr>
+                <tr><td>Quota</td><td>单租户资源上限</td></tr>
+                <tr><td>RateLimiter</td><td>Guava 限流工具</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Post-filter 会导致什么问题？为什么生产环境必须用 Pre-filter？</li>
+              <li>共享 Collection 和 Collection-per-tenant 各有什么优缺点？你的选择是什么？</li>
+              <li>如何设计一个检索层的配额系统？限流和降级如何配合？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一章：<a href="#ch-basics-04-es-hybrid">Elasticsearch 混合检索</a></p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://milvus.io/docs" target="_blank" rel="noopener">Milvus 文档</a></li>
-    <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/knn-search.html" target="_blank" rel="noopener">Elasticsearch kNN</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/basics-03-metadata-lab/</code></li>
-  <li>记录检索/索引相关笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：元数据过滤与多租户</h4>
-  <p><code>demos/basics-03-metadata-lab/</code> — 写一条防止跨部门检索的 expr</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-basics-04-es-hybrid">Elasticsearch 混合检索</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://milvus.io/docs/boolean.md" target="_blank">Milvus Filter 表达式语法</a></li>
+      <li><a href="https://milvus.io/docs/index-scalar.md" target="_blank">标量索引</a></li>
+      <li><a href="https://milvus.io/docs/multi_tenancy.md" target="_blank">多租户最佳实践</a></li>
+      <li><a href="https://milvus.io/docs/resource_group.md" target="_blank">资源隔离与配额</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol class="steps steps-operate">
+      <li>写一条 filter 表达式实现部门+密级 ACL。</li>
+      <li>为 tenant_id 创建标量索引，测试 filter 后搜索延迟。</li>
+      <li>对比 Pre-filter 和 Post-filter 的返回条数差异。</li>
+      <li>实现 Java 版 RateLimiter 配额检查。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo</h4>
+      <p><code>demos/basics-03-metadata-lab/</code> — 验收：写一条防止跨部门检索的 filter 表达式。</p>
+    </div>
+  </div>
 </section>

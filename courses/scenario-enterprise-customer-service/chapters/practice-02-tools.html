@@ -3,43 +3,385 @@
   <button type="button" class="btn-mark-done" data-chapter="practice-02-tools" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：OpenAPI 工具、参数校验、幂等与双栈实现</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>客服核心能力在工具；幻觉改单必须用 API 真执行。</p></div>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：OpenAPI 工具定义、参数校验、幂等与双栈实现</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>客服 Bot 不能「假装已改单」——所有写操作必须通过工具层调用真实 ERP 接口。<span class="term" data-term-id="dual-stack-tool" tabindex="0">dual stack tool</span> 定义 Python Agent 侧的工具调用规范，Spring 侧负责实际 API 执行。本章通过 CorpAssist 的订单查询、退款申请、地址修改三个核心工具，手把手实现生产级工具调用。</p></div>
       <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S2 智能客服场景端到端落地</li>
-        <li>贯通意图路由、工具、转人工与评测</li>
-        <li>完成 Demo 与测验</li></ul></div>
+        <li>用 OpenAPI Schema 定义客服工具的输入输出结构</li>
+        <li>实现 <span class="term" data-term-id="param-validate" tabindex="0">参数校验</span>（Python Pydantic + Java Bean Validation）</li>
+        <li>设计 <span class="term" data-term-id="idempotent-tool" tabindex="0">幂等机制</span> 防止重复执行写操作</li>
+        <li>在 Spring AI Tools 中注册并调用真实 ERP 接口</li>
+      </ul></div>
+      <div class="notice"><strong>本章先记住 3 件事</strong><ul>
+        <li><strong>工具定义是契约</strong>：输入输出用 OpenAPI Schema 描述，LLM 按 Schema 生成参数，不得修改。</li>
+        <li><strong>所有写操作必须幂等</strong>：用 Idempotency-Key 防止重复退款或重复改址。</li>
+        <li><strong>双栈分工</strong>：Python 定义工具 Schema（给 LLM 看），Spring 执行工具调用（调 ERP）。</li>
+      </ul></div>
     </div>
-    <div class="section-block"><h3>OpenAPI 工具</h3><p>query_order、propose_refund、update_address。 关联：<span class="term" data-term-id="order-tool" tabindex="0">order tool</span>、<span class="term" data-term-id="refund-tool" tabindex="0">refund tool</span>。</p></div>
-    <div class="section-block"><h3>校验与幂等</h3><p>Pydantic 校验；Idempotency-Key。 关联：<span class="term" data-term-id="address-tool" tabindex="0">address tool</span>、<span class="term" data-term-id="openapi-tool" tabindex="0">openapi tool</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="order-tool" tabindex="0">order tool</span> · <span class="term" data-term-id="refund-tool" tabindex="0">refund tool</span> · <span class="term" data-term-id="address-tool" tabindex="0">address tool</span> · <span class="term" data-term-id="openapi-tool" tabindex="0">openapi tool</span> · <span class="term" data-term-id="param-validate" tabindex="0">param validate</span> · <span class="term" data-term-id="idempotent-tool" tabindex="0">idempotent tool</span> · <span class="term" data-term-id="dual-stack-tool" tabindex="0">dual stack tool</span> · <span class="term" data-term-id="erp-connector" tabindex="0">erp connector</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-java">@Tool(description = "查询订单状态")
-public String queryOrder(@P("订单号") String orderId) {
-  return orderClient.getStatus(orderId);
+
+    <div class="section-block">
+      <h3>三大核心工具定义</h3>
+      <p><span class="term" data-term-id="order-tool" tabindex="0">order tool</span>、<span class="term" data-term-id="refund-tool" tabindex="0">refund tool</span>、<span class="term" data-term-id="address-tool" tabindex="0">address tool</span> 是客服系统最常用的三个工具。每个工具的定义遵循 OpenAPI Schema 规范，确保 LLM 和代码层对工具的理解一致。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 工具调用场景</span>
+        用户说「帮我退掉 O2025001 这个订单，退款到原账户」——Agent 意图识别为 refund，进入 DST 收集订单号和退款方式，确认后调用 refund 工具。工具调用结果直接展示给用户（「订单 O2025001 已退款 ¥299，预计 3-5 个工作日到账」），LLM 不做转述。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>工具调用架构：双栈协作</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant A as Python Agent<br>LangGraph
+    participant T as Spring AI Tools<br>BFF
+    participant E as ERP 系统
+
+    U->>A: "退款 O2025001"
+    A->>A: DST 收集参数
+    A->>T: POST /tools/refund<br>{orderId,amount,idempotencyKey}
+    T->>T: 参数校验 + 幂等检查
+    T->>E: ERP refund API
+    E-->>T: 退款结果
+    T-->>A: 工具结果
+    A-->>U: "已退款 ¥299"</pre>
+        <p class="diagram-caption">双栈分工：Python Agent 负责工具选择和参数收集，Spring BFF 负责参数校验、幂等检查和 ERP 调用。</p>
+      </div>
+
+      <h4>Python 侧：工具 Schema 定义</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy">复制</button></div>
+<pre><code class="language-python"># tools_schema.py — CorpAssist 工具 Schema 定义
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+from datetime import datetime
+import hashlib
+
+class QueryOrderParams(BaseModel):
+    """查询订单工具参数"""
+    order_id: str = Field(..., description="订单号，格式 O+8位数字", pattern=r"^O\d{8}$")
+    customer_phone: Optional[str] = Field(None, description="客户手机号后4位用于验证")
+
+    @field_validator("order_id")
+    @classmethod
+    def validate_order_id(cls, v: str) -> str:
+        if not v.startswith("O") or len(v) != 9:
+            raise ValueError(f"订单号格式错误: {v}")
+        return v
+
+class RefundParams(BaseModel):
+    """退款工具参数（写操作，需幂等）"""
+    order_id: str = Field(..., description="订单号", pattern=r"^O\d{8}$")
+    amount: float = Field(..., ge=0.01, le=99999.99, description="退款金额，单位元")
+    reason: str = Field(..., max_length=500, description="退款原因")
+    idempotency_key: str = Field(default="", description="幂等键，由客户端生成")
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def auto_idempotency(cls, v: str, info) -> str:
+        if not v:
+            data = info.data
+            v = hashlib.md5(f"refund:{data.get('order_id')}:{data.get('amount')}:{datetime.now().date()}".encode()).hexdigest()[:16]
+        return v
+
+class AddressParams(BaseModel):
+    """修改地址工具参数（写操作，需幂等）"""
+    order_id: str = Field(..., pattern=r"^O\d{8}$")
+    new_address: str = Field(..., min_length=5, max_length=200)
+    contact_phone: str = Field(..., pattern=r"^1\d{10}$")
+    idempotency_key: str = Field(default="")
+
+# OpenAPI Schema 注册（给 LLM 用的工具定义）
+TOOLS_OPENAPI = {
+    "query_order": {
+        "name": "query_order",
+        "description": "查询订单状态、物流信息和金额。读操作，无需幂等。",
+        "parameters": QueryOrderParams.model_json_schema(),
+    },
+    "apply_refund": {
+        "name": "apply_refund",
+        "description": "提交退款申请。写操作，幂等（Idempotency-Key）。",
+        "parameters": RefundParams.model_json_schema(),
+    },
+    "update_address": {
+        "name": "update_address",
+        "description": "修改订单收货地址。写操作，幂等（Idempotency-Key）。",
+        "parameters": AddressParams.model_json_schema(),
+    },
 }</code></pre></div>
-      <div class="mermaid-wrap"><h5>工具调用：订单/退款/改址</h5>
-      <pre class="mermaid">flowchart LR
-  User --> Intent[意图路由]
-  Intent --> Agent[客服 Agent]
-  Agent --> Tools[订单工具]
-  Agent --> Human[人工坐席]</pre></div>
+
+      <h4>Java Spring 侧：工具注册与幂等检查</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy">复制</button></div>
+<pre><code class="language-java">// ErpTools.java — Spring AI Tools 注册
+@Component
+public class ErpTools {
+
+    private final ErpClient erpClient;
+    private final IdempotencyService idempotencyService;
+
+    public ErpTools(ErpClient erpClient, IdempotencyService idempotencyService) {
+        this.erpClient = erpClient;
+        this.idempotencyService = idempotencyService;
+    }
+
+    @Tool(description = "查询订单状态。读操作，无需幂等。")
+    public String queryOrder(@P("订单号，格式 O+8位数字") String orderId) {
+        Order order = erpClient.queryOrder(orderId);
+        return String.format("订单 %s：状态 %s，金额 ¥%.2f，物流 %s",
+            order.orderId(), order.status(), order.amount(), order.logistics());
+    }
+
+    @Tool(description = "提交退款申请。写操作，Idempotency-Key 防重复。")
+    public String applyRefund(
+            @P("订单号") String orderId,
+            @P("退款金额，单位元") double amount,
+            @P("退款原因") String reason,
+            @P("幂等键，防重复") String idempotencyKey) {
+
+        // 幂等检查
+        if (idempotencyService.exists(idempotencyKey)) {
+            return idempotencyService.getResult(idempotencyKey);
+        }
+
+        // 参数校验
+        if (amount &lt;= 0 || amount &gt; 99999.99) {
+            throw new IllegalArgumentException("退款金额超出范围");
+        }
+
+        // 调用 ERP
+        RefundResult result = erpClient.refund(orderId, amount, reason);
+        idempotencyService.save(idempotencyKey, result.toString());
+
+        return String.format("退款成功：订单 %s，金额 ¥%.2f，预计 %d 个工作日到账",
+            orderId, amount, result.expectedDays());
+    }
+
+    @Tool(description = "修改订单收货地址。写操作，Idempotency-Key 防重复。")
+    public String updateAddress(
+            @P("订单号") String orderId,
+            @P("新地址") String newAddress,
+            @P("联系电话") String contactPhone,
+            @P("幂等键") String idempotencyKey) {
+
+        if (idempotencyService.exists(idempotencyKey)) {
+            return idempotencyService.getResult(idempotencyKey);
+        }
+        if (newAddress.length() &lt; 5) {
+            throw new IllegalArgumentException("地址至少 5 个字符");
+        }
+        AddressResult result = erpClient.updateAddress(orderId, newAddress, contactPhone);
+        idempotencyService.save(idempotencyKey, result.toString());
+        return "地址修改成功：" + newAddress;
+    }
+}
+
+// IdempotencyService.java — 幂等服务
+@Service
+public class IdempotencyService {
+    private final RedisTemplate&lt;String, String&gt; redis;
+
+    public IdempotencyService(RedisTemplate&lt;String, String&gt; redis) {
+        this.redis = redis;
+    }
+
+    public boolean exists(String key) {
+        return Boolean.TRUE.equals(redis.hasKey("idempotent:" + key));
+    }
+
+    public String getResult(String key) {
+        return redis.opsForValue().get("idempotent:" + key);
+    }
+
+    public void save(String key, String result) {
+        redis.opsForValue().set("idempotent:" + key, result, Duration.ofDays(30));
+    }
+}</code></pre></div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>工具无 Schema 约束，LLM 可以生成任意字段</li>
+            <li>写操作无幂等检查，网络重试导致重复退款</li>
+            <li>参数无校验，非法输入直达 ERP</li>
+            <li>Python Agent 直调 ERP，绕过 Spring 网关</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>OpenAPI Schema 约束 LLM 的参数生成</li>
+            <li>Idempotency-Key 防重复，Redis 存储 30 天</li>
+            <li>Pydantic / Bean Validation 调用前校验</li>
+            <li>Python 定义 Schema，Spring 执行调用</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：幂等键应该由谁生成？Python Agent 还是 Spring BFF？</summary>
+        <p><strong>Spring BFF</strong>。Python Agent 可能因为网络问题重复发送请求，如果由 Python 生成幂等键，重复请求可能携带相同的幂等键，但首次请求的结果还未返回时第二次请求就到了——幂等检查无效。Spring 侧在入口处生成幂等键更可靠，或者由客户端生成但要求幂等键包含业务唯一标识（订单号+金额+日期）。</p>
+      </details>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>OpenAPI 工具、参数校验、幂等与双栈实现</li>
-    <li>下一步：客服 Agent 双栈实现</li></ul></div>
+
+    <div class="section-block">
+      <h3><span class="term" data-term-id="erp-connector" tabindex="0">ERP Connector</span>：适配层设计</h3>
+      <p>ERP Connector 是企业 ERP 系统的适配层，负责将 Spring AI Tools 的调用翻译为 ERP 的 API 请求。核心职责：协议转换（HTTP/SOAP/DB）、认证鉴权（API Key/OAuth）、错误处理（ERP 返回的业务异常映射为标准化错误码）。</p>
+
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy">复制</button></div>
+<pre><code class="language-java">// ErpConnector.java — ERP 适配层
+@Component
+public class ErpConnector {
+
+    private final RestTemplate restTemplate;
+
+    public ErpConnector(RestTemplate restTemplate) {
+        this.restTemplate = restTemplate;
+    }
+
+    public Order queryOrder(String orderId) {
+        try {
+            ResponseEntity&lt;Order&gt; resp = restTemplate.getForEntity(
+                "http://erp-system/api/orders/{id}", Order.class, orderId);
+            return resp.getBody();
+        } catch (HttpClientErrorException.NotFound e) {
+            throw new BusinessException("ORDER_NOT_FOUND", "订单不存在: " + orderId);
+        } catch (HttpServerErrorException e) {
+            throw new BusinessException("ERP_UNAVAILABLE", "ERP 系统繁忙，请稍后重试");
+        }
+    }
+
+    public RefundResult refund(String orderId, double amount, String reason) {
+        // 构建 ERP 请求
+        Map&lt;String, Object&gt; request = new HashMap&lt;&gt;();
+        request.put("orderId", orderId);
+        request.put("amount", amount);
+        request.put("reason", reason);
+        // 调用 ERP 退款接口
+        ResponseEntity&lt;RefundResult&gt; resp = restTemplate.postForEntity(
+            "http://erp-system/api/refunds", request, RefundResult.class);
+        return resp.getBody();
+    }
+}</code></pre></div>
+
+      <div class="notice">
+        <strong>ERP Connector 生产实践</strong>
+        <p>1) 所有 ERP 调用设置 5s 超时，超时后触发熔断（转人工而非重试）；2) ERP 返回的业务异常（如订单已退款、订单不存在）映射为标准化 BusinessException，LLM 不直接暴露错误细节；3) 审计日志记录每次工具调用的请求和响应，用于对账和排查。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>为什么工具调用结果要直接写回，不让 LLM 转述？</summary>
+          <div class="learn-faq-body">LLM 转述可能产生幻觉——ERP 返回「退款成功」但 LLM 可能说「退款被驳回」或编造不存在的详细信息。<span class="term" data-term-id="api-not-hallucinate" tabindex="0">api not hallucinate</span> 原则要求工具结果以模板格式化后直接展示给用户，LLM 仅负责选择模板和填充参数。</div>
+        </details>
+        <details>
+          <summary>幂等键的过期时间怎么设？</summary>
+          <div class="learn-faq-body">建议 30 天。Refund 幂等键的覆盖周期是退款处理的全流程（包括退款到账），通常 3-7 个工作日。30 天可以覆盖绝大多数退款周期。过期后幂等键失效，但历史记录在审计日志中可查。</div>
+        </details>
+        <details>
+          <summary>参数校验在哪一层做？Python 还是 Spring？</summary>
+          <div class="learn-faq-body"><strong>两层都做</strong>。Python 侧用 Pydantic 做快速校验，拦截明显不合法的参数（如金额负数），减少无效请求对 Spring 的冲击。Spring 侧做完整校验和业务规则校验（如退款金额不能超过订单金额），确保进入 ERP 的数据合规。</div>
+        </details>
+        <details>
+          <summary>工具调用如果超时了，应该重试吗？</summary>
+          <div class="learn-faq-body">写操作不自动重试，因为不确定 ERP 端是否已处理。应该返回超时错误给 Agent，Agent 标记订单为「待确认」状态，后续通过对账任务确认 ERP 状态。读操作可以有限重试（2 次，间隔 1s）。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>三大工具</strong>：查单（读）、退款（写）、改址（写），OpenAPI Schema 定义输入输出契约。</li>
+        <li><strong>参数校验</strong>：Python Pydantic（快速校验）+ Spring Bean Validation（完整校验），双层防御。</li>
+        <li><strong>幂等机制</strong>：Idempotency-Key + Redis 30 天存储，防止重复退款/改址。</li>
+        <li><strong>ERP Connector</strong>：适配层负责协议转换、超时熔断、审计日志。</li>
+        <li><strong>双栈分工</strong>：Python 定义工具 Schema 给 LLM，Spring 执行工具调 ERP。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <div class="learn-checklist" data-storage-key="scenario-enterprise-customer-service_practice02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="tool-schema" /> 能用 OpenAPI Schema 定义 query/refund/address 三个工具</label></li>
+          <li><label><input type="checkbox" data-id="idempotent" /> 能解释幂等键的生成策略和 Redis 存储设计</label></li>
+          <li><label><input type="checkbox" data-id="param-validate" /> 能写出 Pydantic + Bean Validation 双层参数校验</label></li>
+          <li><label><input type="checkbox" data-id="dual-tool" /> 能画出双栈工具调用的序列图</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet"><details><summary>本章速查卡</summary><div class="learn-cheat-body"><table>
+        <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+        <tbody>
+          <tr><td>Order Tool</td><td>查单工具，读操作，无需幂等</td></tr>
+          <tr><td>Refund Tool</td><td>退款工具，写操作，Idempotency-Key</td></tr>
+          <tr><td>Address Tool</td><td>改址工具，写操作，Idempotency-Key</td></tr>
+          <tr><td>OpenAPI Tool</td><td>用 OpenAPI Schema 定义工具契约</td></tr>
+          <tr><td>Param Validate</td><td>参数校验：Pydantic + Bean Validation 双层</td></tr>
+          <tr><td>Idempotent Tool</td><td>幂等键：Redis 存储，30 天过期</td></tr>
+          <tr><td>Dual Stack Tool</td><td>双栈：Python Schema + Spring 执行</td></tr>
+          <tr><td>ERP Connector</td><td>ERP 适配层：协议转换 + 认证 + 审计</td></tr>
+        </tbody>
+      </table></div></details></div>
+
+      <div class="learn-interview">
+        <details><summary>答辩 / 面试口述题</summary><div class="learn-interview-body"><ol>
+          <li>客服系统的写操作（退款、改址）如何防止重复执行？请描述幂等设计的具体方案，包括幂等键的生成、存储、检查流程。</li>
+          <li>为什么工具调用结果要强制写回而不让 LLM 转述？如果用户问「退款到哪了」LLM 需要引用工具结果但又不能编造，如何平衡？</li>
+          <li>Python Agent 和 Spring BFF 在工具调用上的分工是什么？为什么不让 Python 直调 ERP？</li>
+        </ol></div></details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-practice-03-agent-dual">客服 Agent 双栈实现</a> 将把路由和工具调用整合到完整的 Agent 中。</p>
+    </div>
   </div>
+
   <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a></li>
-    <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI Tools</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI Tools — 官方工具调用框架</a></li>
+    <li><a href="https://docs.pydantic.dev/latest/" target="_blank" rel="noopener">Pydantic — Python 数据校验库</a></li>
+    <li><a href="https://redis.io/docs/manual/patterns/idempotency/" target="_blank" rel="noopener">Redis 幂等模式 — 官方最佳实践</a></li>
   </ul></div>
+
   <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-02-tools-lab/</code></li>
-  <li>写一条 S2 客服落地笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：工具调用：订单/退款/改址</h4>
-  <p><code>demos/practice-02-tools-lab/</code> — 填工具矩阵</p></div></div>
+    <p class="steps-intro">用 CorpAssist 客服工具场景，完成工具定义和调用的完整实现（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>用 OpenAPI Schema 格式定义 refund 工具的输入输出结构。</li>
+      <li>在 Python 中用 Pydantic 实现参数校验，包括 order_id 格式校验和金额范围校验。</li>
+      <li>在 Spring 中用 @Tool 注解注册 query_order 和 apply_refund 两个工具。</li>
+      <li>实现 IdempotencyService，用 Redis 存储幂等键并设置 30 天过期。</li>
+      <li>端到端测试：Python Agent 调用 Spring 工具 → ERP 执行 → 结果返回用户。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+    <li>
+      <p class="judgment-stem">线上发现用户 A 的退款申请提交了 3 次，ERP 中出现了 3 条退款记录。请排查可能的原因和修复方案。</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p><strong>可能原因</strong>：1) 幂等键缺失或生成重复性不足；2) 幂等检查在 Redis 和 ERP 之间有空窗期；3) 客户端重试时未带相同幂等键。<strong>修复方案</strong>：1) 确保所有写操作工具强制要求 idempotency_key 参数；2) 幂等键包含 {业务类型}:{订单号}:{日期} 三元组；3) Redis 幂等检查 + 数据库唯一约束双保险。</p></div>
+        </details>
+      </div>
+    </li>
+    <li>
+      <p class="judgment-stem">ERP 接口响应时间从 200ms 突然变成 10s，客服系统应该怎么处理？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p><strong>应立即熔断</strong>：工具调用设置 5s 超时，超时后返回「系统繁忙」并触发转人工。不应无限等待或自动重试（写操作）。同时告警通知值班运维。ERP 恢复后自动解除熔断（半开状态检测）。</p></div>
+        </details>
+      </div>
+    </li>
+    </ol>
+    <div class="demo-box"><h4 class="demo-box-title">Demo：工具调用</h4><p>目录：<code>demos/practice-02-tools-lab/</code>。<strong>验收</strong>：POST /tools/refund 返回幂等结果，重复请求返回相同响应，非法参数返回 422 错误。</p></div>
+  </div>
+
   <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-03-agent-dual">客服 Agent 双栈实现</a></li>
+    <li><strong>下一章</strong>：<a href="#ch-practice-03-agent-dual">客服 Agent 双栈实现</a></li>
+    <li><a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/idempotency" target="_blank" rel="noopener">Azure 架构中心 — 幂等模式指南</a></li>
+    <li><a href="https://spec.openapis.org/oas/v3.1.0" target="_blank" rel="noopener">OpenAPI Specification 3.1 — Schema 规范</a></li>
   </ul></div>
 </section>

@@ -17,6 +17,7 @@
           <li>输出 L1/L2 <span class="term" data-term-id="arch-diagram" tabindex="0">arch diagram</span>，标注数据流与信任边界</li>
           <li>写清 <span class="term" data-term-id="dual-stack-split" tabindex="0">dual stack split</span>：<span class="term" data-term-id="python-role" tabindex="0">python role</span> vs <span class="term" data-term-id="spring-role" tabindex="0">spring role</span></li>
           <li>发布 <span class="term" data-term-id="openapi-contract" tabindex="0">openapi contract</span> 作为唯一 <span class="term" data-term-id="integration-point" tabindex="0">integration point</span></li>
+          <li>编写 ADR 记录关键架构决策</li>
         </ul>
       </div>
       <div class="notice">
@@ -33,112 +34,301 @@
       <h3>架构图</h3>
       <aside class="learn-scenario" aria-label="业务情境">
         <span class="learn-scenario-title">CorpAssist · 方案评审会（20 分钟）</span>
-        客户 IT 问：「模型调用走哪条网络？OA 文档如何进索引？」你需要用架构图 30 秒内指清边界，而不是现场改代码。
+        客户 IT 问：「模型调用走哪条网络？OA 文档如何进索引？」你需要用架构图 30 秒内指清边界，而不是现场改代码。方案评审有 15 分钟提问环节，图不清楚 = 丢分。
       </aside>
-      <p>企业级方案图建议两层：<strong>L1</strong> 用户—BFF—AI 服务—知识源；<strong>L2</strong> 部署单元、VPC、密钥与日志落点。</p>
+
+      <p>企业级方案图建议两层：<strong>L1</strong> 用户—BFF—AI 服务—知识源；<strong>L2</strong> 部署单元、VPC、密钥与日志落点。两图配合回答 80% 的评审问题。</p>
+
       <table class="outline-table">
-        <thead><tr><th>图层</th><th>必画元素</th><th>CorpAssist 示例</th></tr></thead>
+        <thead><tr><th>图层</th><th>必画元素</th><th>CorpAssist 示例</th><th>常见遗漏</th></tr></thead>
         <tbody>
-          <tr><td>信任边界</td><td>DMZ / 内网 / 模型 API</td><td>门户经 Spring BFF；Python 仅内网</td></tr>
-          <tr><td>数据流</td><td>采集→解析→索引→检索</td><td>OA 增量 Job + ACL 元数据</td></tr>
-          <tr><td>可观测</td><td>traceId 贯穿</td><td>BFF 生成 trace，Python 回传 span</td></tr>
+          <tr><td>信任边界</td><td>DMZ / 内网 / 模型 API</td><td>门户经 Spring BFF；Python 仅内网</td><td>漏画厂商 API 的信任域</td></tr>
+          <tr><td>数据流</td><td>采集→解析→索引→检索</td><td>OA 增量 Job + ACL 元数据</td><td>只画请求流不画数据流</td></tr>
+          <tr><td>可观测</td><td>traceId 贯穿</td><td>BFF 生成 trace，Python 回传 span</td><td>日志采集与告警链路缺失</td></tr>
+          <tr><td>安全</td><td>密钥管理、网络隔离</td><td>API Key 在 BFF 侧托管</td><td>密钥存储方式不标注</td></tr>
         </tbody>
       </table>
+
       <div class="mermaid-wrap">
-        <h5>CorpAssist L1 参考</h5>
+        <h5>CorpAssist L1 架构参考</h5>
         <pre class="mermaid">flowchart LR
-  User[业务用户] --> Portal[企业门户]
-  Portal --> BFF[Spring BFF]
-  BFF --> RAG[Python RAG]
-  RAG --> VDB[(向量库)]
-  RAG --> LLM[通义 API]
-  BFF --> SSO[企业 SSO]</pre>
-        <p class="diagram-caption">评审先讲 L1，再展开 L2 防火墙与 <a href="#ch-basics-03-vendor">厂商选型</a> 依赖。</p>
+          User[业务用户] --> Portal[企业门户]
+          Portal --> BFF[Spring BFF]
+          BFF --> RAG[Python RAG 服务]
+          RAG --> VDB[(向量库: Milvus)]
+          RAG --> LLM[通义 API]
+          BFF --> SSO[企业 SSO / LDAP]
+          BFF --> Log[审计日志]
+          subgraph DMZ[DMZ]
+            Portal
+            BFF
+          end
+          subgraph Internal[内网]
+            RAG
+            VDB
+          end</pre>
+        <p class="diagram-caption">评审先讲 L1：用户→门户→BFF→RAG→模型/向量库。再展开 L2 具体部署。信任边界用虚线框标注。</p>
       </div>
+
+      <h4>L2 部署图关键元素</h4>
+      <ul>
+        <li><strong>BFF</strong>：2 节点 + 负载均衡 + Actuator 健康检查；JVM heap 4G；端口 8080</li>
+        <li><strong>Python RAG</strong>：2 节点 + Gunicorn + 内网 LB；端口 50051（gRPC）</li>
+        <li><strong>向量库</strong>：Milvus 2 副本 + 对象存储挂载</li>
+        <li><strong>监控</strong>：Grafana + Prometheus + 结构化日志（JSON 格式）</li>
+        <li><strong>网关</strong>：Kong/APISIX + 限流 + 熔断</li>
+      </ul>
+
+      <h4>Architecture Decision Records (ADR) 模板</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown"># ADR-001: 选择双栈架构（Spring BFF + Python RAG）
+
+## 背景
+CorpAssist 需要同时满足：企业鉴权/合规（Java 生态优势）
+与 AI 模型编排（Python 生态优势）。
+
+## 决策
+采用双栈：Spring Boot BFF + Python FastAPI RAG，
+通过 OpenAPI REST 通信。
+
+## 备选方案
+1. 全 Python 单体 — 鉴权与审计不满足企业要求
+2. 全 Java 单体 — AI 框架集成周期长
+
+## 影响
+- 正：各栈发挥专长，独立发布
+- 负：需要维护两套 CI/CD，联调成本增加
+
+## 状态
+已批准</pre></code>
+      </div>
+
       <details class="learn-micro-check">
         <summary>先想 10 秒：客户要求「Python 直连公网门户」，图上应改哪条边？</summary>
-        <p>应改为<strong>仅 BFF 对门户暴露</strong>，Python 在内网；否则 Spring 鉴权与审计链断裂。</p>
+        <p>应改为<strong>仅 BFF 对门户暴露</strong>，Python 在内网；否则 Spring 鉴权与审计链断裂。如果客户坚持，更新 risk register 标注「鉴权链路绕过 BFF」为高风险。</p>
       </details>
     </div>
 
     <div class="section-block">
       <h3>分工</h3>
-      <p><span class="term" data-term-id="dual-stack-split" tabindex="0">dual stack split</span> 按<strong>状态与责任</strong>切分，不是「谁更懂 AI」。</p>
+      <p><span class="term" data-term-id="dual-stack-split" tabindex="0">dual stack split</span> 按<strong>状态与责任</strong>切分，不是「谁更懂 AI」。核心原则：谁拥有这份数据的生命周期，谁就负责维护。</p>
+
       <table class="outline-table learn-decision-table">
-        <thead><tr><th>能力域</th><th>Python</th><th>Spring BFF</th></tr></thead>
+        <thead><tr><th>能力域</th><th>Python（算法）</th><th>Spring BFF（Java）</th></tr></thead>
         <tbody>
-          <tr><td>文档解析与切块</td><td>✓ 拥有</td><td>触发 Job、读状态</td></tr>
-          <tr><td>RAG / rerank</td><td>✓ 拥有</td><td>聚合响应、限流</td></tr>
-          <tr><td>SSO / 部门 ACL</td><td>消费 filter</td><td>✓ 签发 claims</td></tr>
-          <tr><td>SSE / 会话</td><td>流式片段</td><td>✓ 连接管理</td></tr>
-          <tr><td>Prompt 版本</td><td>✓ 单一事实源</td><td>禁止第二套副本</td></tr>
+          <tr><td>文档解析与切块</td><td>✓ 拥有：解析 Pipeline、Chunk 策略、向量化</td><td>触发 Job、读状态</td></tr>
+          <tr><td>RAG 检索 / rerank</td><td>✓ 拥有：混合检索 + 重排序 + 引用生成</td><td>聚合响应、限流、熔断</td></tr>
+          <tr><td>SSO / 部门 ACL</td><td>消费 BFF 下发的 filter scope</td><td>✓ 签发 claims + ACL 矩阵</td></tr>
+          <tr><td>SSE / 会话管理</td><td>流式生成文本片段</td><td>✓ 连接管理 + 会话持久化</td></tr>
+          <tr><td>Prompt 版本</td><td>✓ 单一事实源</td><td>禁止第二套副本，只传 scene_id</td></tr>
+          <tr><td>审计日志</td><td>输出结构化日志</td><td>✓ 汇聚 + 持久化 + 合规查询</td></tr>
         </tbody>
       </table>
+
       <div class="role-cards">
-        <article class="role-card"><span class="role-card-title">算法负责人</span><p class="role-card-desc">对引用率、评测集负责；不单独背合同 SLA 口径。</p></article>
-        <article class="role-card"><span class="role-card-title">Java 架构</span><p class="role-card-desc">对鉴权、熔断、对外 P95 负责。</p></article>
-        <article class="role-card"><span class="role-card-title">项目经理</span><p class="role-card-desc">RACI 与 solution doc 版本对齐 discovery 纪要。</p></article>
+        <article class="role-card"><span class="role-card-title">算法负责人（Python）</span><p class="role-card-desc">对引用率、评测集、索引质量负责；不单独背合同 SLA 口径。</p></article>
+        <article class="role-card"><span class="role-card-title">Java 架构（Spring）</span><p class="role-card-desc">对鉴权、熔断、对外 P95、合规审计负责。</p></article>
+        <article class="role-card"><span class="role-card-title">项目经理</span><p class="role-card-desc">RACI 与 solution doc 版本对齐 discovery 纪要；维护双方联调计划。</p></article>
       </div>
+
       <div class="learn-compare">
         <div class="learn-compare-col learn-compare-bad">
           <span class="learn-compare-heading">不推荐</span>
           <ul>
             <li>Python 与 Spring 各维护一套 Prompt</li>
-            <li>BFF 直接调 DashScope 绕过 RAG</li>
+            <li>BFF 直接调 DashScope 绕过 RAG 服务</li>
+            <li>Java 团队自己写一个 Embedding 客户端</li>
+            <li>两边都能改检索参数，无统一配置</li>
           </ul>
         </div>
         <div class="learn-compare-col learn-compare-good">
           <span class="learn-compare-heading">推荐</span>
           <ul>
-            <li>契约规定 /v1/chat 仅 BFF→Python</li>
+            <li>契约规定 /v1/chat（REST）仅 BFF→Python</li>
             <li>Prompt 变更走 PR + golden 回归</li>
+            <li>检索参数以 Python 配置为准</li>
+            <li>统一配置中心（Apollo / Nacos）</li>
           </ul>
         </div>
       </div>
+
+      <h4>RACI 分工矩阵（节选）</h4>
+      <table class="outline-table">
+        <thead><tr><th>任务</th><th>Python</th><th>Spring</th><th>PM</th><th>客户 IT</th></tr></thead>
+        <tbody>
+          <tr><td>系统架构设计</td><td>C</td><td>R/A</td><td>C</td><td>I</td></tr>
+          <tr><td>RAG 检索质量</td><td>R/A</td><td>C</td><td>I</td><td>I</td></tr>
+          <tr><td>鉴权与安全</td><td>C</td><td>R/A</td><td>C</td><td>C</td></tr>
+          <tr><td>验收评测</td><td>R</td><td>C</td><td>A</td><td>I</td></tr>
+        </tbody>
+      </table>
+      <p class="table-note">R=执行, A=批准, C=咨询, I=知会</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么 BFF 不能直接调模型 API 跳过 RAG 服务？</summary>
+        <p>因为 ACL 过滤、检索引用生成、Prompt 组装都在 Python RAG 服务中。BFF 直接调模型会绕过 ACL 与引用链路，导致合规风险和不一致的回答格式。</p>
+      </details>
     </div>
 
     <div class="section-block">
       <h3>接口</h3>
-      <p><span class="term" data-term-id="openapi-contract" tabindex="0">openapi contract</span> 是双栈主 <span class="term" data-term-id="integration-point" tabindex="0">integration point</span>。PoC 前建议冻结 <code>/v1/chat</code>、<code>/v1/ingest/status</code>、<code>/v1/eval/run</code>。</p>
+      <p><span class="term" data-term-id="openapi-contract" tabindex="0">openapi contract</span> 是双栈主 <span class="term" data-term-id="integration-point" tabindex="0">integration point</span>。PoC 前建议冻结 <code>/v1/chat</code>、<code>/v1/ingest/status</code>、<code>/v1/eval/run</code> 三条核心路径。</p>
+
+      <h4>三条核心路径说明</h4>
+      <table class="outline-table">
+        <thead><tr><th>路径</th><th>方法</th><th>用途</th><th>调用方</th><th>生产者</th></tr></thead>
+        <tbody>
+          <tr><td><code>/v1/chat</code></td><td>POST</td><td>问答请求（带 ACL scope）</td><td>BFF</td><td>Python RAG</td></tr>
+          <tr><td><code>/v1/ingest/status</code></td><td>GET</td><td>查询索引任务状态</td><td>BFF</td><td>Python Index Worker</td></tr>
+          <tr><td><code>/v1/eval/run</code></td><td>POST</td><td>触发离线评测</td><td>CI/CD</td><td>Python Eval 服务</td></tr>
+        </tbody>
+      </table>
+
       <div class="code-block">
         <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
         <pre><code class="language-yaml">openapi: 3.0.3
+info:
+  title: CorpAssist RAG API
+  version: "1.0.0"
+  description: Python RAG 服务接口（仅内网 BFF 调用）
+servers:
+  - url: http://rag-service.internal:50051/api/v1
 paths:
   /v1/chat:
     post:
-      summary: CorpAssist 问答（BFF 调用）
+      summary: CorpAssist 问答（BFF 调用，内网）
       parameters:
         - in: header
           name: X-Trace-Id
           required: true
+          schema: { type: string }
+        - in: header
+          name: X-Acl-Scope
+          required: true
+          schema: { type: string }
       requestBody:
+        required: true
         content:
           application/json:
             schema:
+              type: object
+              required: [query, top_k]
               properties:
-                query: { type: string }
-                deptId: { type: string }
-                citationsRequired: { type: boolean, default: true }</code></pre>
+                query:
+                  type: string
+                  maxLength: 2000
+                  description: "用户输入（已脱敏）"
+                top_k:
+                  type: integer
+                  minimum: 1
+                  maximum: 20
+                  default: 5
+                scene_id:
+                  type: string
+                  enum: [s1_rag, s2_cs, s3_agent]
+                  description: "场景标识，BFF 传 scene_id，Python 端加载对应 Prompt 版本"
+                citations_required:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: 成功响应 + 引用列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  answer: { type: string }
+                  citations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        doc_id: { type: string }
+                        score: { type: number }
+                        snippet: { type: string }
+                  trace_id: { type: string }
+        "422":
+          description: 参数校验失败
+        "504":
+          description: 模型 API 超时</pre></code>
       </div>
+
+      <h4>契约测试门禁</h4>
       <ul>
         <li><strong>版本</strong>：URL 前缀 <code>/v1</code>；破坏性变更升 <code>v2</code>。</li>
         <li><strong>错误码</strong>：4xx 可重试策略；5xx 触发 BFF 降级话术。</li>
-        <li><strong>门禁</strong>：consumer/provider 契约测试进 CI。</li>
+        <li><strong>门禁</strong>：consumer/provider 契约测试进 CI；任意 breaking change 阻断发布。</li>
+        <li><strong>字段兼容性</strong>：新增字段用 optional + default；不移除已有字段。</li>
       </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># Spring Cloud Contract 示例（consumer 端）
+contracts:
+  - name: "should_return_chat_response"
+    request:
+      method: POST
+      url: /api/v1/chat
+      headers:
+        X-Trace-Id: "test-trace-001"
+        X-Acl-Scope: "hr-department"
+      body:
+        query: "年假天数"
+        top_k: 5
+        scene_id: "s1_rag"
+    response:
+      status: 200
+      body:
+        answer: "根据公司制度..."
+        citations:
+          - doc_id: "FIN-2025-001"
+            score: 0.92
+            snippet: "年假标准..."</pre></code>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无版本号，直接改生产接口</li>
+            <li>Java 和 Python 各自写文档，不一致</li>
+            <li>无 trace_id 贯穿，排障靠猜</li>
+            <li>错误码混用，Java 5xx 当 Python 4xx</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>OpenAPI 统一管理 + 版本号</li>
+            <li>trace_id 贯穿所有服务</li>
+            <li>契约测试（contract testing）进 CI</li>
+            <li>错误码与服务端 ProblemDetail 对齐</li>
+          </ul>
+        </div>
+      </div>
+
       <div class="learn-faq">
         <details><summary>客户要求「接口文档放二期」？</summary>
-          <div class="learn-faq-body">PoC 可简化为 3 路径 Markdown 附件，但<strong>字段名与验收指标</strong>不得口头漂移，否则 <a href="#ch-practice-03-acceptance">验收与 SLA</a> 无法对齐。</div>
+          <div class="learn-faq-body">PoC 可简化为 3 路径 Markdown 附件，但<strong>字段名与验收指标</strong>不得口头漂移，否则 <a href="#ch-practice-03-acceptance">验收与 SLA</a> 无法对齐。建议将核心 API 的字段定义写入合同附件。</div>
+        </details>
+        <details><summary>Python RAG 接口需要鉴权吗？</summary>
+          <div class="learn-faq-body">需要。Python RAG 服务在内网也应做服务间鉴权——推荐 mTLS 或 service token（BFF 签发）。不鉴权的内网接口是常见安全隐患。</div>
+        </details>
+        <details><summary>变更 OpenAPI 审批流程是什么？</summary>
+          <div class="learn-faq-body">OpenAPI 变更需要双方架构师审批：① 在 Git 上发起 PR ② 标注 breaking/ non-breaking ③ Java + Python 架构师 approve ④ 更新契约测试 ⑤ 同步更新 solution doc。</div>
         </details>
       </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
-      <p class="chapter-conclusions-lead">三条对应上文：架构图、分工、接口。</p>
+      <p class="chapter-conclusions-lead">三条对应上文：架构图、分工、接口——three artifacts that define the delivery baseline。</p>
       <ul class="chapter-conclusions-list">
         <li><strong>架构图</strong>：L1 业务视图 + L2 部署；标注 SSO、向量库、通义与审计链。</li>
-        <li><strong>分工</strong>：Python 管道与评测；Spring 编排、鉴权、对外 SLA。</li>
-        <li><strong>接口</strong>：OpenAPI 冻结路径；契约测试先于大规模联调。</li>
+        <li><strong>分工</strong>：Python 管道与评测；Spring 编排、鉴权、对外 SLA。RACI 矩阵明确责任。</li>
+        <li><strong>接口</strong>：OpenAPI 冻结 3 条路径；契约测试先于大规模联调。</li>
       </ul>
     </div>
 
@@ -148,38 +338,43 @@ paths:
         <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
         <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
         <ul>
-          <li><label><input type="checkbox" data-id="l1" /> 能口述 CorpAssist L1 五节点数据流</label></li>
+          <li><label><input type="checkbox" data-id="l1" /> 能口述 CorpAssist L1 五节点数据流及信任边界</label></li>
           <li><label><input type="checkbox" data-id="raci" /> 能填分工表「谁拥有」各 3 项</label></li>
-          <li><label><input type="checkbox" data-id="api" /> 能列出 OpenAPI 三个必选路径</label></li>
-          <li><label><input type="checkbox" data-id="lab" /> 已完成 demos/basics-02-architecture-doc-lab</label></li>
-          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+          <li><label><input type="checkbox" data-id="api" /> 能列出 OpenAPI 三个必选路径及核心字段</label></li>
+          <li><label><input type="checkbox" data-id="contract" /> 能说明契约测试在 CI 中的作用</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
         </ul>
       </div>
+
       <div class="learn-cheat-sheet">
         <details><summary>本章速查卡</summary>
           <div class="learn-cheat-body">
             <table>
               <thead><tr><th>要点</th><th>记住一句</th></tr></thead>
               <tbody>
-                <tr><td>L1 图</td><td>用户→BFF→RAG→库/模型</td></tr>
-                <tr><td>分工</td><td>Python 管道，Spring 治理</td></tr>
-                <tr><td>契约</td><td>OpenAPI + trace + 版本</td></tr>
+                <tr><td>L1 图</td><td>用户→BFF→RAG→库/模型；信任边界标注</td></tr>
+                <tr><td>分工</td><td>Python 管道，Spring 治理；RACI 矩阵</td></tr>
+                <tr><td>契约</td><td>OpenAPI + trace_id + 版本；contract test</td></tr>
+                <tr><td>ADR</td><td>架构决策记录；背景→决策→备选→影响</td></tr>
               </tbody>
             </table>
           </div>
         </details>
       </div>
+
       <div class="learn-interview">
         <details><summary>答辩 / 面试口述题</summary>
           <div class="learn-interview-body">
             <ol>
               <li>（场景）为什么 CorpAssist 不采用「全 Python 单体」？</li>
               <li>（判断）BFF 直接调 LLM 跳过 RAG 是否可接受？</li>
-              <li>契约测试应在 PoC 前还是试点前冻结？</li>
+              <li>契约测试应在 PoC 前还是试点前冻结？为什么？</li>
+              <li>如果 Java 和 Python 团队对接口字段有争议，如何裁决？</li>
             </ol>
           </div>
         </details>
       </div>
+
       <p class="chapter-review-next">下一步：完成架构图 Lab 与测验；下一章 <a href="#ch-basics-03-vendor">厂商与国产化选型</a>。</p>
     </div>
   </div>
@@ -190,6 +385,7 @@ paths:
       <li><a href="https://swagger.io/specification/" target="_blank" rel="noopener">OpenAPI Specification 3.x</a></li>
       <li><a href="https://spring.io/projects/spring-ai" target="_blank" rel="noopener">Spring AI — BFF 集成参考</a></li>
       <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">通义 Model Studio</a></li>
+      <li><a href="https://cloud.spring.io/spring-cloud-contract/" target="_blank" rel="noopener">Spring Cloud Contract — 契约测试框架</a></li>
     </ul>
   </div>
 
@@ -198,25 +394,25 @@ paths:
     <p class="steps-intro">补全 L1 架构图、分工表与 openapi.yaml 骨架（约 30 分钟），产出在 <code>demos/basics-02-architecture-doc-lab/</code>。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>在 <code>demos/basics-02-architecture-doc-lab/arch-l1.mmd</code> 画用户→BFF→RAG→向量库→通义。</li>
-      <li>复制分工表为 <code>raci.md</code>，标 Python/Spring 各 4 项「拥有」。</li>
-      <li>编写 <code>openapi.yaml</code> 含 /v1/chat 的 deptId、citationsRequired。</li>
-      <li>（可选）1 分钟口述为何 integration point 只有 OpenAPI。</li>
+      <li>在 <code>demos/basics-02-architecture-doc-lab/arch-l1.mmd</code> 画用户→BFF→RAG→向量库→通义，标注信任边界。</li>
+      <li>复制分工表为 <code>raci.md</code>，标 Python/Spring 各 4 项「拥有」并扩展 RACI 列。</li>
+      <li>编写 <code>openapi.yaml</code> 含 /v1/chat 的 deptId、citationsRequired 等必填字段。</li>
+      <li>写一条 ADR：记录「选择双栈架构」的决策背景与替代方案。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
       <li>
         <p class="judgment-stem">（判断）PoC 阶段 Spring 与 Python 各维护 system prompt。应？A) 允许 B) 禁止，单一事实源在 Python C) 仅 Spring 维护</p>
-        <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p><strong>B</strong>。Prompt 分叉导致评测与生产不一致；BFF 只传 sceneId。</p></div></details></div>
+        <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p><strong>B</strong>。Prompt 分叉导致评测与生产不一致；BFF 只传 scene_id。</p></div></details></div>
       </li>
       <li>
-        <p class="judgment-stem">（场景）联调顺序：① 架构图 ② 改模型 ③ 定 OpenAPI ④ 加日志。最应先？</p>
-        <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p><strong>① → ③</strong>。无图与契约则联调无法纳入 solution doc 版本。</p></div></details></div>
+        <p class="judgment-stem">（场景）联调顺序：① 架构图 ② 改模型 ③ 定 OpenAPI ④ 加日志。最应先做？</p>
+        <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p><strong>① → ③</strong>。无图与契约则联调无法纳入 solution doc 版本。改模型（②）属于后续优化。</p></div></details></div>
       </li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：双栈方案设计文档实验室</h4>
-      <p>目录：<code>demos/basics-02-architecture-doc-lab/</code>。<strong>验收</strong>：<code>arch-l1.mmd</code>、<code>raci.md</code>、<code>openapi.yaml</code> 齐全且含 trace/ACL；README 可勾选。</p>
+      <p>目录：<code>demos/basics-02-architecture-doc-lab/</code>。<strong>验收</strong>：<code>arch-l1.mmd</code>、<code>raci.md</code>、<code>openapi.yaml</code> 齐全且含 trace/ACL + ADR。</p>
     </div>
   </div>
 

@@ -3,43 +3,373 @@
   <button type="button" class="btn-mark-done" data-chapter="advanced-01-reliability" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产化与答辩</strong> · 能力：工具失败、超时、降级与审计</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>办公 Agent 上线必须可靠；工具挂了就降级+转人工。</p></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产化与答辩</strong> · 能力：设计工具重试与熔断、超时控制、降级策略与审计追踪</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>办公 Agent 上线后，工具随时可能挂——ERP 系统维护、邮件服务超时、日历 API 限流。没有可靠性设计的 Agent 就是「天气好的时候能用」的玩具。本章用 CorpAssist 生产故障场景讲透 <span class="term" data-term-id="reliability-s3" tabindex="0">reliability s3</span>。</p></div>
       <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S3 办公自动化场景端到端落地</li>
-        <li>贯通 LangGraph 与 Spring AI Alibaba 双栈 Agent</li>
-        <li>完成 Demo 与测验</li></ul></div>
+        <li>设计工具调用的重试与熔断策略</li>
+        <li>配置 Agent 级别和工具级别的超时控制</li>
+        <li>实现降级策略和人工兜底</li>
+        <li>建立 Agent 完整审计追踪</li>
+      </ul></div>
     </div>
-    <div class="section-block"><h3>重试与熔断</h3><p>工具 3 次重试；熔断固定话术。 关联：<span class="term" data-term-id="tool-retry" tabindex="0">tool retry</span>、<span class="term" data-term-id="circuit-agent" tabindex="0">circuit agent</span>。</p></div>
-    <div class="section-block"><h3>审计</h3><p>每步 tool I/O 留痕。 关联：<span class="term" data-term-id="human-fallback" tabindex="0">human fallback</span>、<span class="term" data-term-id="timeout-tool" tabindex="0">timeout tool</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="tool-retry" tabindex="0">tool retry</span> · <span class="term" data-term-id="circuit-agent" tabindex="0">circuit agent</span> · <span class="term" data-term-id="human-fallback" tabindex="0">human fallback</span> · <span class="term" data-term-id="timeout-tool" tabindex="0">timeout tool</span> · <span class="term" data-term-id="audit-agent" tabindex="0">audit agent</span> · <span class="term" data-term-id="degrade-agent" tabindex="0">degrade agent</span> · <span class="term" data-term-id="reliability-s3" tabindex="0">reliability s3</span> · <span class="term" data-term-id="ops-agent" tabindex="0">ops agent</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-yaml">reliability:
-  tool_retry: 3
-  step_timeout_sec: 30
-  fallback: human_queue
-  audit: full_tool_io</code></pre></div>
-      <div class="mermaid-wrap"><h5>可靠性：重试、熔断与人工兜底</h5>
-      <pre class="mermaid">flowchart LR
-  User --> Agent[办公 Agent]
-  Agent --> Tools[MCP 工具]
-  Agent --> Human[人工审批]</pre></div>
+
+    <div class="section-block"><h3>重试与熔断策略</h3>
+    <p><span class="term" data-term-id="tool-retry" tabindex="0">tool retry</span> 是可靠性的第一道防线。<span class="term" data-term-id="circuit-agent" tabindex="0">circuit agent</span> 采用熔断模式，防止无效重试打爆下游。</p>
+
+    <div class="mermaid-wrap"><h5>Agent 熔断机制</h5>
+    <pre class="mermaid">flowchart TB
+      Call[工具调用] --> State{熔断状态}
+      State -->|CLOSED\n正常| Execute[执行调用]
+      Execute -->|成功| Return[返回结果]
+      Execute -->|失败 3 次| Open[OPEN\n熔断打开]
+      Open -->|直接拒绝| Fallback[降级策略]
+      Open -->|超时后| HalfOpen[HALF_OPEN\n半开探测]
+      HalfOpen -->|探测成功| Close[CLOSE\n恢复]
+      HalfOpen -->|探测失败| Open
+
+      subgraph Config[熔断配置]
+        Threshold[阈值: 3 次失败]
+        Timeout[超时: 30s]
+        Reset[重置: 60s]
+      end</pre>
+      <p class="diagram-caption"><span class="term" data-term-id="circuit-agent" tabindex="0">circuit agent</span> 状态机：Closed → Open → Half-Open → Closed。</p>
     </div>
+
+    <h4>Python：熔断实现</h4>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># circuit_breaker.py
+import time
+from enum import Enum
+from typing import Callable, Any
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class CircuitBreaker:
+    def __init__(self, threshold: int = 3,
+                 reset_timeout: int = 60):
+        self.state = CircuitState.CLOSED
+        self.threshold = threshold
+        self.reset_timeout = reset_timeout
+        self.fail_count = 0
+        self.last_fail_time = 0
+
+    def call(self, func: Callable, *args, **kwargs) -> Any:
+        if self.state == CircuitState.OPEN:
+            if time.time() - self.last_fail_time > self.reset_timeout:
+                self.state = CircuitState.HALF_OPEN
+            else:
+                raise CircuitBreakerOpenError("熔断已打开")
+
+        try:
+            result = func(*args, **kwargs)
+            if self.state == CircuitState.HALF_OPEN:
+                self.state = CircuitState.CLOSED
+                self.fail_count = 0
+            return result
+        except Exception as e:
+            self.fail_count += 1
+            self.last_fail_time = time.time()
+            if self.fail_count >= self.threshold:
+                self.state = CircuitState.OPEN
+            raise e
+
+# 使用示例
+email_breaker = CircuitBreaker(threshold=3, reset_timeout=60)
+
+def send_email_with_breaker(to, subject, body):
+    try:
+        return email_breaker.call(email_api.send, to, subject, body)
+    except CircuitBreakerOpenError:
+        return {"error": "邮件服务熔断", "fallback": "已存入延迟队列"}</pre></div>
+
+    <h4>Java：Resilience4j 熔断</h4>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// CircuitBreakerConfig.java
+@Configuration
+public class CircuitBreakerConfig {
+
+    @Bean
+    public CircuitBreaker emailCircuitBreaker() {
+        return CircuitBreaker.of("emailService",
+            CircuitBreakerConfig.custom()
+                .failureRateThreshold(50)
+                .waitDurationInOpenState(Duration.ofSeconds(60))
+                .slidingWindowSize(10)
+                .build());
+    }
+
+    @Bean
+    public CircuitBreaker attendanceCircuitBreaker() {
+        return CircuitBreaker.of("attendanceService",
+            CircuitBreakerConfig.custom()
+                .failureRateThreshold(30)
+                .waitDurationInOpenState(Duration.ofSeconds(30))
+                .slidingWindowSize(5)
+                .build());
+    }
+}
+
+// 使用示例
+@Service
+public class ResilientEmailService {
+
+    private final CircuitBreaker circuitBreaker;
+    private final EmailClient emailClient;
+
+    public String sendWithCircuitBreaker(EmailRequest req) {
+        return circuitBreaker.executeSupplier(
+            () -> emailClient.send(req));
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>超时与降级</h3>
+    <p><span class="term" data-term-id="timeout-tool" tabindex="0">timeout tool</span> 是防止 Agent 线程耗尽的关键。每个工具调用必须有独立超时。<span class="term" data-term-id="degrade-agent" tabindex="0">degrade agent</span> 策略定义了降级时的后备方案。</p>
+
+    <table class="outline-table">
+      <thead><tr><th>工具</th><th>超时</th><th>降级策略</th></tr></thead>
+      <tbody>
+        <tr><td>邮件发送</td><td>30s</td><td>存入延迟队列，返回「稍后发送」</td></tr>
+        <tr><td>考勤查询</td><td>10s</td><td>返回上次缓存数据，标记「非实时」</td></tr>
+        <tr><td>日历创建</td><td>15s</td><td>生成 ICS 文件让用户手动导入</td></tr>
+        <tr><td>工单创建</td><td>20s</td><td>记录工单草稿到本地，异步同步</td></tr>
+      </tbody>
+    </table>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># timeout_handling.py
+import asyncio
+from typing import Any, Callable
+
+class TimeoutHandler:
+    def __init__(self, default_timeout: int = 30):
+        self.default_timeout = default_timeout
+
+    async def call_with_timeout(self, func: Callable,
+                                 timeout: int = None,
+                                 fallback: Callable = None,
+                                 *args, **kwargs) -> Any:
+        t = timeout or self.default_timeout
+        try:
+            return await asyncio.wait_for(func(*args, **kwargs), timeout=t)
+        except asyncio.TimeoutError:
+            print(f"工具调用超时 ({t}s)，执行降级")
+            if fallback:
+                return fallback(*args, **kwargs)
+            return {"error": "timeout", "message": f"超过 {t} 秒未响应"}
+
+# Java 侧使用 Spring 的 @Timeout 注解
+</pre></div>
+    </div>
+
+    <div class="section-block"><h3>人工兜底（Human Fallback）</h3>
+    <p><span class="term" data-term-id="human-fallback" tabindex="0">human fallback</span> 是可靠性的最后一道防线。当所有自动策略都失败时，必须有路径转到人工处理。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># human_fallback.py
+class HumanFallback:
+    def __init__(self, approval_queue):
+        self.queue = approval_queue
+
+    def fallback_to_human(self, task: dict, reason: str):
+        """将失败的任务转人工处理"""
+        fallback_task = {
+            "original_task": task,
+            "fallback_reason": reason,
+            "status": "pending_human",
+            "created_at": time.time(),
+            "priority": task.get("priority", "normal")
+        }
+        self.queue.push(fallback_task)
+        return {
+            "status": "FALLBACK_TO_HUMAN",
+            "message": f"已转人工处理，原因：{reason}",
+            "task_id": fallback_task["id"]
+        }
+
+    def query_human_result(self, task_id: str) -> dict:
+        """查询人工处理结果"""
+        return self.queue.get_result(task_id)</pre></div>
+
+    <p><span class="term" data-term-id="audit-agent" tabindex="0">audit agent</span> 记录 Agent 每一步操作的完整 I/O，包括成功/失败、入参、出参、耗时。审计日志格式：</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-json">{
+  "audit_id": "a7f3b2c1",
+  "timestamp": "2026-05-31T10:30:00Z",
+  "agent_id": "leave-agent-v1",
+  "session_id": "session-001",
+  "step": 3,
+  "action": "tool_call",
+  "tool": "leave_api.submit",
+  "input": {"leave_id": "L2026001"},
+  "output": {"status": "submitted", "approval_id": "AP001"},
+  "duration_ms": 1234,
+  "success": true,
+  "error": null
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>故障演练与混沌测试</h3>
+    <p>可靠性不是配置完就完事的，需要通过故障演练来验证。混沌测试（Chaos Engineering）可以有效发现 Agent 可靠性的薄弱环节。</p>
+
+    <table class="outline-table">
+      <thead><tr><th>演练场景</th><th>注入故障</th><th>预期行为</th><th>验证方法</th></tr></thead>
+      <tbody>
+        <tr><td>考勤 API 超时</td><td>工具调用延迟 &gt; 30s</td><td>超时 → 熔断 → 降级返回缓存</td><td>检查审计日志有 timeout 记录</td></tr>
+        <tr><td>邮件服务 500</td><td>连续 5 次返回 500</td><td>3 次重试 → 熔断 → 延迟队列</td><td>确认邮件在 60s 后重新发送</td></tr>
+        <tr><td>Redis 宕机</td><td>停止 Redis 服务</td><td>记忆降级到本地缓存</td><td>Agent 仍可执行，但标记 non-realtime</td></tr>
+        <tr><td>审批人全离线</td><td>审批接口一直 pending</td><td>30 分钟超时 → 自动升级</td><td>确认升级后的审批人收到通知</td></tr>
+    </table>
+
+    <p>Python 侧注入故障的混沌测试框架：</p>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># chaos_test.py
+import asyncio
+from unittest.mock import patch
+
+class ChaosInjector:
+    def __init__(self, tool_fn, failure_rate=0.3, delay_range=(0.1, 5.0)):
+        self.tool_fn = tool_fn
+        self.failure_rate = failure_rate
+        self.delay_range = delay_range
+
+    async def call(self, *args, **kwargs):
+        import random, time
+        delay = random.uniform(*self.delay_range)
+        await asyncio.sleep(delay)
+
+        if random.random() < self.failure_rate:
+            raise TimeoutError(f"混沌注入：工具超时 {delay:.1f}s")
+
+        return await self.tool_fn(*args, **kwargs)
+
+# 在测试中使用
+chaos_email = ChaosInjector(email_api.send, failure_rate=0.3)
+result = await chaos_email.call("test@corp.com", "subject", "body")
+assert result.get("fallback"), "熔断未触发"</pre></div>
+
+    <p>Java 侧可以使用 Chaos Monkey for Spring Boot：</p>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// ChaosConfiguration.java
+@Configuration
+@Profile("chaos-monkey")
+public class ChaosConfiguration {
+    @Bean
+    public ChaosMonkey chaosMonkey() {
+        return ChaosMonkey.builder()
+            .assaultsActive(true)
+            .latencyRangeStart(1000)
+            .latencyRangeEnd(30000)
+            .exceptionsActive(true)
+            .watchedServices(List.of("emailService", "calendarService"))
+            .build();
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>可靠性配置清单</h3>
+    <p><span class="term" data-term-id="ops-agent" tabindex="0">ops agent</span> 可靠性配置示例：</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-yaml"># reliability-config.yaml
+reliability:
+  tool:
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      initial_delay_ms: 1000
+      multiplier: 2
+    circuit_breaker:
+      threshold: 3
+      reset_timeout_sec: 60
+      half_open_max_calls: 1
+    timeout:
+      default_sec: 30
+      email: 30
+      calendar: 15
+      attendance: 10
+  fallback:
+    strategy: human_queue
+    queue: corp_assist_fallback
+    escalation_after_min: 30
+  audit:
+    enabled: true
+    storage: elasticsearch
+    retention_days: 90</pre></div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>工具失败、超时、降级与审计</li>
-    <li>下一步：工作流与简历叙事</li></ul></div>
+    <ul class="chapter-conclusions-list">
+      <li>熔断机制保护下游：Closed → Open → Half-Open 状态机</li>
+      <li>每个工具设置独立超时，超时后执行降级策略</li>
+      <li>降级兜底：缓存 → 延迟队列 → 人工兜底</li>
+      <li>所有工具调用记录审计日志（入参、出参、耗时、成功/失败）</li>
+      <li>可靠性配置集中管理推荐 YAML 或配置中心</li>
+    </ul></div>
+
+    <div class="section-block"><h3>常见问题（FAQ）</h3>
+    <div class="learn-faq">
+      <details><summary>熔断打开后，Agent 怎么知道恢复了？</summary><div class="learn-faq-body">Half-Open 状态会定期发送探测请求。如果探测成功则关闭熔断，失败则继续 Open。探测频率可配，建议 60s 一次。</div></details>
+      <details><summary>降级返回「稍后处理」，用户怎么知道结果？</summary><div class="learn-faq-body">降级策略应该包含通知机制：异步任务完成后通过 WebSocket/邮件/钉钉通知用户结果。Agent 应同步返回「你的请求已提交，处理完成后会通知你」。</div></details>
+      <details><summary>审计日志会不会太大？</summary><div class="learn-faq-body">全量审计确实会产生大量数据。建议：全量写 Elasticsearch（保留 90 天），抽样写成本更低的存储（如 S3 冷存）。监控系统只关注错误日志和性能指标。</div></details>
+    </div></div>
+
+    <div class="section-block learn-review-block"><h3>复习与自检</h3>
+    <div class="learn-checklist" data-storage-key="scenario_advanced01">
+      <p class="learn-checklist-lead">过关清单</p>
+      <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+      <ul>
+        <li><label><input type="checkbox" data-id="circuit" /> 能画出熔断状态机图</label></li>
+        <li><label><input type="checkbox" data-id="timeout" /> 能为每个工具配置独立超时</label></li>
+        <li><label><input type="checkbox" data-id="fallback" /> 能设计降级策略和人工兜底</label></li>
+        <li><label><input type="checkbox" data-id="audit" /> 能设计审计日志格式</label></li>
+        <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+      </ul>
+    </div>
+
+    <div class="learn-cheat-sheet"><details><summary>本章速查卡</summary><div class="learn-cheat-body"><table>
+      <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term" data-term-id="tool-retry" tabindex="0">tool retry</span></td><td>工具调用指数退避重试</td></tr>
+        <tr><td><span class="term" data-term-id="circuit-agent" tabindex="0">circuit agent</span></td><td>熔断保护下游不被连续失败打爆</td></tr>
+        <tr><td><span class="term" data-term-id="human-fallback" tabindex="0">human fallback</span></td><td>自动策略失败后转人工</td></tr>
+        <tr><td><span class="term" data-term-id="timeout-tool" tabindex="0">timeout tool</span></td><td>工具级超时控制</td></tr>
+        <tr><td><span class="term" data-term-id="audit-agent" tabindex="0">audit agent</span></td><td>全量操作审计</td></tr>
+        <tr><td><span class="term" data-term-id="degrade-agent" tabindex="0">degrade agent</span></td><td>降级策略定义</td></tr>
+        <tr><td><span class="term" data-term-id="reliability-s3" tabindex="0">reliability s3</span></td><td>S3 可靠性工程</td></tr>
+        <tr><td><span class="term" data-term-id="ops-agent" tabindex="0">ops agent</span></td><td>运维配置</td></tr>
+      </tbody>
+    </table></div></details></div>
+
+    <div class="learn-interview"><details><summary>答辩 / 面试口述题</summary><div class="learn-interview-body"><ol>
+      <li>考勤 API 挂了，Agent 还应该继续工作吗？你怎么设计降级策略？</li>
+      <li>熔断阈值设多少合适？设太小会频繁误熔断，设太大保护作用有限。</li>
+      <li>人工兜底的 SLA 怎么保证？如果人工 1 小时没处理，Agent 需要做什么？</li>
+    </ol></div></details></div>
+    </div>
   </div>
+
   <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a></li>
-    <li><a href="https://java2ai.com/docs/dev/models/dashScope/" target="_blank" rel="noopener">Spring AI Alibaba</a></li>
+    <li><a href="https://resilience4j.readme.io/" target="_blank" rel="noopener">Resilience4j — JVM 弹性库</a></li>
+    <li><a href="https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/" target="_blank" rel="noopener">LangGraph — Human-in-the-Loop</a></li>
+    <li><a href="https://www.elastic.co/elasticsearch/" target="_blank" rel="noopener">Elasticsearch — 审计日志存储</a></li>
   </ul></div>
+
   <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/advanced-01-reliability-lab/</code></li>
-  <li>写一条 S3 Agent 落地笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：可靠性：重试、熔断与人工兜底</h4>
-  <p><code>demos/advanced-01-reliability-lab/</code> — 写 fallback 策略</p></div></div>
+  <ol class="steps steps-operate">
+    <li>用 Python 实现一个带熔断的邮件工具调用</li>
+    <li>用 Resilience4j 配置 Spring Boot 熔断</li>
+    <li>设计 3 个办公工具的降级策略并写测试</li>
+    <li>完成 <code>demos/advanced-01-reliability-lab/</code></li>
+  </ol>
+  <div class="demo-box"><h4 class="demo-box-title">Demo：可靠性实验室</h4><p><code>demos/advanced-01-reliability-lab/</code> — 配置可靠性 YAML 和降级策略。</p></div></div>
+
   <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-advanced-02-portfolio">工作流与简历叙事</a></li>
+    <li><strong>下一章</strong>：<a href="#ch-advanced-02-portfolio">工作流与简历叙事</a></li>
+    <li><a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker" target="_blank" rel="noopener">Cloud Design Patterns — Circuit Breaker</a></li>
   </ul></div>
 </section>

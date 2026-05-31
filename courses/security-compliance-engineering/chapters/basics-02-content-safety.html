@@ -3,181 +3,239 @@
     <h2><span class="chapter-done-badge">已完成</span>内容安全检测</h2>
     <button type="button" class="btn-mark-done" data-chapter="basics-02-content-safety" aria-label="标记本章完成">标记完成</button>
   </header>
-
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>威胁与模型</strong> · 能力：设计 CorpAssist 入站/出站 moderation 与 Spring/Python 双栈 Advisor 链</p>
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>威胁与模型</strong> · 能力：实现输入输出双向内容审核与双栈 Advisor 配置</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
-        <p>S5 内容工坊与 S2 客服都要处理<strong>违规、仇恨、色情、政治敏感</strong>等内容。<span class="term" data-term-id="content-safety" tabindex="0">content safety</span> 不是「上线前调一次 Prompt」，而是<strong>入站拦截 + 出站复核</strong>的可运维链路；缺任一侧会出现「脏输入进模型」或「有害输出已送达用户」。</p>
+        <p>CorpAssist 每天处理数千条用户消息，其中可能包含攻击性语言、敏感信息或越狱尝试。如果只有模型自带的安全对齐（RLHF），你无法控制哪些内容被拦截、哪些被放行。<span class="term" data-term-id="content-safety" tabindex="0">Content safety</span> 让你在应用层定义自己的审核策略。</p>
       </div>
       <div class="notice notice-outcome">
         <strong>学完你能</strong>
         <ul>
-          <li>配置 <span class="term" data-term-id="input-moderation" tabindex="0">input moderation</span> 与 <span class="term" data-term-id="output-moderation" tabindex="0">output moderation</span> 的触发点与拒答策略</li>
-          <li>在 Spring 注册 <span class="term" data-term-id="safeguard-advisor" tabindex="0">safeguard advisor</span>，在 Python 侧实现对称 <span class="term" data-term-id="dual-stack-filter" tabindex="0">dual stack filter</span></li>
-          <li>区分 <span class="term" data-term-id="toxic-detect" tabindex="0">toxic detect</span> 与 <span class="term" data-term-id="policy-violation" tabindex="0">policy violation</span> 的处置差异</li>
+          <li>设计并实现 <span class="term" data-term-id="input-moderation" tabindex="0">input moderation</span> 和 <span class="term" data-term-id="output-moderation" tabindex="0">output moderation</span></li>
+          <li>用 Spring AI <span class="term" data-term-id="safeguard-advisor" tabindex="0">Advisor</span> 在 BFF 侧加过滤层</li>
+          <li>用 Python middleware 做护栏</li>
+          <li>理解 <span class="term" data-term-id="moderation-api" tabindex="0">Moderation API</span> 的用法和局限性</li>
         </ul>
       </div>
       <div class="notice">
-        <strong>本章先记住 3 件事</strong>
+        <strong>本章先记住 2 件事</strong>
         <ul>
-          <li><strong>双向审核</strong>：入站防注入与违规输入；出站防模型幻觉式有害内容（含流式 chunk）。</li>
-          <li><strong>双栈一致</strong>：同一 <code>policy_version</code> 与阈值；避免 Python 松、Spring 严导致路由绕过。</li>
-          <li><strong>可审计拒答</strong>：拒答须带 <code>reason_code</code>，勿统一 500 或空回复（合规与运营都需要）。</li>
+          <li><strong>双向审核不可偏废</strong>：输入审核防攻击，输出审核防意外——模型好不等于输出没问题。</li>
+          <li><strong>Advisor 是 Spring AI 的安全插件</strong>：在 ChatClient 流程中插入 pre-call/post-call 钩子做过滤。</li>
         </ul>
       </div>
     </div>
 
     <div class="section-block">
-      <h3>输入输出审核</h3>
+      <h3>四层审核架构</h3>
       <aside class="learn-scenario" aria-label="业务情境">
-        <span class="learn-scenario-title">CorpAssist · 内容工坊（S5）</span>
-        运营同学生成「双十一促销文案」。入站需拦截竞品诋毁与绝对化用语；出站需拦截未验证的「全网最低价」等 <span class="term" data-term-id="policy-violation" tabindex="0">policy violation</span>，并保留审核记录供品牌合规抽查。
+        <span class="learn-scenario-title">CorpAssist · 内容审核（35 秒）</span>
+        用户输入含有攻击性语言，或模型回复意外包含敏感词汇。CorpAssist 用 Spring AI Advisor 在 Java 侧和 Python middleware 在 Python 侧实现统一的内容审核策略。
       </aside>
-      <div class="mermaid-wrap">
-        <h5>Moderation 双向链路</h5>
-        <pre class="mermaid">flowchart TB
-  U[用户输入] --> IM[input moderation]
-  IM -->|block| R1[拒答+reason_code]
-  IM -->|pass| LLM[LLM/RAG]
-  LLM --> OM[output moderation]
-  OM -->|block| R2[替换/拒答]
-  OM -->|pass| OUT[响应用户]</pre>
-        <p class="diagram-caption">流式场景下 outbound 需缓冲或逐 chunk 检测，避免前半段已输出违规内容。</p>
-      </div>
-      <h4>入站 vs 出站职责</h4>
+
+      <h4>审核层级</h4>
       <table class="outline-table">
         <thead>
-          <tr><th>阶段</th><th>检测目标</th><th>典型动作</th><th>CorpAssist 配置键</th></tr>
+          <tr><th>层级</th><th>位置</th><th>检查内容</th><th>动作</th></tr>
         </thead>
         <tbody>
-          <tr>
-            <td><span class="term" data-term-id="input-moderation" tabindex="0">input moderation</span></td>
-            <td>注入、辱骂、违法请求</td>
-            <td>HTTP 400 + 统一拒答模板</td>
-            <td><code>moderation.inbound.enabled</code></td>
-          </tr>
-          <tr>
-            <td><span class="term" data-term-id="output-moderation" tabindex="0">output moderation</span></td>
-            <td>有害生成、PII、过度承诺</td>
-            <td>截断流、替换句子、整段拒答</td>
-            <td><code>moderation.outbound.enabled</code></td>
-          </tr>
+          <tr><td>L1 网关</td><td>API Gateway</td><td>明显注入模式、SQL 注入、XSS</td><td>直接 403</td></tr>
+          <tr><td>L2 BFF</td><td>Spring AI Advisor</td><td>Moderation API + 自定义词库</td><td>阻断或替换</td></tr>
+          <tr><td>L3 Python</td><td>FastAPI middleware</td><td>自定义规则 + 正则</td><td>阻断或脱敏</td></tr>
+          <tr><td>L4 出站</td><td>Output Advisor</td><td>敏感信息、策略违规</td><td>拦截回复或替换内容</td></tr>
         </tbody>
       </table>
-      <h4>Spring 入站 Advisor 示例</h4>
+
+      <h4>Spring AI Advisor：输入审核</h4>
       <div class="code-block">
-        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-        <pre><code class="language-java">@Bean
-ChatClient chatClient(ChatModel model, ContentSafetyAdvisor safetyAdvisor) {
-  return ChatClient.builder(model)
-      .defaultAdvisors(safetyAdvisor)  // 入站+出站 hook
-      .build();
-}
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import org.springframework.ai.chat.client.advisor.api.CallAroundAdvisor;
+import org.springframework.ai.chat.client.advisor.api.CallAroundAdvisorChain;
 
 @Component
-class ContentSafetyAdvisor implements CallAdvisor, StreamAdvisor {
-  @Override
-  public ChatClientRequest before(ChatClientRequest req, AdvisorChain chain) {
-    ModerationResult in = moderationApi.checkInput(req.prompt());
-    if (in.blocked()) throw new PolicyBlockedException(in.reasonCode());
-    return req;
-  }
+public class InputModerationAdvisor implements CallAroundAdvisor {
+    private final ModerationService moderation;
+    private final Set<String> BLOCKED = Set.of(
+        "hack", "crack", "exploit", "malware",
+        "ignore instructions", "jailbreak"
+    );
+
+    @Override
+    public ChatResponse callAround(CallAroundAdvisorChain chain,
+                                   ChatRequest request) {
+        String text = request.getUserText();
+        for (String kw : BLOCKED) {
+            if (text.toLowerCase().contains(kw)) {
+                log.warn("Input blocked: keyword={}", kw);
+                return ChatResponse.builder()
+                    .content("输入包含不允许的内容").build();
+            }
+        }
+        ModerationResult mod = moderation.check(text);
+        if (mod.isFlagged()) {
+            return ChatResponse.builder()
+                .content("输入内容不合规").build();
+        }
+        return chain.callAround(request);
+    }
+}
+
+// 输出审核 Advisor
+@Component
+public class OutputModerationAdvisor implements CallAroundAdvisor {
+    private static final List<Pattern> SENSITIVE = List.of(
+        Pattern.compile("\\d{18}"), Pattern.compile("1[3-9]\\d{9}")
+    );
+
+    @Override
+    public ChatResponse callAround(CallAroundAdvisorChain chain,
+                                   ChatRequest request) {
+        ChatResponse resp = chain.callAround(request);
+        for (Pattern p : SENSITIVE) {
+            if (p.matcher(resp.getContent()).find()) {
+                return ChatResponse.builder()
+                    .content("回复包含不可输出的信息").build();
+            }
+        }
+        return resp;
+    }
+}
+
+// 注册到 ChatClient
+@Bean
+public ChatClient chatClient(ChatModel model,
+                             InputModerationAdvisor in,
+                             OutputModerationAdvisor out) {
+    return ChatClient.builder(model).advisors(in, out).build();
 }</code></pre>
       </div>
-      <details class="learn-micro-check">
-        <summary>先想 10 秒：只做 outbound、不做 inbound 会怎样？</summary>
-        <p>恶意/超长/注入 payload 仍进入 LLM，浪费 Token 并可能触发<strong>间接注入</strong>；inbound 是成本与安全的双保险。</p>
-      </details>
-    </div>
 
-    <div class="section-block">
-      <h3>双栈 Advisor</h3>
-      <p><span class="term" data-term-id="dual-stack-filter" tabindex="0">dual stack filter</span> 指：CorpAssist 网关 → Python AI 服务 → Spring 治理面<strong>三层</strong>使用同一策略包，而非各写各的 regex。</p>
-      <div class="learn-tabs" role="tablist" aria-label="双栈 moderation">
-        <input type="radio" name="sec-b02-stack" id="sec-b02-tab-java" class="learn-tab-input" checked />
-        <input type="radio" name="sec-b02-stack" id="sec-b02-tab-py" class="learn-tab-input" />
-        <label for="sec-b02-tab-java">Spring AI Advisor</label>
-        <label for="sec-b02-tab-py">Python 护栏</label>
-        <div class="learn-tab-panel" id="sec-b02-panel-java" role="tabpanel">
-          <p><strong>位置</strong>：<code>ChatClient</code> Advisor 链、SSE 网关 filter。</p>
-          <p><strong>集成</strong>：DashScope/OpenAI <span class="term" data-term-id="moderation-api" tabindex="0">moderation api</span> 或自建分类器；Micrometer 打点 <code>moderation.blocked</code>。</p>
-        </div>
-        <div class="learn-tab-panel" id="sec-b02-panel-py" role="tabpanel">
-          <p><strong>位置</strong>：FastAPI middleware + LangChain <code>Runnable</code> 前后置。</p>
-          <p><strong>集成</strong>：同 <code>policy_version</code> YAML；RAG 检索结果也须过 inbound 规则（防间接注入）。</p>
-        </div>
-      </div>
-      <h4>Python 对称 middleware</h4>
+      <h4>Python 护栏：FastAPI Middleware</h4>
       <div class="code-block">
-        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-        <pre><code class="language-python"># corpassist/middleware/content_safety.py
-async def moderation_middleware(request: Request, call_next):
-    body = await request.json()
-    result = moderation_client.check(body["messages"], policy_version=POLICY_V)
-    if result.blocked:
-        return JSONResponse({"error": "policy_blocked", "reason": result.code}, status=400)
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from fastapi import Request, HTTPException
+from openai import OpenAI
+import re
+
+class ContentSafetyMiddleware:
+    """FastAPI 内容安全中间件。"""
+
+    def __init__(self):
+        self.client = OpenAI()
+        self.blocked = [
+            r"ignore\s+(above|previous|all)",
+            r"system\s+prompt",
+            r"you\s+are\s+(now|free)",
+        ]
+
+    async def check_input(self, text: str) -> str | None:
+        for p in self.blocked:
+            if re.search(p, text, re.IGNORECASE):
+                return "输入包含不允许的内容"
+        try:
+            resp = self.client.moderations.create(input=text)
+            if resp.results[0].flagged:
+                cats = [c for c, v in
+                        resp.results[0].categories.model_dump().items() if v]
+                return f"内容不合规: {cats}"
+        except Exception as e:
+            log.error("Moderation API error: %s", e)
+            return "审核服务不可用"
+        return None
+
+    async def check_output(self, text: str) -> str | None:
+        if re.search(r"\d{18}", text):
+            return "回复包含个人信息"
+        return None
+
+@app.middleware("http")
+async def safety_middleware(request: Request, call_next):
+    if request.url.path == "/v1/agent/chat":
+        body = await request.json()
+        safety = ContentSafetyMiddleware()
+        err = await safety.check_input(body.get("question", ""))
+        if err:
+            raise HTTPException(400, err)
     response = await call_next(request)
-    return await scan_stream_if_needed(response)</code></pre>
-      </div>
-      <div class="learn-compare">
-        <div class="learn-compare-col learn-compare-bad">
-          <span class="learn-compare-heading">反模式</span>
-          <ul>
-            <li>Spring 调 cloud API，Python 裸奔</li>
-            <li>拒答无 reason_code，运营无法统计</li>
-            <li>流式 SSE 不做 outbound 扫描</li>
-          </ul>
-        </div>
-        <div class="learn-compare-col learn-compare-good">
-          <span class="learn-compare-heading">推荐</span>
-          <ul>
-            <li>Git 管理 <code>policies/content-v{n}.yaml</code></li>
-            <li>CI 跑 golden 拒答/放行用例</li>
-            <li>blocked 事件进 audit（见 practice-03）</li>
-          </ul>
-        </div>
+    return response</code></pre>
       </div>
 
-      <h4>S2 客服 vs S5 内容工坊：profile 差异</h4>
-      <table class="outline-table">
-        <thead>
-          <tr><th>维度</th><th>S2 对外客服</th><th>S5 内容工坊</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>inbound 重点</td><td>辱骂、违法咨询、注入</td><td>竞品攻击、敏感政治</td></tr>
-          <tr><td>outbound 重点</td><td>PII、过度承诺</td><td>广告法、绝对化用语</td></tr>
-          <tr><td>fail-closed</td><td>Moderation API 超时必拒答</td><td>同左，profile 阈值可略调</td></tr>
-        </tbody>
-      </table>
+      <h4>审核架构</h4>
+      <div class="mermaid-wrap">
+        <h5>双栈审核流程</h5>
+        <pre class="mermaid">flowchart TB
+  U[用户输入] --> GW[API Gateway]
+  GW -->|L1 网关| BFF[Spring AI BFF]
+  BFF -->|L2 Input Advisor| LLM[LLM]
+  LLM -->|L4 Output Advisor| RESP[回复]
+  BFF -->|HTTP| PY[Python Agent]
+  PY -->|L3 Middleware| PY_LLM[Python LLM]
+  PY_LLM -->|输出审核| P_RESP[回复]
+  style GW fill:#ff8
+  style BFF fill:#8ff
+  style PY fill:#f8f</pre>
+        <p class="diagram-caption">四层审核架构确保任何一层被绕过还有 backup。L1-L4 从粗到细纵深防御。</p>
+      </div>
 
-      <details class="learn-micro-check">
-        <summary>判断：Python middleware 已拦截违规，Spring 侧可以不挂 Advisor 吗？</summary>
-        <p><strong>不可以。</strong>在线 ChatClient 路径必须经过 Spring Advisor，保证每一跳 LLM 调用都被覆盖；Python 可能只服务部分 endpoint 或离线批处理。</p>
-      </details>
+      <div class="learn-faq">
+        <details>
+          <summary>Moderation API 误报率多高？</summary>
+          <div class="learn-faq-body">OpenAI Moderation API 在标准测试集上误报率约 1-3%，但企业场景的特定词汇可能被误判。建议构建自定义的领域适配层覆盖。</div>
+        </details>
+        <details>
+          <summary>Advisor 和 Filter 有什么区别？</summary>
+          <div class="learn-faq-body"><span class="term" data-term-id="safeguard-advisor" tabindex="0">Advisor</span> 是 Spring AI 的 ChatClient 插件点，可以访问 ChatRequest/Response 对象。Filter 是 Servlet 层面的。Advisor 在 LLM 调用前后执行，比 Filter 更贴近 LLM 上下文。</div>
+        </details>
+        <details>
+          <summary><span class="term" data-term-id="toxic-detect" tabindex="0">Toxic detect</span> 和 Moderation 的关系？</summary>
+          <div class="learn-faq-body">Toxic detect 是检测有毒内容的子集（仇恨言论、暴力），Moderation API 覆盖更广（含自残、违法活动等）。CorpAssist 两者并用。</div>
+        </details>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只在输入做审核</strong> — 输出也可能产生不合规内容。</li>
+          <li><strong>Moderation API 失败时放行</strong> — 应 fail-closed 默认拦截。</li>
+          <li><strong>使用单一审核层</strong> — 4 层纵深确保任何一层被绕过还有 backup。</li>
+          <li><strong>不记录审核日志</strong> — 安全审计需知道哪些内容被拦截。</li>
+        </ul>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li><strong>输入输出审核</strong>：双向链路；inbound 省 Token 并防注入，outbound 防有害生成与过度承诺。</li>
-        <li><strong>双栈 Advisor</strong>：Spring Advisor + Python middleware 共享 policy_version；RAG chunk 同样要审。</li>
+        <li><strong>四层审核</strong>：网关 → 输入 Advisor → Python middleware → 输出 Advisor。</li>
+        <li><strong>双向覆盖</strong>：输入防攻击注入，输出防意外泄露。</li>
+        <li><strong>Fail-closed</strong>：审核服务不可用时默认拦截而非放行。</li>
+        <li><strong>配置化规则</strong>：审核词库和策略管理从代码中分离。</li>
+        <li><strong>双栈对称</strong>：Spring AI Advisor 和 Python middleware 各司其职。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="security-compliance-engineering_basics02">
-        <p class="learn-checklist-lead">过关清单</p>
-        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
         <ul>
-          <li><label><input type="checkbox" data-id="in-out" /> 能画出 inbound/outbound 决策点</label></li>
-          <li><label><input type="checkbox" data-id="stream" /> 能说明流式 outbound 的两种实现思路</label></li>
-          <li><label><input type="checkbox" data-id="policy" /> 能解释 policy_version 为何必须双栈一致</label></li>
+          <li><label><input type="checkbox" data-id="layers" /> 能说出 4 层审核各层的职责</label></li>
+          <li><label><input type="checkbox" data-id="advisor" /> 能实现 Spring AI 输入/输出 Advisor</label></li>
+          <li><label><input type="checkbox" data-id="middleware" /> 能实现 Python middleware 护栏</label></li>
+          <li><label><input type="checkbox" data-id="moderation" /> 能解释 Moderation API 用法和局限</label></li>
           <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
         </ul>
       </div>
+
       <div class="learn-cheat-sheet">
         <details>
           <summary>本章速查卡</summary>
@@ -185,72 +243,57 @@ async def moderation_middleware(request: Request, call_next):
             <table>
               <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
               <tbody>
-                <tr><td>input moderation</td><td>有害/注入输入不进 LLM</td></tr>
-                <tr><td>output moderation</td><td>模型输出对外前最后一检</td></tr>
-                <tr><td>safeguard advisor</td><td>Spring ChatClient 可插拔审核链</td></tr>
-                <tr><td>dual stack filter</td><td>Java+Python 共用 policy_version</td></tr>
+                <tr><td>content safety</td><td>输入输出内容的安全审核</td></tr>
+                <tr><td>input moderation</td><td>用户输入的安全检查</td></tr>
+                <tr><td>output moderation</td><td>LLM 输出的安全检查</td></tr>
+                <tr><td>safeguard advisor</td><td>Spring AI 的安全插件</td></tr>
+                <tr><td>dual stack filter</td><td>双栈对称过滤架构</td></tr>
+                <tr><td>toxic detect</td><td>有毒内容检测（仇恨/暴力）</td></tr>
+                <tr><td>policy violation</td><td>策略违规检测</td></tr>
+                <tr><td>moderation api</td><td>OpenAI/Azure 的内容审核 API</td></tr>
               </tbody>
             </table>
           </div>
         </details>
       </div>
+
       <div class="learn-interview">
         <details>
           <summary>答辩 / 面试口述题</summary>
           <div class="learn-interview-body">
             <ol>
-              <li>设计 S2 客服双向 moderation 链路，说明 block 时 audit 应记哪些字段。</li>
-              <li>流式 SSE 场景如何做 outbound 扫描而不破坏用户体验？</li>
-              <li>为何 RAG chunk 也要过 inbound 规则？</li>
+              <li>你们怎么实现 LLM 输入输出的内容审核？Advisor 和 Filter 怎么分工？</li>
+              <li>Moderation API 误报或漏报怎么处理？</li>
+              <li>为什么不能只依赖模型自带的安全对齐？</li>
             </ol>
           </div>
         </details>
       </div>
-      <p class="chapter-review-next">下一步：完成测验；下一章 <a href="#ch-basics-03-injection">注入与越狱</a> 深入攻击手法与 defense layer。</p>
+      <p class="chapter-review-next">下一步：完成测验与 Demo；下一章 <a href="#ch-basics-03-injection">注入与越狱</a> 深入攻击手法。</p>
     </div>
   </div>
 
   <div class="official-links content-section">
     <h3>官方文档</h3>
     <ul>
-      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
       <li><a href="https://platform.openai.com/docs/guides/moderation" target="_blank" rel="noopener">OpenAI Moderation API</a></li>
-      <li><a href="https://help.aliyun.com/zh/model-studio/content-security" target="_blank" rel="noopener">阿里云百炼 — 内容安全</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
+      <li><a href="https://learn.microsoft.com/en-us/azure/ai-services/content-safety/" target="_blank" rel="noopener">Azure AI Content Safety</a></li>
     </ul>
   </div>
 
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <p class="steps-intro">为 S5 营销文案场景编写 <code>content-v1.yaml</code> 片段：2 条 inbound 规则 + 2 条 outbound 规则（约 25 分钟）。</p>
+    <p class="steps-intro">实现输入输出 Advisor 和 Python middleware（约 25 分钟）。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>根据正文「入站 vs 出站」表，为「绝对化用语」「未验证价格承诺」各写 1 条规则（含 <code>action: block</code> 与 <code>reason_code</code>）。</li>
-      <li>对照 Java Advisor 代码块，列出 Spring 侧需注册的 Advisor 顺序（before LLM / after LLM）。</li>
-      <li>为 Python middleware 补一段「RAG chunk inbound 扫描」伪代码（3～5 行）。</li>
-      <li>（可选）阅读 <code>demos/basics-02-content-safety-lab/moderation-flow.md</code> 并对照你的 YAML。</li>
-    </ol>
-    <h4 class="practice-section-title">判断练习</h4>
-    <ol class="steps-judgment-list">
-      <li>
-        <p class="judgment-stem">（场景）流式客服已输出半句辱骂再被切断。下列哪项<strong>不能</strong>单独作为长期方案？A) 加强 outbound chunk 检测 B) 仅降低 temperature C) 拒答模板 + audit D) inbound 拦截辱骂输入</p>
-        <div class="learn-practice-answer">
-          <details><summary>参考答案</summary>
-            <div class="learn-practice-answer-body"><p><strong>B</strong>：temperature 与内容安全无稳定因果关系；A/C/D 都是工程可控措施。</p></div>
-          </details>
-        </div>
-      </li>
+      <li>实现 Spring AI InputModerationAdvisor（参考正文代码块）。</li>
+      <li>实现 Python ContentSafetyMiddleware 的 check_input 方法。</li>
+      <li>配置输出审核规则：识别并拦截身份证号和手机号。</li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：内容安全检测</h4>
-      <p>目录：<code>demos/basics-02-content-safety-lab/</code>。<strong>验收</strong>：完成 <code>moderation-flow.md</code> 中 inbound/outbound 检查清单勾选。</p>
+      <p>目录：<code>demos/basics-02-content-safety-lab/</code>。<strong>验收</strong>：<code>moderation-rules.yaml</code> 包含 4 层审核的规则配置。</p>
     </div>
-  </div>
-
-  <div class="resources content-section">
-    <h3>延伸学习</h3>
-    <ul>
-      <li><strong>下一章</strong>：<a href="#ch-basics-03-injection">注入与越狱</a></li>
-      <li><a href="#ch-basics-01-threat-model">LLM 应用威胁模型</a> — 注入分类</li>
-    </ul>
   </div>
 </section>

@@ -1,43 +1,380 @@
 <section id="ch-advanced-02-agent-memory" class="chapter" data-chapter="advanced-02-agent-memory">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>Agent 场景记忆</h2>
-  <button type="button" class="btn-mark-done" data-chapter="advanced-02-agent-memory" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent 场景记忆</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-agent-memory" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>生产级上下文</strong> · 能力：LangGraph checkpoint 与多 Agent 共享</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>S3 Agent 长任务需 checkpoint 与共享黑板。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>设计 CorpAssist 可控上下文窗口与三层混合记忆</li>
-        <li>双栈实现会话/长期记忆并对接 RAG 与 Agent</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产级上下文</strong> · 能力：LangGraph Checkpoint、多 Agent 共享记忆</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 场景对记忆有特殊要求：长任务需要 Checkpoint 支持中断恢复；多 Agent 协作需要共享<strong>黑板书</strong>；每个 Agent 的 <span class="term" data-term-id="mem-scope" tabindex="0">mem scope</span> 需要差异化管理。本章将 CorpAssist 记忆系统扩展到 Agent 场景。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>使用 <span class="term" data-term-id="langgraph-checkpoint" tabindex="0">langgraph checkpoint</span> 持久化 Agent 状态</li>
+          <li>设计 <span class="term" data-term-id="multi-agent-share" tabindex="0">multi agent share</span> 共享记忆模式</li>
+          <li>实现 <span class="term" data-term-id="shared-blackboard" tabindex="0">shared blackboard</span> 协作</li>
+          <li>管理 <span class="term" data-term-id="thread-state" tabindex="0">thread state</span> 和 <span class="term" data-term-id="resume-agent" tabindex="0">resume agent</span></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Checkpoint 是关键</strong>：Agent 任务可能执行数分钟，必须支持中断后恢复。</li>
+          <li><strong>共享记忆要隔离</strong>：不同 Agent 共享读但不一定共享写，scope 管理很重要。</li>
+          <li><strong>Thread ID 对齐</strong>：Agent thread_id 必须与 session_id 一致才能共享会话。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>Checkpoint</h3><p>Postgres/Redis checkpoint；中断恢复。 关联：<span class="term" data-term-id="langgraph-checkpoint" tabindex="0">langgraph checkpoint</span>、<span class="term" data-term-id="multi-agent-share" tabindex="0">multi agent share</span>。</p></div>
-    <div class="section-block"><h3>多 Agent 共享</h3><p>共享工作记忆；私有长期记忆。 关联：<span class="term" data-term-id="agent-memory" tabindex="0">agent memory</span>、<span class="term" data-term-id="checkpoint-store" tabindex="0">checkpoint store</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="langgraph-checkpoint" tabindex="0">langgraph checkpoint</span> · <span class="term" data-term-id="multi-agent-share" tabindex="0">multi agent share</span> · <span class="term" data-term-id="agent-memory" tabindex="0">agent memory</span> · <span class="term" data-term-id="checkpoint-store" tabindex="0">checkpoint store</span> · <span class="term" data-term-id="shared-blackboard" tabindex="0">shared blackboard</span> · <span class="term" data-term-id="thread-state" tabindex="0">thread state</span> · <span class="term" data-term-id="resume-agent" tabindex="0">resume agent</span> · <span class="term" data-term-id="mem-scope" tabindex="0">mem scope</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python">from langgraph.checkpoint.redis import RedisSaver
-graph = builder.compile(checkpointer=RedisSaver(redis_url))
-# thread_id = session_id 对齐双栈</code></pre></div>
-      <div class="mermaid-wrap"><h5>Agent 场景记忆</h5>
-      <pre class="mermaid">flowchart TB
-  Working[工作记忆] --> Session[会话 Redis]
-  Session --> Long[长期 向量+DB]
-  Session --> LLM[LLM 上下文]</pre></div>
+
+    <div class="section-block">
+      <h3>LangGraph Checkpoint：Agent 状态持久化</h3>
+
+      <p><span class="term" data-term-id="langgraph-checkpoint" tabindex="0">langgraph checkpoint</span> 是 LangGraph 的 Agent 状态持久化机制。<span class="term" data-term-id="checkpoint-store" tabindex="0">checkpoint store</span> 存储到 PostgreSQL 或 Redis。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Agent Checkpoint 生命周期</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant Agent as CorpAssist Agent
+    participant Graph as LangGraph
+    participant Store as Checkpoint Store
+
+    Agent->>Graph: 开始任务 (thread_id)
+    Note over Graph: Step 1: 查询订单
+    Graph->>Store: 保存 Checkpoint 1
+    Note over Graph: Step 2: 查询库存
+    Graph->>Store: 保存 Checkpoint 2
+    Note over Graph: Step 3: 生成回复 (中断)
+    Graph->>Store: 保存 Checkpoint 3
+
+    Agent-->>Graph: 恢复任务 (thread_id)
+    Graph->>Store: 加载 Checkpoint 3
+    Note over Graph: Step 4: 继续执行
+    Graph->>Store: 保存 Checkpoint 4
+    Graph-->>Agent: 任务完成</pre>
+        <p class="diagram-caption">Agent 任务在每一步后保存 Checkpoint，中断后从最新 Checkpoint 恢复。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># LangGraph Checkpoint - Agent 状态持久化
+from langgraph.checkpoint.redis import RedisSaver
+from langgraph.graph import StateGraph
+
+# 定义 Agent 状态
+class AgentState(TypedDict):
+    messages: list
+    order_context: dict
+    user_id: str
+    step: int
+
+# 配置 Checkpointer
+checkpointer = RedisSaver(
+    url="redis://localhost:6379",
+    ttl=86400  # 24h
+)
+
+# 构建 Agent Graph
+graph = StateGraph(AgentState)
+# ... 添加节点和边 ...
+
+# 编译时绑定 Checkpointer
+agent = graph.compile(checkpointer=checkpointer)
+
+# 运行 Agent，thread_id 与 session_id 对齐
+result = agent.invoke(
+    {"messages": [user_msg], "user_id": user_id},
+    config={"configurable": {"thread_id": f"thread:{session_id}"}}
+)
+
+# 恢复 Agent
+result = agent.invoke(
+    None,  # 继续之前的输入
+    config={"configurable": {"thread_id": f"thread:{session_id}"}}
+)</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Agent 客服场景</span>
+        用户提交了一个复杂工单：「查询订单 20240501 状态，如果已发货则预约改地址，同时生成一个投诉工单」。这个任务需要 5-8 步 Agent 操作。用户在第 3 步时关闭了页面。20 分钟后重新打开，Agent 从最后一个 Checkpoint 恢复，继续完成后续操作，用户无需重复之前的对话。
+      </aside>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>LangGraph checkpoint 与多 Agent 共享</li>
-    <li>下一步：记忆的成本与延迟</li></ul></div>
+
+    <div class="section-block">
+      <h3>多 Agent 共享记忆</h3>
+
+      <p><span class="term" data-term-id="multi-agent-share" tabindex="0">multi agent share</span> 允许多个 Agent 共享上下文。使用 <span class="term" data-term-id="shared-blackboard" tabindex="0">shared blackboard</span> 模式。</p>
+
+      <div class="mermaid-wrap">
+        <h5>多 Agent 共享黑板书模式</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph Agents[Agent 团队]
+        A1[订单查询 Agent]
+        A2[库存 Agent]
+        A3[投诉 Agent]
+        A4[CRM 更新 Agent]
+    end
+
+    subgraph Blackboard[共享黑板书]
+        B1[用户信息]
+        B2[当前上下文]
+        B3[中间结果]
+    end
+
+    subgraph Private[私有记忆]
+        P1[Agent A1 执行日志]
+        P2[Agent A3 草稿]
+    end
+
+    A1 -->|读取/写入| Blackboard
+    A2 -->|读取| Blackboard
+    A3 -->|读取/写入| Blackboard
+    A4 -->|读取| Blackboard
+    A1 -.->|私有| Private
+    A3 -.->|私有| Private
+
+    style Blackboard fill:#f39c12,color:#fff</pre>
+        <p class="diagram-caption">共享黑板书 + 私有记忆分离：协作信息共享，执行细节隔离。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 共享黑板书实现
+from typing import Any
+import json
+
+class SharedBlackboard:
+    """Redis 实现的共享黑板书"""
+    def __init__(self, redis_client, session_id: str):
+        self.redis = redis_client
+        self.key = f"corpassist:blackboard:{session_id}"
+
+    def write(self, key: str, value: Any, agent: str):
+        data = json.dumps({"value": value, "writer": agent, "scope": "shared"})
+        self.redis.hset(self.key, key, data)
+        self.redis.expire(self.key, 86400)
+
+    def read(self, key: str) -> Any:
+        data = self.redis.hget(self.key, key)
+        if data:
+            return json.loads(data)["value"]
+        return None
+
+    def get_all(self) -> dict:
+        result = {}
+        for k, v in self.redis.hgetall(self.key).items():
+            parsed = json.loads(v)
+            result[k.decode()] = parsed["value"]
+        return result
+
+
+class PrivateMemory:
+    """Agent 私有记忆"""
+    def __init__(self, redis_client, agent_id: str, session_id: str):
+        self.key = f"corpassist:private:{agent_id}:{session_id}"
+        self.redis = redis_client
+
+    def write_log(self, step: int, log: str):
+        self.redis.rpush(self.key, f"[Step {step}] {log}")
+        self.redis.expire(self.key, 86400)</code></pre>
+      </div>
+
+      <h4>Java 实现：多 Agent 共享</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// 多 Agent 共享记忆 - Java 实现
+@Service
+public class AgentMemoryService {
+
+    private final RedisTemplate&lt;String, Object&gt; redis;
+
+    public AgentMemoryService(RedisTemplate&lt;String, Object&gt; redis) {
+        this.redis = redis;
+    }
+
+    public void writeToBlackboard(String sessionId, String key,
+                                   Object value, String agent) {
+        String redisKey = "corpassist:blackboard:" + sessionId;
+        Map&lt;String, Object&gt; data = Map.of(
+            "value", value, "writer", agent, "scope", "shared"
+        );
+        redis.opsForHash().put(redisKey, key, data);
+        redis.expire(redisKey, 24, TimeUnit.HOURS);
+    }
+
+    public Object readFromBlackboard(String sessionId, String key) {
+        String redisKey = "corpassist:blackboard:" + sessionId;
+        Map&lt;Object, Object&gt; data = redis.opsForHash().entries(redisKey);
+        return data.get(key);
+    }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Thread/Scope 管理与 Agent 恢复</h3>
+
+      <p><span class="term" data-term-id="thread-state" tabindex="0">thread state</span> 管理 Agent 的执行线程。<span class="term" data-term-id="resume-agent" tabindex="0">resume agent</span> 从 Checkpoint 恢复 Agent 执行。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>概念</th><th>说明</th><th>与 session 的关系</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Thread</td><td>Agent 的一次执行实例</td><td>thread_id = session_id + step</td>
+          </tr>
+          <tr>
+            <td>Checkpoint</td><td>某一步的状态快照</td><td>按 thread_id 索引</td>
+          </tr>
+          <tr>
+            <td>Blackboard</td><td>多 Agent 共享上下文</td><td>按 session_id 索引</td>
+          </tr>
+          <tr>
+            <td>Scope</td><td>记忆可见范围</td><td>global/agent/step 三级</td>
+          </tr>
+        </tbody>
+      </radiobutton>
+      </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无 Checkpoint，Agent 重跑全部步骤</li>
+            <li>所有 Agent 共享全部记忆，无隔离</li>
+            <li>thread_id 随意生成，无法关联会话</li>
+            <li>Agent 失败后无恢复路径</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>每步后保存 Checkpoint，支持恢复</li>
+            <li>共享黑板书 + 私有记忆分离</li>
+            <li>thread_id = session_id + step，可追溯</li>
+            <li>注册 Resume Handler 处理恢复</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>检查理解：thread_id 为什么需要对齐 session_id？</summary>
+        <p>当用户从 Agent 切回普通对话，或从一个 Agent 切换到另一个 Agent，session_id 保证用户上下文不丢失。thread_id 附加 step 信息用于精确恢复某一步。</p>
+      </details>
+
+      <h4>常见问题（FAQ）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>Checkpoint 存储在哪里？性能如何？</summary>
+          <div class="learn-faq-body">LangGraph 支持 Redis 和 PostgreSQL。Redis 适合高性能场景（< 10ms 读写），PostgreSQL 适合需要复杂查询的场景。推荐 Redis 用于 Checkpoint，PostgreSQL 用于历史记录。</div>
+        </details>
+        <details>
+          <summary>多个 Agent 同时写入黑板书会冲突吗？</summary>
+          <div class="learn-faq-body">黑板书使用 Redis Hash，每个字段独立操作。不同 Agent 写不同 key 不会冲突。如果写同一 key，最后写入者获胜。需要事务性写入时使用 Redis Watch 或 Lua 脚本。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>LangGraph Checkpoint</strong>：Agent 每步后保存状态，支持中断恢复，通过 RedisSaver 持久化。</li>
+        <li><strong>共享黑板书</strong>：Redis 实现的共享上下文，多 Agent 可通过黑板书交换信息。</li>
+        <li><strong>私有记忆</strong>：每个 Agent 维护私有执行日志和中间状态，不共享。</li>
+        <li><strong>Thread ID 对齐</strong>：thread_id = session_id + step 保证跨 Agent 的会话连续性。</li>
+        <li><strong>Scope 管理</strong>：记忆分为 global/session/agent 三级可见范围。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="context-memory-engineering_advanced02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="checkpoint" /> 能用 LangGraph Checkpoint 持久化 Agent 状态</label></li>
+          <li><label><input type="checkbox" data-id="blackboard" /> 能实现共享黑板书模式</label></li>
+          <li><label><input type="checkbox" data-id="scope" /> 能设计记忆 scope 管理策略</label></li>
+          <li><label><input type="checkbox" data-id="resume" /> 能实现 Agent 中断恢复</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>LangGraph Checkpoint</td><td>Agent 状态每步持久化，支持恢复</td></tr>
+                <tr><td>Shared Blackboard</td><td>多 Agent 的 Redis 共享上下文</td></tr>
+                <tr><td>Thread State</td><td>Agent 执行实例的状态</td></tr>
+                <tr><td>Mem Scope</td><td>global/session/agent 三级可见范围</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何在多 Agent 场景下设计共享记忆？黑板书模式的优缺点？</li>
+              <li>Agent Checkpoint 如何保障数据一致性？</li>
+              <li>用户从 Agent 对话切换到普通对话，如何保证上下文连续？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-03-cost-latency">记忆的成本与延迟</a> — 优化记忆系统的性能与成本。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://docs.spring.io/spring-ai/reference/api/chat-memory.html" target="_blank" rel="noopener">Spring AI Chat Memory</a></li>
-    <li><a href="https://langchain-ai.github.io/langgraph/concepts/memory/" target="_blank" rel="noopener">LangGraph Memory</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/advanced-02-agent-memory-lab/</code></li>
-  <li>写一条上下文/记忆工程笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：Agent 场景记忆</h4>
-  <p><code>demos/advanced-02-agent-memory-lab/</code> — 写 thread_id 规则</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-advanced-03-cost-latency">记忆的成本与延迟</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://langchain-ai.github.io/langgraph/concepts/persistence/" target="_blank" rel="noopener">LangGraph Persistence — Checkpoint 文档</a></li>
+      <li><a href="https://python.langchain.com/docs/modules/memory/" target="_blank" rel="noopener">LangChain Memory</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现 Agent Checkpoint 和共享黑板书（约 25 分钟）。</p>
+    <ol class="steps steps-operate">
+      <li>使用 LangGraph 构建一个三步 Agent，配置 Redis Checkpointer。</li>
+      <li>实现 SharedBlackboard 类，多 Agent 共享上下文。</li>
+      <li>验证中断后从 Checkpoint 恢复完整的 Agent 状态。</li>
+      <li>测试 thread_id 与 session_id 对齐的会话连续性。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Agent 场景记忆</h4>
+      <p>目录：<code>demos/advanced-02-agent-memory-lab/</code>。<strong>验收</strong>：Checkpoint 正确保存/恢复、黑板书读写正常。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-03-cost-latency">记忆的成本与延迟</a></li>
+    </ul>
+  </div>
 </section>

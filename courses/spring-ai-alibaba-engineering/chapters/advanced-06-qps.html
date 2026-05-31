@@ -1,45 +1,525 @@
 <section id="ch-advanced-06-qps" class="chapter" data-chapter="advanced-06-qps">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>生产 QPS 与缓存分层</h2>
-  <button type="button" class="btn-mark-done" data-chapter="advanced-06-qps" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>生产 QPS 与缓存分层</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-06-qps" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
       <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>平台与生产</strong> · 能力：连接池、异步与削峰</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Agent 调用链长，需连接池与异步避免线程耗尽。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S3 Agent 场景实践本章能力</li>
-        <li>对照 Python LangGraph 说明选型</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 调用链很长：用户请求 → 路由 Agent → Graph 多步 → 多次 LLM 调用 → 多次工具调用。每一步的延迟和吞吐都会积累。生产环境需要从 <span class="term" data-term-id="connection-pool" tabindex="0">connection pool</span>、<span class="term" data-term-id="async-agent" tabindex="0">async agent</span>、<span class="term" data-term-id="cache-tier" tabindex="0">cache tier</span> 三个维度做 QPS 优化。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>配置 HTTP 连接池和线程池优化 Agent 吞吐</li>
+          <li>实现 <span class="term" data-term-id="async-agent" tabindex="0">async agent</span> 非阻塞执行</li>
+          <li>设计 <span class="term" data-term-id="peak-shaving" tabindex="0">peak shaving</span> 削峰策略</li>
+          <li>从 <span class="term" data-term-id="non-infra-view" tabindex="0">non infra view</span> 角度优化 QPS</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>连接池先于应用优化</strong>：LLM API 调用依赖 HTTP 连接池，不当配置是最大瓶颈。</li>
+          <li><strong>异步是吞吐关键</strong>：使用虚拟线程或 Reactor 实现非阻塞 Agent 执行。</li>
+          <li><strong>缓存分层降 QPS</strong>：语义缓存命中一次 = 省下一次 LLM 调用。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>连接池与异步</h3><p>httpx/WebClient 池；长任务异步化。 关联：<span class="term" data-term-id="connection-pool" tabindex="0">connection pool</span>、<span class="term" data-term-id="async-agent" tabindex="0">async agent</span>。</p></div>
-    <div class="section-block"><h3>削峰</h3><p>队列缓冲 Agent 任务。 关联：<span class="term" data-term-id="peak-shaving" tabindex="0">peak shaving</span>、<span class="term" data-term-id="qps-tuning" tabindex="0">qps tuning</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="connection-pool" tabindex="0">connection pool</span> · <span class="term" data-term-id="async-agent" tabindex="0">async agent</span> · <span class="term" data-term-id="peak-shaving" tabindex="0">peak shaving</span> · <span class="term" data-term-id="qps-tuning" tabindex="0">qps tuning</span> · <span class="term" data-term-id="thread-pool" tabindex="0">thread pool</span> · <span class="term" data-term-id="batch-tool" tabindex="0">batch tool</span> · <span class="term" data-term-id="cache-tier" tabindex="0">cache tier</span> · <span class="term" data-term-id="non-infra-view" tabindex="0">non infra view</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-yaml">http:
-  pool:
-    maxConnections: 200
-  async:
-    agentExecutor: virtualThreads</code></pre></div>
-      <div class="mermaid-wrap"><h5>生产 QPS 与缓存分层</h5>
-      <pre class="mermaid">flowchart LR
-  DS[DashScope] --> SAA[Spring AI Alibaba]
-  SAA --> AG[ReactAgent/Graph]
-  AG --> MCP[MCP 工具]</pre></div>
+
+    <div class="section-block">
+      <h3>连接池优化</h3>
+
+      <p><span class="term" data-term-id="connection-pool" tabindex="0">connection pool</span> 是 Agent 调用 LLM API 的底层瓶颈。DashScope 的 HTTP 连接池配置直接影响并发上限。</p>
+
+      <h4>HTTP 连接池配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    dashscope:
+      chat:
+        options:
+          model: qwen-max
+  # HTTP 客户端连接池
+  reactor:
+    netty:
+      pool:
+        max-connections: 500
+        acquire-timeout: 5000
+        max-idle-time: 30000
+
+# WebClient 配置
+corpassist:
+  http-client:
+    pool:
+      max-connections: 500
+      max-pending-acquire: 1000
+      pending-acquire-timeout: 5s
+    connect-timeout: 3s
+    read-timeout: 30s
+    write-timeout: 10s</code></pre>
+      </div>
+
+      <h4>配置化 Connection Manager</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Configuration
+public class HttpClientConfig {
+
+    @Bean
+    public WebClient dashscopeWebClient(HttpClient httpClient) {
+        return WebClient.builder()
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            .baseUrl("https://dashscope.aliyun.com")
+            .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+            .build();
+    }
+
+    @Bean
+    public HttpClient dashscopeHttpClient() {
+        return HttpClient.create()
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)
+            .responseTimeout(Duration.ofSeconds(30))
+            .doOnConnected(conn ->
+                conn.addHandlerLast(new ReadTimeoutHandler(30))
+            )
+            .metrics(true, () -> new MicrometerChannelMetricsRecorder("dashscope", "http"));
+    }
+}</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>连接池优化要点</strong>
+        <ul>
+          <li>max-connections 至少要大于预期并发 × Agent 步数（如 100 QPS × 5 步 = 500）</li>
+          <li>必须设 acquire-timeout，否则线程在等待连接时永久阻塞</li>
+          <li>启用 HTTP 指标监控连接池使用率，超过 70% 时扩容</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>连接池、异步与削峰</li>
-    <li>下一步：面试：通义栈架构题</li></ul></div>
+
+    <div class="section-block">
+      <h3>虚拟线程与异步 Agent</h3>
+
+      <p><span class="term" data-term-id="async-agent" tabindex="0">async agent</span> 使用虚拟线程（Java 21+）或 Reactor 实现非阻塞执行。<span class="term" data-term-id="thread-pool" tabindex="0">thread pool</span> 配置不当是 QPS 瓶颈的另一来源。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># 启用虚拟线程（Java 21+）
+spring:
+  threads:
+    virtual:
+      enabled: true
+
+# Agent 线程池配置
+corpassist:
+  agent:
+    thread-pool:
+      # 不使用虚拟线程时，自定义线程池
+      core-size: 50
+      max-size: 200
+      queue-capacity: 500
+      keep-alive: 60s</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// 异步 Agent 执行器
+@Service
+public class AsyncAgentExecutor {
+
+    private final GraphExecutor graphExecutor;
+
+    public AsyncAgentExecutor(GraphExecutor graphExecutor) {
+        this.graphExecutor = graphExecutor;
+    }
+
+    /**
+     * 异步执行 Graph，不阻塞请求线程
+     */
+    public CompletableFuture<GraphResult> executeAsync(String graphId, Object state) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return graphExecutor.execute(graphId, state).get();
+            } catch (Exception e) {
+                throw new RuntimeException("Agent execution failed", e);
+            }
+        });
+    }
+
+    /**
+     * 批量异步执行（并行工具调用场景）
+     */
+    public List<CompletableFuture<GraphResult>> executeBatch(List<BatchTask> tasks) {
+        return tasks.stream()
+            .map(task -> executeAsync(task.graphId(), task.state()))
+            .toList();
+    }
+}
+
+// Controller 中异步处理
+@PostMapping("/corpassist/batch")
+public Flux<GraphResult> batchProcess(@RequestBody List<BatchRequest> requests) {
+    List<CompletableFuture<GraphResult>> futures = requests.stream()
+        .map(req -> asyncExecutor.executeAsync(req.graphId(), req.toState()))
+        .toList();
+
+    return Flux.fromIterable(futures)
+        .flatMap(Mono::fromFuture);
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>QPS 优化：非 Infra 视角</h3>
+
+      <p><span class="term" data-term-id="non-infra-view" tabindex="0">non infra view</span> 强调从 Agent 设计层面优化 QPS，而不是只堆基础设施。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>优化维度</th><th>做法</th><th>QPS 提升</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>减少步数</td>
+            <td>合并多次工具调用为批量 API</td>
+            <td>2-3x</td>
+          </tr>
+          <tr>
+            <td>语义缓存</td>
+            <td>高频问题缓存，跳过 LLM</td>
+            <td>5-10x (命中时)</td>
+          </tr>
+          <tr>
+            <td>模型分级</td>
+            <td>简单问题用 qwen-turbo</td>
+            <td>2x</td>
+          </tr>
+          <tr>
+            <td>并行工具</td>
+            <td>独立的工具调用并行执行</td>
+            <td>2-5x</td>
+          </tr>
+          <tr>
+            <td>异步释放</td>
+            <td>请求线程不阻塞等 Agent</td>
+            <td>3-5x</td>
+          </tr>
+        </tbody>
+      </array>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只堆机器不优化应用</li>
+            <li>Agent 步数不加控制</li>
+            <li>每次请求都走完整 LLM 调用</li>
+            <li>同步阻塞执行</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>先优化应用再扩容</li>
+            <li>控制 maxSteps 减少不必要的推理</li>
+            <li>语义缓存 + 模型分级减负</li>
+            <li>异步 + 虚拟线程释放资源</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>削峰策略</h3>
+
+      <p><span class="term" data-term-id="peak-shaving" tabindex="0">peak shaving</span> 使用消息队列缓冲突发的 Agent 请求。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">corpassist:
+  peak-shaving:
+    enabled: true
+    queue: rocketmq  # 或 rabbitmq / kafka
+    topic: corpassist-agent-tasks
+    consumer-group: agent-consumer
+    max-concurrent: 20   # 最大并发消费数
+    queue-size: 10000    # 队列最大长度</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// RocketMQ 消费者异步执行 Agent
+@Component
+@RocketMQMessageListener(
+    topic = "corpassist-agent-tasks",
+    consumerGroup = "agent-consumer"
+)
+public class AgentTaskConsumer implements RocketMQListener<AgentTask> {
+
+    private final GraphExecutor graphExecutor;
+
+    @Override
+    public void onMessage(AgentTask task) {
+        // 异步执行 Graph，不阻塞消息线程
+        CompletableFuture.runAsync(() -> {
+            try {
+                graphExecutor.execute(task.graphId(), task.state());
+            } catch (Exception e) {
+                log.error("Agent execution failed: {}", task.taskId(), e);
+                // 发送到死信队列
+            }
+        });
+    }
+}</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="batch-tool" tabindex="0">batch tool</span> 将多次工具调用合并为一次批量调用，显著减少步数：</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Tool(name = "batch_query", description = "批量查询员工信息，输入多个员工 ID 用逗号分隔")
+public String batchQuery(String employeeIds) {
+    List<String> ids = Arrays.asList(employeeIds.split(","));
+    // 一次批量查询替代多次独立查询
+    List<Employee> employees = employeeService.batchFind(ids);
+    return employees.stream()
+        .map(e -> "%s: %s, %s".formatted(e.empId(), e.name(), e.department()))
+        .collect(Collectors.joining("\n"));
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>缓存分层设计</h3>
+
+      <p><span class="term" data-term-id="cache-tier" tabindex="0">cache tier</span> 将缓存分为三层：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>缓存内容</th><th>存储</th><th>TTL</th><th>命中率</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>L1: 本地缓存</td>
+            <td>高频 FAQ 答案</td>
+            <td>Caffeine</td>
+            <td>5 min</td>
+            <td>~20%</td>
+          </tr>
+          <tr>
+            <td>L2: 语义缓存</td>
+            <td>语义相似的问题</td>
+            <td>Redis</td>
+            <td>1 h</td>
+            <td>~30%</td>
+          </tr>
+          <tr>
+            <td>L3: 结果缓存</td>
+            <td>精确 match 的中间结果</td>
+            <td>Redis</td>
+            <td>10 min</td>
+            <td>~10%</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class TieredCacheService {
+
+    private final Cache<String, String> localCache;     // Caffeine L1
+    private final SemanticCacheService semanticCache;   // Redis L2
+    private final RedisTemplate<String, String> resultCache; // L3
+
+    public TieredCacheService() {
+        this.localCache = Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(Duration.ofMinutes(5))
+            .recordStats()
+            .build();
+    }
+
+    public Optional<String> get(String userMessage) {
+        // L1: 本地缓存
+        String l1Result = localCache.getIfPresent(userMessage);
+        if (l1Result != null) return Optional.of(l1Result);
+
+        // L2: 语义缓存
+        Optional<String> l2Result = semanticCache.getCached(userMessage);
+        if (l2Result.isPresent()) {
+            localCache.put(userMessage, l2Result.get()); // 提升到 L1
+            return l2Result;
+        }
+
+        // L3: 精确结果缓存
+        String l3Key = "result:" + DigestUtils.md5Hex(userMessage);
+        String l3Result = resultCache.opsForValue().get(l3Key);
+        if (l3Result != null) {
+            localCache.put(userMessage, l3Result);
+            return Optional.of(l3Result);
+        }
+
+        return Optional.empty();
+    }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>连接池设多大合适？</summary>
+          <div class="learn-faq-body">
+            公式：maxConnections = 目标 QPS × 每个 Agent 的平均 LLM 调用次数 × 平均响应时间（秒）。例如：50 QPS × 5 次 LLM 调用 × 2 秒 = 500。再加 20% 余量 = 600。
+          </div>
+        </details>
+        <details>
+          <summary>虚拟线程和平台线程在 Agent 场景的性能差异？</summary>
+          <div class="learn-faq-body">
+            虚拟线程的优势在 IO 密集型场景。Agent 调用 LLM 是 IO 等待（占 90%+ 时间），虚拟线程能将线程数从 200 提升到数千而不增加内存开销。实测虚拟线程 + Reactor Netty 可提升 3-5x 吞吐。
+          </div>
+        </details>
+        <details>
+          <summary>削峰队列满了怎么办？</summary>
+          <div class="learn-faq-body">
+            队列满时应立即拒绝（而非阻塞）并返回"当前请求量较高，请稍后重试"。设置队列监控告警，使用率 > 80% 时触发扩容流程。
+          </div>
+        </details>
+        <details>
+          <summary>QPS 上不去，Log 显示连接池都在等待，怎么快速排查？</summary>
+          <div class="learn-faq-body">
+            检查 (1) max-connections 是否太小；(2) acquire-timeout 是否太短导致误判；(3) 是否有 TLS 握手瓶颈。启用 HTTP 客户端 metrics 查看连接池状态。生产建议：连接池是第一个查询点。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>连接池优先</strong>：正确的 HTTP 连接池配置是 QPS 提升的第一步。</li>
+        <li><strong>异步释放</strong>：虚拟线程 + Reactor 非阻塞执行提升吞吐。</li>
+        <li><strong>非 Infra 优化</strong>：减少步数、缓存、模型分级比堆机器更有效。</li>
+        <li><strong>削峰保护</strong>：消息队列缓冲突发流量，防止 LLM 限流。</li>
+        <li><strong>三层缓存</strong>：L1 Caffeine + L2 语义 + L3 结果，逐层降 QPS。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba-engineering_advanced06">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="conn-pool" /> 能配置 HTTP 连接池并估算合理大小</label></li>
+          <li><label><input type="checkbox" data-id="async" /> 能实现异步 Agent 执行不阻塞请求线程</label></li>
+          <li><label><input type="checkbox" data-id="non-infra" /> 能说出至少 3 个非基础设施的 QPS 优化手段</label></li>
+          <li><label><input type="checkbox" data-id="cache-tier" /> 能设计三层缓存架构</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Connection Pool</td><td>HTTP 连接池，QPS 的第一瓶颈</td></tr>
+                <tr><td>Async Agent</td><td>非阻塞执行，虚拟线程释放资源</td></tr>
+                <tr><td>Peak Shaving</td><td>消息队列缓冲突发流量</td></tr>
+                <tr><td>QPS Tuning</td><td>先优应用再扩机器</td></tr>
+                <tr><td>Thread Pool</td><td>线程池配置影响并发能力</td></tr>
+                <tr><td>Batch Tool</td><td>批量工具调用减少步数</td></tr>
+                <tr><td>Cache Tier</td><td>L1 Caffeine + L2 Redis 语义 + L3 结果</td></tr>
+                <tr><td>Non-Infra View</td><td>应用层优化优于基础设施扩容</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 系统的 QPS 瓶颈通常在哪里？列举 3 个常见瓶颈及解决思路。</li>
+              <li>虚拟线程如何帮助 Agent 系统提升吞吐？与 Reactor 异步模型相比呢？</li>
+              <li>设计一个多层缓存方案来降低 LLM 调用量，每层的 TTL 和存储选型是什么？</li>
+              <li>大促流量是平时的 10 倍，你会从哪些层面做 QPS 保障？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：下一章 <a href="#ch-advanced-07-interview">面试：通义栈架构题</a> 是全课最后一章。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://java2ai.com/docs/dev/models/dashScope/" target="_blank" rel="noopener">Spring AI Alibaba DashScope</a></li>
-    <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">百炼 / Model Studio</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/advanced-06-qps-lab/</code></li>
-  <li>写一条与 LangGraph 或 DashScope 的对照笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：生产 QPS 与缓存分层</h4>
-  <p><code>demos/advanced-06-qps-lab/</code> — 写 1 条 QPS 优化措施</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-advanced-07-interview">面试：通义栈架构题</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://projectreactor.io/docs/netty/release/reference/index.html" target="_blank" rel="noopener">Reactor Netty — 连接池配置</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/reference/features/threading.html" target="_blank" rel="noopener">Spring Boot — 虚拟线程支持</a></li>
+      <li><a href="https://github.com/ben-manes/caffeine" target="_blank" rel="noopener">Caffeine — Java 本地缓存库</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/qps/" target="_blank" rel="noopener">百炼 QPS 配额说明</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">优化一个 Agent 服务的 QPS（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>配置 HTTP 连接池 max-connections=200</li>
+      <li>启用虚拟线程或自定义线程池</li>
+      <li>实现语义缓存并填充常见问题</li>
+      <li>用压测工具（wrk/jmeter）验证 QPS 提升</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：生产 QPS 与缓存分层</h4>
+      <p>目录：<code>demos/advanced-06-qps-lab/</code>。<strong>验收</strong>：压测后 QPS 提升至少 50%。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-07-interview">面试：通义栈架构题</a></li>
+      <li><strong>韧性</strong>：<a href="#ch-advanced-02-resilience">限流与降级</a></li>
+      <li><strong>缓存</strong>：<a href="../context-memory-engineering/index.html">上下文缓存工程</a></li>
+    </ul>
+  </div>
 </section>

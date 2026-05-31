@@ -3,40 +3,568 @@
   <button type="button" class="btn-mark-done" data-chapter="basics-03-auth" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈架构</strong> · 能力：JWT 传递、服务间信任与租户隔离</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Python 服务不能各自验用户；BFF 签发/转发可信上下文。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist 双栈场景实践本章集成能力</li>
-        <li>说明 Spring 治理面与 Python 能力面分工</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈架构</strong> · 能力：JWT 传递、服务间信任与租户隔离</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong>
+        <p>双栈鉴权的核心挑战：Python 服务不能各自验用户 JWT，否则每个服务都需要同步公钥、处理令牌刷新、维护认证逻辑。正确做法是 Spring Gateway 统一鉴权，Python 只相信 <strong>网内可信 Header</strong>。本章详细讲解 <span class="term" data-term-id="jwt-forward" tabindex="0">jwt forward</span> 和 <span class="term" data-term-id="service-trust" tabindex="0">service trust</span> 的设计。</p>
+      </div>
+      <div class="notice notice-outcome"><strong>学完你能</strong>
+        <ul>
+          <li>设计 Spring Gateway 统一鉴权的完整流程（OAuth2 + JWT）</li>
+          <li>基于 <span class="term" data-term-id="user-context" tabindex="0">user context</span> 在双栈间传递用户身份</li>
+          <li>实现 <span class="term" data-term-id="m2m-auth" tabindex="0">m2m auth</span> 服务间 M2M 认证</li>
+          <li>设计基于 <span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span> 的多租户隔离方案</li>
+          <li>理解 <span class="term" data-term-id="zero-trust" tabindex="0">zero trust</span> 在服务网格中的应用</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>JWT 传递</h3><p>Gateway 验签；BFF 注入 X-User-Id/Tenant。 关联：<span class="term" data-term-id="jwt-forward" tabindex="0">jwt forward</span>、<span class="term" data-term-id="service-trust" tabindex="0">service trust</span>。</p></div>
-    <div class="section-block"><h3>服务间信任</h3><p>内网 mTLS 或 signed internal JWT。 关联：<span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span>、<span class="term" data-term-id="m2m-auth" tabindex="0">m2m auth</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="jwt-forward" tabindex="0">jwt forward</span> · <span class="term" data-term-id="service-trust" tabindex="0">service trust</span> · <span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span> · <span class="term" data-term-id="m2m-auth" tabindex="0">m2m auth</span> · <span class="term" data-term-id="user-context" tabindex="0">user context</span> · <span class="term" data-term-id="internal-token" tabindex="0">internal token</span> · <span class="term" data-term-id="acl-header" tabindex="0">acl header</span> · <span class="term" data-term-id="zero-trust" tabindex="0">zero trust</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">http</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-http">POST /v1/rag/query HTTP/1.1
-Authorization: Bearer &lt;user-jwt&gt;
-X-Tenant-Id: corp-001
-X-Request-Id: req-uuid</code></pre></div>
-      <div class="mermaid-wrap"><h5>统一鉴权</h5>
-      <pre class="mermaid">flowchart LR
-  Spring[Spring 治理面] <-->|OpenAPI| Python[Python 能力面]</pre></div>
+
+    <div class="section-block">
+      <h3>统一鉴权架构：Spring Gateway 集中式认证</h3>
+      <p>双栈鉴权的核心设计原则：<strong>认证在 Gateway，授权在服务</strong>。Spring Cloud Gateway 作为统一入口，负责所有用户的认证，Python 服务不再需要关心用户是谁、令牌是否有效——它只需要相信 Gateway 注入的 Header。</p>
+
+      <div class="mermaid-wrap">
+        <h5>统一鉴权流程</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant GW as Spring Gateway
+    participant AUTH as Auth Service\n(Keycloak)
+    participant BFF as Spring BFF
+    participant PY as Python AI 服务
+
+    U->>GW: POST /api/v1/rag/query\nAuthorization: Bearer &lt;jwt&gt;
+    GW->>GW: 1. 提取 JWT
+    GW->>AUTH: 2. 校验 JWT 签名\n(JWK 端点)
+    AUTH-->>GW: 3. 用户身份 + claims
+    GW->>GW: 4. 注入可信 Header
+    GW->>BFF: 5. 转发请求\nX-User-Id, X-Tenant-Id\nX-User-Role, X-Request-Id
+    BFF->>BFF: 6. 校验 Header 完整性
+    BFF->>PY: 7. 调用 Python\n（携带可信 Header）
+    PY->>PY: 8. 按 X-Tenant-Id 隔离检索\n仅需信任 Header
+
+    Note over GW,PY: Python 不需要验 JWT，相信 Gateway 注入的 Header</pre>
+        <p class="diagram-caption">统一鉴权流程：Gateway 负责 JWT 校验，Python 服务只接收可信 Header。</p>
+      </div>
+
+      <h4>Spring Gateway JWT 校验过滤器</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring Cloud Gateway - JWT 校验与 Header 注入
+@Component
+public class JwtAuthFilter implements GlobalFilter, Ordered {
+
+    private final ReactiveJwtDecoder jwtDecoder;
+
+    public JwtAuthFilter(ReactiveJwtDecoder jwtDecoder) {
+        this.jwtDecoder = jwtDecoder;
+    }
+
+    @Override
+    public Mono&lt;Void&gt; filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String authHeader = exchange.getRequest()
+            .getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+
+        String token = authHeader.substring(7);
+        return jwtDecoder.decode(token)
+            .flatMap(jwt -&gt; {
+                // 注入可信 Header
+                ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
+                    .header("X-User-Id", jwt.getClaimAsString("sub"))
+                    .header("X-Tenant-Id", jwt.getClaimAsString("tenant_id"))
+                    .header("X-User-Role", jwt.getClaimAsString("role"))
+                    .header("X-Request-Id", UUID.randomUUID().toString())
+                    .build();
+                ServerWebExchange modifiedExchange = exchange.mutate()
+                    .request(modifiedRequest).build();
+                return chain.filter(modifiedExchange);
+            })
+            .onErrorResume(e -&gt; {
+                exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                return exchange.getResponse().setComplete();
+            });
+    }
+
+    @Override
+    public int getOrder() {
+        return -100; // 高优先级
+    }
+}</code></pre>
+      </div>
+
+      <h4>Python 服务获取用户信息（从 Header）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python - 从可信 Header 获取用户上下文
+from fastapi import FastAPI, Depends, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional
+
+app = FastAPI(title="CorpAssist Python AI")
+
+class UserContext(BaseModel):
+    user_id: str
+    tenant_id: str
+    role: str
+    request_id: str
+
+async def get_user_context(
+    x_user_id: str = Header(...),
+    x_tenant_id: str = Header(...),
+    x_user_role: str = Header(default="user"),
+    x_request_id: str = Header(default=""),
+) -> UserContext:
+    """从 Gateway 注入的可信 Header 获取用户上下文"""
+    return UserContext(
+        user_id=x_user_id,
+        tenant_id=x_tenant_id,
+        role=x_user_role,
+        request_id=x_request_id,
+    )
+
+@app.post("/v1/rag/query")
+async def rag_query(
+    request: RagQueryRequest,
+    ctx: UserContext = Depends(get_user_context),
+):
+    # 使用 ctx.tenant_id 隔离向量库
+    # 使用 ctx.user_id 记录请求来源
+    # 使用 ctx.request_id 记录日志
+    return await perform_rag_query(request, ctx)
+</code></pre>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>JWT 传递、服务间信任与租户隔离</li>
-    <li>下一步：docker-compose 联调环境</li></ul></div>
+
+    <div class="section-block">
+      <h3>JWT 传递与 Header 规范</h3>
+      <p><span class="term" data-term-id="jwt-forward" tabindex="0">jwt forward</span> 指 Gateway 校验 JWT 后，将用户信息通过自定义 Header 传递到下游服务。Header 设计规范：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>Header</th><th>类型</th><th>来源</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>X-User-Id</code></td>
+            <td>String</td>
+            <td>JWT sub</td>
+            <td>用户的唯一标识（如 1001）</td>
+          </tr>
+          <tr>
+            <td><code>X-Tenant-Id</code></td>
+            <td>String</td>
+            <td>JWT tenant_id</td>
+            <td>企业租户标识（如 corp-001）</td>
+          </tr>
+          <tr>
+            <td><code>X-User-Role</code></td>
+            <td>String</td>
+            <td>JWT role</td>
+            <td>角色：admin/user/auditor</td>
+          </tr>
+          <tr>
+            <td><code>X-Request-Id</code></td>
+            <td>UUID</td>
+            <td>Gateway 生成</td>
+            <td>全链路追踪 ID</td>
+          </tr>
+          <tr>
+            <td><code>X-User-Name</code></td>
+            <td>String</td>
+            <td>JWT name</td>
+            <td>用户显示名（可选）</td>
+          </tr>
+          <tr>
+            <td><code>X-User-Dept</code></td>
+            <td>String</td>
+            <td>JWT dept</td>
+            <td>用户部门（用于 ACL 过滤）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>安全提示</strong>
+        <p>Gateway 必须在注入可信 Header 之前清除客户端传入的同名 Header，防止用户伪造。Spring Gateway 的 <code>RemoveRequestHeader</code> 过滤器可用于此目的。</p>
+      </div>
+
+      <h4>Gateway 清除恶意 Header 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># Spring Cloud Gateway 配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: corpassist-bff
+          uri: http://spring-bff:8081
+          predicates:
+            - Path=/api/v1/corpassist/**
+          filters:
+            # 清除客户端传入的可信 Header（防伪造）
+            - RemoveRequestHeader=X-User-Id
+            - RemoveRequestHeader=X-Tenant-Id
+            - RemoveRequestHeader=X-User-Role
+            - RemoveRequestHeader=X-Request-Id
+            # JWT 校验过滤器（自定义）
+            - name: JwtAuthFilter</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>服务间 M2M 认证</h3>
+      <p><span class="term" data-term-id="m2m-auth" tabindex="0">m2m auth</span> 用于 Spring BFF 调用 Python 服务时的服务间认证。虽然 Python 服务部署在内网，但仍然建议添加一层轻量认证：</p>
+
+      <ul>
+        <li><strong>内部 JWT</strong>（<span class="term" data-term-id="internal-token" tabindex="0">internal token</span>)：BFF 使用自己的客户端凭证向 Auth Service 获取内部令牌</li>
+        <li><strong>mTLS</strong>：服务间通信使用双向 TLS 证书验证（服务网格中常见）</li>
+        <li><strong>内网 IP 白名单</strong>：Python 服务只允许 Spring BFF 的 Pod IP 调用</li>
+      </ul>
+
+      <h4>Spring BFF M2M 认证</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring BFF - 服务间 M2M 认证
+@Service
+public class PythonServiceClient {
+
+    private final WebClient pythonClient;
+    private String cachedInternalToken;
+    private Instant tokenExpiry;
+
+    public Mono&lt;RagQueryResponse&gt; queryRag(RagQueryRequest request,
+                                             String userId, String tenantId) {
+        return getInternalToken()
+            .flatMap(token -&gt; pythonClient.post()
+                .uri("/v1/rag/query")
+                .header("Authorization", "Bearer " + token)
+                .header("X-User-Id", userId)
+                .header("X-Tenant-Id", tenantId)
+                .bodyValue(request)
+                .retrieve()
+                .bodyToMono(RagQueryResponse.class));
+    }
+
+    private Mono&lt;String&gt; getInternalToken() {
+        if (cachedInternalToken != null
+            && Instant.now().isBefore(tokenExpiry.minusSeconds(60))) {
+            return Mono.just(cachedInternalToken);
+        }
+        // 使用客户端凭证模式获取内部令牌
+        return authClient.getToken(
+            "corpassist-bff", "client-secret",
+            "corpassist-python-api")
+            .map(response -&gt; {
+                cachedInternalToken = response.accessToken();
+                tokenExpiry = Instant.now()
+                    .plusSeconds(response.expiresIn());
+                return cachedInternalToken;
+            });
+    }
+}</code></pre>
+      </div>
+
+      <h4>Python 验证内部 JWT</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python - 验证内部 M2M JWT
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+
+security_scheme = HTTPBearer(auto_error=False)
+
+# 内部 JWT 公钥（从 Auth Service 同步）
+INTERNAL_JWKS = {
+    "keys": [
+        # ... 内部服务的 RSA 公钥
+    ]
+}
+
+async def verify_internal_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
+) -> str:
+    """验证内部 M2M 令牌"""
+    if credentials is None:
+        # 如果没有令牌，仅依赖内网 Header（信任 Gateway）
+        return "anonymous"
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            INTERNAL_JWKS,
+            algorithms=["RS256"],
+            audience="corpassist-python-api",
+        )
+        return payload.get("sub", "unknown")
+    except jwt.PyJWTError:
+        # M2M 验证失败时，仍允许内网请求通过
+        # 但需要记录告警
+        logger.warning("Internal token verification failed")
+        return "untrusted"
+</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户隔离</h3>
+      <p><span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span> 是 CorpAssist 企业场景中的核心需求。不同企业（租户）的数据必须严格隔离。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>隔离层级</th><th>实现方式</th><th>隔离强度</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>向量库</strong></td>
+            <td>每个租户独立的 collection/partition</td>
+            <td>强</td>
+          </tr>
+          <tr>
+            <td><strong>检索过滤</strong></td>
+            <td>检索时传入 tenant_id 作为 filter 表达式</td>
+            <td>中</td>
+          </tr>
+          <tr>
+            <td><strong>会话存储</strong></td>
+            <td>Redis key 前缀: session:{tenant_id}:{user_id}</td>
+            <td>强</td>
+          </tr>
+          <tr>
+            <td><strong>审计日志</strong></td>
+            <td>DB 表中 tenant_id 字段分区</td>
+            <td>中</td>
+          </tr>
+          <tr>
+            <td><strong>LLM 调用</strong></td>
+            <td>按租户配置不同的 model/temperature</td>
+            <td>弱</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>所有租户共享同一个向量 collection</li>
+            <li>Python 自己从 JWT 解析 tenant_id</li>
+            <li>不使用 X-Tenant-Id Header</li>
+            <li>租户隔离仅依赖代码逻辑，无基础设施保障</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>每个租户独立 collection + partition</li>
+            <li>Python 从可信 Header 读取 tenant_id</li>
+            <li>BFF 校验 tenant_id 与用户是否匹配</li>
+            <li>向量检索时强制加入 tenant_id 过滤</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Python 租户隔离检索</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python - 基于租户的向量检索隔离
+async def perform_rag_query(
+    request: RagQueryRequest,
+    ctx: UserContext,
+) -> RagQueryResponse:
+    """按租户隔离执行 RAG 查询"""
+
+    # 1. 按租户选择 vector store
+    collection_name = f"corp_{ctx.tenant_id}"
+
+    vector_store = Milvus(
+        embedding_function=embeddings,
+        collection_name=collection_name,
+        connection_args={"host": "milvus", "port": "19530"},
+    )
+
+    # 2. 检索时强制加入部门过滤
+    retriever = vector_store.as_retriever(
+        search_kwargs={
+            "k": request.top_k,
+            "expr": f'dept == "{ctx.dept}"' if ctx.dept else None,
+        }
+    )
+
+    # 3. 构建 RAG Chain
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=ChatOpenAI(model="gpt-4o", temperature=0),
+        retriever=retriever,
+    )
+
+    result = await qa_chain.ainvoke({"query": request.query})
+    return RagQueryResponse(answer=result["result"], sources=[])
+</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>零信任架构</h3>
+      <p><span class="term" data-term-id="zero-trust" tabindex="0">zero trust</span> 在双栈鉴权中的应用：即使 Python 服务运行在内网，也不自动信任任何请求。实施要点：</p>
+
+      <ul>
+        <li><strong>请求必须包含有效令牌</strong>：内部 JWT 或 Gateway 签发的会话令牌</li>
+        <li><strong>每次都验签</strong>：不缓存认证结果（除了 M2M token 的过期时间缓存）</li>
+        <li><strong>最小权限</strong>：Python 服务只获得执行所需的最小 scope</li>
+        <li><strong>审计日志</strong>：所有跨服务调用记录请求方身份和操作</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>Python 服务如何知道当前用户的角色和权限？</summary>
+          <div class="learn-faq-body">
+            通过 Spring Gateway 注入的 X-User-Role 和 X-User-Dept Header。Python 不需要自己解析 JWT，直接从 Header 读取即可。这样做的好处是：认证逻辑只在一个地方（Gateway）实现，Python 服务更轻量。
+          </div>
+        </details>
+        <details>
+          <summary>如果 Gateway 挂了，Python 服务还能工作吗？</summary>
+          <div class="learn-faq-body">
+            不能直接对外提供服务，这是设计上的。Gateway 是整个系统的<strong>唯一入口</strong>，Gateway 不可用意味着整个系统不可用。但 Python 服务可以处理 BFF 的内部请求。高可用方案：Gateway 多副本 + 健康检查 + 自动重启。
+          </div>
+        </details>
+        <details>
+          <summary>内部 JWT 和用户 JWT 有什么区别？</summary>
+          <div class="learn-faq-body">
+            用户 JWT 由外部 OAuth2 提供商签发，包含用户身份信息。内部 JWT 由 Auth Service 用<strong>客户端凭证模式</strong>签发，用于服务间认证。内部 JWT 的受众（aud）限制为特定的 Python API，生命周期更短（通常 5-15 分钟）。
+          </div>
+        </details>
+        <details>
+          <summary>X-Tenant-Id 会在响应中返回给客户端吗？</summary>
+          <div class="learn-faq-body">
+            不应该。X-Tenant-Id 是<strong>内部 Header</strong>，Spring BFF 在返回响应给客户端前应该删除它（RemoveResponseHeader 过滤器）。客户端不应该知道内部租户标识的具体值。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>集中认证</strong>：Spring Gateway 统一校验 JWT，Python 不用重复实现鉴权</li>
+        <li><strong>可信 Header</strong>：Gateway 注入 X-User-Id/X-Tenant-Id 等 Header，下游服务信任它们</li>
+        <li><strong>M2M 认证</strong>：服务间使用内部 JWT 或 mTLS 增强安全</li>
+        <li><strong>租户隔离</strong>：基于 X-Tenant-Id 在向量库/Redis/数据库层面进行数据隔离</li>
+        <li><strong>下一步</strong>：在 <a href="#ch-basics-04-local-compose">Docker Compose 本地开发栈</a> 中将本章的鉴权体系编排为可运行的本地环境</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-composite-integration_basics03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="jwt-forward" /> 能画出统一鉴权的完整流程，标注每个节点的认证动作</label></li>
+          <li><label><input type="checkbox" data-id="header-spec" /> 能列出所有可信 Header 及其来源和业务含义</label></li>
+          <li><label><input type="checkbox" data-id="tenant" /> 能解释多租户隔离的 3 种实现方式及其强度</label></li>
+          <li><label><input type="checkbox" data-id="m2m" /> 能写出 BFF 获取内部令牌的代码片段</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="jwt-forward" tabindex="0">jwt forward</span></td><td>Gateway 校验后通过 Header 传递用户信息</td></tr>
+                <tr><td><span class="term" data-term-id="service-trust" tabindex="0">service trust</span></td><td>内网服务间使用内部 JWT 或 mTLS 认证</td></tr>
+                <tr><td><span class="term" data-term-id="tenant-isolation" tabindex="0">tenant isolation</span></td><td>按 X-Tenant-Id 隔离向量库/Redis/DB</td></tr>
+                <tr><td><span class="term" data-term-id="m2m-auth" tabindex="0">m2m auth</span></td><td>客户端凭证模式，服务间安全通信</td></tr>
+                <tr><td><span class="term" data-term-id="user-context" tabindex="0">user context</span></td><td>包含用户身份/租户/角色的上下文对象</td></tr>
+                <tr><td><span class="term" data-term-id="internal-token" tabindex="0">internal token</span></td><td>内部服务使用的短生命周期 JWT</td></tr>
+                <tr><td><span class="term" data-term-id="acl-header" tabindex="0">acl header</span></td><td>用于权限控制的 Header 字段</td></tr>
+                <tr><td><span class="term" data-term-id="zero-trust" tabindex="0">zero trust</span></td><td>内网也不自动信任，每次请求都要认证</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 Python 服务不能直接校验用户 JWT？如果 Python 需要知道用户角色，应该怎么做？</li>
+              <li>多租户场景下，如何防止一个租户的用户查询到另一个租户的数据？列出至少 3 层防护。</li>
+              <li>BFF 调用 Python 服务时，使用什么认证方式？请对比内部 JWT 和 mTLS 的优劣。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-basics-04-local-compose">Docker Compose 本地开发栈</a> 将搭建完整的本地联调环境。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://swagger.io/specification/" target="_blank" rel="noopener">OpenAPI</a></li>
-    <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank" rel="noopener">Spring Cloud Gateway</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/basics-03-auth-lab/</code></li>
-  <li>写一条双栈分工或契约对照笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：统一鉴权</h4>
-  <p><code>demos/basics-03-auth-lab/</code> — 写 Python 必读的 3 个 Header</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-basics-04-local-compose">docker-compose 联调环境</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html" target="_blank" rel="noopener">Spring Security — JWT 资源服务器配置</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway/gatewayfilter-factories.html" target="_blank" rel="noopener">Spring Cloud Gateway — 过滤器工厂</a></li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/security/oauth2-scopes/" target="_blank" rel="noopener">FastAPI — 安全与作用域</a></li>
+      <li><a href="https://www.keycloak.org/docs/latest/securing_apps/" target="_blank" rel="noopener">Keycloak — 应用安全指南</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 CorpAssist 双栈场景中配置统一的鉴权流程（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>配置 Spring Cloud Gateway 的 JWT 校验过滤器，实现用户 Header 注入</li>
+      <li>实现 Python FastAPI 的依赖注入函数，从 Header 读取用户上下文</li>
+      <li>配置 BFF 的 M2M 内部 JWT 获取逻辑</li>
+      <li>实现基于 tenant_id 的向量库隔离检索</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">你发现 Python 服务收到的 X-User-Id 和 JWT 中的 sub 不一致，应该怎么排查？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>1) 检查 Gateway 的 JWT 校验过滤器是否正确解析 sub claim；2) 检查 RemoveRequestHeader 是否清除了客户端传入的 X-User-Id；3) 检查 Gateway 日志看 JWT 解析结果；4) 检查 BFF 是否有额外的 Header 重写逻辑。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">安全审计发现 X-Tenant-Id 在日志中没有脱敏，如何处理？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>1) 在日志配置中添加 X-Tenant-Id 的脱敏规则（如使用 Logback 的 PatternMasking）；2) 确保响应中不返回 X-Tenant-Id；3) 审计日志中记录租户信息但去标识化。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：统一鉴权</h4>
+      <p>目录：<code>demos/basics-03-auth-lab/</code>。<strong>验收</strong>：写出 Python 服务必须读取的 3 个 Header 及其业务含义，并实现 Header 读取的依赖注入代码。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-local-compose">Docker Compose 本地开发栈</a> — 搭建完整联调环境</li>
+      <li><a href="https://oauth.net/2/" target="_blank" rel="noopener">OAuth 2.0 — 授权协议详解</a></li>
+      <li><a href="https://jwt.io/introduction" target="_blank" rel="noopener">JWT.io — JSON Web Token 介绍</a></li>
+      <li><a href="https://www.keycloak.org/" target="_blank" rel="noopener">Keycloak — 开源身份和访问管理</a></li>
+    </ul>
+  </div>
 </section>

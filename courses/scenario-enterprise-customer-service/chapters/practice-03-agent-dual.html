@@ -3,45 +3,400 @@
   <button type="button" class="btn-mark-done" data-chapter="practice-03-agent-dual" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：LangGraph/Python 与 Spring AI Tools 会话打通</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Python 跑 Agent 逻辑；Spring 管会话与对外 SSE。</p></div>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：LangGraph Agent/Python + Spring AI Tools + 会话打通</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>客服 Agent 是典型的需要 Python（Agent 编排）和 Spring（工具+会话）协作的场景。<span class="term" data-term-id="dual-agent-cs" tabindex="0">dual agent cs</span> 通过 Redis 共享 DST 状态，实现双栈无缝协作。本章搭建完整的双栈客服 Agent。</p></div>
       <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S2 智能客服场景端到端落地</li>
-        <li>贯通意图路由、工具、转人工与评测</li>
-        <li>完成 Demo 与测验</li></ul></div>
+        <li>用 LangGraph 构建客服 Agent 状态图（接收消息 → DST → 选工具 → 执行 → 回复）</li>
+        <li>用 <span class="term" data-term-id="spring-ai-tools" tabindex="0">Spring AI Tools</span> 注册企业工具并暴露给 Python Agent 调用</li>
+        <li>实现 <span class="term" data-term-id="session-bridge" tabindex="0">session bridge</span> 通过 Redis 共享双栈的 DST 状态</li>
+        <li>配置 SSE 流式输出，首 Token 延迟 &lt; 300ms</li>
+      </ul></div>
+      <div class="notice"><strong>本章先记住 3 件事</strong><ul>
+        <li><strong>LangGraph 管 Agent 流</strong>：意图→槽位收集→工具调用→回答，一个状态图描述完整流程。</li>
+        <li><strong>Spring 管工具执行</strong>：所有 ERP 调用在 Spring 侧完成，不走 Python，保证安全与审计。</li>
+        <li><strong>Redis 是共享状态层</strong>：<span class="term" data-term-id="bff-session" tabindex="0">bff session</span> 与 <span class="term" data-term-id="sse-cs" tabindex="0">SSE 流式</span> 都通过 Redis 同步 DST 状态。</li>
+      </ul></div>
     </div>
-    <div class="section-block"><h3>双栈 Agent</h3><p>BFF 持 session_id；转发 Python Agent。 关联：<span class="term" data-term-id="langgraph-cs" tabindex="0">langgraph cs</span>、<span class="term" data-term-id="spring-ai-tools" tabindex="0">spring ai tools</span>。</p></div>
-    <div class="section-block"><h3>会话打通</h3><p>Redis DST 两边读同一 key。 关联：<span class="term" data-term-id="session-bridge" tabindex="0">session bridge</span>、<span class="term" data-term-id="dual-agent-cs" tabindex="0">dual agent cs</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="langgraph-cs" tabindex="0">langgraph cs</span> · <span class="term" data-term-id="spring-ai-tools" tabindex="0">spring ai tools</span> · <span class="term" data-term-id="session-bridge" tabindex="0">session bridge</span> · <span class="term" data-term-id="dual-agent-cs" tabindex="0">dual agent cs</span> · <span class="term" data-term-id="sse-cs" tabindex="0">sse cs</span> · <span class="term" data-term-id="python-agent-cs" tabindex="0">python agent cs</span> · <span class="term" data-term-id="bff-session" tabindex="0">bff session</span> · <span class="term" data-term-id="agent-s2" tabindex="0">agent s2</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-yaml">session:
-  store: redis
-  key: corpassist:cs:{session_id}
-agent:
-  python_endpoint: /v1/cs/agent/run
-  spring_tools: [query_order]</code></pre></div>
-      <div class="mermaid-wrap"><h5>客服 Agent 双栈实现</h5>
-      <pre class="mermaid">flowchart LR
-  User --> Intent[意图路由]
-  Intent --> Agent[客服 Agent]
-  Agent --> Tools[订单工具]
-  Agent --> Human[人工坐席]</pre></div>
+
+    <div class="section-block">
+      <h3>双栈 Agent 架构</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 双栈 Agent 协作</span>
+        用户发送「我要改地址，订单 O2025001，改成北京市朝阳区望京 SOHO」。Python Agent 收到消息后从 Redis 读取 DST 状态，确认当前意图为 change_address，补充槽位（order_id、new_address），然后通过 HTTP 调用 Spring 侧的 updateAddress 工具，工具结果返回后更新 DST 并通过 SSE 推送给前端。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>双栈 Agent 完整通信序列</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant F as 前端
+    participant S as Spring BFF
+    participant P as Python Agent<br>LangGraph
+    participant R as Redis DST
+    participant E as ERP
+
+    F->>S: SSE 连接 /chat
+    S->>S: 鉴权+租户识别
+    F->>S: 用户消息
+    S->>R: 读取 DST 状态
+    S->>P: POST /agent/run<br>{message, dst, sessionId}
+    P->>P: LangGraph 推理
+    Note over P: 意图识别→槽位收集→工具选择
+    P->>S: POST /tools/query 或 /tools/refund
+    S->>E: ERP 调用
+    E-->>S: ERP 结果
+    S-->>P: 工具结果
+    P->>R: 更新 DST 状态
+    P-->>S: Agent 回答 (SSE)
+    S-->>F: SSE 流式输出</pre>
+        <p class="diagram-caption">双栈通过 Redis 共享 DST 状态，Python LangGraph Agent 负责推理和流程编排，Spring BFF 负责工具执行和 SSE 推送。</p>
+      </div>
+
+      <p><span class="term" data-term-id="langgraph-cs" tabindex="0">langgraph cs</span> 定义客服 Agent 的状态图，包含四个核心节点：receive（接收消息）→ update_dst（更新对话状态）→ select_tool（选工具或直接回复）→ execute_tool_or_reply（执行工具或生成回复）。<span class="term" data-term-id="python-agent-cs" tabindex="0">python agent cs</span> 是 LangGraph 在 Python 侧的部署单元，每个会话对应一个 Agent 实例。</p>
+
+      <h4>Python 侧：LangGraph Agent 定义</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy">复制</button></div>
+<pre><code class="language-python"># agent_graph.py — CorpAssist 双栈 Agent 状态图
+from typing import TypedDict, List, Optional, Literal
+from langgraph.graph import StateGraph, END
+from openai import OpenAI
+import httpx
+import json
+
+class AgentState(TypedDict):
+    """Agent 状态"""
+    session_id: str
+    message: str
+    intent: Optional[str]
+    confidence: float
+    dst_slots: dict
+    tool_result: Optional[str]
+    response: Optional[str]
+
+class CSToolExecutor:
+    """工具执行器：通过 HTTP 调用 Spring BFF 的工具"""
+
+    def __init__(self, spring_base: str = "http://spring-bff:8080"):
+        self.spring_base = spring_base
+
+    async def execute(self, tool_name: str, params: dict) -> str:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{self.spring_base}/tools/{tool_name}",
+                json=params,
+            )
+            resp.raise_for_status()
+            return resp.json()["result"]
+
+class CSLangGraphAgent:
+    """客服 Agent — LangGraph 实现"""
+
+    def __init__(self):
+        self.tool_executor = CSToolExecutor()
+        self.llm = OpenAI(base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph:
+        builder = StateGraph(AgentState)
+
+        builder.add_node("receive", self._receive)
+        builder.add_node("update_dst", self._update_dst)
+        builder.add_node("select_action", self._select_action)
+        builder.add_node("execute_tool", self._execute_tool)
+        builder.add_node("generate_reply", self._generate_reply)
+
+        builder.set_entry_point("receive")
+        builder.add_edge("receive", "update_dst")
+        builder.add_edge("update_dst", "select_action")
+        builder.add_conditional_edges("select_action",
+            self._decide_next, {
+                "execute_tool": "execute_tool",
+                "generate_reply": "generate_reply",
+                "handoff": "generate_reply",
+            })
+        builder.add_edge("execute_tool", "generate_reply")
+        builder.add_edge("generate_reply", END)
+        return builder.compile()
+
+    async def _receive(self, state: AgentState) -> AgentState:
+        """接收用户消息"""
+        print(f"[receive] 会话 {state['session_id']}: {state['message'][:50]}")
+        return state
+
+    async def _update_dst(self, state: AgentState) -> AgentState:
+        """LLM 提取槽位更新 DST"""
+        resp = self.llm.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "提取用户消息中的客服槽位，返回 JSON：{intent, slots}"},
+                      {"role": "user", "content": state["message"]}],
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(resp.choices[0].message.content)
+        state["intent"] = result.get("intent")
+        state["dst_slots"].update(result.get("slots", {}))
+        return state
+
+    async def _select_action(self, state: AgentState) -> AgentState:
+        """选择下一步动作"""
+        if state["intent"] in ("complaint", "human"):
+            state["response"] = "handoff"
+            return state
+        if state["intent"] in ("refund", "change_address") and self._slots_ready(state):
+            return state  # 走 execute_tool
+        return state  # 走 generate_reply
+
+    def _decide_next(self, state: AgentState) -> Literal["execute_tool", "generate_reply", "handoff"]:
+        if state.get("response") == "handoff":
+            return "handoff"
+        if state["intent"] in ("query_order", "refund", "change_address") and self._slots_ready(state):
+            return "execute_tool"
+        return "generate_reply"
+
+    def _slots_ready(self, state: AgentState) -> bool:
+        required = {"query_order": ["order_id"], "refund": ["order_id", "amount"],
+                    "change_address": ["order_id", "new_address"]}
+        slots = required.get(state.get("intent", ""), [])
+        return all(s in state["dst_slots"] for s in slots)
+
+    async def _execute_tool(self, state: AgentState) -> AgentState:
+        tool_map = {"query_order": "query", "refund": "refund", "change_address": "address"}
+        tool = tool_map.get(state["intent"], "")
+        if tool:
+            state["tool_result"] = await self.tool_executor.execute(tool, state["dst_slots"])
+        return state
+
+    async def _generate_reply(self, state: AgentState) -> AgentState:
+        if state["intent"] == "complaint":
+            state["response"] = "已为您转接人工客服，请稍候。"
+        elif state["tool_result"]:
+            state["response"] = state["tool_result"]
+        else:
+            # 槽位不足，反问
+            missing = self._missing_slots(state)
+            state["response"] = f"请提供以下信息：{', '.join(missing)}"
+        return state
+
+    async def run(self, session_id: str, message: str) -> str:
+        initial = AgentState(session_id=session_id, message=message, intent=None,
+                             confidence=0.0, dst_slots={}, tool_result=None, response=None)
+        result = await self.graph.ainvoke(initial)
+        return result.get("response", "抱歉，暂时无法处理，已转人工。")</code></pre></div>
+
+      <h4>Java Spring 侧：BFF 会话与 SSE 推送</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy">复制</button></div>
+<pre><code class="language-java">// ChatController.java — Spring BFF 会话端点
+@RestController
+@RequestMapping("/api/chat")
+public class ChatController {
+
+    private final PythonAgentClient agentClient;
+    private final RedisTemplate&lt;String, Object&gt; redis;
+    private final SseEmitterManager sseManager;
+
+    public ChatController(PythonAgentClient agentClient, RedisTemplate&lt;String, Object&gt; redis, SseEmitterManager sseManager) {
+        this.agentClient = agentClient;
+        this.redis = redis;
+        this.sseManager = sseManager;
+    }
+
+    @PostMapping("/send")
+    public SseEmitter sendMessage(@RequestBody ChatRequest request) {
+        String sessionId = request.sessionId();
+        SseEmitter emitter = sseManager.createEmitter(sessionId);
+
+        // 异步处理
+        CompletableFuture.runAsync(() -> {
+            try {
+                // 1. 读取 DST 状态
+                Map&lt;String, Object&gt; dst = redis.opsForHash().entries("dst:" + sessionId);
+
+                // 2. 调用 Python Agent
+                AgentResponse response = agentClient.runAgent(sessionId, request.message(), dst);
+
+                // 3. SSE 流式推送
+                for (String chunk : response.stream()) {
+                    emitter.send(SseEmitter.event().name("token").data(chunk));
+                }
+                emitter.send(SseEmitter.event().name("done").data(""));
+
+                // 4. 更新 DST
+                redis.opsForHash().putAll("dst:" + sessionId, response.updatedDst());
+            } catch (Exception e) {
+                try { emitter.send(SseEmitter.event().name("error").data("系统繁忙，请稍后重试")); } catch (Exception ignored) {}
+            } finally {
+                emitter.complete();
+            }
+        });
+        return emitter;
+    }
+}
+
+// SseEmitterManager.java — SSE 连接管理
+@Component
+public class SseEmitterManager {
+    private final Map&lt;String, SseEmitter&gt; emitters = new ConcurrentHashMap&lt;&gt;();
+
+    public SseEmitter createEmitter(String sessionId) {
+        SseEmitter emitter = new SseEmitter(120_000L); // 2 分钟超时
+        emitters.put(sessionId, emitter);
+        emitter.onCompletion(() -> emitters.remove(sessionId));
+        emitter.onTimeout(() -> emitters.remove(sessionId));
+        return emitter;
+    }
+}</code></pre></div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>单一语言实现全部功能（Python 或 Java 大包大揽）</li>
+            <li>无状态共享，每次请求从头开始</li>
+            <li>Agent 直调 ERP，绕过 BFF 的鉴权与审计</li>
+            <li>非流式响应，用户等待 5s+ 才有反馈</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Python 管 Agent 编排 + Spring 管工具/SSE，各取所长</li>
+            <li>Redis 共享 DST 状态，会话持续追踪</li>
+            <li>Python 调 Spring 工具端点，不直连 ERP</li>
+            <li>SSE 流式输出，首 Token &lt; 300ms</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：LangGraph 状态图和传统的 if-else 客服流程有什么本质区别？</summary>
+        <p>LangGraph 状态图是<strong>声明式有向图</strong>，节点之间通过条件边路由，状态显式传递。if-else 是<strong>过程式判断</strong>，逻辑硬编码在代码中。状态图的优势：节点可独立测试、条件边可动态扩展（如新增意图时只需加一条边）、状态可序列化（存 Redis 实现跨请求持久化）。</p>
+      </details>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>LangGraph/Python 与 Spring AI Tools 会话打通</li>
-    <li>下一步：降级与人工转接</li></ul></div>
+
+    <div class="section-block">
+      <h3><span class="term" data-term-id="session-bridge" tabindex="0">Session Bridge</span>：Redis DST 状态共享</h3>
+      <p><span class="term" data-term-id="bff-session" tabindex="0">bff session</span> 在 Spring 侧管理会话生命周期，<span class="term" data-term-id="python-agent-cs" tabindex="0">python agent cs</span> 在 Python 侧执行推理。两者通过 Redis 共享 DST 状态：DST 数据以 Hash 结构存储在 Redis 中，key 为 <code>dst:{sessionId}</code>，字段包括 intent、slots、history_summary、tool_trace 等。</p>
+
+      <table class="outline-table">
+        <thead><tr><th>Redis Key</th><th>字段</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>dst:{sessionId}</code></td><td>intent, slots</td><td>当前意图和槽位</td></tr>
+          <tr><td><code>dst:{sessionId}</code></td><td>history_summary</td><td>最近 3 轮摘要</td></tr>
+          <tr><td><code>dst:{sessionId}</code></td><td>tool_trace</td><td>本轮工具调用记录</td></tr>
+          <tr><td><code>session:{sessionId}</code></td><td>ssemitter</td><td>SSE 连接标识</td></tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>DST 状态共享实践</strong>
+        <p>1) Redis 中的 DST 设置 30 分钟 TTL，与客服会话超时一致；2) Python Agent 每次推理前先读 DST，推理后写回；3) intent 变更时自动清理旧槽位（如从 change_address 切为 refund，清理 address 相关槽位）；4) 转人工时将 DST 序列化为 JSON 放入移交 payload。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>为什么不直接用 Python 实现全部功能，还要引入 Spring BFF？</summary>
+          <div class="learn-faq-body">企业级部署要求：1) 工具调用经过 Spring 层可以统一做鉴权、审计、限流；2) ERP 接口通常只有 Java SDK 或 SOAP 协议，Java 侧集成更成熟；3) 双栈架构允许 Python Agent 和 Spring 工具独立扩缩容（Agent 需要 GPU，工具需要网络吞吐）。</div>
+        </details>
+        <details>
+          <summary>LangGraph 和 LangChain Agent 有什么区别？</summary>
+          <div class="learn-faq-body">LangGraph 是图结构的状态机，天然支持循环、条件分支、并行节点，适合客服这种需要多轮对话和工具调用的场景。LangChain Agent 是线性循环（AgentExecutor），每次循环重新选择工具，客服场景下状态管理不够精确。</div>
+        </details>
+        <details>
+          <summary>SSE 流式断了怎么办？</summary>
+          <div class="learn-faq-body">SSE 有自动重连机制（EventSource 默认重试）。Spring BFF 侧的 SseEmitter 设置 2 分钟超时，断线后前端重新建立连接。Python Agent 的推理结果如果已经生成但连接断了，下次请求时复用之前的 DST 状态，不会丢失上下文。</div>
+        </details>
+        <details>
+          <summary>Redis DST 和 Agent 中的状态如何保持同步？</summary>
+          <div class="learn-faq-body">Python Agent 每次推理前从 Redis 读取最新 DST，推理结束后写回。写操作用 Redis Hash 的 HSET 命令，支持字段级别更新。如果 Agent 推理过程中 DST 被其他请求修改（极小概率），下一次推理时会读取到最新状态。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>LangGraph Agent</strong>：声明式状态图编排客服流程，节点可独立测试，条件边可动态扩展。</li>
+        <li><strong>Spring AI Tools</strong>：Java 侧注册工具端点，提供鉴权、审计、限流等企业级能力。</li>
+        <li><strong>Redis 会话桥梁</strong>：DST 以 Hash 结构存储在 Redis 中，Python 和 Spring 双栈共享。</li>
+        <li><strong>SSE 流式</strong>：Spring BFF 推送 Agent 生成结果至前端，首 Token 延迟 &lt; 300ms。</li>
+        <li><strong>双栈独立扩缩容</strong>：Python Agent（推理密集型）和 Spring BFF（IO 密集型）按需扩缩。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <div class="learn-checklist" data-storage-key="scenario-enterprise-customer-service_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="dual-seq" /> 能画出双栈 Agent 完整通信序列图</label></li>
+          <li><label><input type="checkbox" data-id="langgraph" /> 知道 LangGraph 状态图的节点和条件边定义</label></li>
+          <li><label><input type="checkbox" data-id="redis-bridge" /> 知道 Redis DST 的 Hash 结构字段设计</label></li>
+          <li><label><input type="checkbox" data-id="tool-call" /> 能解释 Python 如何通过 HTTP 调用 Spring 工具</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet"><details><summary>本章速查卡</summary><div class="learn-cheat-body"><table>
+        <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+        <tbody>
+          <tr><td>LangGraph CS</td><td>客服 Agent 状态图：receive → update_dst → select_tool → execute → reply</td></tr>
+          <tr><td>Spring AI Tools</td><td>Java 工具框架：@Tool 注解注册，Python 通过 HTTP 调用</td></tr>
+          <tr><td>Session Bridge</td><td>双栈会话桥梁：Redis Hash 结构共享 DST 状态</td></tr>
+          <tr><td>Dual Agent CS</td><td>双栈 Agent 架构：Python 推理 + Spring 工具</td></tr>
+          <tr><td>SSE CS</td><td>流式输出：EventSource 自动重连，2 分钟超时</td></tr>
+          <tr><td>Python Agent CS</td><td>Python 侧 LangGraph 部署单元，每会话一个实例</td></tr>
+          <tr><td>BFF Session</td><td>Spring 会话管理：鉴权+限流+DST 读写</td></tr>
+          <tr><td>Agent S2</td><td>S2 Agent 标准：状态持久化+工具安全+流式体验</td></tr>
+        </tbody>
+      </table></div></details></div>
+
+      <div class="learn-interview">
+        <details><summary>答辩 / 面试口述题</summary><div class="learn-interview-body"><ol>
+          <li>为什么客服 Agent 需要双栈架构（Python + Spring）？单语言实现有什么局限性？请从工具调用、性能、安全三个角度展开。</li>
+          <li>LangGraph 状态图相比传统的 AgentExecutor 循环在客服场景中有哪些优势？请用一个实际场景（如中途切换意图）来说明。</li>
+          <li>双栈架构中 DST 状态如何保证一致性？如果 Python Agent 在推理时崩溃，DST 状态如何处理？</li>
+        </ol></div></details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-practice-04-handoff">降级与人工转接</a> 将在 Agent 基础上实现转人工和上下文移交。</p>
+    </div>
   </div>
+
   <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a></li>
-    <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI Tools</a></li>
+    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph — 官方文档与教程</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI Tools — 工具注册与调用</a></li>
+    <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events" target="_blank" rel="noopener">MDN — Server-Sent Events 规范</a></li>
   </ul></div>
+
   <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-03-agent-dual-lab/</code></li>
-  <li>写一条 S2 客服落地笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：客服 Agent 双栈实现</h4>
-  <p><code>demos/practice-03-agent-dual-lab/</code> — 画双栈序列</p></div></div>
+    <p class="steps-intro">用 CorpAssist 双栈 Agent 场景，完成 LangGraph 状态图构建（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>画双栈 Agent 通信序列图，标注 Python 和 Spring 的分工边界。</li>
+      <li>在 LangGraph 中定义 5 个节点（receive/update_dst/select_action/execute_tool/generate_reply）。</li>
+      <li>在 Spring 中实现 SSE 端点，使用 SseEmitter + CompletableFuture 异步推送。</li>
+      <li>配置 Redis 存储 DST 状态，验证 Python Agent 在两次推理间能读取到历史 DST。</li>
+      <li>端到端测试：用户发送「退款 O2025001」→ Agent 收集参数 → 调用工具 → SSE 流式回复。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+    <li>
+      <p class="judgment-stem">线上发现用户在第 5 轮对话时意图从「退款」变更为「改地址」，但 Agent 仍继续收集退款参数。问题出在哪？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p><strong>DST 未在 intent 变更时清理旧槽位</strong>。LangGraph 的 update_dst 节点需要检测 intent 是否变化，如果变化则清空旧 intent 的所有槽位。修复方案：在 update_dst 中维护槽位版本号，intent 变更时版本号+1，槽位按版本号隔离。</p></div>
+        </details>
+      </div>
+    </li>
+    </ol>
+    <div class="demo-box"><h4 class="demo-box-title">Demo：Agent 双栈</h4><p>目录：<code>demos/practice-03-agent-dual-lab/</code>。<strong>验收</strong>：POST /chat/send 返回 SSE 流式回复，Redis 中 DST 状态持续更新。</p></div>
+  </div>
+
   <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-04-handoff">降级与人工转接</a></li>
+    <li><strong>下一章</strong>：<a href="#ch-practice-04-handoff">降级与人工转接</a></li>
+    <li><a href="https://arxiv.org/abs/2305.13711" target="_blank" rel="noopener">论文：Multi-Agent Collaboration — 双栈 Agent 协作模式</a></li>
+    <li><a href="https://redis.io/docs/data-types/hashes/" target="_blank" rel="noopener">Redis Hashes — Hash 数据结构最佳实践</a></li>
   </ul></div>
 </section>

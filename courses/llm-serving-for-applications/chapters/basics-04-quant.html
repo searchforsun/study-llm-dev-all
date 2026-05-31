@@ -1,44 +1,527 @@
 <section id="ch-basics-04-quant" class="chapter" data-chapter="basics-04-quant">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>量化选型</h2>
-  <button type="button" class="btn-mark-done" data-chapter="basics-04-quant" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>量化选型</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-quant" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Serving 基础</strong> · 能力：INT4/8 量化、精度与硬件匹配</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>7B 单卡 24G 常需 AWQ/GPTQ；应用岗会选型不会写 kernel。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S4 推理场景实践本章能力</li>
-        <li>说明 vLLM 私有化与双栈客户端接入</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Serving 基础</strong> · 能力：为 CorpAssist S4 选择 INT4/INT8 量化方案并评估精度-显存取舍</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>7B 模型 FP16 权重约 14GB，24GB 单卡放不下权重 + KV cache + 并发槽位。<span class="term" data-term-id="int4-quant" tabindex="0">INT4 量化</span> 可将权重压至 5～6GB，但精度有代价。CorpAssist S4 场景下，代码补全对量化敏感度低于通用对话——你需要掌握 <span class="term" data-term-id="quant-select" tabindex="0">量化选型</span> 方法，而非深入算子实现。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用决策树为 S4 与运营文案场景选择 AWQ / GPTQ / INT8</li>
+          <li>估算量化后显存占用并判断 24GB 卡是否够用</li>
+          <li>设计一条「量化评测流水线」：Golden Set → 推理 → 对比得分</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>量化减显存</strong>：<span class="term" data-term-id="memory-save" tabindex="0">memory save</span> 主要来自权重精度降低，KV cache 仍需单独估算。</li>
+          <li><strong>精度与质量</strong>：<span class="term" data-term-id="quality-loss" tabindex="0">quality loss</span> 随任务而异；代码补全 INT4 通常可接受，创意写作更敏感。</li>
+          <li><strong>硬件匹配</strong>：<span class="term" data-term-id="hardware-match" tabindex="0">hardware match</span> 决定量化格式——AWQ 对 NVIDIA 各代架构支持最广。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>INT4/8 与精度</h3><p>AWQ 4bit 显存减半；评测掉点可接受才上。 关联：<span class="term" data-term-id="int4-quant" tabindex="0">int4 quant</span>、<span class="term" data-term-id="int8-quant" tabindex="0">int8 quant</span>。</p></div>
-    <div class="section-block"><h3>硬件</h3><p>A10 24G vs A100 80G 选型。 关联：<span class="term" data-term-id="awq-gptq" tabindex="0">awq gptq</span>、<span class="term" data-term-id="precision-trade" tabindex="0">precision trade</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="int4-quant" tabindex="0">int4 quant</span> · <span class="term" data-term-id="int8-quant" tabindex="0">int8 quant</span> · <span class="term" data-term-id="awq-gptq" tabindex="0">awq gptq</span> · <span class="term" data-term-id="precision-trade" tabindex="0">precision trade</span> · <span class="term" data-term-id="hardware-match" tabindex="0">hardware match</span> · <span class="term" data-term-id="quant-select" tabindex="0">quant select</span> · <span class="term" data-term-id="memory-save" tabindex="0">memory save</span> · <span class="term" data-term-id="quality-loss" tabindex="0">quality loss</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-markdown">| 量化 | 显存 | 质量 |
-|------|------|------|
-| FP16 | 高 | 最好 |
-| AWQ INT4 | 低 | 略降 |
-| INT8 | 中 | 接近 FP16 |</code></pre></div>
-      <div class="mermaid-wrap"><h5>量化选型</h5>
-      <pre class="mermaid">flowchart LR
-  App[Spring/Python] --> vLLM
-  vLLM --> GPU[GPU 推理]</pre></div>
+
+    <div class="section-block">
+      <h3>INT4/8 精度与显存</h3>
+      <p><span class="term" data-term-id="precision-trade" tabindex="0">精度-显存权衡 (precision trade)</span> 是量化选型的核心。下表对比常见精度级别在 7B 模型上的大致表现（以实测为准）：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>精度</th><th>权重体积</th><th>显存节省</th><th>典型质量损失</th><th>推荐场景</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>FP16</td>
+            <td>~14 GB</td>
+            <td>基线</td>
+            <td>无</td>
+            <td>硬件充裕的基准评测</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="int8-quant" tabindex="0">INT8</span></td>
+            <td>~7 GB</td>
+            <td>50%</td>
+            <td>极微，通常 &lt; 1%</td>
+            <td>高精度敏感任务</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="int4-quant" tabindex="0">INT4 (AWQ/GPTQ)</span></td>
+            <td>~4–6 GB</td>
+            <td>60-70%</td>
+            <td>可接受，代码 &lt; 3%</td>
+            <td>CorpAssist S4 主力</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>量化后显存分布（7B AWQ，max-model-len=8K）</h5>
+        <pre class="mermaid">pie showData
+    title 显存占用 ~20 GB / 24 GB 卡
+    "权重 (AWQ INT4)" : 5
+    "KV Cache (8K)" : 6
+    "激活与算子临时" : 3
+    "系统预留" : 2
+    "剩余可用" : 8</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="memory-save" tabindex="0">memory save</span> 来自权重从 FP16 14GB 降至 5GB；KV cache 随 <code>max-model-len</code> 与并发数线性增长。</p>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S4 量化选型（60 秒）</span>
+        一台 24GB A10，跑 7B 代码模型，计划支撑 8 并发 FIM 补全。FP16 权重 14GB 吃掉大半，KV cache 留给 8K 上下文约需 6GB，剩余不足 4GB 给 8 个并发槽位——必须量化。AWQ INT4 权重降至 5GB，KV 6GB，剩余 13GB 给并发，绰绰有余。
+      </aside>
+
+      <h4>量化方式对比</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>不评测直接上线 INT4</li>
+            <li>用 INT8 却仍需要降 KV 的 max-model-len</li>
+            <li>把量化说成「无损压缩」</li>
+            <li>多个量化格式轮换但不清除 GPU 缓存</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>固定 200 条 S4 prompt 做 Golden Set 对比</li>
+            <li>优先 AWQ（生态广、vLLM 原生支持）</li>
+            <li>跑完整 FP16 → INT4 → INT8 三角评测</li>
+            <li>记录每条输出的人工评分或自动指标</li>
+          </ul>
+        </div>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>INT4/8 量化、精度与硬件匹配</li>
-    <li>下一步：KV 缓存与性能（应用层）</li></ul></div>
+
+    <div class="section-block">
+      <h3>AWQ 与 GPTQ 选型</h3>
+      <p><span class="term" data-term-id="awq-gptq" tabindex="0">AWQ 和 GPTQ</span> 是当前最主流的 INT4 后训练量化方法。vLLM 对两者均原生支持，但选型有细微差别：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>AWQ</th><th>GPTQ</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>量化原理</td>
+            <td>按激活值分布保护重要通道</td>
+            <td>基于 Hessian 矩阵的梯度补偿</td>
+          </tr>
+          <tr>
+            <td>vLLM 支持</td>
+            <td>原生 <code>--quantization awq</code></td>
+            <td>原生 <code>--quantization gptq</code></td>
+          </tr>
+          <tr>
+            <td>推理速度</td>
+            <td>略快（有 kernel 融合优化）</td>
+            <td>与 AWQ 接近</td>
+          </tr>
+          <tr>
+            <td>校准数据</td>
+            <td>无需，自动</td>
+            <td>需少量校准样本</td>
+          </tr>
+          <tr>
+            <td>CorpAssist 推荐</td>
+            <td>首选</td>
+            <td>备选（已有 GPTQ 权重时）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>使用 AutoAWQ 量化模型</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 量化脚本：将 HuggingFace 模型转为 AWQ INT4
+# pip install autoawq
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+
+model_path = "Qwen/Qwen2.5-Coder-7B-Instruct"
+quant_path = "./models/Qwen2.5-Coder-7B-Instruct-AWQ"
+quant_config = {
+    "zero_point": True,
+    "q_group_size": 128,
+    "w_bit": 4,  # INT4
+    "version": "GEMM"
+}
+
+model = AutoAWQForCausalLM.from_pretrained(
+    model_path, device_map="auto"
+)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+# 提供少量校准样本（约 128 条即可）
+calib_data = [
+    "def fibonacci(n):\n    \"\"\"计算斐波那契数列\"\"\"\n",
+    "public class Singleton {\n    private static Singleton instance;\n",
+    "SELECT * FROM users WHERE id = ?",
+]  # 实际使用 128+ 条
+
+model.quantize(tokenizer, quant_config=quant_config, calib_data=calib_data)
+model.save_pretrained(quant_path, safetensors=True)
+tokenizer.save_pretrained(quant_path)
+print(f"AWQ 量化完成，权重保存至 {quant_path}")
+# 输出：权重从 ~14GB 降至 ~5GB</code></pre>
+      </div>
+
+      <h4>vLLM 加载量化模型启动</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 启动 vLLM 服务 - AWQ 量化版本
+python -m vllm.entrypoints.openai.api_server \
+  --model ./models/Qwen2.5-Coder-7B-Instruct-AWQ \
+  --quantization awq \
+  --served-model-name corp-coder-7b \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.9 \
+  --host 0.0.0.0 --port 8000
+
+# 验证启动后显存占用（单位 MB）
+nvidia-smi --query-gpu=memory.used --format=csv</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么校准数据用代码片段而非新闻文本？</summary>
+        <p><span class="term" data-term-id="awq-gptq" tabindex="0">AWQ/GPTQ</span> 的校准数据影响量化后质量。代码任务用代码校准，保留 FIM、缩进与特殊 token 的精度；新闻文本校准可能导致代码场景掉点。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>硬件匹配</h3>
+      <p><span class="term" data-term-id="hardware-match" tabindex="0">硬件与量化格式的匹配 (hardware match)</span> 影响推理速度与兼容性：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>GPU 架构</th><th>推荐量化</th><th>注意</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>NVIDIA A100 (Ampere)</td>
+            <td>AWQ INT4 / INT8</td>
+            <td>INT8 tensor core 有加速；AWQ 权重 4bit 有 kernel</td>
+          </tr>
+          <tr>
+            <td>NVIDIA A10 / RTX 4090 (Ada)</td>
+            <td>AWQ INT4</td>
+            <td>24GB 主打；AWQ + 7B 是最佳配合</td>
+          </tr>
+          <tr>
+            <td>NVIDIA V100 (Volta)</td>
+            <td>INT8 或 FP16</td>
+            <td>INT4 kernel 支持有限，优先 INT8</td>
+          </tr>
+          <tr>
+            <td>昇腾 / 寒武纪</td>
+            <td>需厂商确认</td>
+            <td>NPU 量化格式与 CUDA 不同</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 量化后质量评测脚本（Golden Set）
+from openai import OpenAI
+import json
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+# S4 代码补全 Golden Set（固定 10 条评测 prompt）
+golden_set = [
+    {"prompt": "def quick_sort(arr):", "expected_pattern": "return"},
+    {"prompt": "public class Hello {", "expected_pattern": "System.out"},
+    {"prompt": "SELECT * FROM users WHERE", "expected_pattern": "="},
+]
+
+def eval_quality():
+    results = []
+    for item in golden_set:
+        resp = client.completions.create(
+            model="corp-coder-7b",
+            prompt=item["prompt"],
+            max_tokens=64
+        )
+        completion = resp.choices[0].text
+        # 简单质量检查：是否包含期望关键词
+        passed = item["expected_pattern"] in completion
+        results.append({
+            "prompt": item["prompt"],
+            "completion": completion[:80],
+            "passed": passed
+        })
+    passed_rate = sum(r["passed"] for r in results) / len(results)
+    print(f"Golden Set 通过率: {passed_rate:.0%}")
+    return results
+
+if __name__ == "__main__":
+    eval_quality()</code></pre>
+      </div>
+
+      <h4>Spring AI 配置：通过 Java 调用量化推理</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// Spring AI 配置 - 指向量化推理集群
+// 与 FP16 版本使用相同接口，客户端无感知
+
+@Configuration
+public class QuantInferConfig {
+
+    @Bean
+    @Primary
+    public OpenAiChatModel quantChatModel() {
+        return OpenAiChatModel.builder()
+            .baseUrl("http://vllm-awq:8000/v1")
+            .apiKey("EMPTY")
+            .defaultOptions(OpenAiChatOptions.builder()
+                .model("corp-coder-7b")
+                .maxTokens(512)
+                .temperature(0.1)
+                .build())
+            .build();
+    }
+
+    @Bean
+    public ChatClient quantChatClient(OpenAiChatModel model) {
+        return ChatClient.builder(model).build();
+    }
+}
+
+// 使用示例
+@Service
+public class CodeCompletionService {
+    private final ChatClient chatClient;
+
+    public CodeCompletionService(ChatClient chatClient) {
+        this.chatClient = chatClient;
+    }
+
+    public String completeCode(String prefix) {
+        return chatClient.prompt()
+            .user(prefix)
+            .call()
+            .content();
+    }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 落地：量化策略决策树</h3>
+      <div class="mermaid-wrap">
+        <h5>S4 量化选型决策树</h5>
+        <pre class="mermaid">flowchart TD
+    Start[开始选型] --> Q1{GPU 显存 >= 48GB?}
+    Q1 -->|是| FP16[使用 FP16 无需量化]
+    Q1 -->|否| Q2{24GB 卡运行 7B 模型?}
+    Q2 -->|是| Q3{是否需要高并发 >8?}
+    Q3 -->|是| AWQ[选 AWQ INT4]
+    Q3 -->|否| INT8[选 INT8 质量更稳]
+    Q2 -->|否| Q4{14B 模型?}
+    Q4 -->|是| AWQ_TP[AWQ INT4 + 张量并行]
+    Q4 -->|否| Q5{CPU 推理?}
+    Q5 -->|是| GGUF[llama.cpp GGUF]
+    Q5 -->|否| Cloud[走云 API fallback]
+
+    AWQ --> Eval[Golden Set 评测]
+    INT8 --> Eval
+    Eval --> Pass{通过率 >= 95%?}
+    Pass -->|是| Deploy[上线]
+    Pass -->|否| Upgrade[换更高精度或调校准数据]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="quant-select" tabindex="0">quant select</span> 结合显存预算、模型规模与并发需求，优先走 AWQ INT4 路径。</p>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S4 · 量化部署示例</span>
+        <p>团队采购 2 台 A10 24GB 跑 S4 代码补全。决策过程：</p>
+        <ol>
+          <li>7B Full FP16 → 14GB，加上 KV cache 8K/8 并发 ≈ 6GB，剩余 4GB 紧张 → 必须量化。</li>
+          <li>INT8 → 7GB 权重 + 6GB KV ≈ 13GB，剩余 11GB → 可选。</li>
+          <li>AWQ INT4 → 5GB 权重 + 6GB KV ≈ 11GB，剩余 13GB → 最优性价比。</li>
+          <li>Golden Set 评测：AWQ 通过率 97%（vs FP16 99%），接受。</li>
+        </ol>
+        <p>最终采用 <code>Qwen2.5-Coder-7B-Instruct-AWQ</code>，单卡支撑 15 并发，TTFT &lt; 500ms。</p>
+      </aside>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>量化万能论</strong>— 量化后仍要留足 KV cache 余量，max-model-len 过大一样 OOM。</li>
+          <li><strong>只看权重体积</strong>— 显存大头可能是 KV cache 而非权重，尤其长上下文场景。</li>
+          <li><strong>量化不评测</strong>— 不同任务对精度敏感度天差地别，必跑 Golden Set。</li>
+          <li><strong>忽略 kernel 兼容</strong>— 老旧 GPU 可能没有 INT4 kernel，会退化为 CPU 计算。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>AWQ 和 GPTQ 可以混合使用吗？</summary>
+          <div class="learn-faq-body">
+            同一 vLLM 实例只能加载一种量化格式。混合使用需要通过网关路由到不同后端实例。CorpAssist 场景建议统一为 AWQ，减少运维复杂度。
+          </div>
+        </details>
+        <details>
+          <summary>量化后的模型还能微调吗？</summary>
+          <div class="learn-faq-body">
+            理论上 INT4 模型可以做 QLoRA，但 CorpAssist 实践中建议：先全精度微调 → 再量化部署，而非量化后微调。量化后微调的质量损失更难评估。
+          </div>
+        </details>
+        <details>
+          <summary>INT4 量化对 FIM（Fill-in-Middle）场景影响大吗？</summary>
+          <div class="learn-faq-body">
+            实证表明影响较小。代码补全对数值精度不敏感，只要校准数据包含 FIM 格式的 prompt。建议在校准集中加入 <code>&lt;fim_prefix&gt;</code>/<code>&lt;fim_suffix&gt;</code> 标记。
+          </div>
+        </details>
+        <details>
+          <summary>没有 GPU 能不能跑量化？</summary>
+          <div class="learn-faq-body">
+            CPU 推理可以用 llama.cpp 的 GGUF 量化格式（详见 <a href="#ch-advanced-01-tgi-alt">TGI 与其他引擎</a>），但吞吐远低于 GPU。CorpAssist 生产场景不建议 CPU 量化推理。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>INT4/8 量化</strong>：权重体积减半，显存释放给 KV cache 与并发槽位；<span class="term" data-term-id="memory-save" tabindex="0">memory save</span> 是核心收益。</li>
+        <li><strong>AWQ vs GPTQ</strong>：AWQ 校准简单、vLLM 原生、推理略快，是 S4 首选；<span class="term" data-term-id="awq-gptq" tabindex="0">awq gptq</span> 对比需结合实际硬件。</li>
+        <li><strong>精度评估</strong>：<span class="term" data-term-id="quality-loss" tabindex="0">quality loss</span> 用 Golden Set 量化，不可凭感觉；代码补全 INT4 通常可接受。</li>
+        <li><strong>硬件匹配</strong>：<span class="term" data-term-id="hardware-match" tabindex="0">hardware match</span> 决定 kernel 可用性；旧架构优先 INT8 而非 INT4。</li>
+        <li><strong>评测流水线</strong>：固定 prompt → 多精度推理 → 对比得分，纳入 CI 防止回归。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="quant-method" /> 能区分 AWQ 与 GPTQ 的核心差异</label></li>
+          <li><label><input type="checkbox" data-id="vram-calc" /> 能为 7B 模型 + 8K 上下文估算量化后显存</label></li>
+          <li><label><input type="checkbox" data-id="golden-set" /> 能设计一条 Golden Set 量化评测方案</label></li>
+          <li><label><input type="checkbox" data-id="hardware-aware" /> 能为 A10/A100/V100 分别推荐量化格式</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="int4-quant" tabindex="0">INT4 量化</span></td><td>4bit 权重，显存降 60%+，代码场景通常可接受</td></tr>
+                <tr><td><span class="term" data-term-id="int8-quant" tabindex="0">INT8 量化</span></td><td>8bit 权重，质量损失极小，显存降 50%</td></tr>
+                <tr><td><span class="term" data-term-id="awq-gptq" tabindex="0">AWQ/GPTQ</span></td><td>主流 INT4 后训练量化方法；AWQ 校准更简单</td></tr>
+                <tr><td><span class="term" data-term-id="precision-trade" tabindex="0">precision trade</span></td><td>精度与显存的跷跷板，用 Golden Set 定量决策</td></tr>
+                <tr><td><span class="term" data-term-id="hardware-match" tabindex="0">hardware match</span></td><td>量化格式必须匹配 GPU kernel 支持</td></tr>
+                <tr><td><span class="term" data-term-id="quant-select" tabindex="0">quant select</span></td><td>按显存/并发/任务三维度选择量化策略</td></tr>
+                <tr><td><span class="term" data-term-id="memory-save" tabindex="0">memory save</span></td><td>量化释放显存给 KV cache 和更多并发</td></tr>
+                <tr><td><span class="term" data-term-id="quality-loss" tabindex="0">quality loss</span></td><td>量化带来的质量下降，需任务级评估</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>你如何为 CorpAssist S4 的 7B 代码模型做量化选型？请列出决策因子和评测方法。</li>
+              <li>AWQ 与 GPTQ 的核心区别是什么？为什么 CorpAssist 倾向 AWQ？</li>
+              <li>量化后显存占用如何估算？为什么不能只看权重体积？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成下方 Demo 与测验；下一章 <a href="#ch-basics-05-kv-cache-app">KV 缓存与性能（应用层）</a>：在量化基础上理解 KV cache 对延迟与并发的约束。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM</a></li>
-    <li><a href="https://docs.docker.com/compose/" target="_blank" rel="noopener">Docker Compose</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/basics-04-quant-lab/</code></li>
-  <li>写一条推理部署或量化笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：量化选型</h4>
-  <p><code>demos/basics-04-quant-lab/</code> — 填一行量化选型</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-basics-05-kv-cache-app">KV 缓存与性能（应用层）</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.vllm.ai/en/latest/features/quantization.html" target="_blank" rel="noopener">vLLM — 量化支持文档</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/en/quantization/awq" target="_blank" rel="noopener">HuggingFace — AWQ 量化指南</a></li>
+      <li><a href="https://github.com/casper-hansen/AutoAWQ" target="_blank" rel="noopener">AutoAWQ — 量化工具库</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html" target="_blank" rel="noopener">Spring AI — OpenAI Chat 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist S4 完成量化选型表格，并用 Golden Set 评测你的量化方案。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制正文「精度对比表」，为 7B 模型估算 FP16 / INT8 / AWQ 三种精度下的可用并发数（给定 24GB 卡、8K 上下文）。</li>
+      <li>修改 Python 评测脚本，加入 5 条你工作中常用的代码补全 prompt。</li>
+      <li>用 vLLM 启动量化模型，运行评测脚本记录通过率。</li>
+      <li>在 <code>demos/basics-04-quant-lab/quant-matrix.md</code> 填写你的选型结果。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">你的 AWQ 量化模型在通用对话上掉点 5%，但代码补全通过率 98%。能否上线 S4？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>可以。S4 场景是代码补全而非通用对话，代码指标通过即可。但需在 release note 注明量化适用范围，避免被误用于通用问答场景。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">将 max-model-len 从 8K 拉到 32K 后显存不够，你优先调什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>优先降低 max-num-seqs（并发槽位），其次是升级量化精度或加卡。32K 上下文通常少量长文档场景使用，不需要高并发。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：量化选型矩阵</h4>
+      <p>目录：<code>demos/basics-04-quant-lab/</code>（<code>quant-matrix.md</code>）。<strong>验收</strong>：填写 FP16/INT8/AWQ 三行并发数，并附一条 Golden Set 评测命令。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-05-kv-cache-app">KV 缓存与性能（应用层）</a></li>
+      <li><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ 论文：Activation-aware Weight Quantization</a></li>
+      <li><a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ 论文：Accurate Post-Training Quantization</a></li>
+    </ul>
+  </div>
 </section>

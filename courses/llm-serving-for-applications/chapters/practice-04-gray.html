@@ -6,7 +6,7 @@
 
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：推理模型 <span class="term" data-term-id="model-version-route" tabindex="0">model version route</span> 与 <span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span></p>
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：推理模型 <span class="term" data-term-id="model-version-route" tabindex="0">model version route</span> 与 <span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span></p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
         <p>CorpAssist S4 将 <code>qwen-7b-awq</code> 升级到 v2 时，不能一次性切流。<span class="term" data-term-id="infer-gray" tabindex="0">infer gray</span> 让 Python 补全服务与 Spring BFF 共用<strong>稳定</strong>的 <span class="term" data-term-id="model-alias" tabindex="0">model alias</span>，由网关按 <span class="term" data-term-id="route-weight" tabindex="0">route weight</span> 把少量流量打到新 vLLM 实例，指标劣化再 <span class="term" data-term-id="version-switch" tabindex="0">version switch</span> 回滚。</p>
@@ -16,7 +16,7 @@
         <ul>
           <li>设计 header / 比例两种 <span class="term" data-term-id="canary-infer" tabindex="0">canary infer</span> 路由</li>
           <li>列出 TTFT、错误率、补全采纳率三类回滚触发条件</li>
-          <li>说明 <span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span> 与生产灰度的边界</li>
+          <li>配置 Spring AI 端的 model alias 实现零代码版本切换</li>
         </ul>
       </div>
       <div class="notice">
@@ -30,14 +30,33 @@
     </div>
 
     <div class="section-block">
-      <h3>路由</h3>
+      <h3>模型版本路由策略</h3>
       <aside class="learn-scenario" aria-label="业务情境">
         <span class="learn-scenario-title">CorpAssist S4 · AWQ v2 上线</span>
         平台组发布 <code>vllm-v2</code>（新量化权重），研发侧仍调用 <code>model: corp-coder-7b</code>。网关 5% 流量走 v2，其余走 v1；内部评测用 <code>X-Infer-Canary: 1</code> 强制金丝雀。
       </aside>
+
       <p><span class="term" data-term-id="model-version-route" tabindex="0">Model version route</span> 在<strong>推理入口</strong>完成：Spring <a href="#ch-practice-02-spring-remote">远程 ChatModel</a> 与 Python <a href="#ch-practice-01-python-client">OpenAI client</a> 的 <code>base_url</code> 指向<strong>统一网关</strong>，由网关解析后端 <code>vllm-v1:8000</code> / <code>vllm-v2:8000</code>。</p>
 
-      <h4>灰度路由配置（Lab 草案）</h4>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist · 推理灰度路径</h5>
+        <pre class="mermaid">flowchart LR
+          Py[Python 补全] --> GW[推理网关]
+          Sp[Spring BFF] --> GW
+          GW -->|95%| V1[vLLM v1]
+          GW -->|5%| V2[vLLM v2 AWQ]
+          V1 --> GPU1[GPU Pool A]
+          V2 --> GPU2[GPU Pool B]
+
+          subgraph routes["路由策略"]
+              R1[比例路由\n5%→20%→50%]
+              R2[Header 路由\nX-Infer-Canary:1]
+          end
+          GW --- routes</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="infer-gray" tabindex="0">infer gray</span> 发生在网关；vLLM 实例各自独立，共享 OpenAI API 契约。</p>
+      </div>
+
+      <h4>灰度路由配置</h4>
       <div class="code-block">
         <div class="code-toolbar">
           <span class="lang-tag">yaml</span>
@@ -47,13 +66,29 @@
 model_alias: corp-coder-7b
 default_backend: vllm-v1:8000
 canary_backend: vllm-v2:8000
-canary_percent: 5
+canary_percent: 5          # 从 5% 开始
 
 routing:
-  default: vllm-v1:8000
-  canary: vllm-v2:8000
-  canary_percent: 5
-header_canary: X-Infer-Canary</code></pre>
+  strategies:
+    - type: weight
+      weight_canary: 5     # 5% 流量走 v2
+      weight_default: 95   # 95% 走 v1
+    - type: header
+      header: X-Infer-Canary
+      value: "1"          # 设置此 header 强制走金丝雀
+
+rollback:
+  triggers:
+    - metric: p95_latency_ms
+      threshold: 3000
+      window: 5m
+    - metric: error_rate
+      threshold: 0.02
+      window: 5m
+    - metric: empty_completion_rate
+      threshold: 0.05
+      window: 5m
+  action: set_canary_percent_to_0</code></pre>
       </div>
 
       <table class="outline-table learn-decision-table">
@@ -74,7 +109,7 @@ header_canary: X-Infer-Canary</code></pre>
           <tr>
             <td>租户 / 部门路由</td>
             <td>大客单独版本</td>
-            <td>与 <span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span> 实验区分：AB 要固定 cohort</td>
+            <td>与 <span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span> 区分：AB 要固定 cohort</td>
           </tr>
         </tbody>
       </table>
@@ -86,6 +121,7 @@ header_canary: X-Infer-Canary</code></pre>
             <li>Spring 配置两套 <code>base-url</code>，业务 if 切换</li>
             <li>灰度直接改 <code>served-model-name</code>，客户端跟着改</li>
             <li>无 trace：无法区分 v1/v2 延迟</li>
+            <li>灰度期间不监控 S4 空补全率</li>
           </ul>
         </div>
         <div class="learn-compare-col learn-compare-good">
@@ -94,20 +130,9 @@ header_canary: X-Infer-Canary</code></pre>
             <li>单 alias + 网关路由</li>
             <li>日志带 <code>backend_version=v2</code> 标签</li>
             <li>与 <a href="#ch-practice-03-stream">流式监控</a> 的 TTFT 联动</li>
+            <li>灰度期间双跑 A/B 对比</li>
           </ul>
         </div>
-      </div>
-
-      <div class="mermaid-wrap">
-        <h5>CorpAssist · 推理灰度路径</h5>
-        <pre class="mermaid">flowchart LR
-  Py[Python 补全] --> GW[推理网关]
-  Sp[Spring BFF] --> GW
-  GW -->|95%| V1[vLLM v1]
-  GW -->|5%| V2[vLLM v2 AWQ]
-  V1 --> GPU1[GPU Pool A]
-  V2 --> GPU2[GPU Pool B]</pre>
-        <p class="diagram-caption"><span class="term" data-term-id="infer-gray" tabindex="0">infer gray</span> 发生在网关；vLLM 实例各自独立，共享 OpenAI API 契约。</p>
       </div>
 
       <details class="learn-micro-check">
@@ -117,27 +142,168 @@ header_canary: X-Infer-Canary</code></pre>
     </div>
 
     <div class="section-block">
-      <h3>回滚</h3>
-      <p><span class="term" data-term-id="rollback-model" tabindex="0">Rollback model</span> 是<strong>运维动作</strong>：当 <span class="term" data-term-id="canary-infer" tabindex="0">canary infer</span> 指标越过阈值，将 <code>canary_percent</code> 置 0 或切默认 backend，必要时配合 <span class="term" data-term-id="version-switch" tabindex="0">version switch</span> 冻结发布。</p>
+      <h3>Spring AI 端灰度配置</h3>
+      <p>Spring AI 通过 <code>model</code> 字段指向 alias，不感知后端版本：</p>
 
-      <h4>回滚触发（gray-route.yaml）</h4>
       <div class="code-block">
         <div class="code-toolbar">
-          <span class="lang-tag">yaml</span>
+          <span class="lang-tag">java</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-yaml">rollback:
-  triggers:
-    - metric: p95_latency_ms
-      threshold: 3000
-      window: 5m
-    - metric: error_rate
-      threshold: 0.02
-      window: 5m
-  action: set_canary_percent_to_0</code></pre>
+        <pre><code class="language-java">// Spring AI 灰度配置 — 客户端只看 model alias
+import org.springframework.ai.openai.OpenAiChatModel;
+import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class GrayReleaseConfig {
+
+    /**
+     * 客户端只认 model alias "corp-coder-7b"
+     * 版本切换在网关层，此处不需要改任何代码
+     */
+    @Bean
+    public OpenAiChatModel grayReadyChatModel() {
+        return OpenAiChatModel.builder()
+            .baseUrl("http://infer-gateway:8000/v1")  // 指向网关而非直连 vLLM
+            .apiKey("EMPTY")
+            .defaultOptions(OpenAiChatOptions.builder()
+                .model("corp-coder-7b")   // alias
+                .temperature(0.1)
+                .maxTokens(512)
+                .build())
+            .build();
+    }
+}
+
+// 灰度请求追踪：强制走金丝雀路径
+@Service
+public class CanaryService {
+
+    private final ChatClient chatClient;
+
+    public String chatWithCanary(String message, boolean forceCanary) {
+        var spec = chatClient.prompt().user(message);
+        if (forceCanary) {
+            // 内部用户/自动化评测走金丝雀路径
+            spec = spec
+                .system(s -> s.param("X-Infer-Canary", "1"));
+        }
+        return spec.call().content();
+    }
+}</code></pre>
       </div>
 
-      <p>S4 代码补全额外关注：<strong>空补全率</strong>、<strong>FIM 截断错误</strong>（常与 <a href="#ch-basics-04-quant">量化精度</a> 或 <code>max-model-len</code> 有关）。回滚前用 <span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span> 对比脚本固定 200 条 prompt，避免凭体感。</p>
+      <p>Python 服务同样只需要改 <code>base_url</code> 指向网关：</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Python 客户端 — 指向推理网关，不关心后端版本
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://infer-gateway:8000/v1",  # 网关
+    api_key="EMPTY",
+)
+
+# 强制金丝雀路径
+client.default_headers = {"X-Infer-Canary": "1"}
+
+# 普通的服务调用，model 名始终用 alias
+resp = client.chat.completions.create(
+    model="corp-coder-7b",
+    messages=[{"role": "user", "content": "写一个二分查找"}],
+)</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>回滚与观测</h3>
+      <p><span class="term" data-term-id="rollback-model" tabindex="0">Rollback model</span> 是<strong>运维动作</strong>：当 <span class="term" data-term-id="canary-infer" tabindex="0">canary infer</span> 指标越过阈值，将 <code>canary_percent</code> 置 0 或切默认 backend，必要时配合 <span class="term" data-term-id="version-switch" tabindex="0">version switch</span> 冻结发布。</p>
+
+      <h4>灰度放量计划</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>阶段</th><th>金丝雀比例</th><th>观察窗口</th><th>回滚条件</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Phase 1</td>
+            <td>5%</td>
+            <td>24h</td>
+            <td>P95 延迟 > 3s 或错误率 > 2%</td>
+          </tr>
+          <tr>
+            <td>Phase 2</td>
+            <td>20%</td>
+            <td>48h</td>
+            <td>空补全率 > 5% 或用户反馈负面</td>
+          </tr>
+          <tr>
+            <td>Phase 3</td>
+            <td>50%</td>
+            <td>24h</td>
+            <td>与 v1 的 A/B 对比劣化</td>
+          </tr>
+          <tr>
+            <td>全量</td>
+            <td>100%</td>
+            <td>—</td>
+            <td>保留 v1 实例 72h 用于快速回滚</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>A/B 对比脚本</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># A/B 对比 — 固定 prompt 集，分别请求 v1 和 v2
+import json, time
+from openai import OpenAI
+
+v1_client = OpenAI(base_url="http://vllm-v1:8000/v1", api_key="EMPTY")
+v2_client = OpenAI(base_url="http://vllm-v2:8000/v1", api_key="EMPTY")
+
+GOLDEN_PROMPTS = [
+    "def fibonacci(n):",
+    "public class Singleton {",
+    "git merge 和 rebase 的区别",
+    "SELECT * FROM users WHERE",
+]
+
+def ab_compare():
+    results = {"v1": [], "v2": []}
+    for prompt in GOLDEN_PROMPTS:
+        for label, client in [("v1", v1_client), ("v2", v2_client)]:
+            t0 = time.time()
+            resp = client.chat.completions.create(
+                model="corp-coder-7b",  # 两端都用 alias
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=128,
+            )
+            elapsed = time.time() - t0
+            results[label].append({
+                "prompt": prompt,
+                "latency": elapsed,
+                "output_length": len(resp.choices[0].message.content),
+            })
+    # 汇总对比
+    v1_avg = sum(r["latency"] for r in results["v1"]) / len(results["v1"])
+    v2_avg = sum(r["latency"] for r in results["v2"]) / len(results["v2"])
+    print(f"v1 平均延迟: {v1_avg*1000:.0f}ms")
+    print(f"v2 平均延迟: {v2_avg*1000:.0f}ms")
+    print(f"差异: {(v2_avg-v1_avg)/v1_avg*100:+.1f}%")
+
+if __name__ == "__main__":
+    ab_compare()</code></pre>
+      </div>
 
       <details class="learn-faq">
         <summary>FAQ：回滚 vLLM 版本要不要重启 Spring？</summary>
@@ -145,17 +311,93 @@ header_canary: X-Infer-Canary</code></pre>
       </details>
     </div>
 
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>灰度期间发现 v2 延迟高但错误率正常，应该回滚吗？</summary>
+          <div class="learn-faq-body">
+            不一定立即全量回滚。先确认是否仅 v2 cohort 受影响。如果是量化导致的固有问题，降 canary_percent 至 0 并修复后重新灰度。如果延迟超过 SLA 则立即回滚。
+          </div>
+        </details>
+        <details>
+          <summary>没有网关层如何做灰度？</summary>
+          <div class="learn-faq-body">
+            可以使用 Spring Cloud LoadBalancer 或客户端侧随机路由，但不推荐。更好的方案是使用 K8s Ingress 的金丝雀发布（<code>nginx.ingress.kubernetes.io/canary-weight</code>）或 Service Mesh 的流量分割。
+          </div>
+        </details>
+        <details>
+          <summary>灰度模型和当前模型的输出格式不一致怎么办？</summary>
+          <div class="learn-faq-body">
+            这是灰度前必须验证的。在 Golden Set 上跑输出格式校验。如果新模型的输出格式有变化（如 JSON schema 不同），需要先升级消费者代码再灰度模型。
+          </div>
+        </details>
+        <details>
+          <summary>A/B 对比和灰度发布的区别？</summary>
+          <div class="learn-faq-body">
+            A/B 是<strong>实验</strong>（固定 cohort 长时间对比），灰度为<strong>发布</strong>（逐步放量最终全量）。A/B 需要统计显著性，灰度主要看 SLA 回滚条件。CorpAssist 场景中，灰度前先用 A/B 做离线对比。
+          </div>
+        </details>
+      </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
         <li><strong>路由</strong>：model alias + 网关比例/header 灰度，双栈零改 model 字段。</li>
-        <li><strong>回滚</strong>：延迟/错误率/业务指标触发，优先 <code>canary_percent: 0</code>。</li>
-        <li><strong>观测</strong>：请求必须带 backend 版本标签，才能做 ab infer 与复盘。</li>
+        <li><strong>回滚</strong>：<span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span> 延迟/错误率/业务指标触发，优先 <code>canary_percent: 0</code>。</li>
+        <li><strong>观测</strong>：请求必须带 <span class="term" data-term-id="version-switch" tabindex="0">version switch</span> 标签，才能做 ab infer 与复盘。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_practice04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="alias-concept" /> 能解释 model alias 对双栈灰度的作用</label></li>
+          <li><label><input type="checkbox" data-id="gray-strategies" /> 能列出 2 种以上灰度路由策略</label></li>
+          <li><label><input type="checkbox" data-id="rollback-triggers" /> 能写出至少 3 条回滚触发条件</label></li>
+          <li><label><input type="checkbox" data-id="ab-compare" /> 能设计一条 A/B 对比脚本</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="infer-gray" tabindex="0">infer gray</span></td><td>推理服务灰度发布</td></tr>
+                <tr><td><span class="term" data-term-id="model-version-route" tabindex="0">model version route</span></td><td>按模型版本路由请求</td></tr>
+                <tr><td><span class="term" data-term-id="rollback-model" tabindex="0">rollback model</span></td><td>模型版本回滚操作</td></tr>
+                <tr><td><span class="term" data-term-id="canary-infer" tabindex="0">canary infer</span></td><td>金丝雀推理发布</td></tr>
+                <tr><td><span class="term" data-term-id="route-weight" tabindex="0">route weight</span></td><td>按权重比例路由</td></tr>
+                <tr><td><span class="term" data-term-id="model-alias" tabindex="0">model alias</span></td><td>模型别名，客户端不感知版本</td></tr>
+                <tr><td><span class="term" data-term-id="version-switch" tabindex="0">version switch</span></td><td>版本切换</td></tr>
+                <tr><td><span class="term" data-term-id="ab-infer" tabindex="0">ab infer</span></td><td>A/B 推理对比实验</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>推理模型上线如何做灰度发布？model alias 在其中的作用是什么？</li>
+              <li>灰度期间应该监控哪些指标？写出至少 3 条回滚触发条件。</li>
+              <li>如果没有网关基础设施，如何在客户端层实现基础的灰度分流？风险是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一章 <a href="#ch-practice-05-corpassist-deploy">实战：CorpAssist 推理部署</a> — 把 v1/v2 与网关写进 compose 验收清单。</p>
     </div>
   </div>
@@ -163,9 +405,10 @@ header_canary: X-Infer-Canary</code></pre>
   <div class="official-links content-section">
     <h3>官方文档</h3>
     <ul>
-      <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM</a></li>
-      <li><a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html" target="_blank" rel="noopener">Nginx Upstream（路由参考）</a></li>
-      <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/" target="_blank" rel="noopener">Kubernetes Ingress（K8s 灰度见 advanced-02）</a></li>
+      <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM — 官方文档</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/" target="_blank" rel="noopener">Kubernetes Ingress — 金丝雀发布</a></li>
+      <li><a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html" target="_blank" rel="noopener">Nginx Upstream — 加权路由</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/openai-chat.html" target="_blank" rel="noopener">Spring AI — OpenAI Chat</a></li>
     </ul>
   </div>
 
@@ -174,39 +417,35 @@ header_canary: X-Infer-Canary</code></pre>
     <p class="steps-intro">在 <code>demos/practice-04-gray-lab/gray-route.yaml</code> 上补全回滚条件，并画一张你司网关灰度拓扑。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>为 <code>rollback.triggers</code> 增加一条 S4 业务指标（如空补全率 &gt; 5%）。</li>
-      <li>写清 <code>canary_percent</code> 从 5 → 20 → 50 的三步放量计划与每步观察窗口。</li>
-      <li>说明 Spring 与 Python 的 <code>base_url</code> 应指向网关还是直连 vLLM（结合 <a href="#ch-practice-02-spring-remote">Spring 远程</a>）。</li>
-      <li>完成右侧章节测验（lsfa-p04）。</li>
+      <li>为 <code>rollback.triggers</code> 增加一条 S4 业务指标（如空补全率 > 5%）。</li>
+      <li>写出 canary_percent 从 5 → 20 → 50 的三步放量计划与每步观察窗口。</li>
+      <li>说明 Spring 与 Python 的 <code>base_url</code> 应指向网关还是直连 vLLM。</li>
+      <li>运行 Python A/B 对比脚本，记录 v1/v2 延迟差异。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
       <li>
-        <p class="judgment-stem">灰度第二天 P95 延迟升 40%，错误率正常。是否应立即 rollback？列出你的决策依据（至少 2 条）。</p>
+        <p class="judgment-stem">灰度第二天 P95 延迟升 40%，错误率正常。是否应立即 rollback？</p>
         <div class="learn-practice-answer">
           <details>
             <summary>参考答案</summary>
-            <div class="learn-practice-answer-body">
-              <p>不一定立即全量回滚：先确认是否仅 v2 cohort、是否 TTFT 与 <a href="#ch-practice-03-stream">流式</a> 配置变化；若超 SLA 且影响用户则降 canary_percent 或回滚；保留 ab 样本对比 v1/v2。</p>
-            </div>
+            <div class="learn-practice-answer-body"><p>不一定立即全量回滚：先确认是否仅 v2 cohort、是否 TTFT 配置变化；若超 SLA 且影响用户则降 canary_percent 或回滚；保留 ab 样本对比 v1/v2。</p></div>
           </details>
         </div>
       </li>
       <li>
-        <p class="judgment-stem">团队在 Spring 里新增 <code>vllmV2BaseUrl</code> 字段按用户 ID 切换。这种 <span class="term" data-term-id="model-version-route" tabindex="0">model version route</span> 有何风险？</p>
+        <p class="judgment-stem">团队在 Spring 里新增 <code>vllmV2BaseUrl</code> 字段按用户 ID 切换。这种 model version route 有何风险？</p>
         <div class="learn-practice-answer">
           <details>
             <summary>参考答案</summary>
-            <div class="learn-practice-answer-body">
-              <p>逻辑散落、难统一回滚、观测标签不一致；应上移到网关并保留 model alias。</p>
-            </div>
+            <div class="learn-practice-answer-body"><p>逻辑散落、难统一回滚、观测标签不一致；应上移到网关并保留 model alias。</p></div>
           </details>
         </div>
       </li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：灰度与版本</h4>
-      <p>目录：<code>demos/practice-04-gray-lab/</code>（<code>gray-route.yaml</code>）。<strong>验收</strong>：补全至少 2 条 rollback 触发；写明 header 与比例两种路由的使用场景。</p>
+      <p>目录：<code>demos/practice-04-gray-lab/</code>（<code>gray-route.yaml</code>）。验收：补全至少 2 条 rollback 触发；写明 header 与比例两种路由的使用场景。</p>
     </div>
   </div>
 

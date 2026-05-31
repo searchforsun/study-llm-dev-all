@@ -3,42 +3,377 @@
   <button type="button" class="btn-mark-done" data-chapter="practice-01-langgraph" aria-label="标记本章完成">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：图定义、检查点与人工审批节点</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Python 轨 S3 主力：LangGraph 显式建模审批分支。</p></div>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：图定义、检查点与人工审批节点实现</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Python 轨的 S3 主力框架是 LangGraph。显式 Graph 建模审批分支、Checkpoint 持久化状态、interrupt 实现 human-in-the-loop 是生产级 Agent 的标配。本章用 CorpAssist 请假流程完整走一遍。</p></div>
       <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S3 办公自动化场景端到端落地</li>
-        <li>贯通 LangGraph 与 Spring AI Alibaba 双栈 Agent</li>
-        <li>完成 Demo 与测验</li></ul></div>
+        <li>用 StateGraph 定义办公 Agent 工作流</li>
+        <li>配置 Checkpointer 实现执行状态持久化</li>
+        <li>使用 interrupt 实现人工审批节点</li>
+        <li>在 LangGraph 中集成 MCP 工具</li>
+      </ul></div>
     </div>
-    <div class="section-block"><h3>图与检查点</h3><p>plan→execute→approve 节点；Redis checkpoint。 关联：<span class="term" data-term-id="langgraph-workflow" tabindex="0">langgraph workflow</span>、<span class="term" data-term-id="graph-checkpoint" tabindex="0">graph checkpoint</span>。</p></div>
-    <div class="section-block"><h3>人工审批</h3><p>interrupt_before 高风险工具。 关联：<span class="term" data-term-id="human-approval-node" tabindex="0">human approval node</span>、<span class="term" data-term-id="state-graph-s3" tabindex="0">state graph s3</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="langgraph-workflow" tabindex="0">langgraph workflow</span> · <span class="term" data-term-id="graph-checkpoint" tabindex="0">graph checkpoint</span> · <span class="term" data-term-id="human-approval-node" tabindex="0">human approval node</span> · <span class="term" data-term-id="state-graph-s3" tabindex="0">state graph s3</span> · <span class="term" data-term-id="interrupt-node" tabindex="0">interrupt node</span> · <span class="term" data-term-id="python-s3" tabindex="0">python s3</span> · <span class="term" data-term-id="compile-graph" tabindex="0">compile graph</span> · <span class="term" data-term-id="office-graph" tabindex="0">office graph</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python">builder.add_node("plan", plan_node)
-builder.add_node("execute", execute_tools)
-builder.add_node("approve", human_gate)
-graph = builder.compile(checkpointer=cp, interrupt_before=["execute"])</code></pre></div>
-      <div class="mermaid-wrap"><h5>LangGraph 工作流实现</h5>
-      <pre class="mermaid">flowchart LR
-  User --> Agent[办公 Agent]
-  Agent --> Tools[MCP 工具]
-  Agent --> Human[人工审批]</pre></div>
+
+    <div class="section-block"><h3>StateGraph 定义办公工作流</h3>
+    <p><span class="term" data-term-id="langgraph-workflow" tabindex="0">langgraph workflow</span> 通过 StateGraph 显式定义状态和节点转换。每个节点是一个处理函数，边定义了状态流向。Agent 的状态在每一步都可审计和回放。</p>
+
+    <div class="mermaid-wrap"><h5>请假审批 LangGraph 工作流</h5>
+    <pre class="mermaid">flowchart TB
+      Start[用户输入] --> Plan[Planner Node\n解析意图]
+      Plan --> CheckBalance[Check Leave Balance\n查假期余额]
+      CheckBalance --> Draft[Draft Leave\n生成请假草稿]
+      Draft --> HumanGate{人工审批\ninterrupt_before}
+      HumanGate -->|批准| Submit[提交审批系统]
+      HumanGate -->|驳回| Revise[返回修改意见]
+      HumanGate -->|超时| Escalate[升级到上级审批]
+      Submit --> Log[Log & Notify\n记录+通知]
+      Revise --> Plan
+      Escalate --> HumanGate</pre>
+      <p class="diagram-caption"><span class="term" data-term-id="state-graph-s3" tabindex="0">state graph s3</span> 请假流程：interrupt_before 高风险节点，等待人工审批。</p>
     </div>
+
+    <aside class="learn-scenario" aria-label="业务情境">
+      <span class="learn-scenario-title">CorpAssist · 请假流程</span>
+      员工说「请下周二到周四的年假」。Agent 先查余额（15 天），判断可用后生成请假草稿，然后在「提交审批」节点前 interrupt，等待直属上级审批。上级在审批页面点击「通过」，Agent 继续执行提交。整个过程由 LangGraph Checkpoint 持久化。
+    </aside>
+
+    <h4>Python：请假 Agent 核心代码</h4>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># leave_agent_graph.py
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict, Optional
+
+class LeaveState(TypedDict):
+    user_input: str
+    balance: Optional[float]
+    draft: Optional[dict]
+    approval: Optional[str]  # approved/rejected/escalated
+    result: Optional[str]
+
+def planner_node(state: LeaveState) -> dict:
+    prompt = f"解析请假请求：{state['user_input']}\n"
+    prompt += "提取：开始日期、结束日期、请假类型"
+    parsed = llm.invoke(prompt)
+    return {"draft": parsed}
+
+def check_balance_node(state: LeaveState) -> dict:
+    balance = leave_api.get_balance(user_id)
+    return {"balance": balance}
+
+def draft_node(state: LeaveState) -> dict:
+    draft = leave_api.create_draft(
+        start=state["draft"]["start"],
+        end=state["draft"]["end"],
+        leave_type=state["draft"]["type"]
+    )
+    return {"draft": draft}
+
+def submit_node(state: LeaveState) -> dict:
+    result = leave_api.submit(state["draft"]["id"])
+    return {"result": result, "approval": "submitted"}
+
+def should_approve(state: LeaveState) -> str:
+    return state.get("approval", "pending")
+
+# Graph 构建
+builder = StateGraph(LeaveState)
+builder.add_node("planner", planner_node)
+builder.add_node("check_balance", check_balance_node)
+builder.add_node("draft", draft_node)
+builder.add_node("submit", submit_node)
+
+builder.set_entry_point("planner")
+builder.add_edge("planner", "check_balance")
+builder.add_edge("check_balance", "draft")
+builder.add_conditional_edges("draft", should_approve, {
+    "approved": "submit",
+    "rejected": END,
+    "escalated": END,
+    "pending": "submit"  # 中断后恢复继续执行
+})
+builder.add_edge("submit", END)
+
+# 编译时配置 checkpointer 和 interrupt
+checkpointer = MemorySaver()
+graph = builder.compile(
+    checkpointer=checkpointer,
+    interrupt_before=["submit"]  # 在 submit 前中断等待审批
+)</pre></div>
+    </div>
+
+    <div class="section-block"><h3>Checkpoint 与状态持久化</h3>
+    <p><span class="term" data-term-id="graph-checkpoint" tabindex="0">graph checkpoint</span> 是 LangGraph 的核心能力之一。每次节点执行后，Checkpointer 自动保存完整状态。Agent 重启或中断后可以从上次 checkpoint 恢复，无需重新执行已完成步骤。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># 使用 checkpointer 恢复执行
+config = {"configurable": {"thread_id": "leave-001"}}
+
+# 第一次执行，在 submit 前中断
+result = graph.invoke({"user_input": "请下周二到周四年假"}, config)
+print(result)  # 执行到 interrupt_before，等待审批
+
+# 审批通过后，恢复执行
+result = graph.invoke({
+    "approval": "approved",
+    "draft": result["draft"]
+}, config)
+print(result)  # 继续执行 submit 节点</pre></div>
+
+    <p>Checkpoint 支持多种存储后端：</p>
+    <table class="outline-table">
+      <thead><tr><th>存储</th><th>适合场景</th><th>特性</th></tr></thead>
+      <tbody>
+        <tr><td>MemorySaver</td><td>开发测试</td><td>进程内存，重启丢失</td></tr>
+        <tr><td>SqliteSaver</td><td>单机部署</td><td>持久化到文件</td></tr>
+        <tr><td>PostgresSaver</td><td>生产环境</td><td>分布式、高可用</td></tr>
+        <tr><td>RedisSaver</td><td>高吞吐场景</td><td>低延迟、支持 TTL</td></tr>
+      </tbody>
+    </table>
+
+    <p><span class="term" data-term-id="interrupt-node" tabindex="0">interrupt node</span> 实现了 human-in-the-loop。当执行到 <code>interrupt_before</code> 指定的节点时，Graph 暂停并等待外部输入。审批系统通过调用 <code>graph.invoke</code> 传入审批结果，Graph 从断点继续。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># approval_callback.py
+class ApprovalHandler:
+    def __init__(self, graph, thread_id: str):
+        self.graph = graph
+        self.thread_id = thread_id
+        self.config = {"configurable": {"thread_id": thread_id}}
+
+    def check_pending(self) -> list:
+        """查询所有等待审批的 Agent 任务"""
+        state = self.graph.get_state(self.config)
+        if state.next and "submit" in state.next:
+            return [{
+                "thread_id": self.thread_id,
+                "pending_node": state.next[0],
+                "context": state.values.get("draft", {})
+            }]
+        return []
+
+    def approve(self) -> dict:
+        """批准：传入 approved 状态继续执行"""
+        return self.graph.invoke({"approval": "approved"}, self.config)
+
+    def reject(self, reason: str) -> dict:
+        """驳回：传入 rejected 状态终止"""
+        return self.graph.invoke({"approval": "rejected", "reason": reason}, self.config)
+
+    def escalate(self) -> dict:
+        """升级到上级审批"""
+        return self.graph.invoke({"approval": "escalated"}, self.config)</pre></div>
+    </div>
+
+    <div class="section-block"><h3>Java 侧对等实现：Spring AI Alibaba Graph</h3>
+    <p>Java 侧虽然 Spring AI Alibaba 的 Graph API 与 LangGraph 不同，但概念相通。见 <a href="#ch-practice-02-saa-agent">Spring AI Alibaba Agent/Graph</a> 详细对照。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// LangGraph 概念的 Java 对照示例
+// 注：Spring AI Alibaba 使用 ReactAgent 而非 StateGraph，
+// 但可通过自定义 ToolCallback + ApprovalService 实现等价功能
+@Service
+public class LangGraphStyleService {
+
+    public LeaveResponse processLeave(String userInput) {
+        // 1. Planner — 解析意图
+        LeavePlan plan = llmPlanner.parse(userInput);
+
+        // 2. Check Balance — 调用考勤 API
+        double balance = attendanceClient.getBalance(plan.getEmployeeId());
+
+        // 3. Draft — 生成请假单（类似 graph node）
+        LeaveDraft draft = leaveClient.createDraft(plan, balance);
+
+        // 4. Human Approval — 类似 interrupt_before
+        ApprovalRequest approval = approvalService.createTask(draft);
+        if (!approval.isApproved()) {
+            return LeaveResponse.rejected(approval.getReason());
+        }
+
+        // 5. Submit — continue after approval
+        String result = leaveClient.submit(draft.getId());
+        return LeaveResponse.success(result);
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block"><h3>条件边与状态路由实践</h3>
+    <p>LangGraph 的条件边（Conditional Edge）是 Agent 智能决策的关键。相比硬编码的 if-else，条件边让 LLM 根据当前状态动态决定下一步走向。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># conditional_router.py
+def approval_router(state: LeaveState) -> str:
+    """根据审批状态动态路由"""
+    status = state.get("approval_status", "pending")
+
+    if status == "approved":
+        return "submit"
+    elif status == "rejected":
+        return "notify_rejection"
+    elif status == "escalated":
+        return "escalate_approval"
+    else:
+        # pending → 继续等待（保持 interrupt）
+        return "wait"
+
+def timeout_router(state: LeaveState) -> str:
+    """审批超时处理"""
+    elapsed = time.time() - state["approval_created_at"]
+    if elapsed > 1800:  # 30 分钟超时
+        return "escalate"
+    return "wait"
+
+# Graph 中配置条件边
+builder.add_conditional_edges(
+    "approval_wait",
+    approval_router,
+    {
+        "submit": "submit_node",
+        "notify_rejection": "rejection_node",
+        "escalate": "escalate_node",
+        "wait": "approval_wait"
+    }
+)</pre></div>
+
+    <p>这种路由方式比传统工作流引擎更灵活：路由规则由 LLM 动态生成，而不是预定义的 XML/DSL。但也要注意：条件边不能太多（建议不超过 5 条），否则 LLM 的决策准确率会下降。</p>
+
+    <h4>Java 侧对等实现：条件路由</h4>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">// ConditionalRouter.java
+@Component
+public class ConditionalRouter {
+
+    public String route(LeaveState state) {
+        ApprovalStatus status = state.getApprovalStatus();
+        return switch (status) {
+            case APPROVED -> "submit";
+            case REJECTED -> "notify";
+            case ESCALATED -> "escalate";
+            case PENDING -> {
+                if (state.isTimeout(30, TimeUnit.MINUTES)) {
+                    yield "escalate";
+                }
+                yield "wait";
+            }
+        };
+    }
+}</pre></div>
+
+    <p>条件边的设计原则：每个条件边的出边不超过 5 条。分支太多时，拆分为多层条件边（先判断大类，再判断子类）。</p>
+    </div>
+
+    <div class="section-block"><h3>流式输出与实时状态更新</h3>
+    <p>LangGraph 的流式输出（Streaming）机制让 Agent 执行过程可以实时展示给用户。这在办公场景中非常实用——用户可以看到 Agent 正在「查余额」「填单」等步骤，而不是等待最终结果。</p>
+
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-python"># streaming_demo.py
+def stream_agent_execution(user_input: str):
+    """流式输出 Agent 执行过程"""
+    config = {"configurable": {"thread_id": "session-01"}}
+    events = graph.stream({"user_input": user_input}, config)
+
+    for event in events:
+        for node_name, state in event.items():
+            # 实时推送状态到前端
+            if node_name == "check_balance":
+                yield {"type": "progress", "message": "正在查询假期余额..."}
+            elif node_name == "draft":
+                yield {"type": "progress", "message": "正在生成请假草稿..."}
+            elif node_name == "approval":
+                yield {"type": "interrupt", "message": "等待上级审批..."}
+            elif node_name.endswith("_result"):
+                yield {"type": "result", "data": state}
+            # 推送监控数据
+            yield {"type": "metrics", "step": state.get("step"),
+                   "tokens": state.get("token_count")}
+
+# 前端通过 SSE 接收流式更新
+@app.get("/agent/stream")
+async def agent_stream(user_input: str):
+    return StreamingResponse(
+        stream_agent_execution(user_input),
+        media_type="text/event-stream"
+    )</pre></div>
+
+    <p>Java 侧通过 Spring WebFlux 实现类似效果：</p>
+    <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+    <pre><code class="language-java">@GetMapping(path = "/agent/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;AgentEvent&gt; streamAgent(String userInput) {
+    return agentService.executeStream(userInput)
+        .map(state -> new AgentEvent(state.getNode(), state.getMessage()))
+        .doOnNext(event -> log.debug("Agent event: {}", event));
+}</pre></div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>图定义、检查点与人工审批节点</li>
-    <li>下一步：Spring AI Alibaba Agent/Graph</li></ul></div>
+    <ul class="chapter-conclusions-list">
+      <li>StateGraph 定义节点 + 边 = 显式 Agent 工作流</li>
+      <li>Checkpointer 自动保存执行状态，支持中断恢复</li>
+      <li>interrupt_before 实现在工具调用前等待人工审批</li>
+      <li>条件边让 Agent 动态决策路由，但分支数需控制在 5 条以内</li>
+      <li>流式输出让用户实时看到 Agent 执行过程</li>
+      <li>生产环境推荐 PostgresSaver 或 RedisSaver</li>
+    </ul></div>
+
+    <div class="section-block"><h3>常见问题（FAQ）</h3>
+    <div class="learn-faq">
+      <details><summary>interrupt_before 和 interrupt_after 有什么区别？</summary><div class="learn-faq-body">interrupt_before 在节点执行前中断（适合审批场景），interrupt_after 在节点执行后中断（适合审计场景）。审批一般用 interrupt_before，防止未经授权的操作已执行。</div></details>
+      <details><summary>Checkpoint 存储会不会太大？</summary><div class="learn-faq-body">每个 checkpoint 只存储状态变化（delta）而非全量，大小通常为几 KB。长时间运行的 Agent 建议定期归档旧 checkpoint 或用 TTL 自动清理。</div></details>
+      <details><summary>审批超时不处理怎么办？</summary><div class="learn-faq-body">可以在 Graph 中加一个超时节点：定时检查审批状态，超时后走 escalate 分支升级到上级审批人。LangGraph 的 <code>@workflow.timeout</code> 可以配置整体运行超时。</div></details>
+    </div></div>
+
+    <div class="section-block learn-review-block"><h3>复习与自检</h3>
+    <div class="learn-checklist" data-storage-key="scenario_practice01">
+      <p class="learn-checklist-lead">过关清单</p>
+      <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+      <ul>
+        <li><label><input type="checkbox" data-id="graph-def" /> 能用 StateGraph 定义 4 个节点的办公流程</label></li>
+        <li><label><input type="checkbox" data-id="checkpoint" /> 能配置 Checkpointer 并恢复执行</label></li>
+        <li><label><input type="checkbox" data-id="interrupt" /> 能实现 interrupt_before 审批节点</label></li>
+        <li><label><input type="checkbox" data-id="storage" /> 能说出 3 种 Checkpoint 存储后端</label></li>
+        <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+      </ul>
+    </div>
+
+    <div class="learn-cheat-sheet"><details><summary>本章速查卡</summary><div class="learn-cheat-body"><table>
+      <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+      <tbody>
+        <tr><td><span class="term" data-term-id="langgraph-workflow" tabindex="0">langgraph workflow</span></td><td>StateGraph 定义节点+边的 Agent 工作流</td></tr>
+        <tr><td><span class="term" data-term-id="graph-checkpoint" tabindex="0">graph checkpoint</span></td><td>自动保存每步状态，支持中断恢复</td></tr>
+        <tr><td><span class="term" data-term-id="human-approval-node" tabindex="0">human approval node</span></td><td>interrupt_before 实现人工审批</td></tr>
+        <tr><td><span class="term" data-term-id="state-graph-s3" tabindex="0">state graph s3</span></td><td>办公场景的状态图定义</td></tr>
+        <tr><td><span class="term" data-term-id="interrupt-node" tabindex="0">interrupt node</span></td><td>中断节点等待外部输入</td></tr>
+        <tr><td><span class="term" data-term-id="python-s3" tabindex="0">python s3</span></td><td>Python 轨的 S3 实现</td></tr>
+        <tr><td><span class="term" data-term-id="compile-graph" tabindex="0">compile graph</span></td><td>编译 Graph 并配置 Checkpointer</td></tr>
+        <tr><td><span class="term" data-term-id="office-graph" tabindex="0">office graph</span></td><td>办公自动化流程的 Graph 定义</td></tr>
+      </tbody>
+    </table></div></details></div>
+
+    <div class="learn-interview"><details><summary>答辩 / 面试口述题</summary><div class="learn-interview-body"><ol>
+      <li>LangGraph 的 Checkpoint 机制是如何实现中断恢复的？和传统工作流引擎的断点有什么区别？</li>
+      <li>如果审批人一直不处理，interrupt 会一直等吗？架构上怎么兜底？</li>
+      <li>StateGraph 和 React Agent 在 LangGraph 中是什么关系？什么场景用哪个？</li>
+    </ol></div></details></div>
+    </div>
   </div>
+
   <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a></li>
-    <li><a href="https://java2ai.com/docs/dev/models/dashScope/" target="_blank" rel="noopener">Spring AI Alibaba</a></li>
+    <li><a href="https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/" target="_blank" rel="noopener">LangGraph — Human-in-the-Loop</a></li>
+    <li><a href="https://langchain-ai.github.io/langgraph/concepts/persistence/" target="_blank" rel="noopener">LangGraph — Persistence</a></li>
+    <li><a href="https://langchain-ai.github.io/langgraph/how-tos/stream-values/" target="_blank" rel="noopener">LangGraph — Streaming</a></li>
   </ul></div>
+
   <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-01-langgraph-lab/</code></li>
-  <li>写一条 S3 Agent 落地笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：LangGraph 工作流实现</h4>
-  <p><code>demos/practice-01-langgraph-lab/</code> — 列 4 个节点</p></div></div>
+  <ol class="steps steps-operate">
+    <li>用 StateGraph 实现一个 5 节点的报销审批流程</li>
+    <li>配置 SqliteSaver 并验证中断恢复功能</li>
+    <li>实现一个超时自动升级的审批分支</li>
+    <li>完成 <code>demos/practice-01-langgraph-lab/</code></li>
+  </ol>
+  <div class="demo-box"><h4 class="demo-box-title">Demo：LangGraph 工作流</h4><p><code>demos/practice-01-langgraph-lab/</code> — 定义请假 graph 的 4 个节点。</p></div></div>
+
   <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-02-saa-agent">Spring AI Alibaba Agent/Graph</a></li>
+    <li><strong>下一章</strong>：<a href="#ch-practice-02-saa-agent">Spring AI Alibaba Agent/Graph</a></li>
+    <li><a href="https://blog.langchain.dev/langgraph-a-control-system-for-agentic-ai/" target="_blank" rel="noopener">LangGraph — 控制系统的 Agentic AI</a></li>
   </ul></div>
 </section>

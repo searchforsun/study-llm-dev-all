@@ -1,5 +1,12 @@
-# Demo：成本感知路由
+# Demo: 成本感知路由
 
-[章节](../../index.html#ch-advanced-01-cost-router)
+关联章节: [成本感知路由](../chapters/advanced-01-cost-router.html)
 
-写 daily_budget 设值理由
+## 场景
+小模型前置 + 语义缓存降本。
+
+## 文件
+- `cost-policy.yaml` — 成本策略配置
+
+## 验证
+对比开启前后日均成本变化, 缓存命中率 ≥ 20%。

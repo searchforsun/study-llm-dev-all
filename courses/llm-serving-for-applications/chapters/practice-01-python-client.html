@@ -1,42 +1,483 @@
 <section id="ch-practice-01-python-client" class="chapter" data-chapter="practice-01-python-client">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>Python 指向推理集群</h2>
-  <button type="button" class="btn-mark-done" data-chapter="practice-01-python-client" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Python 指向推理集群</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-python-client" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：配置 OpenAI 客户端、负载均衡与超时</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>FastAPI/RAG 服务 base_url 指向 vLLM 集群。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S4 推理场景实践本章能力</li>
-        <li>说明 vLLM 私有化与双栈客户端接入</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈接入</strong> · 能力：配置 OpenAI 客户端指向私有化 vLLM 集群、负载均衡与超时处理</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 的后台服务（RAG、补全、Agent）常以 Python 实现。它们必须通过 <span class="term" data-term-id="python-openai-client" tabindex="0">OpenAI 客户端</span> 指向私有化推理集群。跟云 API 不同的是：私有化环境下 <span class="term" data-term-id="base-url" tabindex="0">base_url</span> 是内网 vLLM、超时需重新估算、多实例还需 <span class="term" data-term-id="load-balance" tabindex="0">负载均衡</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>配置 OpenAI SDK 指向 vLLM 集群并设置合理的超时与重试</li>
+          <li>设计带连接池与退避策略的 Python 客户端</li>
+          <li>排查「客户端报错但 vLLM 正常」类的典型问题</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>base_url</strong>：私有化 vLLM 的 <code>/v1</code> 后缀不可缺少。</li>
+          <li><strong>超时</strong>：<span class="term" data-term-id="infer-timeout" tabindex="0">推理超时</span> 必须大于最长生成时间，否则流式中断。</li>
+          <li><strong>连接池</strong>：<span class="term" data-term-id="httpx-pool" tabindex="0">httpx 连接池</span> 限制并发；高 QPS 场景需调大 <code>max_connections</code>。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>负载与超时</h3><p>多实例 round-robin；read timeout 120s。 关联：<span class="term" data-term-id="python-openai-client" tabindex="0">python openai client</span>、<span class="term" data-term-id="load-balance" tabindex="0">load balance</span>。</p></div>
-    <div class="section-block"><h3>客户端</h3><p>OpenAI(base_url=vllm_url)。 关联：<span class="term" data-term-id="infer-timeout" tabindex="0">infer timeout</span>、<span class="term" data-term-id="base-url" tabindex="0">base url</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="python-openai-client" tabindex="0">python openai client</span> · <span class="term" data-term-id="load-balance" tabindex="0">load balance</span> · <span class="term" data-term-id="infer-timeout" tabindex="0">infer timeout</span> · <span class="term" data-term-id="base-url" tabindex="0">base url</span> · <span class="term" data-term-id="retry-infer" tabindex="0">retry infer</span> · <span class="term" data-term-id="cluster-endpoint" tabindex="0">cluster endpoint</span> · <span class="term" data-term-id="httpx-pool" tabindex="0">httpx pool</span> · <span class="term" data-term-id="py-serving-client" tabindex="0">py serving client</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python">from openai import OpenAI
-client = OpenAI(base_url="http://vllm:8000/v1", api_key="EMPTY")
-resp = client.chat.completions.create(model="qwen", messages=[...])</code></pre></div>
-      <div class="mermaid-wrap"><h5>Python 指向推理集群</h5>
-      <pre class="mermaid">flowchart LR
-  App[Spring/Python] --> vLLM
-  vLLM --> GPU[GPU 推理]</pre></div>
+
+    <div class="section-block">
+      <h3>负载与超时</h3>
+      <p><span class="term" data-term-id="load-balance" tabindex="0">负载均衡 (load balance)</span> 在 Python 客户端层有两种实现方式：</p>
+      <ol>
+        <li><strong>客户端侧 round-robin</strong>：在代码中维护多个 base_url，随机或轮询选择。</li>
+        <li><strong>网关侧负载均衡</strong>：客户端只连一个网关 endpoint，网关转发到多个 vLLM 后端（推荐）。</li>
+      </ol>
+
+      <p>CorpAssist 生产环境推荐方案 2（网关负载），但在开发和小规模部署中方案 1 更常见。</p>
+
+      <h4>超时配置全景</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>超时类型</th><th>参数</th><th>S4 推荐值</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>连接超时</td>
+            <td><code>timeout.connect</code></td>
+            <td>5～10s</td>
+            <td>vLLM 启动或重启时的 TCP 连接</td>
+          </tr>
+          <tr>
+            <td>读取超时</td>
+            <td><code>timeout.read</code></td>
+            <td>60～300s</td>
+            <td>流式场景必须大于最长生成时间</td>
+          </tr>
+          <tr>
+            <td>写入超时</td>
+            <td><code>timeout.write</code></td>
+            <td>10s</td>
+            <td>发送请求体，通常非瓶颈</td>
+          </tr>
+          <tr>
+            <td>池连接超时</td>
+            <td><code>httpx.Limits.max_connections</code></td>
+            <td>≥ 预期并发 × 1.5</td>
+            <td>避免池耗尽阻塞请求</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Python RAG 服务调推理</span>
+        RAG 服务接收用户问题后检索相关代码片段，拼 prompt 调 vLLM 生成回答。要求：最大检索 8 个片段（约 3K tokens），生成 512 tokens，总耗时可能超过 30s。
+      </aside>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>不设任何超时（默认 5min read timeout 可能太长）</li>
+            <li>超时后直接抛异常不重试</li>
+            <li>每次请求新建 OpenAI client（无连接池）</li>
+            <li>多个线程共用一个 client 但不设 limits</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>设 read timeout=120s 兼顾短补全与长生成</li>
+            <li>超时后指数退避重试（最多 2 次）</li>
+            <li>全局单例 OpenAI client</li>
+            <li>按并发预估配置 httpx limits</li>
+          </ul>
+        </div>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>配置 OpenAI 客户端、负载均衡与超时</li>
-    <li>下一步：Spring AI 远程 ChatModel</li></ul></div>
+
+    <div class="section-block">
+      <h3>Python OpenAI 客户端实战</h3>
+      <p><span class="term" data-term-id="python-openai-client" tabindex="0">Python OpenAI 客户端</span> 是连接 vLLM 的标准方式。<span class="term" data-term-id="py-serving-client" tabindex="0">推理客户端</span> 的核心是正确配置 <span class="term" data-term-id="base-url" tabindex="0">base_url</span> 与 <span class="term" data-term-id="cluster-endpoint" tabindex="0">cluster endpoint</span>。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># corp_assist/infer_client.py — CorpAssist 推理客户端
+import os
+import time
+import random
+from typing import Optional
+
+from openai import OpenAI, APIError, APITimeoutError
+from openai.lib.streaming import ChatCompletionStream
+
+# ---------- 全局单例 ----------
+_INFER_CLIENT: Optional[OpenAI] = None
+
+def get_infer_client() -> OpenAI:
+    """获取全局推理客户端（单例模式，复用连接池）"""
+    global _INFER_CLIENT
+    if _INFER_CLIENT is None:
+        # 支持多 endpoint 随机负载均衡
+        base_urls = os.environ.get(
+            "INFER_BASE_URLS",
+            "http://vllm:8000/v1"
+        ).split(",")
+        selected_url = random.choice(base_urls)
+
+        from httpx import Limits, Timeout
+        _INFER_CLIENT = OpenAI(
+            base_url=selected_url,
+            api_key=os.environ.get("INFER_API_KEY", "EMPTY"),
+            timeout=Timeout(
+                connect=10.0,   # 连接超时
+                read=120.0,     # 读超时（流式需更长）
+                write=10.0,     # 写超时
+            ),
+            max_retries=2,
+            default_headers={
+                "X-CorpAssist-Service": "python-rag",
+            }
+        )
+        # 调整 httpx 连接池
+        _INFER_CLIENT._client._limits = Limits(
+            max_connections=50,
+            max_keepalive_connections=20,
+        )
+    return _INFER_CLIENT
+
+
+# ---------- 带重试的推理调用 ----------
+def chat_completion(
+    messages: list,
+    model: str = "corp-coder-7b",
+    max_tokens: int = 512,
+    temperature: float = 0.1,
+    stream: bool = False,
+    max_retries: int = 2,
+):
+    """
+    统一推理入口：带指数退避重试。
+    用于 CorpAssist 各 Python 后台服务。
+    """
+    client = get_infer_client()
+    last_error = None
+
+    for attempt in range(1 + max_retries):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=stream,
+            )
+        except APITimeoutError as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 2 ** attempt + random.uniform(0, 1)
+                print(f"推理超时，第 {attempt+1} 次重试，等待 {wait:.1f}s")
+                time.sleep(wait)
+        except APIError as e:
+            if e.status_code in (429, 502, 503):
+                last_error = e
+                if attempt < max_retries:
+                    wait = 2 ** attempt + random.uniform(0, 1)
+                    print(f"API 错误 {e.status_code}，重试中...")
+                    time.sleep(wait)
+            else:
+                raise  # 4xx 客户端错误直接抛出
+    raise last_error or RuntimeError("推理失败")
+
+
+# ---------- 流式补全（用于 IDE 插件后端） ----------
+def stream_completion(messages: list, **kwargs):
+    """流式生成，逐 token 返回"""
+    response = chat_completion(messages=messages, stream=True, **kwargs)
+    for chunk in response:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+# ---------- 使用示例 ----------
+if __name__ == "__main__":
+    # 非流式调用
+    resp = chat_completion([
+        {"role": "user", "content": "用 Python 写一个快速排序"}
+    ])
+    print("非流式结果:", resp.choices[0].message.content[:100])
+
+    # 流式调用
+    print("流式结果:", end="")
+    for token in stream_completion([
+        {"role": "user", "content": "Java 单例模式怎么写"}
+    ]):
+        print(token, end="", flush=True)
+    print()</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>Python 客户端 → 推理集群流量路径</h5>
+        <pre class="mermaid">flowchart LR
+    Py[Python 服务\nRAG/Agent/补全] -->|HTTPS| GW[推理网关\n可选: Nginx/Kong]
+    GW -->|round-robin| V1[vLLM 实例 1\n:8000]
+    GW -->|round-robin| V2[vLLM 实例 2\n:8000]
+    V1 --> GPU1[GPU Pool A]
+    V2 --> GPU2[GPU Pool B]
+
+    Py -.->|直连 fallback| V1
+
+    style Py fill:#d4e6f1
+    style GW fill:#f9e79f
+    style V1 fill:#d5f5e3
+    style V2 fill:#d5f5e3</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="cluster-endpoint" tabindex="0">cluster endpoint</span> 可以是网关或直连实例；Python 客户端通过 <code>base_url</code> 切换。</p>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：100 个并发线程共用一个 OpenAI client，连接池会怎样？</summary>
+        <p>httpx 默认 max_connections=10，100 并发时 90 个线程等待连接，延迟飙升。必须按 <span class="term" data-term-id="httpx-pool" tabindex="0">httpx 连接池</span> 估算调大。生产中常用 <code>max_connections=并发数*1.5</code>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>多集群 Fallback</h3>
+      <p><span class="term" data-term-id="retry-infer" tabindex="0">推理重试 (retry infer)</span> 应区分「可重试」与「不可重试」错误：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>错误类型</th><th>可重试?</th><th>策略</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>连接超时 / DNS 解析失败</td>
+            <td>是</td>
+            <td>换 endpoint 重试</td>
+          </tr>
+          <tr>
+            <td>429 Rate Limit</td>
+            <td>是</td>
+            <td>退避重试或 fallback 云 API</td>
+          </tr>
+          <tr>
+            <td>502 / 503 网关错误</td>
+            <td>是</td>
+            <td>退避 + 换实例</td>
+          </tr>
+          <tr>
+            <td>400 model not found</td>
+            <td>否</td>
+            <td>修配置</td>
+          </tr>
+          <tr>
+            <td>401 认证失败</td>
+            <td>否</td>
+            <td>修 api_key</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>Fallback 到云 API 实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># fallback 策略：私有化失败时切换到 DashScope 云 API
+import os
+from openai import OpenAI
+
+# 私有化 client
+private_client = OpenAI(
+    base_url="http://vllm:8000/v1",
+    api_key="EMPTY",
+    timeout=120,
+)
+
+# 云 API client (DashScope)
+cloud_client = OpenAI(
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    api_key=os.environ["DASHSCOPE_API_KEY"],
+)
+
+
+def infer_with_fallback(messages: list, model: str = "corp-coder-7b"):
+    """
+    优先私有化，失败后回退云 API。
+    云侧使用不同 model 名（qwen-turbo）。
+    """
+    for attempt, (client, model_name, label) in enumerate([
+        (private_client, model, "私有化"),
+        (cloud_client, "qwen-turbo", "云 API"),
+    ]):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                max_tokens=512,
+                timeout=60,
+            )
+            print(f"[{label}] 推理成功")
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"[{label}] 失败: {e}")
+            if attempt == 1:
+                raise  # 云 API 也失败则真的失败
+    return None</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>OpenAI client 的 base_url 为什么必须带 <code>/v1</code>？</summary>
+          <div class="learn-faq-body">
+            因为 OpenAI SDK 拼路径时会在 base_url 后面追加 <code>/chat/completions</code>。如果 base_url 设为 <code>http://vllm:8000</code>，最终请求变成 <code>http://vllm:8000/chat/completions</code>（少了一级），vLLM 无法路由。正确写法：<code>http://vllm:8000/v1</code>。
+          </div>
+        </details>
+        <details>
+          <summary>连接池耗尽会怎样？</summary>
+          <div class="learn-faq-body">
+            HTTPX 的连接池有上限。耗尽时新请求会等待空闲连接，导致延迟飙升。现象：请求数增加但 QPS 不变甚至下降。解决方法：调大 <code>max_connections</code>，或使用异步客户端 <code>AsyncOpenAI</code>。
+          </div>
+        </details>
+        <details>
+          <summary>客户端重试和 vLLM 的去重怎么配合？</summary>
+          <div class="learn-faq-body">
+            vLLM 本身不提供幂等去重。如果业务需要幂等（如多次重试不产生重复扣费），应在请求中加入 <code>X-Request-Id</code> header 并在业务层去重。简单场景下最多 2 次重试 + 退避即可。
+          </div>
+        </details>
+        <details>
+          <summary>为什么我设置了 timeout 但请求还是卡住？</summary>
+          <div class="learn-faq-body">
+            可能是流式场景下 read timeout 未被正确传递。OpenAI SDK 流式模式下 read timeout 作用于每个 chunk 之间，若 vLLM 生成长文本但客户端 read timeout 过短，可能在中途断开。建议调大 read timeout 到 120s+。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>客户端配置</strong>：<span class="term" data-term-id="python-openai-client" tabindex="0">OpenAI 客户端</span> 指向 vLLM 需正确 base_url、超时与连接池。</li>
+        <li><strong>负载均衡</strong>：<span class="term" data-term-id="load-balance" tabindex="0">负载均衡</span> 推荐网关方案；客户端直连用于开发测试。</li>
+        <li><strong>超时</strong>：<span class="term" data-term-id="infer-timeout" tabindex="0">推理超时</span> 按场景配置，流式需更大的 read timeout。</li>
+        <li><strong>重试</strong>：<span class="term" data-term-id="retry-infer" tabindex="0">重试策略</span> 区分可重试/不可重试错误，指数退避最多 2 次。</li>
+        <li><strong>Fallback</strong>：私有化失败时切换到云 API，确保服务不中断。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="base-url-format" /> 能写出正确的 vLLM base_url 格式（含 /v1 后缀）</label></li>
+          <li><label><input type="checkbox" data-id="timeout-config" /> 能为流式和非流式场景分别设置 timeout</label></li>
+          <li><label><input type="checkbox" data-id="pool-limit" /> 能估算并发场景需要的 httpx 连接池大小</label></li>
+          <li><label><input type="checkbox" data-id="fallback-chain" /> 能写出私有化 → 云 API 的 fallback 链</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="python-openai-client" tabindex="0">python openai client</span></td><td>OpenAI SDK 连接私有化 vLLM，base_url 要带 /v1</td></tr>
+                <tr><td><span class="term" data-term-id="load-balance" tabindex="0">load balance</span></td><td>多 vLLM 实例间分发请求，推荐网关方式</td></tr>
+                <tr><td><span class="term" data-term-id="infer-timeout" tabindex="0">infer timeout</span></td><td>推理超时分 connect/read/write，流式 read 需 120s+</td></tr>
+                <tr><td><span class="term" data-term-id="base-url" tabindex="0">base url</span></td><td>推理端点地址，含 /v1 路径</td></tr>
+                <tr><td><span class="term" data-term-id="retry-infer" tabindex="0">retry infer</span></td><td>指数退避重试，最多 2 次</td></tr>
+                <tr><td><span class="term" data-term-id="cluster-endpoint" tabindex="0">cluster endpoint</span></td><td>推理集群的统一入口点</td></tr>
+                <tr><td><span class="term" data-term-id="httpx-pool" tabindex="0">httpx pool</span></td><td>HTTPX 连接池，需按并发调大</td></tr>
+                <tr><td><span class="term" data-term-id="py-serving-client" tabindex="0">py serving client</span></td><td>Python 推理客户端封装</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Python 客户端配置 vLLM 推理时，最常见的三个配置错误是什么？如何排查？</li>
+              <li>如何设计一个高可用的 Python 推理客户端？需要考虑哪些故障场景？</li>
+              <li>私有化推理集群和云 API 的客户端配置有何不同？Fallback 策略如何设计？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成下方 Demo；下一章 <a href="#ch-practice-02-spring-remote">Spring AI 远程 ChatModel</a>：用 Java Spring AI 配置私有化推理端点与 fallback。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM</a></li>
-    <li><a href="https://docs.docker.com/compose/" target="_blank" rel="noopener">Docker Compose</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-01-python-client-lab/</code></li>
-  <li>写一条推理部署或量化笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：Python 指向推理集群</h4>
-  <p><code>demos/practice-01-python-client-lab/</code> — 写 timeout 配置</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-02-spring-remote">Spring AI 远程 ChatModel</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/api-reference" target="_blank" rel="noopener">OpenAI API Reference</a></li>
+      <li><a href="https://www.python-httpx.org/advanced/limits/" target="_blank" rel="noopener">HTTPX — 连接池与超时文档</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/use-qwen-by-calling-api" target="_blank" rel="noopener">DashScope — OpenAI 兼容模式</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener">vLLM — OpenAI API 服务</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成 Python 推理客户端配置，包含超时、重试与 fallback。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>修改正文中的 <code>get_infer_client()</code>，增加 HTTPX 连接池大小配置。</li>
+      <li>编写一个带退避重试的流式补全函数，模拟超时场景。</li>
+      <li>在私有化故障时切换到 DashScope 云 API（需要 DASHSCOPE_API_KEY）。</li>
+      <li>运行 <code>demos/practice-01-python-client-lab/client.py</code>，记录超时和连接池相关日志。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">你的 Python 推理客户端报 <code>Connection pool is full</code>，但 vLLM 负载很低。问题出在哪？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>客户端 HTTPX 连接池 max_connections 太小，请求在客户端排队而非 vLLM。调大上限或使用异步 client。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">流式补全在 30 秒后中断，但同样的非流式请求 60 秒能完成。最可能的原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>流式模式下的 read timeout 设置过短。非流式请求的统一超时可能恰好更长，或者流式场景中每个 SSE chunk 之间的间隔超过了 timeout。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Python 推理客户端</h4>
+      <p>目录：<code>demos/practice-01-python-client-lab/</code>（<code>client.py</code>）。<strong>验收</strong>：运行脚本，输出含超时配置与重试日志。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-spring-remote">Spring AI 远程 ChatModel</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/performance/performance_tips.html" target="_blank" rel="noopener">vLLM 性能优化</a></li>
+    </ul>
+  </div>
 </section>

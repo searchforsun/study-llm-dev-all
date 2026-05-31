@@ -1,0 +1,380 @@
+<section id="ch-practice-04-guardrails" class="chapter" data-chapter="practice-04-guardrails">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>护栏与安全约束</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-guardrails" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>多 Agent 编排</strong> · 能力：为 Agent 系统建立安全护栏</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 拥有调用工具和执行操作的能力，这意味着 <span class="term" data-term-id="guardrails" tabindex="0">guardrails</span> 不是可选项，而是生产系统的必备组件。一个没有护栏的 Agent 可能被 prompt injection 利用、误调用高危工具、输出敏感信息、或生成不合规内容。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 Agent 的输入验证和注入防护机制</li>
+          <li>实现工具白名单和权限控制</li>
+          <li>配置输出合规检查和内容安全阀</li>
+          <li>使用 Nvidia NeMo Guardrails 或自定义规则</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>输入过滤</strong>：用户输入可能包含 prompt injection，需要在进入 Agent 前清洗。</li>
+          <li><strong>工具权限</strong>：高危操作（删除、转账）需要白名单+人工确认双重保护。</li>
+          <li><strong>输出检查</strong>：Agent 的回复不应包含敏感信息、不合规内容或幻觉。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>安全护栏分层架构</h3>
+
+      <p>Agent 的安全护栏应该覆盖从输入到输出的全链路。每一层解决不同维度的安全问题。</p>
+
+      <div class="mermaid-wrap">
+        <h5>六层安全护栏</h5>
+        <pre class="mermaid">flowchart TB
+    Input[用户输入] --> L1[L1: 输入过滤\nXSS/SQL注入/Prompt注入]
+    L1 --> L2[L2: 意图验证\n是否在允许范围内]
+    L2 --> L3[L3: 工具权限\n白名单+操作级别]
+    L3 --> L4[L4: 参数校验\n格式/范围/业务规则]
+    L4 --> L5[L5: 执行沙箱\n限流/熔断/审计]
+    L5 --> L6[L6: 输出检查\n脱敏/合规/内容安全]
+    L6 --> Output[最终输出]</pre>
+        <p class="diagram-caption">六层安全护栏从输入到输出全面覆盖 Agent 安全风险。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>防护内容</th><th>实现方式</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>L1 输入过滤</td><td>Prompt injection、XSS、SQL 注入</td><td>正则过滤、编码检测、敏感词库</td></tr>
+          <tr><td>L2 意图验证</td><td>请求是否在 Agent 服务范围内</td><td>意图分类器、边界检查</td></tr>
+          <tr><td>L3 工具权限</td><td>哪些工具可被调用</td><td>白名单、角色-工具映射</td></tr>
+          <tr><td>L4 参数校验</td><td>参数格式、范围、业务约束</td><td>JSON Schema 校验、正则</td></tr>
+          <tr><td>L5 执行沙箱</td><td>限流、熔断、全量审计</td><td>RateLimiter、审计日志</td></tr>
+          <tr><td>L6 输出检查</td><td>敏感信息、合规、内容安全</td><td>脱敏器、分类器、关键词</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>输入验证与注入防护</h3>
+
+      <p>Prompt injection 是最常见的 Agent 安全威胁。攻击者通过在用户输入中嵌入指令，试图覆盖或绕过 Agent 的 System Prompt。</p>
+
+      <h4>Python：输入过滤器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import re
+from typing import Optional
+
+class InputSanitizer:
+    """Agent 输入过滤器"""
+
+    INJECTION_PATTERNS = [
+        r"忽略(之前|以上|所有).*指令",
+        r"忘记.*(角色|规则|约束)",
+        r"你(现在|接下来).*(是|扮演)",
+        r"system\s*:",
+        r"<\|im_start\|>",
+        r"ignore.*(above|instructions|previous)",
+    ]
+
+    SENSITIVE_PATTERNS = [
+        r"\b\d{18}\b",           # 身份证号
+        r"\b1[3-9]\d{9}\b",      # 手机号
+        r"\b\d{16,19}\b",        # 银行卡号
+    ]
+
+    @classmethod
+    def sanitize(cls, text: str) -> tuple[bool, str, Optional[str]]:
+        """清洗输入，返回(是否通过, 清洗后文本, 拒绝原因)"""
+        # 1. 检测注入
+        for pattern in cls.INJECTION_PATTERNS:
+            if re.search(pattern, text):
+                return False, text, "检测到可能的注入攻击"
+
+        # 2. 检测敏感信息
+        for pattern in cls.SENSITIVE_PATTERNS:
+            if re.search(pattern, text):
+                return False, text, "输入包含敏感信息，已拒绝"
+
+        # 3. 长度检查
+        if len(text) > 4000:
+            text = text[:4000]
+
+        return True, text, None
+
+# 使用
+is_safe, cleaned, reason = InputSanitizer.sanitize(user_input)
+if not is_safe:
+    return f"输入被拒绝：{reason}"</pre>
+      </div>
+
+      <h4>Java：Spring 拦截器实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class AgentInputInterceptor {
+
+    private static final List&lt;Pattern&gt; INJECTION_PATTERNS = List.of(
+        Pattern.compile("忽略(之前|以上|所有).*指令"),
+        Pattern.compile("忘记.*(角色|规则|约束)"),
+        Pattern.compile("你(现在|接下来).*(是|扮演)")
+    );
+
+    public ValidationResult validate(String input) {
+        // 注入检测
+        for (Pattern p : INJECTION_PATTERNS) {
+            if (p.matcher(input).find()) {
+                return ValidationResult.rejected("检测到注入攻击");
+            }
+        }
+        // 长度限制
+        if (input.length() > 4000) {
+            input = input.substring(0, 4000);
+        }
+        return ValidationResult.passed(input);
+    }
+
+    public record ValidationResult(boolean passed, String sanitized, String reason) {
+        public static ValidationResult passed(String text) {
+            return new ValidationResult(true, text, null);
+        }
+        public static ValidationResult rejected(String reason) {
+            return new ValidationResult(false, null, reason);
+        }
+    }
+}</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具白名单与权限控制</h3>
+
+      <p>不是所有 Agent 都应该能调用所有工具。基于角色的权限控制确保每个 Agent 只能在其授权范围内操作。</p>
+
+      <div class="mermaid-wrap">
+        <h5>工具权限模型</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Roles[角色]
+        CS[客服 Agent]
+        AS[售后 Agent]
+        AD[管理员 Agent]
+    end
+    subgraph Permissions[工具权限]
+        QO[query_order: 只读]
+        RO[refund_order: 读写]
+        CT[create_ticket: 读写]
+        DO[delete_order: 管理]
+    end
+    CS -->|读| QO
+    CS -->|读写| CT
+    AS -->|读| QO
+    AS -->|读写| RO
+    AS -->|读写| CT
+    AD -->|读写| QO
+    AD -->|读写| RO
+    AD -->|管理| DO</pre>
+        <p class="diagram-caption">不同角色的 Agent 有不同的工具权限矩阵。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class ToolPermissionManager:
+    """工具权限管理器"""
+
+    def __init__(self):
+        self.permissions = {
+            "客服": {
+                "query_order": "read",
+                "create_ticket": "write",
+            },
+            "售后": {
+                "query_order": "read",
+                "refund_order": "write",
+                "create_ticket": "write",
+            },
+            "管理员": {
+                "query_order": "read",
+                "refund_order": "write",
+                "delete_order": "admin",
+                "create_ticket": "write",
+            }
+        }
+
+    def check_permission(self, role: str, tool: str, action: str) -> bool:
+        """检查角色是否有权限"""
+        if role not in self.permissions:
+            return False
+        if tool not in self.permissions[role]:
+            return False
+        required_level = self.permissions[role][tool]
+        level_map = {"read": 1, "write": 2, "admin": 3}
+        action_map = {"read": 1, "write": 2, "delete": 3}
+        return level_map.get(required_level, 0) >= action_map.get(action, 0)</pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只依赖 LLM 判断安全性</strong>：LLM 本身可能被注入，安全规则必须在 LLM 外部实现。</li>
+          <li><strong>宽松的正则规则</strong>：注入检测模式太窄，攻击者可以轻松绕过。</li>
+          <li><strong>不做输出脱敏</strong>：工具返回了完整的用户数据，未脱敏直接输出。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>输出合规检查</h3>
+
+      <p>Agent 的输出需要经过合规检查再返回给用户。包括：敏感信息脱敏、内容安全审核、格式合规检查。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class OutputGuardrail:
+    """输出护栏：脱敏 + 内容安全 + 合规"""
+
+    @staticmethod
+    def desensitize(text: str) -> str:
+        """脱敏处理"""
+        text = re.sub(r'\b(\d{3})\d{4}(\d{4})\b', r'\1****\2', text)  # 手机号
+        text = re.sub(r'\b(\d{6})\d{8}(\d{4})\b', r'\1********\2', text)  # 身份证
+        return text
+
+    @staticmethod
+    def check_content_safety(text: str) -> tuple[bool, str]:
+        """内容安全审核"""
+        unsafe_patterns = [
+            "银行账号.*\\d+", "密码.*\\S+",
+            "内部资料", "机密"
+        ]
+        for pattern in unsafe_patterns:
+            if re.search(pattern, text):
+                return False, "输出包含受限信息"
+        return True, text
+
+    @classmethod
+    def check(cls, output: str) -> str:
+        """完整输出检查"""
+        output = cls.desensitize(output)
+        ok, result = cls.check_content_safety(output)
+        if not ok:
+            return "抱歉，无法提供此信息（已触发内容安全规则）"
+        return result</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>Guardrails 会影响 Agent 的性能吗？</summary>
+          <div class="learn-faq-body">每层护栏都有计算开销。输入过滤和参数校验通常在微秒级，影响可以忽略。内容安全审核如果用 LLM 做（如用另一个模型审核输出），延迟会显著增加。建议：规则类的检查用代码实现，语义类的检查用轻量模型或采样策略。</div>
+        </details>
+        <details>
+          <summary>如何防止 LLM 被注入后调用高危工具？</summary>
+          <div class="learn-faq-body">三管齐下：① 在 Agent 层建立工具白名单，LLM 只能调用白名单内的工具；② 高危工具（转账、删除）需要额外的人工确认；③ 在工具层做参数校验，拒绝不合理参数。见 <a href="#ch-advanced-03-human-in-loop">人机协作</a> 中的审批流程。</div>
+        </details>
+        <details>
+          <summary>Prompt Injection 检测的准确率有多高？</summary>
+          <div class="learn-faq-body">基于正则或关键词的检测（如本章示例）准确率 70-80%，会有误报和漏报。建议使用专门的安全模型（如 Nvidia NeMo Guardrails、Lakera Guard），准确率可达到 95%+。但安全模型本身也需要持续更新对抗新的攻击手法。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>六层护栏</strong>：从输入过滤到输出检查，覆盖全链路。</li>
+        <li><strong>注入防护</strong>：输入必须经过清洗才能进入 Agent 流程。</li>
+        <li><strong>权限控制</strong>：基于角色的工具白名单，高危操作需人工确认。</li>
+        <li><strong>输出合规</strong>：脱敏、内容安全、格式合规三重检查。</li>
+        <li><strong>外部工具</strong>：NeMo Guardrails 和自定义规则结合使用效果最佳。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_practice04">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="six-layers" /> 能画出六层安全护栏架构</label></li>
+          <li><label><input type="checkbox" data-id="injection" /> 能实现基本的注入检测</label></li>
+          <li><label><input type="checkbox" data-id="permission" /> 能设计工具权限模型</label></li>
+          <li><label><input type="checkbox" data-id="desensitize" /> 能实现输出脱敏</label></li>
+          <li><label><input type="checkbox" data-id="dual-guard" /> 能用双栈实现护栏组件</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Guardrails</td><td>Agent 输入输出安全约束</td></tr>
+                <tr><td>Prompt Injection</td><td>攻击者通过输入覆盖 System Prompt</td></tr>
+                <tr><td>Input Sanitizer</td><td>输入清洗：注入检测+敏感信息过滤</td></tr>
+                <tr><td>Tool Whitelist</td><td>允许 Agent 调用的工具列表</td></tr>
+                <tr><td>RBAC</td><td>基于角色的工具权限控制</td></tr>
+                <tr><td>Output Desensitize</td><td>输出脱敏防止信息泄露</td></tr>
+                <tr><td>Content Safety</td><td>内容安全审核</td></tr>
+                <tr><td>NeMo Guardrails</td><td>Nvidia 开源护栏框架</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 安全为什么要分层防护？只依赖 LLM 判断安全性有什么风险？</li>
+              <li>设计一个工具权限系统，要求支持角色-工具-操作三个维度的控制。</li>
+              <li>如何检测和防御 Prompt Injection？结合一个实际例子说明。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-05-evaluation">Agent 评测方法论</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://github.com/NVIDIA/NeMo-Guardrails" target="_blank" rel="noopener">Nvidia NeMo Guardrails 官方仓库</a></li>
+      <li><a href="https://python.langchain.com/docs/security/" target="_blank" rel="noopener">LangChain 安全最佳实践</a></li>
+      <li><a href="https://owasp.org/www-project-top-10-for-llm-applications/" target="_blank" rel="noopener">OWASP Top 10 for LLM Applications</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p>目录：<code>demos/practice-04-guardrails-lab/</code>。<strong>验收</strong>：Agent 在注入攻击下不会执行未授权操作，输出经过脱敏处理。</p>
+  </div>
+</section>

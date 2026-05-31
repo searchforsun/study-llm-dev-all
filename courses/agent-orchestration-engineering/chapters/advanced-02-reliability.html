@@ -1,0 +1,381 @@
+<section id="ch-advanced-02-reliability" class="chapter" data-chapter="advanced-02-reliability">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent 可靠性工程</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-reliability" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产级 Agent</strong> · 能力：构建高可靠 Agent 系统</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 运行在不确定的环境中——LLM 可能输出异常、工具可能超时、用户可能输入恶意内容。<span class="term" data-term-id="reliability" tabindex="0">reliability</span> 通过循环检测、熔断、重试和降级策略确保 Agent 在故障面前仍能稳定运行。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>实现死循环检测与自动终止</li>
+          <li>配置重试策略与指数退避</li>
+          <li>设计降级与 Fallback 策略</li>
+          <li>规划 Agent 容量与限流</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>死循环必须检测</strong>：重复工具调用、相同参数反复执行是常见故障模式。</li>
+          <li><strong>重试需要退避</strong>：立即重试通常没有意义，指数退避给下游恢复时间。</li>
+          <li><strong>降级比崩溃好</strong>：Agent 无法完成任务时，降级返回部分结果或转人工。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>可靠性架构全景</h3>
+
+      <div class="mermaid-wrap">
+        <h5>Agent 可靠性工程架构</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph Detection[故障检测]
+        LD[循环检测\n重复工具/相同参数]
+        TD[超时检测\nLLM/工具超时]
+        ED[错误率检测\n连续失败 N 次]
+    end
+    subgraph Response[故障响应]
+        Retry[重试 + 退避]
+        CB[熔断器\n暂时禁用故障工具]
+        Fallback[降级\n使用备选方案]
+    end
+    subgraph Recovery[恢复策略]
+        Degrade[降级到\n简化模式]
+        Human[转人工\n升级处理]
+        Cache[缓存\n复用历史结果]
+    end
+    Detection --> Response --> Recovery</pre>
+        <p class="diagram-caption">检测-响应-恢复三层可靠性架构。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>故障类型</th><th>检测方式</th><th>应对策略</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>死循环</td><td>重复工具调用检测、步数上限</td><td>终止循环、转人工</td></tr>
+          <tr><td>工具超时</td><td>超时计时器</td><td>指数退避重试、熔断</td></tr>
+          <tr><td>LLM 异常输出</td><td>输出格式校验</td><td>重新生成、降级</td></tr>
+          <tr><td>外部 API 故障</td><td>连续失败计数</td><td>熔断、切换备选 API</td></tr>
+          <tr><td>上下文溢出</td><td>Token 计数</td><td>压缩、截断、摘要</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>循环检测与熔断</h3>
+
+      <p>死循环是 Agent 最常见的故障模式。检测死循环需要监控工具调用序列：</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from collections import defaultdict
+import hashlib
+
+class LoopDetector:
+    """Agent 死循环检测器"""
+
+    def __init__(self, max_repeated_calls=3, window_size=6):
+        self.call_history: list = []
+        self.max_repeated = max_repeated_calls
+        self.window_size = window_size
+
+    def record_call(self, tool_name: str, args: dict, result: str):
+        """记录一次工具调用"""
+        call_hash = self._hash_call(tool_name, args)
+        self.call_history.append({
+            "tool": tool_name,
+            "args_hash": call_hash,
+            "result_hash": hashlib.md5(result.encode()).hexdigest()
+        })
+
+    def detect_loop(self) -> tuple[bool, str]:
+        """检测死循环"""
+        if len(self.call_history) < self.window_size:
+            return False, ""
+
+        recent = self.call_history[-self.window_size:]
+
+        # 检测 1: 相同工具相同参数连续调用
+        for tool in set(c["tool"] for c in recent):
+            calls = [c for c in recent if c["tool"] == tool]
+            if len(calls) >= self.max_repeated:
+                args_hashes = [c["args_hash"] for c in calls[-self.max_repeated:]]
+                if len(set(args_hashes)) == 1:
+                    return True, f"死循环检测: 工具 {tool} 相同参数连续调用 {self.max_repeated} 次"
+
+        # 检测 2: 来回切换两个工具
+        if len(recent) >= 4:
+            pairs = [(recent[i]["tool"], recent[i+1]["tool"])
+                     for i in range(0, len(recent)-1)]
+            if len(set(pairs)) == 1 and len(pairs) >= 3:
+                return True, f"死循环检测: 工具间来回切换 {pairs[0]}"
+
+        return False, ""
+
+    def _hash_call(self, tool_name: str, args: dict) -> str:
+        return hashlib.md5(
+            f"{tool_name}:{json.dumps(args, sort_keys=True)}".encode()
+        ).hexdigest()
+
+# 集成到 Agent
+detector = LoopDetector()
+
+def tool_node_with_detection(state: AgentState) -> AgentState:
+    for tool_call in state["messages"][-1].tool_calls:
+        result = execute_tool(tool_call)
+        detector.record_call(
+            tool_call["name"],
+            tool_call["args"],
+            result
+        )
+        is_loop, reason = detector.detect_loop()
+        if is_loop:
+            state["loop_detected"] = True
+            state["messages"].append(AIMessage(content=f"已检测到循环，转人工处理：{reason}"))
+            break
+        state["messages"].append({"role": "tool", "content": result})
+    return state</pre>
+      </div>
+
+      <h4>Java 熔断器实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class AgentCircuitBreaker {
+    private final Map&lt;String, AtomicInteger&gt; failureCounts = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Long&gt; circuitOpenUntil = new ConcurrentHashMap&lt;&gt;();
+    private static final int THRESHOLD = 3;
+    private static final long TIMEOUT_MS = 30_000;
+
+    public boolean isAvailable(String toolName) {
+        Long until = circuitOpenUntil.get(toolName);
+        if (until != null) {
+            if (System.currentTimeMillis() &lt; until) {
+                return false;
+            }
+            circuitOpenUntil.remove(toolName);
+            failureCounts.put(toolName, new AtomicInteger(0));
+        }
+        return true;
+    }
+
+    public void recordFailure(String toolName) {
+        AtomicInteger count = failureCounts.computeIfAbsent(
+            toolName, k -&gt; new AtomicInteger(0));
+        if (count.incrementAndGet() &gt;= THRESHOLD) {
+            circuitOpenUntil.put(toolName,
+                System.currentTimeMillis() + TIMEOUT_MS);
+            log.warn("Circuit opened for tool: {}", toolName);
+        }
+    }
+
+    public void recordSuccess(String toolName) {
+        failureCounts.computeIfAbsent(toolName, k -&gt; new AtomicInteger(0)).set(0);
+    }
+}</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>重试策略与退避</h3>
+
+      <p>Agent 工具调用失败时，重试是常见的恢复策略。但重试需要有策略——不加控制的立即重试可能加剧故障。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import time
+import random
+from functools import wraps
+
+def retry_with_backoff(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    jitter: bool = True
+):
+    """指数退避重试装饰器"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (TimeoutError, ConnectionError) as e:
+                    last_exception = e
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    if jitter:
+                        delay += random.uniform(0, delay * 0.1)
+                    if attempt < max_retries - 1:
+                        time.sleep(delay)
+            raise last_exception
+        return wrapper
+    return decorator
+
+# 使用
+@retry_with_backoff(max_retries=3, base_delay=1.0)
+def call_external_api(url: str) -> dict:
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()
+    return response.json()</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>降级与 Fallback</h3>
+
+      <p>当重试和熔断都无效时，Agent 需要降级。降级策略确保 Agent 在故障下仍能提供一定程度的服务。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>降级级别</th><th>行为</th><th>适用场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>L1 简化</td><td>跳过非关键工具调用，只返回已收集信息</td><td>部分工具异常</td></tr>
+          <tr><td>L2 缓存</td><td>返回缓存的历史结果</td><td>查询类工具超时</td></tr>
+          <tr><td>L3 转人工</td><td>将对话转交人工客服</td><td>核心工具全部故障</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class DegradationManager:
+    """降级管理器"""
+
+    def __init__(self):
+        self.failure_count = defaultdict(int)
+        self.degradation_level = 0  # 0=正常, 1=简化, 2=缓存, 3=转人工
+
+    def on_tool_failure(self, tool_name: str):
+        self.failure_count[tool_name] += 1
+        total_failures = sum(self.failure_count.values())
+        if total_failures >= 5:
+            self.degradation_level = 3  # 转人工
+        elif total_failures >= 3:
+            self.degradation_level = 2  # 使用缓存
+        elif total_failures >= 1:
+            self.degradation_level = 1  # 简化
+
+    def should_skip_tool(self, tool_name: str) -> bool:
+        return self.degradation_level >= 1 and tool_name in self.failure_count
+
+    def get_cache_result(self, tool_name: str, args: dict) -> str:
+        return cache.get(f"{tool_name}:{json.dumps(args)}")</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>熔断器打开后，什么时候关闭？</summary>
+          <div class="learn-faq-body">熔断器打开后进入半开状态（通常 30-60 秒后），允许少量请求通过测试下游是否恢复。如果请求成功则关闭熔断器，如果仍然失败则继续保持打开状态。LangGraph 内置的熔断器使用 Resilience4j 的实现。</div>
+        </details>
+        <details>
+          <summary>降级和 Fallback 有什么区别？</summary>
+          <div class="learn-faq-body">降级（Degrade）是主动降低服务质量，在故障发生前或发生时减少功能。Fallback 是执行备选方案，当主方案失败时切换到备选。例如：降级可能是跳过非必须的工具调用，Fallback 可能是使用缓存数据替代实时查询。两者常常配合使用。</div>
+        </details>
+        <details>
+          <summary>重试次数太多会有什么问题？</summary>
+          <div class="learn-faq-body">过多重试会：① 增加 Agent 执行延迟，用户等待时间变长；② 放大对下游系统的压力，可能导致系统崩溃；③ 浪费 Token 成本，每次重试都产生 LLM 调用。建议重试不超过 3 次，配合指数退避和熔断器使用。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>死循环检测</strong>：基于工具调用序列的哈希和模式匹配，检测重复调用。</li>
+        <li><strong>熔断器</strong>：连续失败 N 次后暂时禁用工具，避免级联故障。</li>
+        <li><strong>重试策略</strong>：指数退避 + 随机抖动，避免重试风暴。</li>
+        <li><strong>降级策略</strong>：三级降级（简化/缓存/转人工），确保故障下仍能服务。</li>
+        <li><strong>容量规划</strong>：基于历史数据规划 Agent 并发和限流。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_advanced02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="loop-detect" /> 能实现死循环检测算法</label></li>
+          <li><label><input type="checkbox" data-id="circuit-break" /> 能实现熔断器</label></li>
+          <li><label><input type="checkbox" data-id="retry-backoff" /> 能实现指数退避重试</label></li>
+          <li><label><input type="checkbox" data-id="degrade" /> 能设计三级降级策略</label></li>
+          <li><label><input type="checkbox" data-id="dual-reliable" /> 能用双栈实现可靠性组件</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Loop Detection</td><td>检测重复工具调用防死循环</td></tr>
+                <tr><td>Circuit Breaker</td><td>熔断器防级联故障</td></tr>
+                <tr><td>Exponential Backoff</td><td>重试等待时间指数增长</td></tr>
+                <tr><td>Jitter</td><td>随机抖动防重试风暴</td></tr>
+                <tr><td>Degradation</td><td>主动降级服务质量</td></tr>
+                <tr><td>Fallback</td><td>备选方案兜底</td></tr>
+                <tr><td>Half-Open</td><td>熔断器半开状态测试恢复</td></tr>
+                <tr><td>Escalation</td><td>逐级升级处理</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 死循环有哪些表现？如何检测和自动恢复？</li>
+              <li>熔断器的状态机是怎么工作的？画图说明。</li>
+              <li>设计一个 Agent 降级策略，从检测到恢复完整描述。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-03-human-in-loop">人机协作模式</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://resilience4j.readme.io/" target="_blank" rel="noopener">Resilience4j 文档</a></li>
+      <li><a href="https://langchain-ai.github.io/langgraph/how-tos/loop/" target="_blank" rel="noopener">LangGraph 循环检测</a></li>
+      <li><a href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener">Martin Fowler Circuit Breaker</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p>目录：<code>demos/advanced-02-reliability-lab/</code>。<strong>验收</strong>：死循环检测可正确触发，熔断器在连续失败后打开，降级策略按预期执行。</p>
+  </div>
+</section>

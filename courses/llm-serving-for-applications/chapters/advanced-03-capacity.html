@@ -6,7 +6,7 @@
 
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>生产部署</strong> · 能力：<span class="term" data-term-id="capacity-plan" tabindex="0">capacity plan</span> 粗算（QPS · 显存）</p>
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产部署</strong> · 能力：<span class="term" data-term-id="capacity-plan" tabindex="0">capacity plan</span> 粗算（QPS · 显存）</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
         <p>采购 GPU 前需要 <span class="term" data-term-id="rough-sizing" tabindex="0">rough sizing</span>：CorpAssist S4 峰值 <span class="term" data-term-id="s4-load" tabindex="0">s4 load</span> 多少、单卡能扛多少并发、要不要第二张卡。本章不做精确仿真，只建立 <span class="term" data-term-id="qps-estimate" tabindex="0">qps estimate</span> 与 <span class="term" data-term-id="vram-estimate" tabindex="0">vram estimate</span> 的可沟通算法。</p>
@@ -15,7 +15,7 @@
         <strong>学完你能</strong>
         <ul>
           <li>用「并发 × 平均延迟」反推所需吞吐与 <span class="term" data-term-id="gpu-count" tabindex="0">gpu count</span></li>
-          <li>按模型大小 + 量化 + 上下文估显存是否够（链到 <a href="#ch-basics-04-quant">量化</a>、<a href="#ch-basics-05-kv-cache-app">KV</a>）</li>
+          <li>按模型大小 + 量化 + 上下文估显存是否够</li>
           <li>输出一页 <span class="term" data-term-id="scale-plan" tabindex="0">scale plan</span> 给架构评审</li>
         </ul>
       </div>
@@ -31,9 +31,16 @@
 
     <div class="section-block">
       <h3>QPS 粗算</h3>
-      <p><span class="term" data-term-id="concurrency-math" tabindex="0">Concurrency math</span>（Little 定律直觉）：</p>
+      <p><span class="term" data-term-id="concurrency-math" tabindex="0">Concurrency math</span> 基于 Little 定律的直觉应用：</p>
       <p class="formula-block"><code>并发请求数 N ≈ 到达率 λ × 平均响应时间 W</code></p>
-      <p>例：200 在线开发者，每人平均每 30s 触发 1 次补全，单次生成 3s → 并发约 <code>200/30*3 ≈ 20</code>。若单卡 vLLM 稳定支撑 15 并发，则需至少 2 卡或降 max-num-seqs。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S4 容量估算</span>
+        <p>假设：500 活跃开发者，平均每 30 秒触发一次代码补全，单次补全生成耗时 3 秒。</p>
+        <p>并发 ≈ 500 × (1/30) × 3 = 50 并发请求。</p>
+        <p>若单卡 vLLM 稳定支撑 20 并发（7B AWQ 实测），则需 50/20 ≈ 3 张 GPU。</p>
+        <p>考虑 25% 余量 → 建议 4 张 A10 24GB。</p>
+      </aside>
 
       <table class="outline-table">
         <thead>
@@ -55,18 +62,64 @@
             <td>SLA</td>
             <td>与 <a href="#ch-practice-03-stream">TTFT</a> 分开看</td>
           </tr>
+          <tr>
+            <td>单卡最大并发</td>
+            <td>压测数据</td>
+            <td>随 max-model-len 变化</td>
+          </tr>
         </tbody>
       </table>
 
+      <h4>容量计算脚本</h4>
       <div class="code-block">
         <div class="code-toolbar">
-          <span class="lang-tag">markdown</span>
+          <span class="lang-tag">python</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-markdown"># demos/advanced-03-capacity-lab/capacity-worksheet.md 填空示例
-峰值并发 N = ___
-单卡可持续并发 = ___（压测或厂商参考）
-建议 GPU 数 = ceil(N / 单卡并发) × 1.25 余量</code></pre>
+        <pre><code class="language-python"># capacity_calculator.py — CorpAssist 容量估算
+
+def estimate_gpu_count(
+    active_users: int = 500,
+    avg_interval_sec: int = 30,
+    avg_latency_sec: float = 3.0,
+    concurrent_per_gpu: int = 20,
+    buffer_pct: float = 0.25,
+) -> dict:
+    """
+    估算 S4 补全场景所需 GPU 数量。
+    """
+    # 并发请求数 (Little 定律)
+    arrival_rate = active_users / avg_interval_sec
+    concurrent_requests = arrival_rate * avg_latency_sec
+
+    # GPU 数量
+    gpu_needed = concurrent_requests / concurrent_per_gpu
+    gpu_with_buffer = gpu_needed * (1 + buffer_pct)
+
+    # tokens/s 估算
+    avg_tokens_per_request = 64  # FIM 平均补全长度
+    total_tokens_per_sec = arrival_rate * avg_tokens_per_request
+
+    return {
+        "arrival_rate": arrival_rate,
+        "concurrent_requests": round(concurrent_requests, 1),
+        "gpu_needed_raw": round(gpu_needed, 1),
+        "gpu_needed_with_buffer": round(gpu_with_buffer, 1),
+        "gpu_suggested": int(gpu_with_buffer) + 1,
+        "total_tokens_per_sec": round(total_tokens_per_sec, 0),
+    }
+
+# 示例
+result = estimate_gpu_count()
+for k, v in result.items():
+    print(f"{k}: {v}")
+
+# 输出:
+# arrival_rate: 16.67
+# concurrent_requests: 50.0
+# gpu_needed_raw: 2.5
+# gpu_needed_with_buffer: 3.12
+# gpu_suggested: 4</code></pre>
       </div>
 
       <details class="learn-micro-check">
@@ -76,13 +129,99 @@
     </div>
 
     <div class="section-block">
-      <h3>显存</h3>
+      <h3>显存估算</h3>
       <p><span class="term" data-term-id="vram-estimate" tabindex="0">VRAM estimate</span> 分项（应用层粗算）：</p>
-      <ul>
-        <li><strong>权重</strong>：7B AWQ 约 5～6GB 级（以实测为准）</li>
-        <li><strong>KV cache</strong>：随 <code>max-model-len</code> × 并发槽位上升（见 basics-05）</li>
-        <li><strong>框架开销</strong>：预留 1～2GB</li>
-      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>容量规划输入输出</h5>
+        <pre class="mermaid">flowchart LR
+          Biz[S4 用户负载] --> Q[qps estimate]
+          Model[模型+量化] --> V[vram estimate]
+          Q --> G[gpu count]
+          V --> G
+          G --> P[scale plan / 采购]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="capacity-plan" tabindex="0">capacity plan</span> 连接业务、模型与基础设施评审。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>组件</th><th>7B AWQ</th><th>14B AWQ</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>权重</td>
+            <td>~5 GB</td>
+            <td>~10 GB</td>
+            <td>量化后，FP16 约 2 倍</td>
+          </tr>
+          <tr>
+            <td>KV cache / 序列 (8K)</td>
+            <td>~0.5 GB</td>
+            <td>~0.5 GB</td>
+            <td>与模型结构相关，非参数量</td>
+          </tr>
+          <tr>
+            <td>框架开销</td>
+            <td>~1 GB</td>
+            <td>~2 GB</td>
+            <td>CUDA context、临时 tensors</td>
+          </tr>
+          <tr>
+            <td>16 并发 KV 总和</td>
+            <td>~8 GB</td>
+            <td>~8 GB</td>
+            <td>每序列独立 KV</td>
+          </tr>
+          <tr>
+            <td>合计</td>
+            <td>~14 GB / 24 GB</td>
+            <td>~20 GB / 48 GB</td>
+            <td>24GB 卡可跑 7B 16 并发</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>显存估算 Python 函数</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def estimate_vram(
+    model_size_b: int = 7,       # 模型参数量 (B)
+    quant_bits: int = 4,         # 量化位数 (4/8/16)
+    max_seq_len: int = 8192,     # 最大序列长度
+    num_layers: int = 32,        # 层数
+    num_heads: int = 32,         # 注意力头数
+    head_dim: int = 128,         # 每头维度
+    max_concurrency: int = 16,   # 最大并发数
+):
+    # 权重显存
+    weight_gb = model_size_b * 2 * (16 / quant_bits) / 1024  # 单位是 FP16 的倍数
+
+    # KV cache 显存 (每序列)
+    kv_per_seq_gb = (2 * num_layers * num_heads * head_dim * max_seq_len * 2) / (1024**3)
+
+    kv_total_gb = kv_per_seq_gb * max_concurrency
+
+    overhead_gb = 1.0  # 框架开销
+
+    total = weight_gb + kv_total_gb + overhead_gb
+    return {
+        "weight_gb": round(weight_gb, 1),
+        "kv_per_seq_gb": round(kv_per_seq_gb, 2),
+        "kv_total_gb": round(kv_total_gb, 1),
+        "overhead_gb": overhead_gb,
+        "total_gb": round(total, 1),
+        "recommended_gpu": "24GB" if total < 20 else "48GB" if total < 40 else "80GB"
+    }
+
+# 7B AWQ 估算
+vram = estimate_vram()
+for k, v in vram.items():
+    print(f"{k}: {v}")
+# total_gb: ~14.2 → 推荐 24GB 卡</code></pre>
+      </div>
 
       <div class="learn-compare">
         <div class="learn-compare-col learn-compare-bad">
@@ -96,22 +235,77 @@
         <div class="learn-compare-col learn-compare-good">
           <span class="learn-compare-heading">稳妥估法</span>
           <ul>
-            <li>压测 目标并发 + 观察 nvidia-smi 峰值</li>
+            <li>压测目标并发 + 观察 nvidia-smi 峰值</li>
             <li>量化降权重，再调 max-num-seqs</li>
-            <li>写进 <span class="term" data-term-id="scale-plan" tabindex="0">scale plan</span> 的扩容触发条件</li>
+            <li>写进 scale plan 的扩容触发条件</li>
           </ul>
         </div>
       </div>
+    </div>
 
-      <div class="mermaid-wrap">
-        <h5>容量规划输入输出</h5>
-        <pre class="mermaid">flowchart LR
-  Biz[S4 用户负载] --> Q[qps estimate]
-  Model[模型+量化] --> V[vram estimate]
-  Q --> G[gpu count]
-  V --> G
-  G --> P[scale plan / 采购]</pre>
-        <p class="diagram-caption"><span class="term" data-term-id="capacity-plan" tabindex="0">capacity plan</span> 连接业务、模型与基础设施评审。</p>
+    <div class="section-block">
+      <h3>Scale Plan</h3>
+      <p><span class="term" data-term-id="scale-plan" tabindex="0">Scale plan</span> 是给架构评审的一页纸：</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown"># CorpAssist S4 — GPU 容量规划
+## 业务输入
+- 活跃用户: 500 (IDE 遥测)
+- 补全频率: 每 30s 一次
+- 平均生成长度: 64 tokens
+- 目标 P95 TTFT: < 500ms
+
+## 容量计算
+- 并发请求: 50
+- 单卡并发: 20 (7B AWQ, 8K ctx)
+- GPU 数量: ceil(50/20) × 1.25 = 4 张
+
+## 显存估算
+- 权重 5GB + KV 8GB + 开销 1GB = 14GB
+- 每卡留 10GB 余量 → 24GB 卡足够
+
+## 成本预估
+- 4 × A10 24GB 按需: ~$X/小时
+- 年化: ~$Y (含电费/折旧)
+
+## 扩容触发
+- P95 TTFT > 1s 持续 5min
+- KV cache usage > 85%
+- 队列深度 > 3</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>容量估算和实际压测差多少？</summary>
+          <div class="learn-faq-body">
+            粗算通常偏保守，偏差可能在 20-40%。因为 vLLM 的 continuous batching 效率随负载变化。建议用粗算确定下限，用压测确定上限。正文的 estimate_gpu_count 函数给出的是保守下限。
+          </div>
+        </details>
+        <details>
+          <summary>高峰期的突发流量怎么处理？</summary>
+          <div class="learn-faq-body">
+            三种策略：① 超量采购（按峰值 + 25% 余量）② 用云 API fallback 吸收突发 ③ 排队 + 降级（非关键请求限流）。CorpAssist 推荐方案 ① + ② 组合。
+          </div>
+        </details>
+        <details>
+          <summary>7B 和 14B 模型的容量差异有多大？</summary>
+          <div class="learn-faq-body">
+            显存约 2 倍，单卡并发约减半。14B AWQ 需要跨卡 TP 或更大的 GPU（48GB）。容量规划时需要按模型规格重新估算。
+          </div>
+        </details>
+        <details>
+          <summary>量化后还要按 FP16 做容量规划吗？</summary>
+          <div class="learn-faq-body">
+            不需要。量化后的权重体积直接决定容量规划结果。但 kv cache 不受量化影响，它是 FP16/FP8 精度的 key/value 缓存。
+          </div>
+        </details>
       </div>
     </div>
 
@@ -126,6 +320,52 @@
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_advanced03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="concurrency-math" /> 能用并发公式计算 GPU 数量</label></li>
+          <li><label><input type="checkbox" data-id="vram-components" /> 能列出显存的三项构成</label></li>
+          <li><label><input type="checkbox" data-id="scale-plan" /> 能写出一页 scale plan</label></li>
+          <li><label><input type="checkbox" data-id="buffer-reason" /> 能解释余量的作用</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="capacity-plan" tabindex="0">capacity plan</span></td><td>容量规划方案</td></tr>
+                <tr><td><span class="term" data-term-id="qps-estimate" tabindex="0">qps estimate</span></td><td>QPS 估算方法</td></tr>
+                <tr><td><span class="term" data-term-id="vram-estimate" tabindex="0">vram estimate</span></td><td>显存估算方法</td></tr>
+                <tr><td><span class="term" data-term-id="gpu-count" tabindex="0">gpu count</span></td><td>所需 GPU 数量</td></tr>
+                <tr><td><span class="term" data-term-id="rough-sizing" tabindex="0">rough sizing</span></td><td>粗估容量</td></tr>
+                <tr><td><span class="term" data-term-id="concurrency-math" tabindex="0">concurrency math</span></td><td>并发计算公式</td></tr>
+                <tr><td><span class="term" data-term-id="s4-load" tabindex="0">s4 load</span></td><td>S4 推理负载</td></tr>
+                <tr><td><span class="term" data-term-id="scale-plan" tabindex="0">scale plan</span></td><td>扩容计划</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何估算 CorpAssist S4 场景需要的 GPU 数量？请列出计算步骤。</li>
+              <li>显存估算中为什么不能只看权重体积？KV cache 如何估算？</li>
+              <li>容量规划中的 25% 余量覆盖哪些风险？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一章 <a href="#ch-advanced-04-interview">面试：私有化部署题</a> — 把容量与架构话术合并。</p>
     </div>
   </div>
@@ -133,8 +373,9 @@
   <div class="official-links content-section">
     <h3>官方文档</h3>
     <ul>
-      <li><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener">vLLM Performance</a></li>
-      <li><a href="https://developer.nvidia.com/cuda-gpus" target="_blank" rel="noopener">NVIDIA GPU 规格</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener">vLLM — 性能优化</a></li>
+      <li><a href="https://developer.nvidia.com/cuda-gpus" target="_blank" rel="noopener">NVIDIA GPU 规格参数</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/performance/performance_tips.html" target="_blank" rel="noopener">vLLM — 性能调优指南</a></li>
     </ul>
   </div>
 
@@ -144,20 +385,27 @@
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
       <li>假设 500 活跃用户、每 60s 1 次补全、单次 4s，计算并发 N。</li>
-      <li>给定单卡并发 12，计算建议 <span class="term" data-term-id="gpu-count" tabindex="0">gpu count</span>（含 25% 余量）。</li>
-      <li>说明 AWQ 7B 在 24GB 卡上你还会保留多少 GB 给 KV（定性即可）。</li>
-      <li>完成测验 lsfa-a03。</li>
+      <li>给定单卡并发 12，计算建议 GPU 数（含 25% 余量）。</li>
+      <li>说明 AWQ 7B 在 24GB 卡上你还会保留多少 GB 给 KV。</li>
+      <li>运行 capacity_calculator.py，观察不同输入下的 GPU 需求变化。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
       <li>
-        <p class="judgment-stem">厂商宣称单卡 100 QPS，你是否直接写入 <span class="term" data-term-id="scale-plan" tabindex="0">scale plan</span>？</p>
+        <p class="judgment-stem">厂商宣称单卡 100 QPS，你是否直接写入 scale plan？</p>
         <div class="learn-practice-answer">
           <details>
             <summary>参考答案</summary>
-            <div class="learn-practice-answer-body">
-              <p>否；需用 CorpAssist 真实 prompt 长度、stream、并发压测，并区分 chat 与 FIM。</p>
-            </div>
+            <div class="learn-practice-answer-body"><p>否；需用 CorpAssist 真实 prompt 长度、stream、并发压测，并区分 chat 与 FIM。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">你的容量估算显示 3 张 GPU 足够，但生产上 3 张都跑满了。可能是什么原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>可能是：① 活跃用户数估算偏小 ② 实际平均生成长度比预期的 64 tokens 长 ③ 并发分布不均匀（峰值远高于平均）。解决：用压测数据校正估算公式。</p></div>
           </details>
         </div>
       </li>

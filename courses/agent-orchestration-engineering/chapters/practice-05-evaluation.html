@@ -1,0 +1,342 @@
+<section id="ch-practice-05-evaluation" class="chapter" data-chapter="practice-05-evaluation">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent 评测方法论</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-evaluation" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>多 Agent 编排</strong> · 能力：建立 Agent 评测体系</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 的评估比传统软件更困难——输出是自然语言而非结构化结果。<span class="term" data-term-id="agent-evaluation" tabindex="0">agent evaluation</span> 需要结合离线评测（已知正确答案的数据集）和在线监控（用户反馈和行为指标）。没有评测体系，你无法知道 Agent 是变好了还是变差了。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>构建 Agent 离线评测数据集和自动化流水线</li>
+          <li>定义 CSAT、转人工率等在线业务指标</li>
+          <li>设计回归测试防止 Agent 退化</li>
+          <li>使用 LangSmith 进行评测管理</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>离线评测</strong>：用标注好的数据集测试 Agent 输出质量，发现问题在上线前。</li>
+          <li><strong>在线指标</strong>：真实用户反馈（CSAT）和行为指标（转人工率）反映生产表现。</li>
+          <li><strong>回归测试</strong>：每次 Prompt 修改、工具变更后运行，防止「修复一个 bug 引入三个新 bug」。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>评测体系框架</h3>
+
+      <div class="mermaid-wrap">
+        <h5>Agent 评测体系</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph Offline[离线评测]
+        DS[数据集\n标注 Q&A] --> Eval[评测引擎]
+        Eval --> Metrics[准确率/完整率\n工具调用准确率]
+    end
+    subgraph Online[在线监控]
+        User[用户] --> CSAT[满意度评分]
+        User --> Behavior[行为指标\n转人工/重复提问]
+        System[系统] --> Perf[性能指标\n延迟/成本/步数]
+    end
+    subgraph CI[CI 流水线]
+        PR[代码变更] --> Test[回归测试]
+        Test --> Eval
+        Eval --> Gate[质量门禁]
+        Gate -->|通过| Deploy[上线]
+    end</pre>
+        <p class="diagram-caption">Agent 评测体系覆盖离线、在线和 CI 三个维度。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>指标</th><th>方法</th><th>频率</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>离线</td><td>准确率、完整率、工具正确率</td><td>对比标注答案</td><td>每次变更</td></tr>
+          <tr><td>在线</td><td>CSAT、转人工率、解决率</td><td>用户反馈 + 行为分析</td><td>实时/每日</td></tr>
+          <tr><td>性能</td><td>延迟 P50/P99、Token 消耗</td><td>APM 监控</td><td>实时</td></tr>
+          <tr><td>CI</td><td>回归通过率</td><td>流水线自动触发</td><td>每次提交</td></tr>
+        </tbody>
+      </tbody>
+    </div>
+
+    <div class="section-block">
+      <h3>离线评测与数据集</h3>
+
+      <p>离线评测的核心是高质量的数据集。每个测试用例包含：用户输入、期望的工具调用、期望的最终回答。</p>
+
+      <h4>评测数据集结构</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "test_cases": [
+    {
+      "id": "S2-001",
+      "category": "订单查询",
+      "input": "我的订单 T001 到哪了？",
+      "expected_tools": ["query_order"],
+      "expected_tool_args": {"order_id": "T001"},
+      "expected_response_contains": ["已发货", "物流"],
+      "tags": ["regression", "happy-path"]
+    },
+    {
+      "id": "S2-002",
+      "category": "退款",
+      "input": "我要退款，订单 T002 的衣服太大了",
+      "expected_tools": ["refund_order"],
+      "expected_tool_args": {"order_id": "T002", "reason": "衣服太大"},
+      "expected_response_contains": ["退款", "提交"],
+      "tags": ["regression", "payment"]
+    }
+  ]
+}</pre>
+      </div>
+
+      <h4>Python：离线评测引擎</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class AgentEvaluator:
+    """Agent 离线评测引擎"""
+
+    def __init__(self, agent, test_cases: list):
+        self.agent = agent
+        self.test_cases = test_cases
+
+    def evaluate(self) -> dict:
+        results = {"passed": 0, "failed": 0, "details": []}
+        for case in self.test_cases:
+            result = self._evaluate_single(case)
+            results["details"].append(result)
+            if result["passed"]:
+                results["passed"] += 1
+            else:
+                results["failed"] += 1
+        results["pass_rate"] = results["passed"] / len(self.test_cases)
+        return results
+
+    def _evaluate_single(self, case: dict) -> dict:
+        response = self.agent.invoke({"messages": [HumanMessage(content=case["input"])]})
+
+        checks = {
+            "tool_correct": self._check_tools(response, case.get("expected_tools", [])),
+            "response_quality": self._check_response(response, case.get("expected_response_contains", [])),
+        }
+        passed = all(checks.values())
+        return {"id": case["id"], "passed": passed, "checks": checks}
+
+    def _check_tools(self, response, expected_tools):
+        actual_tools = [m.name for m in response["messages"] if hasattr(m, "name")]
+        return all(t in actual_tools for t in expected_tools)
+
+    def _check_response(self, response, expected_contains):
+        last_msg = response["messages"][-1].content
+        return all(kw in last_msg for kw in expected_contains)</pre>
+      </div>
+
+      <h4>LangSmith 数据集管理</h4>
+      <p>LangSmith 提供了数据集创建、评测运行和结果对比的功能。你可以在 LangSmith 中创建数据集，将 Agent 运行结果自动记录到数据集，然后运行对比评测。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from langsmith import Client, Dataset
+
+client = Client()
+
+# 创建数据集
+dataset = client.create_dataset(
+    "corpassist-s2-eval",
+    description="CorpAssist S2 客服 Agent 评测集"
+)
+
+# 添加示例
+client.create_example(
+    inputs={"input": "查订单 T001"},
+    outputs={
+        "expected_tools": ["query_order"],
+        "expected_response": "已发货"
+    },
+    dataset_id=dataset.id
+)
+
+# 运行评测
+def evaluate_agent(example):
+    result = agent.invoke({"messages": [HumanMessage(content=example["input"])]})
+    return {"response": result["messages"][-1].content}
+
+results = client.run_on_dataset(
+    dataset_name="corpassist-s2-eval",
+    llm_or_chain_fn=evaluate_agent,
+    project_name="s2-v2-eval"
+)</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>在线指标与监控</h3>
+
+      <p>离线评测无法覆盖所有生产场景。在线指标反映 Agent 在真实用户环境中的表现。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>定义</th><th>目标</th><th>采集方式</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>CSAT</td><td>用户满意度评分（1-5）</td><td>> 4.0</td><td>对话结束后弹出评分</td></tr>
+          <tr><td>转人工率</td><td>转人工会话 / 总会话</td><td>< 30%</td><td>系统事件统计</td></tr>
+          <tr><td>首次解决率</td><td>未再次提问的会话比</td><td>> 70%</td><td>24h 内回归分析</td></tr>
+          <tr><td>平均步数</td><td>每次对话的平均 ReAct 步数</td><td>< 5</td><td>Agent 日志统计</td></tr>
+          <tr><td>平均 Token</td><td>每次对话消耗的 Tokens</td><td>< 3000</td><td>LLM 调用日志</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：CSAT 高但转人工率也高，说明什么？</summary>
+        <p>说明 Agent 可能只处理了简单问题（用户满意），但稍微复杂的问题就转人工了。需要检查转人工的触发原因：是 Agent 能力不足、工具缺失还是 System Prompt 过于保守导致过早转交。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>回归测试与 CI</h3>
+
+      <p>回归测试确保 Agent 变更不会引入退化。每次 Prompt 修改、工具变更或模型升级后都应运行回归测试。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># .github/workflows/agent-eval.yml
+name: Agent Evaluation
+on: [pull_request]
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Agent Eval
+        run: |
+          python -m pytest tests/evaluation/ -v --junitxml=results.xml
+      - name: Check Quality Gate
+        run: |
+          python scripts/check_quality_gate.py \
+            --pass-rate 0.85 \
+            --max-regression 0.05
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: results.xml</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>评测数据集的标注工作量太大了，有什么省力的方法？</summary>
+          <div class="learn-faq-body">可以先用 LLM 生成初始数据集（合成数据），然后人工抽样审核修正。也可以从生产日志中采样用户问题和 Agent 回答，由人工标注是否合格。建议从 50 个用例开始，覆盖核心场景，然后逐步扩展到 200-500 个。</div>
+        </details>
+        <details>
+          <summary>Agent 的回答是自然语言，如何自动化判断是否正确？</summary>
+          <div class="learn-faq-body">常用的方法有：① 关键词/正则匹配（简单但不够准确）；② LLM-as-Judge（用另一个 LLM 打分，准确率 85%+）；③ 语义相似度（用 embedding 比较回答和标准答案的相似度）。建议组合使用——先用规则做预检，再用 LLM 判分。</div>
+        </details>
+        <details>
+          <summary>在线指标多久看一次比较合适？</summary>
+          <div class="learn-faq-body">CSAT 和转人工率建议每日看，因为样本量太小时指标波动大。延迟和 Token 消耗建议实时监控，设置告警阈值。每周汇总趋势分析，发现 Agent 表现是否在退化。每次模型升级或 Prompt 变更后需要密切观察 24-48 小时。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>三维评测</strong>：离线（数据集）、在线（用户指标）、CI（回归测试）。</li>
+        <li><strong>数据集设计</strong>：包含输入、期望工具、期望输出三个要素。</li>
+        <li><strong>LLM-as-Judge</strong>：用 LLM 判分是自动化评估自然语言输出的有效方法。</li>
+        <li><strong>在线指标</strong>：CSAT、转人工率、首次解决率反映生产表现。</li>
+        <li><strong>CI 集成</strong>：每次变动自动运行评测，设置质量门禁。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_practice05">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="three-dim" /> 能说出 Agent 评测的三个维度</label></li>
+          <li><label><input type="checkbox" data-id="dataset" /> 能设计评测数据集结构</label></li>
+          <li><label><input type="checkbox" data-id="online-metric" /> 能定义 CSAT 和转人工率指标</label></li>
+          <li><label><input type="checkbox" data-id="ci-integrate" /> 能将评测集成到 CI 流水线</label></li>
+          <li><label><input type="checkbox" data-id="eval-engine" /> 能实现评测引擎</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>离线评测</td><td>标注数据集自动化测试</td></tr>
+                <tr><td>CSAT</td><td>用户满意度评分</td></tr>
+                <tr><td>转人工率</td><td>Agent 无法处理需转人工的比例</td></tr>
+                <tr><td>LLM-as-Judge</td><td>用 LLM 评估 LLM 输出质量</td></tr>
+                <tr><td>质量门禁</td><td>评测通过率低于阈值阻止上线</td></tr>
+                <tr><td>回归测试</td><td>变更后防止 Agent 退化</td></tr>
+                <tr><td>语义相似度</td><td>Embedding 比较回答相似性</td></tr>
+                <tr><td>首次解决率</td><td>用户不重复提问的比率</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 评测比传统软件测试难在哪里？你是如何解决的？</li>
+              <li>如果 Agent 的 CSAT 很高但转人工率也在上升，可能是什么原因？</li>
+              <li>如何建立 Agent 的质量门禁？阈值怎么定？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-01-observability">Agent 可观测性</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.smith.langchain.com/" target="_blank" rel="noopener">LangSmith 官方文档</a></li>
+      <li><a href="https://docs.smith.langchain.com/evaluation/" target="_blank" rel="noopener">LangSmith Evaluation 指南</a></li>
+      <li><a href="https://arxiv.org/abs/2306.05685" target="_blank" rel="noopener">Judging LLM-as-a-Judge with MT-Bench</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p>目录：<code>demos/practice-05-evaluation-lab/</code>。<strong>验收</strong>：能运行离线评测并输出通过率，在线指标定义清晰可监控。</p>
+  </div>
+</section>

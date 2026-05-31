@@ -1,0 +1,460 @@
+<section id="ch-basics-02-tool-use" class="chapter" data-chapter="basics-02-tool-use">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Tool/Function Calling 深度解析</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-tool-use" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Agent 基础认知</strong> · 能力：设计高质量工具并处理调用异常</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>工具是 Agent 与外部世界交互的唯一通道。<span class="term" data-term-id="function-calling" tabindex="0">Function Calling</span> 的可靠性直接决定 Agent 的成败——工具定义不清、参数错误、结果不可解析是 Agent 项目最常见的三大故障源。本章从原理到实践，覆盖工具定义、Schema 设计、参数校验、错误处理和安全的完整链路。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>理解 Function Calling 的底层原理：模型如何声明工具调用需求</li>
+          <li>用 Python Pydantic 和 Java Record 定义高质量工具 Schema</li>
+          <li>实现参数校验、错误处理和超时控制的健壮工具层</li>
+          <li>避免工具设计中的常见陷阱（description 缺失、参数歧义等）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>模型声明工具</strong>：LLM 在响应中返回 <code>tool_calls</code> 结构，不是 LLM 直接执行函数。</li>
+          <li><strong>Schema 即契约</strong>：工具定义（参数名、类型、描述）是模型理解工具的接口说明书。</li>
+          <li><strong>描述决定调用率</strong>：工具描述越清晰，模型正确调用的概率越高。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Function Calling 底层原理</h3>
+
+      <p><span class="term" data-term-id="function-calling" tabindex="0">Function Calling</span> 并非模型「调用函数」，而是模型在生成文本时声明「我需要调用某个函数」。Agent 框架拦截这个声明，执行对应函数，将结果以消息形式返回给模型继续推理。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Function Calling 完整流程</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant Dev as 开发者
+    participant Model as LLM
+    participant Agent as Agent Runtime
+    participant API as 企业 API
+
+    Dev->>Model: 注册工具定义（OpenAPI Schema）
+    Note over Model: 模型内化工具描述
+    Agent->>Model: 用户问题 + 可用工具列表
+    Model-->>Agent: 响应 + tool_calls[query_order("T001")]
+    Agent->>Agent: 解析 tool_calls
+    Agent->>API: 执行 query_order("T001")
+    API-->>Agent: 返回订单数据
+    Agent->>Model: 追加 tool_result 消息
+    Model-->>Agent: 生成最终回复</pre>
+        <p class="diagram-caption">Function Calling 的完整数据流：工具定义、声明、执行、结果回传。</p>
+      </div>
+
+      <p>模型在训练阶段学习了大量 API 调用示例，因此能够理解工具的 JSON Schema 定义。当 <span class="term" data-term-id="tool-schema" tabindex="0">tool schema</span> 足够清晰时，模型可以在推理时自动判断是否需要调用工具、传入什么参数。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：如果没有 Function Calling 能力，Agent 如何实现工具调用？</summary>
+        <p>退化为 prompt 解析模式——让 LLM 输出固定格式字符串（如 <code>TOOL_CALL: query_order|T001</code>），Agent 再用正则或字符串解析提取。这种方式可靠性差，模型容易输出格式错乱。Function Calling 是原生支持的结构化输出，可靠性远超文本解析。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>工具定义与 Schema 设计</h3>
+
+      <p>工具 Schema 是模型理解工具的接口契约。设计良好的 Schema 需要包含：清晰的名称、准确的参数描述、合理的参数类型和必要的校验规则。</p>
+
+      <h4>Python：Pydantic 工具定义</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pydantic import BaseModel, Field
+from typing import Optional
+from langchain_core.tools import tool
+
+class QueryOrderInput(BaseModel):
+    """查询订单的输入参数"""
+    order_id: str = Field(description="订单号，格式如 T2024-001")
+    customer_phone: Optional[str] = Field(
+        default=None,
+        description="客户手机号后四位，用于身份验证"
+    )
+
+@tool(args_schema=QueryOrderInput)
+def query_order(order_id: str, customer_phone: Optional[str] = None) -> str:
+    """查询订单当前状态和物流信息。
+
+    该工具从企业 ERP 系统获取订单数据，
+    返回状态、物流单号和预计送达时间。
+    敏感信息脱敏后返回。
+    """
+    result = order_service.query(order_id)
+    return f"订单 {order_id}: {result.status}, 物流: {result.logistics}"
+
+# 查看自动生成的 JSON Schema
+print(query_order.args_schema.schema())</pre>
+      </div>
+
+      <h4>Java：Spring AI Alibaba 工具定义</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class CorpAssistTools {
+
+    @Tool(name = "query_order",
+          description = "查询订单状态和物流信息。" +
+                        "从企业 ERP 获取数据，返回状态、物流单号和预计送达。")
+    public String queryOrder(
+            @ToolParam(description = "订单号，格式如 T2024-001")
+            String orderId,
+
+            @ToolParam(description = "客户手机号后四位，用于身份验证（可选）",
+                       required = false)
+            String customerPhone) {
+
+        if (orderId == null || orderId.isBlank()) {
+            return "错误：订单号不能为空";
+        }
+        Order order = orderService.findById(orderId);
+        if (order == null) {
+            return "未找到订单: " + orderId;
+        }
+        return "订单 %s 状态：%s，物流单号：%s，预计送达：%s"
+            .formatted(order.id(), order.status(),
+                       order.logisticsNo(), order.estimatedDelivery());
+    }
+
+    @Tool(name = "create_ticket",
+          description = "创建客服工单。需要用户 ID、问题类型和问题描述。")
+    public String createTicket(
+            @ToolParam(description = "用户 ID") String userId,
+            @ToolParam(description = "问题类型：退款/退货/咨询/投诉")
+            String issueType,
+            @ToolParam(description = "问题详细描述，不少于 10 个字")
+            String description) {
+
+        Ticket ticket = ticketService.create(userId, issueType, description);
+        return "工单已创建，编号：%s，预计处理时间：%s"
+            .formatted(ticket.id(), ticket.estimatedResponse());
+    }
+}</pre>
+      </div>
+
+      <h4>自动生成的 JSON Schema</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "name": "query_order",
+  "description": "查询订单状态和物流信息。从企业 ERP 获取数据。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "order_id": {
+        "type": "string",
+        "description": "订单号，格式如 T2024-001"
+      },
+      "customer_phone": {
+        "type": "string",
+        "description": "客户手机号后四位",
+        "default": null
+      }
+    },
+    "required": ["order_id"]
+  }
+}</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>工具方法无 description，模型不知道何时调用</li>
+            <li>参数名含糊（<code>id</code>、<code>data</code>）</li>
+            <li>返回原始 JSON 或 null 不加工</li>
+            <li>一个工具方法做多件事（查询+创建+删除）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>每个 @Tool 写清晰中文 description</li>
+            <li>参数名自解释（<code>orderId</code>、<code>issueType</code>）</li>
+            <li>返回格式化的可读文本</li>
+            <li>每个工具只做一件事（单一职责）</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>参数校验与错误处理</h3>
+
+      <p>工具调用的可靠性取决于三个环节：参数校验、执行保护和结果格式化。模型可能传入不符合预期的参数，工具本身也可能抛出异常，这些都需要 Agent 层妥善处理。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>异常类型</th><th>典型场景</th><th>处理方法</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>参数缺失</td><td>模型未传必填参数</td><td>在工具开头校验，返回友好错误</td></tr>
+          <tr><td>参数格式错误</td><td>订单号格式不对</td><td>正则校验，提示正确格式</td></tr>
+          <tr><td>业务异常</td><td>订单不存在、库存不足</td><td>返回业务错误描述，让模型决策</td></tr>
+          <tr><td>系统异常</td><td>数据库连接超时</td><td>捕获异常，返回降级信息</td></tr>
+          <tr><td>超时</td><td>外部 API 超过 5 秒未响应</td><td>设超时时间，返回超时错误</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Python：健壮的工具实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import re
+from functools import wraps
+from typing import Any
+
+def safe_tool(func):
+    """工具安全包装器"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+            # 限制返回长度
+            if isinstance(result, str) and len(result) > 2000:
+                result = result[:2000] + "...(截断)"
+            return result
+        except ValueError as e:
+            return f"参数错误：{e}"
+        except TimeoutError:
+            return "工具调用超时，请稍后重试"
+        except Exception as e:
+            return f"系统错误，已记录日志：{type(e).__name__}"
+    return wrapper
+
+@tool
+@safe_tool
+def query_order(order_id: str) -> str:
+    """查询订单状态"""
+    if not re.match(r'^T\d{4}-\d{3,}$', order_id):
+        raise ValueError(f"订单号格式错误：{order_id}（正确格式：T2024-001）")
+    order = order_service.query(order_id)
+    if order is None:
+        return f"未找到订单：{order_id}"
+    return format_order(order)</pre>
+      </div>
+
+      <h4>Java：Resilience4j 包装</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class ResilientTools {
+    private static final Logger log = LoggerFactory.getLogger(ResilientTools.class);
+
+    private final OrderService orderService;
+    private final Retry retryPolicy;
+
+    public ResilientTools(OrderService orderService) {
+        this.orderService = orderService;
+        this.retryPolicy = Retry.of("tool-retry",
+            RetryConfig.custom()
+                .maxAttempts(3)
+                .waitDuration(Duration.ofSeconds(1))
+                .retryExceptions(TimeoutException.class, IOException.class)
+                .build());
+    }
+
+    @Tool(name = "query_order_resilient",
+          description = "带重试的订单查询")
+    public String queryOrder(String orderId) {
+        return Try.ofSupplier(() ->
+                Retry.decorateSupplier(retryPolicy, () -> {
+                    Order o = orderService.findById(orderId);
+                    if (o == null) return "未找到订单: " + orderId;
+                    return formatOrder(o);
+                })
+            ).recover(e -> "查询异常：" + e.getMessage())
+            .get();
+    }
+}</pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>工具抛出异常 = Agent 崩溃</strong>：Agent 框架应捕获异常，以消息形式返回给模型，让模型决定是否重试或降级。</li>
+          <li><strong>返回过长不截断</strong>：工具返回 1 万行日志会撑爆上下文。建议截断至 2000 字符内。</li>
+          <li><strong>错误信息含敏感数据</strong>：异常信息可能包含堆栈和数据库细节，返回给模型前需脱敏。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>安全调用策略</h3>
+
+      <p>工具是 Agent 的风险入口。不良设计的工具可能被模型（或被用户 prompt injection 诱导的模型）滥用，造成数据泄露或业务损失。</p>
+
+      <div class="mermaid-wrap">
+        <h5>工具安全调用分层</h5>
+        <pre class="mermaid">flowchart TB
+    Input[用户输入] -->|1. 输入过滤| Sanitize[XSS/SQL 注入过滤]
+    Sanitize -->|2. 权限检查| Auth[工具调用权限校验]
+    Auth -->|3. 限流| RateLimit[QPS/并发限制]
+    RateLimit -->|4. 执行| Execute[工具执行]
+    Execute -->|5. 输出过滤| Output[脱敏/合规审查]
+    Output -->|6. 审计| Audit[全链路日志]</pre>
+        <p class="diagram-caption">六层安全防护：从输入到输出覆盖全链路。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>安全层</th><th>措施</th><th>实现方式</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>输入过滤</td><td>参数正则校验、长度限制</td><td>Pydantic validator / @ToolParam 约束</td></tr>
+          <tr><td>工具白名单</td><td>仅允许注册的工具被调用</td><td>allowed_tools 配置列表</td></tr>
+          <tr><td>操作权限</td><td>读写分离、高危操作确认</td><td>require_confirmation 标志</td></tr>
+          <tr><td>限流熔断</td><td>单工具 QPS 上限</td><td>Resilience4j RateLimiter</td></tr>
+          <tr><td>输出脱敏</td><td>手机号/身份证脱敏</td><td>脱敏注解或正则替换</td></tr>
+          <tr><td>审计日志</td><td>全量工具调用记录</td><td>AOP 切面 + 数据库</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>模型不调用工具怎么办？</summary>
+          <div class="learn-faq-body">
+            首先检查工具 description 是否清晰。常见原因：工具描述模糊、参数描述不全、模型不了解何时该用此工具。解决方案：① 在 System Prompt 中举例说明何时使用该工具；② 增加 <code> strict=True</code> 强制模型必须使用工具；③ 切换到 Function Calling 能力更强的模型（如 Qwen、GPT-4、Claude）。
+          </div>
+        </details>
+        <details>
+          <summary>模型传错了参数怎么办？</summary>
+          <div class="learn-faq-body">
+            模型不会「故意」传错参数，通常是因为：① 参数描述不够清晰；② 参数名含义模糊；③ 用户提供的信息不全。建议在工具开头做参数校验，返回友好错误让模型重新尝试。也可以让工具参数设计更宽松——例如支持模糊匹配的订单号。
+          </div>
+        </details>
+        <details>
+          <summary>工具可以调用另一个工具吗？</summary>
+          <div class="learn-faq-body">
+            工具本身不应直接调用其他工具——这是编排层的职责。如果你发现一个工具需要调用另一个工具，说明这两个功能应该由 Agent 的 ReAct 循环串联，而不是在工具内部耦合。见 <a href="#ch-practice-03-tool-design">工具设计最佳实践</a> 中的粒度讨论。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Function Calling 是声明式</strong>：模型声明需要调用工具，Agent 运行时负责执行和结果回传。</li>
+        <li><strong>Schema 即接口契约</strong>：参数的名称、类型和描述决定了模型能否正确调用工具。</li>
+        <li><strong>错误处理兜底</strong>：工具必须处理参数校验异常、业务异常和系统异常，返回友好错误让模型继续。</li>
+        <li><strong>安全分六层</strong>：从输入过滤到审计日志，每一层都不可或缺。</li>
+        <li><strong>双栈一致</strong>：Python Pydantic 和 Java @ToolParam 在 Schema 设计理念上完全一致。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_basics02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="fc-principle" /> 能用白话解释 Function Calling 的声明式原理</label></li>
+          <li><label><input type="checkbox" data-id="schema-design" /> 能设计包含参数说明和校验的 Schema</label></li>
+          <li><label><input type="checkbox" data-id="error-handle" /> 能实现包含参数校验和异常处理的健壮工具</label></li>
+          <li><label><input type="checkbox" data-id="security-layer" /> 能列出至少 4 层工具安全防护措施</label></li>
+          <li><label><input type="checkbox" data-id="dual-code" /> 能用 Python 和 Java 各写一个完整工具定义</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Function Calling</td><td>模型声明式表达工具调用需求</td></tr>
+                <tr><td>Tool Schema</td><td>工具接口的 JSON Schema 契约</td></tr>
+                <tr><td>Description</td><td>工具描述决定模型调用准确率</td></tr>
+                <tr><td>Arg Validation</td><td>参数校验防止错误数据进入业务层</td></tr>
+                <tr><td>Safe Tool</td><td>包装器处理异常和超时</td></tr>
+                <tr><td>Tool Permission</td><td>工具白名单和操作权限控制</td></tr>
+                <tr><td>Audit Trail</td><td>全量工具调用审计日志</td></tr>
+                <tr><td>Output Truncation</td><td>工具返回结果截断防上下文膨胀</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Function Calling 和传统的 JSON Mode/Prompt 解析相比，优势和劣势分别是什么？</li>
+              <li>设计一个工具时，你会如何编写 description 来提高模型调用准确率？举例说明。</li>
+              <li>如果 Agent 在调用工具时返回了敏感数据（如用户身份证号），你会如何防止？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：下一章 <a href="#ch-basics-03-planning-reasoning">规划与推理模式</a> 学习 Chain-of-Thought 和任务分解技术。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/guides/function-calling" target="_blank" rel="noopener">OpenAI Function Calling 官方指南</a></li>
+      <li><a href="https://python.langchain.com/docs/modules/tools/" target="_blank" rel="noopener">LangChain Tools 官方文档</a></li>
+      <li><a href="https://java2ai.com/docs/dev/tools/tool-calling/" target="_blank" rel="noopener">Spring AI Alibaba Tool Calling 指南</a></li>
+      <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use" target="_blank" rel="noopener">Anthropic Tool Use 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现一组包含参数校验和错误处理的 CorpAssist 工具（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>用 Pydantic 或 Java Record 定义 <code>QueryOrderInput</code> Schema，包含订单号校验规则。</li>
+      <li>实现 <code>query_order</code> 工具，包含参数校验、业务异常和系统异常的处理。</li>
+      <li>添加工具调用的审计日志 AOP 切面。</li>
+      <li>测试模型传入错误参数时工具的恢复行为。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：工具调用实验室</h4>
+      <p>目录：<code>demos/basics-02-tool-use-lab/</code>。<strong>验收</strong>：工具能正确处理正常/异常/边界情况，模型能正确使用工具回答用户问题。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-planning-reasoning">规划与推理模式</a></li>
+      <li><a href="https://cookbook.openai.com/examples/how_to_call_functions_with_chat_models" target="_blank" rel="noopener">OpenAI Function Calling Cookbook</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI Tool API</a></li>
+    </ul>
+  </div>
+</section>

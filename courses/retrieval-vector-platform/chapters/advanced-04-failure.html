@@ -1,43 +1,346 @@
 <section id="ch-advanced-04-failure" class="chapter" data-chapter="advanced-04-failure">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>故障与降级</h2>
-  <button type="button" class="btn-mark-done" data-chapter="advanced-04-failure" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>故障与降级</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-04-failure" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>平台化</strong> · 能力：副本切换与关键词兜底</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>向量库宕机时不能完全不可用；BM25/缓存兜底。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist 检索平台落地本章能力</li>
-        <li>说明 Python 索引与 Spring 只读查询分工</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>平台化</strong> · 能力：Failover 切换、Keyword Fallback 兜底与降级模式设计</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>向量库宕机时不能完全不可用。<span class="term" data-term-id="keyword-fallback" tabindex="0">keyword fallback</span> 到 ES BM25、<span class="term" data-term-id="circuit-breaker" tabindex="0">circuit breaker</span> 保护下游、<span class="term" data-term-id="replica-promote" tabindex="0">replica promote</span> 自动切换——这些是检索平台高可用的命脉。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 <span class="term" data-term-id="failover" tabindex="0">failover</span> 多级降级策略</li>
+          <li>实现 <span class="term" data-term-id="degrade-mode" tabindex="0">degrade mode</span> 自动切换</li>
+          <li>配置 <span class="term" data-term-id="ha-vector" tabindex="0">HA</span> 架构</li>
+          <li>编写 <span class="term" data-term-id="incident-playbook" tabindex="0">incident playbook</span> 故障手册</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>降级分三档</strong>：全功能 → 仅关键词 → 缓存结果 → 报错。</li>
+          <li><strong>Keyword Fallback 是核心</strong>：向量不可用时，ES BM25 仍能提供基本检索。</li>
+          <li><strong>熔断保护下游</strong>：检测到 Milvus 持续报错时主动熔断，避免请求堆积。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>副本切换</h3><p>Milvus 主从提升；健康检查。 关联：<span class="term" data-term-id="failover" tabindex="0">failover</span>、<span class="term" data-term-id="keyword-fallback" tabindex="0">keyword fallback</span>。</p></div>
-    <div class="section-block"><h3>关键词兜底</h3><p>向量不可用时 ES BM25 only。 关联：<span class="term" data-term-id="degrade-mode" tabindex="0">degrade mode</span>、<span class="term" data-term-id="replica-promote" tabindex="0">replica promote</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="failover" tabindex="0">failover</span> · <span class="term" data-term-id="keyword-fallback" tabindex="0">keyword fallback</span> · <span class="term" data-term-id="degrade-mode" tabindex="0">degrade mode</span> · <span class="term" data-term-id="replica-promote" tabindex="0">replica promote</span> · <span class="term" data-term-id="circuit-breaker" tabindex="0">circuit breaker</span> · <span class="term" data-term-id="backup-search" tabindex="0">backup search</span> · <span class="term" data-term-id="ha-vector" tabindex="0">ha vector</span> · <span class="term" data-term-id="incident-playbook" tabindex="0">incident playbook</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-yaml">degrade:
-  vector_down: use_bm25_only
-  cache_hot_queries: true</code></pre></div>
-      <div class="mermaid-wrap"><h5>故障与降级</h5>
-      <pre class="mermaid">flowchart LR
-  PY[Python 索引] --> VS[(Milvus/ES)]
-  SP[Spring 查询] --> VS
-  VS --> RAG[RAG 生成]</pre></div>
+
+    <div class="section-block">
+      <h3>多级降级策略设计</h3>
+
+      <p><span class="term" data-term-id="degrade-mode" tabindex="0">degrade mode</span> 定义了系统在不同故障程度下的行为。CorpAssist 设计四级降级模式：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>等级</th><th>触发条件</th><th>向量检索</th><th>关键词检索</th><th>缓存</th><th>用户体验</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>L0 正常</strong></td><td>-</td><td>启用</td><td>混合</td><td>未命中</td><td>正常</td></tr>
+          <tr><td><strong>L1 向量降级</strong></td><td>Milvus P95 > 500ms</td><td>降级</td><td>仅 BM25</td><td>命中返回</td><td>精度略降</td></tr>
+          <tr><td><strong>L2 仅关键词</strong></td><td>Milvus 不可用</td><td>关闭</td><td>仅 BM25</td><td>命中返回</td><td>深度下降</td></tr>
+          <tr><td><strong>L3 缓存兜底</strong></td><td>ES 也异常</td><td>关闭</td><td>关闭</td><td>仅缓存</td><td>仅热门有效</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>降级自动切换流程</h5>
+        <pre class="mermaid">flowchart TB
+    REQ["搜索请求"] --> CHECK["监控检查"]
+    CHECK -->|"Milvus 正常"| VEC["向量检索 → Rerank"]
+    CHECK -->|"Milvus P95 高"| L1["L1: 仅 BM25"]
+    CHECK -->|"Milvus 不可用"| L2{"ES 可用?"}
+    L2 -->|是| BM["L2: 仅 BM25"]
+    L2 -->|否| L3["L3: 缓存兜底"]
+    VEC --> OUT["正常结果"]
+    L1 --> BM
+    BM --> OUT2["关键词结果"]
+    L3 --> OUT3["缓存结果"]
+
+    style VEC fill:#4A90D9,color:#fff
+    style BM fill:#4ECDC4,color:#fff
+    style L3 fill:#FF6B6B,color:#fff</pre>
+        <p class="diagram-caption">按故障等级自动切换检索模式，保证最坏情况下仍有服务能力。</p>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>副本切换与关键词兜底</li>
-    <li>下一步：面试：召回低怎么排查</li></ul></div>
+
+    <div class="section-block">
+      <h3>Keyword Fallback 实现</h3>
+
+      <p><span class="term" data-term-id="keyword-fallback" tabindex="0">keyword fallback</span> 是降级策略的核心——当向量检索不可用时，退化为 ES BM25 关键词检索。</p>
+
+      <h4>Python：降级路由</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from enum import Enum
+import time
+
+class DegradeLevel(Enum):
+    NORMAL = 0
+    VECTOR_DEGRADED = 1
+    KEYWORD_ONLY = 2
+    CACHE_ONLY = 3
+
+class DegradeRouter:
+    def __init__(self, milvus_threshold_ms=500):
+        self.level = DegradeLevel.NORMAL
+        self.milvus_threshold = milvus_threshold_ms
+        self.last_check = 0
+
+    def check_health(self):
+        """定期检查向量库健康状态"""
+        # 模拟检查：调用 Milvus 健康端点
+        # 实际中通过 Prometheus 指标判定
+        milvus_ok = self._check_milvus()
+
+        if not milvus_ok:
+            self.level = DegradeLevel.KEYWORD_ONLY
+            return
+        # 检查延迟
+        latency = self._measure_latency()
+        if latency > self.milvus_threshold:
+            self.level = DegradeLevel.VECTOR_DEGRADED
+        else:
+            self.level = DegradeLevel.NORMAL
+
+    def search(self, query: str, query_vec: list):
+        """根据降级等级执行不同检索策略"""
+        self.check_health()
+
+        if self.level == DegradeLevel.NORMAL:
+            return self._hybrid_search(query, query_vec)
+        elif self.level == DegradeLevel.VECTOR_DEGRADED:
+            return self._bm25_search(query)
+        elif self.level == DegradeLevel.KEYWORD_ONLY:
+            return self._bm25_search(query)
+        else:
+            return self._cache_search(query)
+
+    def _check_milvus(self):
+        # 模拟 health check
+        return True
+
+    def _measure_latency(self):
+        # 模拟延迟测量
+        return 100
+
+    def _hybrid_search(self, query, query_vec):
+        print(f"[NORMAL] Hybrid search: {query}")
+        return ["vec1", "vec2"]
+
+    def _bm25_search(self, query):
+        print(f"[DEGRADED] BM25 only: {query}")
+        return ["bm25_1", "bm25_2"]
+
+    def _cache_search(self, query):
+        print(f"[CACHE_ONLY] Cache search: {query}")
+        return ["cache_1"]</code></pre>
+      </div>
+
+      <h4>Java：Spring 熔断+降级</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import java.time.Duration;
+
+@Service
+public class DegradeSearchService {
+    private final MilvusClientV2 milvusClient;
+    private final ElasticsearchClient esClient;
+    private final CircuitBreaker milvusBreaker;
+
+    public DegradeSearchService() {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            .failureRateThreshold(50)   // 50% 失败率触发熔断
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .slidingWindowSize(10)
+            .build();
+        this.milvusBreaker = CircuitBreakerRegistry.of(config)
+            .circuitBreaker("milvus");
+    }
+
+    public List<String> search(String query, float[] queryVec) {
+        // 使用熔断器调用 Milvus
+        try {
+            return milvusBreaker.executeSupplier(() -> {
+                var resp = milvusClient.search(SearchReq.builder()
+                    .collectionName("corpassist_kb")
+                    .data(List.of(new FloatVec(queryVec)))
+                    .annsField("embedding")
+                    .topK(5)
+                    .build());
+                return extractIds(resp);
+            });
+        } catch (Exception e) {
+            // 熔断或异常时降级到 BM25
+            return keywordFallback(query);
+        }
+    }
+
+    private List<String> keywordFallback(String query) {
+        // 调用 ES BM25
+        var resp = esClient.search(s -> s
+            .index("corpassist_index")
+            .query(q -> q.match(t -> t.field("chunk_text").query(query)))
+            .size(5),
+            Map.class
+        );
+        return extractEsIds(resp);
+    }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>故障演练与 Playbook</h3>
+
+      <p><span class="term" data-term-id="incident-playbook" tabindex="0">incident playbook</span> 是故障处理的标准操作流程。CorpAssist 的检索故障 playbook 包含三个演练场景。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>注入故障</th><th>预期行为</th><th>验证方法</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Milvus 宕机</td><td>停掉 Milvus 容器</td><td>自动降级到 BM25</td><td>搜索仍返回结果</td></tr>
+          <tr><td>Milvus 延迟飙升</td><td>模拟网络延迟</td><td>降级到 L1</td><td>搜索结果来自 BM25</td></tr>
+          <tr><td>双库不可用</td><td>停 Milvus + ES</td><td>返回缓存结果</td><td>热门查询有结果</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无降级策略，宕机就报错</li>
+            <li>熔断参数拍脑袋</li>
+            <li>不演练故障场景</li>
+            <li>降级后无恢复机制</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>四级降级策略逐级退化</li>
+            <li>熔断参数通过实验确定</li>
+            <li>定期故障演练</li>
+            <li>健康恢复后自动切回</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>降级后怎么恢复？需要人工干预吗？</summary>
+          <div class="learn-faq-body">自动恢复。健康检查持续探测 Milvus 和 ES 的可用性。一旦恢复，自动从 L3 → L0 逐级回升。每级回升后验证 1 分钟，确认稳定后再升级别。</div>
+        </details>
+        <details>
+          <summary>熔断器打开后，多久尝试恢复？</summary>
+          <div class="learn-faq-body">Resilience4j 默认 30 秒后转入 HALF_OPEN 状态，允许一个探测请求。成功则关闭熔断器，失败则继续保持 OPEN。CorpAssist 设置 60 秒等待时长。</div>
+        </details>
+        <details>
+          <summary>Keyword Fallback 返回的结果和正常差多少？</summary>
+          <div class="learn-faq-body">取决于查询类型。精确编号查询几乎无差别；语义查询差别大。CorpAssist 监测发现降级到 BM25 后，用户点击率下降约 15-20%。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>四级降级策略</strong>：正常 → 向量降级 → 关键词 → 缓存。</li>
+        <li><strong>Keyword Fallback 兜底</strong>：向量不可用时 BM25 保底。</li>
+        <li><strong>熔断器保护下游</strong>：故障时快速失败，避免请求堆积。</li>
+        <li><strong>自动恢复机制</strong>：健康检查 + 逐级回升。</li>
+        <li><strong>故障演练定期执行</strong>：验证降级策略有效性。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="retrieval-vector-platform_advanced04">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="degrade" /> 能设计四级降级策略</label></li>
+          <li><label><input type="checkbox" data-id="fallback" /> 能实现 Keyword Fallback</label></li>
+          <li><label><input type="checkbox" data-id="circuit" /> 能配置熔断器参数</label></li>
+          <li><label><input type="checkbox" data-id="recovery" /> 知道自动恢复机制</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Failover</td><td>故障自动切换</td></tr>
+                <tr><td>Degrade Mode</td><td>降级模式 L0-L3</td></tr>
+                <tr><td>Keyword Fallback</td><td>向量不可用时 BM25 兜底</td></tr>
+                <tr><td>Circuit Breaker</td><td>熔断器保护下游</td></tr>
+                <tr><td>Replica Promote</td><td>副本提升为主节点</td></tr>
+                <tr><td>Backup Search</td><td>备用搜索路径</td></tr>
+                <tr><td>HA Vector</td><td>向量库高可用</td></tr>
+                <tr><td>Incident Playbook</td><td>故障处理手册</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>向量数据库宕机时，CorpAssist 的搜索系统如何保证可用？</li>
+              <li>熔断器的三个状态是什么？打开后多久尝试恢复？</li>
+              <li>Keyword Fallback 在什么情况下效果最差？如何缓解？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一章：<a href="#ch-advanced-05-interview">面试：召回低怎么排查</a></p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://milvus.io/docs" target="_blank" rel="noopener">Milvus 文档</a></li>
-    <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/knn-search.html" target="_blank" rel="noopener">Elasticsearch kNN</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/advanced-04-failure-lab/</code></li>
-  <li>记录检索/索引相关笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：故障与降级</h4>
-  <p><code>demos/advanced-04-failure-lab/</code> — 补充降级触发条件</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-advanced-05-interview">面试：召回低怎么排查</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank">Resilience4j CircuitBreaker</a></li>
+      <li><a href="https://milvus.io/docs/configure-milvus.md" target="_blank">Milvus 高可用配置</a></li>
+      <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/high-availability.html" target="_blank">ES 高可用</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol class="steps steps-operate">
+      <li>实现四级降级路由。</li>
+      <li>用 Resilience4j 配置 Milvus 熔断器。</li>
+      <li>写一条 Keyword Fallback 的降级触发条件。</li>
+      <li>编写故障演练场景脚本。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo</h4>
+      <p><code>demos/advanced-04-failure-lab/</code> — 验收：补充降级触发条件。</p>
+    </div>
+  </div>
 </section>

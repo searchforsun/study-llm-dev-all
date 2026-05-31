@@ -1,5 +1,12 @@
-# Demo：模型能力矩阵
+# Demo: 模型能力矩阵
 
-[章节](../../index.html#ch-basics-01-capability-matrix)
+关联章节: [模型能力矩阵](../chapters/basics-01-capability-matrix.html)
 
-补 2 行 CorpAssist 适用模型
+## 场景
+为 S5 场景建立模型能力矩阵。
+
+## 文件
+- `matrix-template.md` — 矩阵模板
+
+## 验证
+填写 3 个以上模型的 tier/capabilities/价格。

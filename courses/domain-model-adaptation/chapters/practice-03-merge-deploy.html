@@ -1,42 +1,417 @@
 <section id="ch-practice-03-merge-deploy" class="chapter" data-chapter="practice-03-merge-deploy">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>合并、量化与接入</h2>
-  <button type="button" class="btn-mark-done" data-chapter="practice-03-merge-deploy" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>模型合并与部署</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-merge-deploy" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>双栈实践</strong> · 能力：GGUF/AWQ 简介与 vLLM 接入指向</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>自托管 adapter 需 merge；量化降显存；推理课深化 vLLM。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist 领域适配场景实践本章能力</li>
-        <li>说明微调 vs RAG 及 Python/DashScope 双路径</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈实践</strong> · 能力：合并 LoRA adapter、量化模型、用 vLLM 部署推理</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>LoRA 训练产物是 adapter，但生产推理框架通常需要<strong>合并后的完整模型</strong>。<span class="term" data-term-id="merge-lora" tabindex="0">合并 LoRA</span>、<span class="term" data-term-id="gguf-intro" tabindex="0">GGUF 量化</span>、<span class="term" data-term-id="awq-intro" tabindex="0">AWQ 量化</span>、<span class="term" data-term-id="vllm-point" tabindex="0">vLLM 部署</span>——每个环节做错都会导致推理性能下降或兼容性问题。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 PEFT 合并 LoRA adapter 并保存为完整模型</li>
+          <li>用 llama.cpp / AutoAWQ 做 <span class="term" data-term-id="quantize-deploy" tabindex="0">模型量化</span></li>
+          <li>用 <span class="term" data-term-id="vllm-point" tabindex="0">vLLM</span> 部署合并后的模型并启动推理服务</li>
+          <li>从 <span class="term" data-term-id="inference-bridge" tabindex="0">Spring 侧调用</span> 私有化部署的模型</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>合并 = 推理兼容</strong>：合并后的模型不需要 PEFT 依赖，任何框架都可加载。</li>
+          <li><strong>量化省显存</strong>：AWQ 4-bit 比 bf16 省 4 倍显存，精度损失 < 1%。</li>
+          <li><strong>vLLM 是生产首选</strong>：PagedAttention + 连续批处理，吞吐比 HF 高 10 倍。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>合并与量化</h3><p>merge_and_unload；AWQ 4bit 简介。 关联：<span class="term" data-term-id="merge-lora" tabindex="0">merge lora</span>、<span class="term" data-term-id="gguf-intro" tabindex="0">gguf intro</span>。</p></div>
-    <div class="section-block"><h3>vLLM</h3><p>指向推理课；OpenAI 兼容 API。 关联：<span class="term" data-term-id="awq-intro" tabindex="0">awq intro</span>、<span class="term" data-term-id="vllm-point" tabindex="0">vllm point</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="merge-lora" tabindex="0">merge lora</span> · <span class="term" data-term-id="gguf-intro" tabindex="0">gguf intro</span> · <span class="term" data-term-id="awq-intro" tabindex="0">awq intro</span> · <span class="term" data-term-id="vllm-point" tabindex="0">vllm point</span> · <span class="term" data-term-id="quantize-deploy" tabindex="0">quantize deploy</span> · <span class="term" data-term-id="merged-model" tabindex="0">merged model</span> · <span class="term" data-term-id="inference-bridge" tabindex="0">inference bridge</span> · <span class="term" data-term-id="self-host-ft" tabindex="0">self host ft</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-bash"># 合并 LoRA 示意
-python merge_lora.py --base Qwen2.5-7B --adapter ./adapters/v1</code></pre></div>
-      <div class="mermaid-wrap"><h5>合并、量化与接入</h5>
-      <pre class="mermaid">flowchart LR
-  Data[语料] --> Train[SFT/LoRA]
-  Train --> Eval[评测]
-  Eval --> Deploy[DashScope/Spring]</pre></div>
+
+    <div class="section-block">
+      <h3>合并 LoRA Adapter</h3>
+
+      <p><span class="term" data-term-id="merge-lora" tabindex="0">合并 LoRA</span> 将 adapter 权重写回基座模型，生成一个完整的、不依赖 PEFT 的模型文件。合并后可用任何推理框架加载。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Adapter 合并部署（60 秒）</span>
+        CorpAssist 的 LoRA adapter 训练完成（corpassist-tone-v1-lora）。团队决定用 vLLM 部署私有化推理。但 vLLM 不直接支持 PEFT adapter 加载，需要先将 adapter 合并回 Qwen2.5-7B 基座。
+      </aside>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># merge_lora.py — 合并 LoRA adapter 到基座模型
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+import torch
+
+# 配置
+BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+ADAPTER_PATH = "./outputs/corpassist-lora-v1/checkpoint-500"
+OUTPUT_PATH = "./outputs/corpassist-lora-v1-merged"
+
+# 加载基座
+print("加载基座模型...")
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+# 加载 adapter
+print("加载 adapter...")
+model = PeftModel.from_pretrained(model, ADAPTER_PATH)
+
+# 合并并卸载
+print("合并 adapter...")
+merged_model = model.merge_and_unload()
+
+# 保存
+print("保存合并后模型...")
+merged_model.save_pretrained(OUTPUT_PATH, safe_serialization=True)
+
+# 保存 tokenizer
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+tokenizer.save_pretrained(OUTPUT_PATH)
+
+# 验证
+from transformers import pipeline
+pipe = pipeline("text-generation", model=merged_model, tokenizer=tokenizer)
+result = pipe("你好，我是 CorpAssist", max_new_tokens=50, do_sample=False)
+print(f"验证输出: {result[0]['generated_text']}")
+print(f"合并完成！模型保存在: {OUTPUT_PATH}")</pre></code>
+      </div>
+
+      <p><span class="term" data-term-id="merged-model" tabindex="0">合并后模型</span> 的大小与基座模型相同（7B ≈ 14GB bf16），但可以直接被推理框架加载。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>用 PEFT 在推理时动态加载 adapter（依赖 PEFT 库）</li>
+            <li>合并时用 fp32 而非 bf16（显存翻倍）</li>
+            <li>合并后不验证直接部署（可能加载失败）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>先合并再部署，任何框架都可加载</li>
+            <li>用 bf16 或 fp16 合并，节省显存</li>
+            <li>合并后运行推理验证后再部署</li>
+          </ul>
+        </div>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>GGUF/AWQ 简介与 vLLM 接入指向</li>
-    <li>下一步：合规与偏见</li></ul></div>
+
+    <div class="section-block">
+      <h3>GGUF 量化：llama.cpp 生态</h3>
+
+      <p><span class="term" data-term-id="gguf-intro" tabindex="0">GGUF</span> 是 llama.cpp 推出的模型格式，专为 CPU 和混合设备推理优化。GGUF 量化可大幅减小模型体积，适合边缘部署。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 用 llama.cpp 将合并模型转为 GGUF Q4_K_M
+# 1. 安装 llama.cpp
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+make -j
+
+# 2. 转为 GGUF 格式
+python convert.py ../outputs/corpassist-lora-v1-merged/ \
+    --outfile ../outputs/corpassist-q4.gguf \
+    --outtype q4_k_m
+
+# 3. 验证推理
+./main -m ../outputs/corpassist-q4.gguf \
+    -p "您好，我是 CorpAssist 小C" \
+    -n 50
+
+# 常见量化级别：q4_k_m（推荐）, q5_k_m（更高精度）, q8_0（几乎无损）</pre></code>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>量化级别</th><th>模型大小 (7B)</th><th>显存</th><th>精度损失</th><th>推荐场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>bf16</td><td>14 GB</td><td>~16 GB</td><td>无</td><td>GPU 推理</td></tr>
+          <tr><td>Q8_0</td><td>7 GB</td><td>~8 GB</td><td>< 1%</td><td>GPU 高精度</td></tr>
+          <tr><td>Q4_K_M</td><td>4 GB</td><td>~5 GB</td><td>~2-3%</td><td>推荐均衡选择</td></tr>
+          <tr><td>Q2_K</td><td>2.5 GB</td><td>~3 GB</td><td>~5-10%</td><td>边缘设备</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>AWQ 量化：GPU 推理优化</h3>
+
+      <p><span class="term" data-term-id="awq-intro" tabindex="0">AWQ (Activation-aware Weight Quantization)</span> 是专为 GPU 推理设计的量化方法。与 GGUF 不同，AWQ 保留 GPU 友好的张量布局，vLLM 原生支持。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># quantize_awq.py — AWQ 量化
+from awq import AutoAWQForCausalLM  # pip install autoawq
+from transformers import AutoTokenizer
+
+model_path = "./outputs/corpassist-lora-v1-merged"
+quant_path = "./outputs/corpassist-lora-v1-awq"
+
+# 加载模型
+model = AutoAWQForCausalLM.from_pretrained(
+    model_path, device_map="auto"
+)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+# AWQ 量化配置
+quant_config = {
+    "quant_method": "awq",
+    "zero_point": True,
+    "q_group_size": 128,
+    "w_bit": 4,              # 4-bit 量化
+    "version": "gemm",
+}
+
+# 量化
+model.quantize(tokenizer, quant_config=quant_config)
+
+# 保存
+model.save_quantized(quant_path, safetensors=True)
+tokenizer.save_pretrained(quant_path)
+
+print(f"AWQ 量化完成: {quant_path}")
+# 大小: ~4.5 GB (vs 14 GB bf16)</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>vLLM 部署推理服务</h3>
+
+      <p><span class="term" data-term-id="vllm-point" tabindex="0">vLLM</span> 是目前最流行的大模型推理引擎。其 PagedAttention 算法解决了 KV Cache 碎片化问题，配合连续批处理（continuous batching），吞吐量可达 HF pipeline 的 10-20 倍。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 启动 vLLM 推理服务（合并后模型）
+python -m vllm.entrypoints.openai.api_server \
+    --model ./outputs/corpassist-lora-v1-merged \
+    --dtype bfloat16 \
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.9 \
+    --port 8000
+
+# 或加载 AWQ 量化模型
+python -m vllm.entrypoints.openai.api_server \
+    --model ./outputs/corpassist-lora-v1-awq \
+    --quantization awq \
+    --dtype auto \
+    --max-model-len 4096 \
+    --port 8000</pre></code>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># vllm_client.py — 调用 vLLM 推理服务
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed",
+)
+
+def ask_corpassist(question: str) -> str:
+    response = client.chat.completions.create(
+        model="corpassist-lora-v1-merged",  # 对应 --model 参数
+        messages=[{"role": "user", "content": question}],
+        temperature=0.3,
+        max_tokens=512,
+    )
+    return response.choices[0].message.content
+
+print(ask_corpassist("OA 密码怎么重置？"))</pre></code>
+      </div>
+
+      <h4>Spring Boot 调用 vLLM 服务</h4>
+      <p><span class="term" data-term-id="inference-bridge" tabindex="0">推理桥接</span> 指的是 Spring 应用通过 HTTP 调用私有化部署的 vLLM 服务。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># application.yaml — Spring 配置 vLLM 接口
+corpassist:
+  vllm:
+    base-url: http://localhost:8000/v1
+    model: corpassist-lora-v1-merged
+    temperature: 0.3
+    max-tokens: 512</pre></code>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// VllmClient.java — Spring 调用 vLLM API
+@Service
+public class VllmClient {
+    private final RestTemplate restTemplate;
+    @Value("${corpassist.vllm.base-url}")
+    private String baseUrl;
+
+    public String chat(String question) {
+        // 构造 OpenAI 兼容请求
+        Map<String, Object> request = Map.of(
+            "model", "corpassist-lora-v1-merged",
+            "messages", List.of(Map.of("role", "user", "content", question)),
+            "temperature", 0.3,
+            "max_tokens", 512
+        );
+        var response = restTemplate.postForEntity(
+            baseUrl + "/chat/completions", request, Map.class
+        );
+        return extractContent(response.getBody());
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>私有化部署 vs DashScope 托管</h3>
+
+      <p><span class="term" data-term-id="self-host-ft" tabindex="0">自行部署 vs 托管</span> 的选择取决于成本、延迟和合规要求。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>私有化部署 (vLLM)</th><th>DashScope 托管</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>GPU 成本</td><td>~0.5-1 美元/小时 (A100)</td><td>按 token 付费，~0.004 元/千 token</td></tr>
+          <tr><td>延迟</td><td>首 token ~50ms</td><td>首 token ~100-200ms（网络开销）</td></tr>
+          <tr><td>数据主权</td><td>数据不出内网</td><td>数据经阿里云</td></tr>
+          <tr><td>运维</td><td>需自行管理 GPU 集群</td><td>零运维</td></tr>
+          <tr><td>弹性</td><td>固定资源</td><td>自动弹性扩缩</td></tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>合并后不量化直接部署</strong>：14GB bf16 模型 vs 4GB Q4_K_M，显存差距 3.5 倍。</li>
+          <li><strong>vLLM 不支持 PEFT</strong>：vLLM 不能动态加载 LoRA adapter（需先合并）。</li>
+          <li><strong>所有层都量化</strong>：embedding 层和 lm_head 量化后精度损失大，AWQ 默认保留 bf16。</li>
+          <li><strong>忽略 vLLM 配置</strong>：gpu_memory_utilization 太低浪费显存，太高容易 OOM。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>合并 Adapter</strong>：merge_and_unload() 生成不依赖 PEFT 的完整模型。</li>
+        <li><strong>GGUF / AWQ</strong>：两种主流量化方法，GGUF 适合边缘，AWQ 适合 GPU 推理。</li>
+        <li><strong>vLLM 部署</strong>：PagedAttention + 连续批处理，吞吐量 10x+。</li>
+        <li><strong>Spring 调用</strong>：OpenAI 兼容 API 格式，RestTemplate 即可对接。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="domain-model-adaptation_practice03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="merge" /> 能写出 adapter 合并代码并验证</label></li>
+          <li><label><input type="checkbox" data-id="quantization" /> 能解释 GGUF 和 AWQ 的区别和适用场景</label></li>
+          <li><label><input type="checkbox" data-id="vllm" /> 能用 vLLM 启动推理服务并调用</label></li>
+          <li><label><input type="checkbox" data-id="spring-call" /> 能写 Spring 代码调用 vLLM 或 DashScope 服务</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="merge-lora" tabindex="0">merge lora</span></td><td>将 adapter 权重写回基座，生成完整模型</td></tr>
+                <tr><td><span class="term" data-term-id="gguf-intro" tabindex="0">gguf intro</span></td><td>llama.cpp 格式，适合 CPU/边缘部署</td></tr>
+                <tr><td><span class="term" data-term-id="awq-intro" tabindex="0">awq intro</span></td><td>4-bit 量化，GPU 推理，vLLM 原生支持</td></tr>
+                <tr><td><span class="term" data-term-id="vllm-point" tabindex="0">vllm point</span></td><td>PagedAttention 推理引擎，吞吐 10x</td></tr>
+                <tr><td><span class="term" data-term-id="quantize-deploy" tabindex="0">quantize deploy</span></td><td>模型量化后部署，省 4x 显存</td></tr>
+                <tr><td><span class="term" data-term-id="merged-model" tabindex="0">merged model</span></td><td>合并后的完整模型，任何框架可加载</td></tr>
+                <tr><td><span class="term" data-term-id="inference-bridge" tabindex="0">inference bridge</span></td><td>Spring 通过 HTTP 调用推理服务</td></tr>
+                <tr><td><span class="term" data-term-id="self-host-ft" tabindex="0">self host ft</span></td><td>私有化部署微调模型 vs 托管</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>你如何决定部署微调模型时用 bf16 还是 4-bit 量化？</li>
+              <li>如果 vLLM 启动后推理速度很慢，你会检查哪些配置？</li>
+              <li>私有化部署 vs DashScope 托管，你的选型逻辑是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一章 <a href="#ch-practice-04-safety">安全对齐与红队测试</a>。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">Hugging Face PEFT</a></li>
-    <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">百炼 Model Studio</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-03-merge-deploy-lab/</code></li>
-  <li>写一条微调或数据质量笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：合并、量化与接入</h4>
-  <p><code>demos/practice-03-merge-deploy-lab/</code> — 写 merge 目的</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-04-safety">合规与偏见</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM 文档</a></li>
+      <li><a href="https://github.com/ggerganov/llama.cpp" target="_blank" rel="noopener">llama.cpp GGUF</a></li>
+      <li><a href="https://github.com/casper-hansen/AutoAWQ" target="_blank" rel="noopener">AutoAWQ 量化</a></li>
+      <li><a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">PEFT 合并指南</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol class="steps steps-operate">
+      <li>合并 LoRA adapter 并验证推理结果正确。</li>
+      <li>用 AutoAWQ 做 4-bit 量化，对比合并前后的显存和速度。</li>
+      <li>启动 vLLM 服务并用 curl 测试。</li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：模型合并与部署实验室</h4>
+      <p>目录：<code>demos/practice-03-merge-deploy-lab/</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-04-safety">安全对齐与红队测试</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/features/quantization.html">vLLM 量化支持</a></li>
+    </ul>
+  </div>
 </section>

@@ -1,44 +1,457 @@
 <section id="ch-practice-03-hybrid-rerank" class="chapter" data-chapter="practice-03-hybrid-rerank">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>混合检索 + Rerank 联调</h2>
-  <button type="button" class="btn-mark-done" data-chapter="practice-03-hybrid-rerank" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>混合检索 + Rerank 联调</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-hybrid-rerank" aria-label="标记本章完成">标记完成</button>
+  </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：共用索引、ablation、延迟与双栈对照</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>Python 建索引 Spring 消费；联调混合权重与 P95。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S1 知识库场景端到端落地</li>
-        <li>贯通 Python 索引与 Spring 问答双栈</li>
-        <li>完成 Demo 与测验</li></ul></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：Python-Spring 共用索引，做 ablation 实验，控制延迟预算</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>前两章分别解决了索引（Python）和问答（Spring AI），本章将两者连接起来——验证双栈共用同一索引的效果。你将通过 <span class="term" data-term-id="ablation-study" tabindex="0">ablation study</span> 对比不同检索策略的 MRR，理解 <span class="term" data-term-id="latency-budget" tabindex="0">latency budget</span> 的分配，并学会在 <span class="term" data-term-id="dual-stack-tune" tabindex="0">dual stack tune</span> 中同时调优 Python 和 Spring 两侧的参数。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>Python 索引与 Spring 问答共用同一份索引（<span class="term" data-term-id="shared-index" tabindex="0">shared index</span>）</li>
+          <li>设计 ablation 实验对比不同配置的 MRR/Recall</li>
+          <li>分解并控制检索+精排的延迟预算</li>
+          <li>Python 端和 Spring 端分别调优（<span class="term" data-term-id="joint-debug" tabindex="0">joint debug</span>）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>共享索引是双栈协作的关键</strong>：Python 写入、Spring 读取，通过同一个 collection 通信。</li>
+          <li><strong>不做 ablation 的优化都是盲调</strong>：关掉 Rerank、关掉 BM25、关掉 RRF，逐项对比才能定位瓶颈。</li>
+          <li><strong>延迟预算要分阶段管控</strong>：检索 + Rerank + LLM 各占多少，超出预期的环节要独立优化。</li>
+        </ul>
+      </div>
     </div>
-    <div class="section-block"><h3>共用索引与 ablation</h3><p>关掉 rerank/关掉 bm25 对比 MRR。 关联：<span class="term" data-term-id="shared-index" tabindex="0">shared index</span>、<span class="term" data-term-id="ablation-study" tabindex="0">ablation study</span>。</p></div>
-    <div class="section-block"><h3>延迟</h3><p>检索+rereank < 800ms 预算。 关联：<span class="term" data-term-id="latency-budget" tabindex="0">latency budget</span>、<span class="term" data-term-id="dual-stack-tune" tabindex="0">dual stack tune</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="shared-index" tabindex="0">shared index</span> · <span class="term" data-term-id="ablation-study" tabindex="0">ablation study</span> · <span class="term" data-term-id="latency-budget" tabindex="0">latency budget</span> · <span class="term" data-term-id="dual-stack-tune" tabindex="0">dual stack tune</span> · <span class="term" data-term-id="rrf-tune" tabindex="0">rrf tune</span> · <span class="term" data-term-id="rerank-latency" tabindex="0">rerank latency</span> · <span class="term" data-term-id="joint-debug" tabindex="0">joint debug</span> · <span class="term" data-term-id="hybrid-s1" tabindex="0">hybrid s1</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-markdown">| 配置 | MRR@10 | P95 ms |
-|------|--------|--------|
-| 仅向量 | 0.62 | 120 |
-| 混合+rerank | 0.81 | 450 |</code></pre></div>
-      <div class="mermaid-wrap"><h5>混合检索 + Rerank 联调</h5>
-      <pre class="mermaid">flowchart LR
-  Docs --> Ingest
-  Ingest --> Index
-  Query --> Retrieve --> Generate</pre></div>
+
+    <div class="section-block">
+      <h3>Python-Spring 共用索引</h3>
+
+      <p><span class="term" data-term-id="shared-index" tabindex="0">shared index</span> 是 CorpAssist 双栈架构的核心理念：Python 索引管线构建向量库和 BM25 索引，Spring AI 问答服务直接读取同一份索引。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 双栈联调场景</span>
+        CorpAssist 上线前需验证 Python 索引的 MRR 和 Spring 问答的延迟。联调发现：索引端 chunk_size 设为 1024 时 MRR 高于 512，但 Spring 端检索延迟增加 40%。需要两端协同调优。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>Python-Spring 共用索引架构</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph 索引侧 (Python)
+        P1[文档解析] --> P2[切分]
+        P2 --> P3[向量化]
+        P3 --> P4[写入 Milvus\ncollection: corpassist_kb]
+        P2 --> P5[写入 ES\nindex: corpassist_bm25]
+    end
+
+    subgraph 索引存储
+        M[(Milvus\n向量索引)]
+        E[(Elasticsearch\nBM25 索引)]
+    end
+
+    subgraph 问答侧 (Spring AI)
+        S1[混合检索] --> S2[RRF 融合]
+        S2 --> S3[BGE-Reranker]
+        S3 --> S4[LLM 生成]
+    end
+
+    P4 --> M
+    P5 --> E
+    S1 --> M
+    S1 --> E
+
+    style P4 fill:#D2691E,color:#fff
+    style S1 fill:#7B68EE,color:#fff
+    style M fill:#4A90D9,color:#fff</pre>
+        <p class="diagram-caption">Python 写入向量库和 BM25 索引，Spring 读取同一份数据。两端通过 Milvus 和 ES 解耦。</p>
+      </div>
+
+      <h4>Spring AI 混合检索实现（双路查询）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// HybridSearchConfig.java — Spring AI 混合检索配置
+@Configuration
+public class HybridSearchConfig {
+
+    @Bean
+    @Primary
+    public VectorStore milvusVectorStore() {
+        return new MilvusVectorStore(MilvusVectorStoreConfig.builder()
+            .withUri("http://milvus:19530")
+            .withCollectionName("corpassist_kb")
+            .build());
+    }
+
+    @Bean
+    public ElasticsearchVectorStore esVectorStore() {
+        return new ElasticsearchVectorStore(
+            ElasticsearchVectorStoreConfig.builder()
+                .withIndexName("corpassist_bm25")
+                .withUri("http://elasticsearch:9200")
+                .build()
+        );
+    }
+
+    @Bean
+    public HybridRetriever hybridRetriever(
+            VectorStore milvusStore,
+            ElasticsearchVectorStore esStore) {
+        return new HybridRetriever(milvusStore, esStore);
+    }
+}
+
+// HybridRetriever.java — RRF 融合检索
+@Component
+public class HybridRetriever {
+    private final VectorStore vectorStore;
+    private final ElasticsearchVectorStore esStore;
+
+    public List<Document> hybridSearch(String query, int topK) {
+        // 向量检索
+        var vectorResults = vectorStore.similaritySearch(
+            SearchRequest.query(query).withTopK(topK * 2));
+
+        // BM25 检索
+        var bm25Results = esStore.similaritySearch(
+            SearchRequest.query(query).withTopK(topK * 2));
+
+        // RRF 融合
+        return rrfMerge(vectorResults, bm25Results, topK, 60);
+    }
+
+    private List<Document> rrfMerge(List<Document> vec, List<Document> bm25,
+                                     int topK, int k) {
+        Map<String, Double> scores = new HashMap<>();
+        indexDocs(vec, scores, k);
+        indexDocs(bm25, scores, k);
+
+        return scores.entrySet().stream()
+            .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+            .limit(topK)
+            .map(entry -> findDocById(entry.getKey(), vec, bm25))
+            .collect(Collectors.toList());
+    }
+}</code></pre>
+      </div>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>共用索引、ablation、延迟与双栈对照</li>
-    <li>下一步：幻觉抑制与答案治理</li></ul></div>
+
+    <div class="section-block">
+      <h3>Ablation 实验设计</h3>
+
+      <p><span class="term" data-term-id="ablation-study" tabindex="0">ablation study</span>（消融实验）通过逐层关闭组件来确认每个组件的贡献度。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Ablation 实验流程</h5>
+        <pre class="mermaid">flowchart TD
+    BASE[基线：纯向量检索\nMRR=0.62] --> A1[+BM25 混合\nMRR=0.74]
+    A1 --> A2[+RRF 融合\nMRR=0.76]
+    A2 --> A3[+BGE-Reranker\nMRR=0.83]
+    A3 --> A4[+Query Rewrite\nMRR=0.85]
+
+    A1 -.- N1[增益 +0.12]
+    A2 -.- N2[增益 +0.02]
+    A3 -.- N3[增益 +0.07]
+    A4 -.- N4[增益 +0.02]
+
+    style BASE fill:#ff4444,color:#fff
+    style A3 fill:#7B68EE,color:#fff
+    style A4 fill:#4A90D9,color:#fff</pre>
+        <p class="diagram-caption">Ablation 结果显示：BM25 混合和 Rerank 是最大贡献者，RRF 和 Query Rewrite 增益较小但仍有价值。</p>
+      </div>
+
+      <h4>Ablation 实验 Python 脚本</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># ablation.py — CorpAssist 消融实验
+from dataclasses import dataclass
+from typing import List, Callable
+import time
+
+@dataclass
+class AblationConfig:
+    use_vector: bool = True
+    use_bm25: bool = True
+    use_rrf: bool = True
+    use_reranker: bool = True
+
+def run_ablation(
+    test_queries: List[dict],  # [{"q": "..", "expected_chunk_ids": [...]}]
+    config: AblationConfig,
+) -> dict:
+    """运行一组 ablation 配置，返回 MRR 和延迟"""
+    start = time.time()
+    total_mrr = 0.0
+
+    for tq in test_queries:
+        candidates = []
+        if config.use_vector:
+            vec_results = vector_store.similarity_search(tq["q"], k=20)
+            candidates.extend(vec_results)
+        if config.use_bm25:
+            bm25_results = bm25_retrieve(tq["q"], k=20)
+            candidates.extend(bm25_results)
+
+        if config.use_rrf:
+            candidates = rrf_merge(candidates, [], top_n=10)
+        else:
+            candidates = candidates[:10]
+
+        if config.use_reranker:
+            reranked = reranker.rerank(tq["q"], candidates, top_k=5)
+            candidates = [c for c, s in reranked]
+
+        # 计算 MRR
+        for rank, doc in enumerate(candidates[:5]):
+            if doc.metadata.get("chunk_id") in tq["expected_chunk_ids"]:
+                total_mrr += 1.0 / (rank + 1)
+                break
+
+    elapsed = time.time() - start
+    mrr = total_mrr / len(test_queries)
+    return {"mrr": round(mrr, 3), "latency_ms": round(elapsed * 1000)}
+
+# 执行 ablation
+configs = [
+    ("纯向量", AblationConfig(use_vector=True, use_bm25=False, use_rrf=False, use_reranker=False)),
+    ("向量+BM25", AblationConfig(use_vector=True, use_bm25=True, use_rrf=True, use_reranker=False)),
+    ("全量(含Rerank)", AblationConfig()),
+]
+for name, cfg in configs:
+    result = run_ablation(test_queries, cfg)
+    print(f"{name}: MRR={result['mrr']}, 延迟={result['latency_ms']}ms")</code></pre>
+      </div>
+
+      <h4>Ablation 结果示例</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>配置</th><th>MRR@10</th><th>Recall@5</th><th>P95 延迟</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>纯向量</td><td>0.62</td><td>0.71</td><td>120ms</td></tr>
+          <tr><td>+BM25 (RRF)</td><td>0.74</td><td>0.82</td><td>180ms</td></tr>
+          <tr><td>+Rerank</td><td>0.83</td><td>0.89</td><td>450ms</td></tr>
+          <tr><td>+Query Rewrite</td><td>0.85</td><td>0.91</td><td>520ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>延迟预算控制</h3>
+
+      <p><span class="term" data-term-id="latency-budget" tabindex="0">latency budget</span> 是控制检索端到端延迟的设计方法。CorpAssist 的 SLA 要求 P95 延迟 &lt; 2s（从用户提问到收到完整答案）。</p>
+
+      <h4>延迟分解</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>阶段</th><th>预算</th><th>实际（P95）</th><th>优化手段</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>向量检索</td><td>100ms</td><td>80ms</td><td>HNSW 索引、减少 topK</td>
+          </tr>
+          <tr>
+            <td>BM25 检索</td><td>100ms</td><td>60ms</td><td>ES 增加副本</td>
+          </tr>
+          <tr>
+            <td>RRF 融合</td><td>20ms</td><td>5ms</td><td>内存计算</td>
+          </tr>
+          <tr>
+            <td>Rerank</td><td>200ms</td><td>150ms</td><td>GPU 推理、减少候选</td>
+          </tr>
+          <tr>
+            <td>LLM 首 Token</td><td>500ms</td><td>350ms</td><td>模型选择、streaming</td>
+          </tr>
+          <tr>
+            <td><strong>合计</strong></td><td><strong>920ms</strong></td><td><strong>645ms</strong></td><td>—</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>Spring AI 延迟监控</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// LatencyMonitor.java — 延迟分解监控
+@Component
+public class LatencyMonitor {
+    private final MeterRegistry meterRegistry;
+
+    public void recordRetrievalLatency(long ms) {
+        meterRegistry.timer("rag.retrieval.latency").record(Duration.ofMillis(ms));
+    }
+
+    public void recordRerankLatency(long ms) {
+        meterRegistry.timer("rag.rerank.latency").record(Duration.ofMillis(ms));
+    }
+
+    public void recordLlmTtft(long ms) {
+        meterRegistry.timer("rag.llm.ttft").record(Duration.ofMillis(ms));
+    }
+
+    @EventListener
+    public void onRequestComplete(RequestCompleteEvent event) {
+        long total = event.getDuration().toMillis();
+        meterRegistry.timer("rag.total.latency").record(Duration.ofMillis(total));
+
+        if (total > 2000) {
+            log.warn("SLA breached: total latency={}ms, breakdown={}",
+                total, event.getBreakdown());
+        }
+    }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>Ablation 实验应该在 Python 端还是 Spring 端做？</summary>
+          <div class="learn-faq-body">两端都要做。Python 端做索引参数的 ablation（chunk_size、overlap、embedding 模型），Spring 端做检索策略的 ablation（BM25 on/off、Rerank on/off、RRF k 值）。CorpAssist 的实践是：先 Python 端固定索引，再 Spring 端调检索策略。</div>
+        </details>
+        <details>
+          <summary>Python 和 Spring 两端的 embedding 模型必须一致吗？</summary>
+          <div class="learn-faq-body">必须一致。Python 端用 text-embedding-3-small 向量化，Spring 端查询时也要用同样的模型。否则向量空间的分布不同，检索结果无意义。CorpAssist 在 Spring AI 配置中指定 <code>spring.ai.openai.embedding.model=text-embedding-3-small</code>。</div>
+        </details>
+        <details>
+          <summary>延迟预算中 Rerank 占了 200ms，如何优化？</summary>
+          <div class="learn-faq-body">三种方案：1) 减少 Rerank 候选数（从 top-30 降到 top-20）；2) 使用更快的 Reranker 模型（bge-reranker-v2-m3 比 v1 快 30%）；3) 使用 GPU 推理（NVIDIA T4 约 150ms / 30 候选，CPU 约 600ms）。详见 <a href="#ch-advanced-02-metrics">效果数据与优化复盘</a>。</div>
+        </details>
+        <details>
+          <summary>联调时发现 Python 索引的 Recall@5 是 0.85，但 Spring 端只有 0.76，可能原因？</summary>
+          <div class="learn-faq-body">常见原因：1) Spring 端的 embedding 模型配置与 Python 端不同；2) Spring 端检索的 FilterExpression 额外过滤了部分文档；3) 两端的相似度阈值不一致（Python 端可能没设 threshold 但 Spring 端设了 0.7）。CorpAssist 的 <span class="term" data-term-id="joint-debug" tabindex="0">joint debug</span> 工具可以逐层对比两端的检索中间结果。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>共享索引解耦双栈</strong>：Python 写入索引，Spring 读取，通过相同 collection 协作。索引 Schema 一致是前提。</li>
+        <li><strong>Ablation 实验量化每步贡献</strong>：BM25 混合 +0.12 MRR，Rerank +0.07 MRR，决策哪些组件必须保留。</li>
+        <li><strong>延迟预算分阶段控制</strong>：向量检索 100ms + BM25 100ms + Rerank 200ms + LLM 500ms，P95 控制在 2s 以内。</li>
+        <li><strong>联合调优需要两端工具链</strong>：Python ablation 框架 + Spring 延迟监控，定位瓶颈时两端日志关联分析。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="scenario-enterprise-rag-kb_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="shared-index" /> 能解释 Python-Spring 共用索引的机制</label></li>
+          <li><label><input type="checkbox" data-id="ablation" /> 能设计 ablation 实验并解读结果</label></li>
+          <li><label><input type="checkbox" data-id="latency" /> 能分解检索阶段的延迟预算</label></li>
+          <li><label><input type="checkbox" data-id="joint" /> 能排查双端检索不一致的问题</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="shared-index" tabindex="0">shared index</span></td><td>Python 写入 Spring 读取，通过同一 collection</td></tr>
+                <tr><td><span class="term" data-term-id="ablation-study" tabindex="0">ablation study</span></td><td>逐组件开关对比贡献度</td></tr>
+                <tr><td><span class="term" data-term-id="latency-budget" tabindex="0">latency budget</span></td><td>各阶段延迟预算分配</td></tr>
+                <tr><td><span class="term" data-term-id="dual-stack-tune" tabindex="0">dual stack tune</span></td><td>Python+Spring 两端协同调优</td></tr>
+                <tr><td><span class="term" data-term-id="rrf-tune" tabindex="0">rrf tune</span></td><td>RRF 的 k 值调优</td></tr>
+                <tr><td><span class="term" data-term-id="rerank-latency" tabindex="0">rerank latency</span></td><td>Rerank 200ms 预算，GPU 加速</td></tr>
+                <tr><td><span class="term" data-term-id="joint-debug" tabindex="0">joint debug</span></td><td>逐层对比两端检索中间结果</td></tr>
+                <tr><td><span class="term" data-term-id="hybrid-s1" tabindex="0">hybrid s1</span></td><td>S1 混合检索：向量+BM25+RRF+Rerank</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>团队争论：到底是先调 Python 索引参数还是先调 Spring 检索策略？你怎么安排 ablation 实验顺序？</li>
+              <li>P95 延迟从 1.2s 升到 3.2s，团队成员说是「Rerank 变慢了」。你怎么用数据确认根因？</li>
+              <li>Python 端 Recall@5=0.88，Spring 端只有 0.75，可能的根因有哪些？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成测验与 Demo；下一章 <a href="#ch-practice-04-hallucination">幻觉抑制与答案治理</a> 将深入答案质量管控。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html" target="_blank" rel="noopener">Spring AI RAG</a></li>
-    <li><a href="https://unstructured-io.github.io/unstructured/" target="_blank" rel="noopener">Unstructured</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-03-hybrid-rerank-lab/</code></li>
-  <li>写一条 S1 落地或评测笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：混合检索 + Rerank 联调</h4>
-  <p><code>demos/practice-03-hybrid-rerank-lab/</code> — 填 ablation 一行</p></div></div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-practice-04-hallucination">幻觉抑制与答案治理</a></li>
-  </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/milvus.html" target="_blank" rel="noopener">Spring AI Milvus</a></li>
+      <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/knn-search.html" target="_blank" rel="noopener">Elasticsearch kNN 搜索</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/elasticsearch.html" target="_blank" rel="noopener">Spring AI Elasticsearch</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">运行 ablation 实验、观察延迟分布（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>运行 <code>demos/practice-03-hybrid-rerank-lab/ablation.py</code>，记录 4 组配置的 MRR。</li>
+      <li>调整 RRF 的 k 值（10/60/100），观察 MRR 变化曲线。</li>
+      <li>启动 Spring AI 应用，通过 Micrometer 观察延迟分解指标。</li>
+      <li>模拟 Python 索引参数变更（如改 chunk_size），在 Spring 端重新测试 MRR。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">Ablation 结果显示 BM25 只提升了 0.02 MRR，是否应该去掉 BM25 以节省架构复杂度？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不建议去掉。</strong> MRR 是整体指标，但 BM25 对精确匹配场景（制度编号、产品型号）有不可替代的作用。建议分析 BM25 对「制度编号类」子集的单独 MRR。如果子集提升大（如 +0.15），即使整体提升小也值得保留。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">延迟预算中 LLM 首 Token 用了 800ms（预算 500ms）。做哪些优化？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>1) 检查 LLM 是否使用了 streaming=true；2) 考虑换更快的模型（gpt-4o-mini → gpt-4o-mini 本身已是最快，考虑用更小的模型）；3) 减少 prompt 中的 context 长度（如 top-5 → top-3）；4) 如果是 API 调用，检查网络延迟，考虑在相同区域部署。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：混合检索 + Rerank 联调</h4>
+      <p>目录：<code>demos/practice-03-hybrid-rerank-lab/</code>。<strong>验收</strong>：输出 ablation 实验结果表 + 延迟分解饼图。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-hallucination">幻觉抑制与答案治理</a></li>
+      <li><a href="https://arxiv.org/abs/2104.08663" target="_blank" rel="noopener">论文：RRF — Reciprocal Rank Fusion</a></li>
+      <li><a href="https://micrometer.io/docs" target="_blank" rel="noopener">Micrometer — 延迟监控框架</a></li>
+    </ul>
+  </div>
 </section>

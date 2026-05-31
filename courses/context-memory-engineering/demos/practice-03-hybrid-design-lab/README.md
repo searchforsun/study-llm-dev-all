@@ -1,5 +1,34 @@
 # Demo：混合记忆架构
 
-[章节](../../index.html#ch-practice-03-hybrid-design)
+[返回章节](../../index.html#ch-practice-03-hybrid-design)
 
-填会话 TTL
+## 目标
+
+实现三层混合记忆的写穿透（write-through）和读合并（read-merge）逻辑，测试会话层覆盖长期层的一致性场景。
+
+## 前置准备
+
+- Python 3.8+ 或 JDK 17+
+- Redis 和 Milvus 实例
+- 已完成 practice-01 和 practice-02 的代码
+
+## 步骤
+
+1. **实现 HybridMemoryWriter**：编写写穿透逻辑 —— 同步写 Redis 会话，异步提取事实写 Milvus 长期记忆。
+
+2. **实现 HybridMemoryReader**：编写读合并逻辑 —— 从 Redis 加载会话历史，从 Milvus 召回长期记忆，去重合并后返回。
+
+3. **实现 MemRouter**：根据用户输入判断需要访问哪些记忆层。简单问候语只查会话，操作意图查长期记忆。
+
+4. **一致性测试**：用户在对话中说「我之前的偏好错了，应该是邮箱接收报告」。验证会话层的修正覆盖了长期层的旧事实。
+
+## 预期输出
+
+写入时三层数据一致。读取时正确合并去重。用户修正偏好后，会话层覆盖长期层，LLM 使用新的事实。
+
+## 验收清单
+
+- [ ] 写穿透实现：同步+异步写入
+- [ ] 读合并实现：去重合并
+- [ ] MemRouter 正确路由请求
+- [ ] 一致性测试通过

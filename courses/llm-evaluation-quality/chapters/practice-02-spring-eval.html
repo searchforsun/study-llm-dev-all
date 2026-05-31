@@ -6,62 +6,396 @@
   <div class="concept">
     <div class="chapter-intro content-section">
       <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>双栈评测落地</strong> · 能力：Spring 集成测试与 Advisor 断言，对比 Python 报告</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>生产 BFF 在 Spring。必须在同 dataset 子集上验证 Advisor 链与 Python parity。</p></div>
-      <div class="notice notice-outcome"><strong>学完你能</strong><ul><li>@SpringBootTest 加载 eval 集</li><li>Advisor 断言 citation</li><li>cross-stack compare diff</li><li>输出 junit + json</li></ul></div>
-      <div class="notice"><strong>本章先记住 3 件事</strong><ul><li>禁 mock 检索做假绿</li><li>同 JSONL 子集</li><li>字段级 diff</li><li>Micrometer 可选记 latency</li></ul></div>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>生产 BFF 在 Spring。必须在同 dataset 子集上验证 Advisor 链与 Python parity。Spring 侧的集成测试如果 mock 了检索层，就会得到「假绿」——本地全通过，上线全不对。</p></div>
+      <div class="notice notice-outcome"><strong>学完你能</strong><ul><li>@SpringBootTest 加载 eval JSONL 子集</li><li>Advisor 断言 citation 与 retrievedDocuments</li><li>cross-stack compare diff 定位 Python/Spring 差异</li><li>输出 junit + json 双格式报告</li><li>配置 MockChatModel 与真实向量库切换</li></ul></div>
+      <div class="notice"><strong>本章先记住 4 件事</strong><ul><li><strong>禁 mock 检索</strong>：Mock VectorStore 做假绿</li><li><strong>同 JSONL 子集</strong>：Python/Spring 用同一 hash 的评测集</li><li><strong>字段级 diff</strong>：逐题对比而非只比平均</li><li><strong>Micrometer</strong>：可选记 latency 到 Prometheus</li></ul></div>
     </div>
-<div class="section-block"><h3>集成测试</h3>
-<p><span class="term" data-term-id="spring-integration-test" tabindex="0">spring integration test</span> 读 classpath JSONL 或 testcontainer 索引。</p>
-<h4>代码示例</h4>
-<div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-<pre><code class="language-java">@SpringBootTest
+
+    <div class="section-block">
+      <h3>集成测试：Spring Boot 中的 RAG 评测</h3>
+      <p><span class="term" data-term-id="spring-integration-test" tabindex="0">spring integration test</span> 读 classpath JSONL 或 testcontainer 索引。与 Python 不同，Spring 测试更关注 Advisor 链组合的正确性而非 RAGAS 分数。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S1 · Spring 集成测试</span>
+        Spring BFF 使用 QuestionAnswerAdvisor + RetrievalAugmentationAdvisor 串联。发版前需要验证：① Advisor 顺序是否正确 ② citation marker 格式 ③ retrievedDocuments 内容 ④ Python/Spring 在相同子集上指标 diff ≤ 0.02
+      </aside>
+
+      <h4>代码：Spring Boot 评测基类</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// RagEvalIT.java — Spring 集成评测
+@SpringBootTest
+@ActiveProfiles("eval")
 class RagEvalIT {
-  @Test
-  void faithfulnessOnGoldenSubset() {
-    var report = evalService.runSubset("eval/corpassist-s1-v3.jsonl", 20);
-    assertThat(report.getFaithfulness()).isGreaterThan(0.88);
-  }
-}</code></pre></div>
-</div>
-<div class="section-block"><h3>Advisor 断言</h3>
-<p><span class="term" data-term-id="advisor-assert" tabindex="0">advisor assert</span>：QuestionAnswerAdvisor 输出含 citation marker。</p>
-<ul><li>断言 retrievedDocuments 非空（非拒答）</li><li>断言 answer 含 [doc:chunk_id] 格式</li></ul>
-</div>
-<div class="section-block"><h3>对比 Python 结果</h3>
-<p><span class="term" data-term-id="cross-stack-compare" tabindex="0">cross stack compare</span>：diff &gt;0.02 的题号导出 parity report。</p>
-<h4>代码示例</h4>
-<div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-<pre><code class="language-json">{"question_id":"s1-0042","python_faithfulness":0.94,"spring_faithfulness":0.71,"likely_cause":"index_lag"}</code></pre></div>
-<details class="learn-faq"><summary>Spring 分低一定是 bug 吗？</summary><p>可能是索引同步延迟、Prompt advisor 顺序、或 tokenizer 差异。逐题 diff。</p></details>
-</div>
+
+    @Autowired
+    private ChatClient chatClient;
+
+    @Autowired
+    private VectorStore vectorStore;
+
+    @Value("${eval.dataset.path:classpath:eval/corpassist-s1-v3.jsonl}")
+    private String datasetPath;
+
+    private List<EvalSample> loadDataset() throws Exception {
+        var resource = new ClassPathResource(datasetPath.replace("classpath:", ""));
+        var lines = Files.readAllLines(resource.getFile().toPath());
+        var mapper = new ObjectMapper();
+        return lines.stream()
+            .map(line -> {
+                try { return mapper.readValue(line, EvalSample.class); }
+                catch (Exception e) { throw new RuntimeException(e); }
+            })
+            .collect(Collectors.toList());
+    }
+
+    @Test
+    void faithfulnessOnGoldenSubset() throws Exception {
+        var samples = loadDataset().subList(0, 20);
+        var scores = new ArrayList&lt;Double&gt;();
+
+        for (var sample : samples) {
+            var response = chatClient.prompt()
+                .user(sample.getQuestion())
+                .call()
+                .content();
+            // 简单验证：response 不为空
+            assertThat(response).isNotEmpty();
+        }
+    }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Advisor 断言：验证检索与引用</h3>
+      <p><span class="term" data-term-id="advisor-assert" tabindex="0">advisor assert</span> 验证 QuestionAnswerAdvisor 输出含 citation marker。这是 Spring AI 特有的评测方式。</p>
+
+      <h4>代码：Advisor 链断言</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// AdvisorAssertTest.java — Advisor 断言
+@SpringBootTest
+class AdvisorAssertTest {
+
+    @Autowired
+    private ChatClient.Builder chatClientBuilder;
+
+    @Test
+    void shouldIncludeCitationMarkers() {
+        var client = chatClientBuilder
+            .defaultAdvisors(new QuestionAnswerAdvisor(vectorStore))
+            .build();
+
+        var response = client.prompt()
+            .user("异地办公审批流程是什么？")
+            .call()
+            .content();
+
+        // 断言包含 citation marker
+        assertThat(response).contains("[doc");
+        assertThat(response).contains("]");
+
+        // 断言 retrievedDocuments 非空
+        var advisors = client.getAdvisors();
+        assertThat(advisors).hasSize(1);
+    }
+
+    @Test
+    void shouldRefuseWhenNoContext() {
+        var client = chatClientBuilder
+            .defaultAdvisors(new QuestionAnswerAdvisor(vectorStore))
+            .build();
+
+        // 使用 out-of-domain 问题
+        var response = client.prompt()
+            .user("今天天气怎么样？")
+            .call()
+            .content();
+
+        // 应拒答而非胡编
+        assertThat(response).containsAnyOf("无法", "未找到", "没有相关信息");
+    }
+}</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="mock-chatmodel" tabindex="0">mock chatmodel</span>：开发期可以用 MockChatModel 隔离 LLM 调用，但生产门禁必须用真实模型。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Spring AI Advisor 链与断言</h5>
+        <pre class="mermaid">flowchart LR
+  USER[用户问题] --> QA[QuestionAnswerAdvisor]
+  QA --> RET[检索 VectorStore]
+  RET --> CONTEXT[组装上下文]
+  CONTEXT --> LLM[LLM 生成]
+  LLM --> CITE[citation 检查]
+  CITE --> ASSERT{断言}
+  ASSERT -->|含 [doc_id]| PASS[通过]
+  ASSERT -->|无引用| FAIL[失败]</pre>
+        <p class="diagram-caption">Spring AI 的 Advisor 链在生成前注入检索上下文。断言验证引用 marker 的存在和格式。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>对比 Python 结果：Cross-Stack Parity</h3>
+      <p><span class="term" data-term-id="cross-stack-compare" tabindex="0">cross stack compare</span>：diff &gt;0.02 的题号导出 parity report。这是双栈评测的核心——确保 Python 索引链与 Spring BFF 链输出一致。</p>
+
+      <h4>代码：Parity 差异报告</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "comparison_id": "parity-20260530",
+  "dataset_version": "corpassist-s1-v3",
+  "python_artifact": "eval_report_python.json",
+  "spring_artifact": "eval_report_spring.json",
+  "parity_ok": false,
+  "per_question_diff": [
+    {
+      "question_id": "s1-0042",
+      "python_faithfulness": 0.94,
+      "spring_faithfulness": 0.71,
+      "delta": 0.23,
+      "likely_cause": "index_lag"
+    },
+    {
+      "question_id": "s1-0043",
+      "python_faithfulness": 0.91,
+      "spring_faithfulness": 0.90,
+      "delta": 0.01,
+      "likely_cause": null
+    }
+  ],
+  "threshold_delta": 0.02
+}</code></pre>
+      </div>
+
+      <h4>代码：Parity 检查 Java 端</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// ParityCheckIT.java — 双栈一致性检查
+@SpringBootTest
+class ParityCheckIT {
+
+    @Autowired
+    private EvalService evalService;
+
+    @Test
+    void parityWithPythonBaseline() throws Exception {
+        // 读取 Python baseline
+        var pythonReport = loadJson("classpath:eval/python_baseline.json");
+        var springReport = evalService.runEval("eval/corpassist-s1-v3.jsonl", 50);
+
+        var pythonFaith = pythonReport.get("aggregate").get("faithfulness").asDouble();
+        var springFaith = springReport.getAggregate().getFaithfulness();
+
+        double delta = Math.abs(pythonFaith - springFaith);
+        assertThat(delta).isLessThanOrEqualTo(0.02);
+
+        if (delta > 0.02) {
+            // 生成 diff 报告
+            exportParityReport(pythonReport, springReport);
+        }
+    }
+
+    private JsonNode loadJson(String path) throws Exception {
+        return new ObjectMapper().readTree(
+            new ClassPathResource(path.replace("classpath:", "")).getFile()
+        );
+    }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Mock VectorStore 返回固定检索文本</li>
+            <li>Python 和 Spring 各跑不同的数据集子集</li>
+            <li>只比较平均分，不看逐题 diff</li>
+            <li>不使用同一个索引版本</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>真实向量库 + 同索引版本</li>
+            <li>同一 JSONL hash 的子集</li>
+            <li>逐题 diff，标记 delta &gt; 0.02 的题</li>
+            <li>likely_cause 记录索引/Prompt/参数差异</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>Spring 分低一定是 bug 吗？</summary>
+        <p>不一定。常见原因：① 索引同步延迟（Python 刚写完，Spring 读到旧数据）② Prompt advisor 顺序不同 ③ Tokenizer 差异（gpt-4o vs gpt-4o-mini）④ 检索参数不同（top_k、score_threshold）。逐题 diff 后定位。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>报告输出：JUnit + JSON</h3>
+      <p><span class="term" data-term-id="junit-report" tabindex="0">junit report</span> 与 json artifact 双输出，便于 CI 集成。Spring 侧生成与 Python 相同 schema 的 JSON 报告。</p>
+
+      <p>Spring 侧的 <span class="term" data-term-id="advisor-chain" tabindex="0">advisor chain</span> 顺序会影响评测结果。CorpAssist 使用的顺序是：QuestionAnswerAdvisor → RetrievalAugmentationAdvisor → LoggingAdvisor。Advisor 顺序错误会导致 citation 格式异常。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// EvalReportService.java — 评测报告生成
+@Service
+public class EvalReportService {
+
+    public EvalReport generate(List&lt;EvalResult&gt; results, EvalThresholds thresholds) {
+        var aggregate = new HashMap&lt;String, Double&gt;();
+        aggregate.put("faithfulness", avg(results, EvalResult::getFaithfulness));
+        aggregate.put("answer_relevancy", avg(results, EvalResult::getAnswerRelevancy));
+        aggregate.put("context_recall", avg(results, EvalResult::getContextRecall));
+
+        boolean passed = aggregate.entrySet().stream()
+            .allMatch(e -> e.getValue() >= thresholds.getMin(e.getKey()));
+
+        return EvalReport.builder()
+            .runId("spring-eval-" + LocalDateTime.now())
+            .gitSha(getGitSha())
+            .datasetVersion(thresholds.getDatasetVersion())
+            .aggregate(aggregate)
+            .passed(passed)
+            .sampleCount(results.size())
+            .build();
+    }
+
+    private double avg(List&lt;EvalResult&gt; results,
+                       ToDoubleFunction&lt;EvalResult&gt; extractor) {
+        return results.stream().mapToDouble(extractor).average().orElse(0);
+    }
+}</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li>Spring 测试用内存 H2 向量库、Python 用 Milvus — 分数不可比。</li>
+          <li>只对比平均分，不看<strong>同一题</strong>的双栈 diff 列表。</li>
+          <li>延迟只测 LLM，不含检索与 Rerank。</li>
+        </ul>
+      </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
-      <p class="chapter-conclusions-lead">本章能力将接入 CorpAssist NS1 评测飞轮与双栈 CI。</p>
-      <ul class="chapter-conclusions-list"><li><strong>集成测试</strong>：<span class="term" data-term-id="spring-integration-test" tabindex="0">spring in</li>
-<li><strong>Advisor 断言</strong>：<span class="term" data-term-id="advisor-assert" tabindex="0">advisor assert</sp</li>
-<li><strong>对比 Python 结果</strong>：<span class="term" data-term-id="cross-stack-compare" tabindex="0">cross stack c</li></ul>
+      <p class="chapter-conclusions-lead">Spring 评测是 Python 评测的补充，确保生产 BFF 的 Advisor 链与 Python 索引链输出一致。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>集成测试</strong>：@SpringBootTest 加载同一 JSONL 子集，真实向量库。</li>
+        <li><strong>Advisor 断言</strong>：验证 citation marker 格式、retrievedDocuments 非空、拒答正确。</li>
+        <li><strong>对比 Python 结果</strong>：逐题 diff，delta &gt; 0.02 标记 likely_cause。</li>
+        <li><strong>双输出</strong>：junit.xml + json artifact，schema 与 Python 对齐。</li>
+      </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="llm-evaluation-quality_practice_02_spring_eval">
         <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
         <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
-        <ul><li><label><input type="checkbox" data-id="c0" /> 能复述本章 4 条核心 takeaway</label></li><li><label><input type="checkbox" data-id="c1" /> 完成正文对照表或代码示例阅读</label></li><li><label><input type="checkbox" data-id="c2" /> 完成判断练习</label></li><li><label><input type="checkbox" data-id="c3" /> 完成 Demo 或等价笔记</label></li><li><label><input type="checkbox" data-id="c4" /> 已完成章节测验</label></li></ul>
+        <ul>
+          <li><label><input type="checkbox" data-id="it-eval" /> 能写出 @SpringBootTest 加载评测集的代码</label></li>
+          <li><label><input type="checkbox" data-id="advisor" /> 能断言 Advisor 输出了 citation marker</label></li>
+          <li><label><input type="checkbox" data-id="parity" /> 能解释 cross-stack diff 报告的结构</label></li>
+          <li><label><input type="checkbox" data-id="no-mock" /> 能说明为什么不能 mock VectorStore</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
       </div>
-      
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>spring integration test</td><td>@SpringBootTest 加载 JSONL 子集</td></tr>
+                <tr><td>advisor assert</td><td>断言 citation marker 和拒答</td></tr>
+                <tr><td>cross stack compare</td><td>逐题 diff Python vs Spring</td></tr>
+                <tr><td>mock chatmodel</td><td>开发期用，生产门禁必须真实</td></tr>
+                <tr><td>eval parity</td><td>双栈 delta ≤ 0.02</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Python RAGAS 0.92 而 Spring 集成测试 0.78，排查步骤是什么？</li>
+              <li>为什么 Spring AI 测试中不能 mock VectorStore？</li>
+              <li>parity report 中的 likely_cause 枚举应该包含哪些值？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-practice-03-ab-online">线上 A/B 与灰度</a>。</p>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul><li><a href="https://docs.spring.io/spring-ai/reference/api/evaluators.html" target="_blank" rel="noopener">Spring AI Evaluators</a></li></ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/evaluators.html" target="_blank" rel="noopener">Spring AI Evaluators</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/features.html#features.testing" target="_blank" rel="noopener">Spring Boot Testing</a></li>
+    </ul>
+  </div>
+
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <p class="steps-intro">阅读 EvalAssertDemo.java，列出 2 个断言点。</p>
+    <p class="steps-intro">运行 Spring 评测集成测试并生成 parity report。</p>
     <h4 class="practice-section-title">操作步骤</h4>
-    <ol class="steps steps-operate"><li>打开 demos/practice-02-spring-eval-lab/EvalAssertDemo.java</li><li>写出 parity diff 报告里 likely_cause 枚举</li><li>说明为何不能在 IT 里 mock VectorStore 返回固定文本</li><li>可选：运行 Demo 测试类</li></ol>
+    <ol class="steps steps-operate">
+      <li>打开 demos/practice-02-spring-eval-lab/EvalAssertDemo.java</li>
+      <li>写出 parity diff 报告里 likely_cause 枚举</li>
+      <li>说明为何不能在 IT 里 mock VectorStore 返回固定文本</li>
+      <li>可选：运行 Demo 测试类</li>
+    </ol>
     <h4 class="practice-section-title">判断练习</h4>
-    <ol class="steps-judgment-list"><li><p class="judgment-stem">发版前只跑 10 条样例手工点检，不做回归集与 CI 门禁。在 CorpAssist 双栈评测落地 场景下风险是什么？</p>
-    <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p>无法发现 Prompt/索引变更导致的回归；难例与拒答边界未覆盖；不符合 NS1 飞轮。应固定 dataset_version + 阈值门禁。</p></div></details></div></li></ol>
-    <div class="demo-box"><h4 class="demo-box-title">Demo：Spring AI 服务评测</h4><p>目录：<code>demos/practice-02-spring-eval-lab/</code> — <strong>验收</strong>：Java 文件含 ≥2 个 assert。</p></div>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">Spring 集成测试全部通过，但 Python 报告显示 context_recall=0.60。Spring 能发版吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不能。Spring 测试只验证 Advisor 链正确性，不评估检索质量。context_recall 低说明检索遗漏信息，Spring 侧同样受影响。需要检查 Python 和 Spring 是否用了同一个索引版本。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Spring AI 服务评测</h4>
+      <p>目录：<code>demos/practice-02-spring-eval-lab/</code> — <strong>验收</strong>：Java 文件含 ≥2 个 assert，parity diff 报告含 likely_cause 枚举。</p>
+    </div>
   </div>
-  <div class="resources content-section"><h3>延伸学习</h3><ul><li><strong>下一章</strong>：<a href="#ch-practice-03-ab-online">线上 A/B 与灰度</a></li></ul></div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-ab-online">线上 A/B 与灰度</a></li>
+    </ul>
+  </div>
 </section>

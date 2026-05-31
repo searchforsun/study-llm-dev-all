@@ -1,246 +1,630 @@
 <section id="ch-practice-02-llamaindex-rag" class="chapter" data-chapter="practice-02-llamaindex-rag">
   <header class="chapter-header">
-    <h2><span class="chapter-done-badge">已完成</span>LlamaIndex RAG 实现（对照）</h2>
+    <h2><span class="chapter-done-badge">已完成</span>LlamaIndex RAG 实战</h2>
     <button type="button" class="btn-mark-done" data-chapter="practice-02-llamaindex-rag" aria-label="标记本章完成">标记完成</button>
   </header>
+
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Python RAG 实践</strong> · 能力：用 LlamaIndex 实现同需求 RAG，对比 LangChain 差异并做迁移决策</p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>CorpAssist 内部有 LangChain 和 LlamaIndex 两套调用。原生支持高阶特性（Router Query Engine、Recursive Retriever），对复杂场景可能减少 40% 样板代码。通过同需求双实现能客观评估选型依据。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 LlamaIndex 完成等效于 LangChain practice-01 的 RAG 管线，运行性能基准测试对比两框架差异，分析代码组织方式的不同，并给出特定场景下的框架选择建议。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><ul><li>LlamaIndex 用 Index + QueryEngine 抽象替代 LCEL 管道</li><li>同需求双实现：HR 政策问答，对比代码行数、延迟、召回率</li><li>LlamaIndex 内置 RouterQueryEngine 可省去手写意图路由</li><li>迁移需评估社区生态、自定义节点灵活性、CorpAssist 内部依赖</li></ul></div>
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Python RAG 实践</strong> · 能力：用 LlamaIndex 构建索引驱动 RAG 系统</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>LlamaIndex 是 LangChain 之外最成熟的 RAG 框架，其核心哲学是「索引优先」——通过 <span class="term" data-term-id="llamaindex-rag" tabindex="0">IngestionPipeline</span> 精细化控制文档处理流程，使用 <span class="term" data-term-id="llamaindex-rag" tabindex="0">Query Engine</span> 封装检索与生成逻辑。本章从 CorpAssist 场景出发，用 LlamaIndex 实现完整的 RAG 管线，并与上一章的 LangChain 实现进行直观对比。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="llamaindex-rag" tabindex="0">IngestionPipeline</span> 构建文档预处理流程：解析、切分、嵌入、索引</li>
+          <li>配置 LlamaIndex <span class="term" data-term-id="llamaindex-rag" tabindex="0">Query Engine</span>：retriever + response synthesizer 组合</li>
+          <li>使用 <span class="term" data-term-id="llamaindex-rag" tabindex="0">Router</span> 实现多策略查询路由</li>
+          <li>客观分析 LangChain 与 LlamaIndex 各自优劣，按场景选型</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>LlamaIndex = 索引为中心</strong>：所有能力围绕 Index 展开，检索和生成是 Index 的方法。</li>
+          <li><strong><span class="term" data-term-id="llamaindex-rag" tabindex="0">IngestionPipeline</span> 是 ETL 利器</strong>：transform 链式组合，缓存中间结果避免重复计算。</li>
+          <li><strong><span class="term" data-term-id="llamaindex-rag" tabindex="0">Router</span> 赋予多策略能力</strong>：同一个问题可路由到不同 Index 或 Query Engine。</li>
+        </ul>
+      </div>
     </div>
+
     <div class="section-block">
-      <h3>同需求双实现对比</h3>
-      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · LangChain vs LlamaIndex</span>同一需求：HR 政策 RAG 问答。输入「年假折算规则」，两套框架各自输出 answer + sources。比较代码量、延迟、召回质量。</aside>
-      <p>LlamaIndex 以 <code>Index</code> 为核心入口：<code>VectorStoreIndex</code> 封装了分块 → Embedding → 存储 → 检索的完整生命周期。查询时通过 <code>as_query_engine()</code> 获得配置好的检索+生成组件，省去手动搭建 LCEL 管道的步骤。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># LlamaIndex 等效实现 — HR 政策问答
-from llama_index.core import VectorStoreIndex, Settings, Document
+      <h3>索引构建：IngestionPipeline 与文档处理</h3>
+
+      <p>LlamaIndex 把文档到索引的整个过程称为 <strong>Ingestion</strong>，核心组件是 <span class="term" data-term-id="llamaindex-rag" tabindex="0">IngestionPipeline</span>。它像一个 ETL 管道：读取原始文档 → 逐节点解析 → 切分成 Node → 提取 embedding → 写入索引。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 知识库索引构建</span>
+        CorpAssist 需将每周更新的员工手册、IT 运维文档和产品说明书自动构建索引。这些文档格式包括 PDF、Markdown 和 Confluence 导出 HTML。LlamaIndex 的 IngestionPipeline 可以统一处理多格式数据源并保持索引一致性。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>LlamaIndex 索引构建流程图</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Ingestion[IngestionPipeline]
+        direction TB
+        Load[FileLoader\nPDF/MD/HTML]
+        Parse[NodeParser\nSentenceSplitter]
+        Embed[Embedding\ntext-embedding-3-small]
+        Store[VectorStoreIndex\nChromaVectorStore]
+    end
+
+    subgraph Query[Query Engine]
+        Ret[Retriever\nVectorIndexRetriever]
+        Synth[ResponseSynthesizer\ncompact/refine]
+    end
+
+    Doc[原始文档集] --> Load
+    Load --> Parse
+    Parse --> Embed
+    Embed --> Store
+    Store -->|索引就绪| Ret
+    Ret -->|top-k nodes| Synth
+    Synth -->|答案| Result
+
+    style Ingestion fill:#2E8B57,color:#fff
+    style Query fill:#4A90D9,color:#fff
+    style Store fill:#7B68EE,color:#fff</pre>
+        <p class="diagram-caption">IngestionPipeline 处理文档 → 索引；Query Engine 完成检索 → 生成。</p>
+      </div>
+
+      <h4>IngestionPipeline 实战</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># ingestion.py — LlamaIndex 文档处理与索引构建
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    Settings,
+    Document,
+)
 from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.extractors import TitleExtractor
 from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.llms.openai import OpenAI
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.core.schema import MetadataMode
+import chromadb
+from typing import List, Optional
 
-Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
-Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
+# 全局配置
+Settings.embed_model = OpenAIEmbedding(
+    model="text-embedding-3-small",
+    embed_batch_size=16,
+    dimensions=512,
+)
 
-# 从已有向量库加载 — 与 LangChain 同一数据源
+def build_ingestion_pipeline(
+    chroma_collection_name: str = "corpassist_llama",
+    persist_dir: str = "./data/chroma_llama",
+) -> IngestionPipeline:
+    """构建 IngestionPipeline：读取 → 切分 → 嵌入 → 存储"""
+    # Chroma 客户端
+    db = chromadb.PersistentClient(path=persist_dir)
+    collection = db.get_or_create_collection(
+        name=chroma_collection_name,
+        metadata={"hnsw:space": "cosine"},
+    )
+    vector_store = ChromaVectorStore(chroma_collection=collection)
+
+    pipeline = IngestionPipeline(
+        transformations=[
+            SentenceSplitter(
+                chunk_size=1024,
+                chunk_overlap=200,
+                separator=" ",
+                paragraph_separator="\n\n",
+                secondary_chunking_regex="[^。！？]+[。！？]?",  # 中文分句
+            ),
+            TitleExtractor(),
+            OpenAIEmbedding(
+                model="text-embedding-3-small",
+                dimensions=512,
+            ),
+        ],
+        vector_store=vector_store,
+    )
+    return pipeline
+
+def run_ingestion(doc_dir: str = "./data/docs") -> VectorStoreIndex:
+    """执行文档摄取"""
+    documents = SimpleDirectoryReader(
+        input_dir=doc_dir,
+        required_exts=[".pdf", ".md", ".html"],
+        recursive=True,
+    ).load_data()
+    print(f"Loaded {len(documents)} documents")
+
+    pipeline = build_ingestion_pipeline()
+    nodes = pipeline.run(documents=documents)
+    print(f"Processed into {len(nodes)} nodes")
+
+    # 从 vector store 创建索引
+    index = VectorStoreIndex.from_vector_store(
+        pipeline.vector_store,
+        embed_model=Settings.embed_model,
+    )
+    return index
+
+if __name__ == "__main__":
+    index = run_ingestion("./data/docs")
+    print(f"Index ready with {len(index.ref_doc_info)} documents")</code></pre>
+      </div>
+
+      <h4>使用已有索引的进阶配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># index_utils.py — 索引管理与高级配置
+from llama_index.core import VectorStoreIndex, StorageContext, load_index_from_storage
+from llama_index.core import Settings
+from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 import chromadb
+import os
 
-db = chromadb.PersistentClient(path="./chroma_db")
-chroma_collection = db.get_or_create_collection("corpassist-hr-v2")
-vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-index = VectorStoreIndex.from_vector_store(vector_store)
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small", dimensions=512)
 
-# 查询引擎 — 单行替代 LCEL 四段链
-query_engine = index.as_query_engine(
-    similarity_top_k=4,
-    node_postprocessors=[],  # 可插入 rerank
-    response_mode="compact",
-)
+def load_or_create_index(
+    collection_name: str = "corpassist_llama",
+    persist_dir: str = "./data/chroma_llama",
+    doc_dir: str = "./data/docs",
+) -> VectorStoreIndex:
+    """加载已有索引；不存在则创建"""
+    db = chromadb.PersistentClient(path=persist_dir)
+    collection = db.get_or_create_collection(collection_name)
 
-response = query_engine.query("年假折算规则")
-print(response.response)
-for node in response.source_nodes:
-    print(node.node_id, node.text[:80], node.score)</code></pre></div>
-      <table class="outline-table"><thead><tr><th>维度</th><th>LangChain (LCEL)</th><th>LlamaIndex</th></tr></thead>
-      <tbody>
-        <tr><td>核心抽象</td><td>Runnable + Chain</td><td>Index + QueryEngine</td></tr>
-        <tr><td>构建代码行数</td><td>45~60 行（含 format_docs）</td><td>25~35 行（Index 自动编排）</td></tr>
-        <tr><td>检索配置</td><td>as_retriever(search_kwargs)</td><td>similarity_top_k + node_postprocessors</td></tr>
-        <tr><td>Prompt 控制</td><td>ChatPromptTemplate 完全自定义</td><td>prompt_helper / custom_prompt 覆盖</td></tr>
-        <tr><td>内置路由</td><td>需手写 router node</td><td>RouterQueryEngine 内置</td></tr>
-        <tr><td>流式支持</td><td>chain.stream()</td><td>query_engine.aquery(stream=True)</td></tr>
-      </tbody></table>
-    </div>
-    <div class="section-block">
-      <h3>性能基准测试</h3>
-      <p>在 CorpAssist HR 知识库（500 篇文档，3200 分块）上对两框架进行基准测试。测试环境：CPU Intel i7-12700, 32GB RAM, OpenAI text-embedding-3-small + gpt-4o-mini, 100 条随机问题。测试重复 3 轮取中位数，预先做 10 次 warmup 消除冷启动偏差。向量库使用 Chroma（SSD 持久化），LLM 调用统一使用 gpt-4o-mini（temperature=0）。</p>
-      <p>Benchmark 脚本的设计要点：1) warmup 阶段读取向量库到内存（Page cache），避免首次查询的冷延迟；2) 每轮测试前重新向量化 query 而非复用缓存结果，模拟真实用户场景；3) 设置超时 30s，超过则标记为失败并重试 1 次；4) 记录每个子步骤的延迟（embed、search、build_prompt、llm_infer、parse），便于定位瓶颈。所有测试结果写入 JSONL 格式，每行包含 query、两框架的完整延迟分解、answer 文本、召回 doc_id 列表。</p>
-      <div class="mermaid-wrap"><h5>P95 延迟对比（毫秒）</h5><pre class="mermaid">flowchart LR
-  subgraph LangChain
-    LC_EM[embed 320ms] --> LC_VEC[vector search 45ms]
-    LC_VEC --> LC_PROMPT[prompt build 12ms]
-    LC_PROMPT --> LC_LLM[LLM infer 890ms]
-    LC_LLM --> LC_PARSE[parse 5ms]
-  end
-  subgraph LlamaIndex
-    LI_EM[embed 318ms] --> LI_VEC[vector search 48ms]
-    LI_VEC --> LI_SYNTH[synthesize 18ms]
-    LI_SYNTH --> LI_LLM[LLM infer 892ms]
-    LI_LLM --> LI_PARSE[parse 4ms]
-  end</pre></div>
-      <table class="outline-table"><thead><tr><th>指标</th><th>LangChain</th><th>LlamaIndex</th><th>差异</th></tr></thead>
-      <tbody>
-        <tr><td>P50 端到端延迟</td><td>1275ms</td><td>1280ms</td><td>+0.4%，无显著差异</td></tr>
-        <tr><td>P95 端到端延迟</td><td>1890ms</td><td>1910ms</td><td>+1.1%</td></tr>
-        <tr><td>召回率@4</td><td>76.2%</td><td>77.1%</td><td>+0.9%</td></tr>
-        <tr><td>Faithfulness</td><td>0.872</td><td>0.869</td><td>-0.3%</td></tr>
-        <tr><td>代码行数（核心）</td><td>52</td><td>28</td><td>-46%</td></tr>
-      </tbody></table>
-      <p>结论：两框架在检索和生成阶段均调用相同的 OpenAI API，端到端延迟差异 < 2%，主要延迟瓶颈在 LLM 推理（~70%）。LlamaIndex 代码更精简（Index 封装了索引构建管线），但 LangChain 在 Prompt 自定义和调试工具（LangSmith）方面更成熟。</p>
-      <p>延迟分布详细分析：向量嵌入阶段两框架完全一致（均调用 OpenAI Embedding API，耗时 318~320ms），向量检索阶段 Chroma 的查询时间约 45~48ms，差异来自结果处理——LlamaIndex 的 Node 解析比 LangChain 的 Document 处理多约 3ms 的元数据提取。Prompt 构建阶段 LangChain 的 RunnableParallel 比 LlamaIndex 的 Synthesizer 少约 6ms。LLM 推理阶段两框架均调用同一 API 端点，耗时几乎相等（892ms vs 890ms，偏差在 API 响应抖动范围内）。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-bash"># 基准测试运行脚本
-cd demos/practice-02-llamaindex-rag-lab
+    if collection.count() > 0:
+        print(f"Loading existing index ({collection.count()} vectors)")
+        vector_store = ChromaVectorStore(chroma_collection=collection)
+        return VectorStoreIndex.from_vector_store(vector_store)
 
-# 安装依赖
-pip install llama-index llama-index-vector-stores-chroma llama-index-embeddings-openai
+    print("Creating new index...")
+    from llama_index.core import SimpleDirectoryReader
+    documents = SimpleDirectoryReader(
+        input_dir=doc_dir,
+        recursive=True,
+    ).load_data()
+    from ingest import build_ingestion_pipeline
+    pipeline = build_ingestion_pipeline(collection_name, persist_dir)
+    nodes = pipeline.run(documents=documents)
+    return VectorStoreIndex.from_vector_store(pipeline.vector_store)
 
-# 运行双栈基准测试
-python benchmark.py \
-  --questions test_data/hr_questions.jsonl \
-  --k 4 \
-  --output results/comparison.json
+def get_index_stats(index: VectorStoreIndex) -> dict:
+    """获取索引统计信息"""
+    stats = {}
+    stats["num_docs"] = len(index.ref_doc_info) if index.ref_doc_info else 0
+    if hasattr(index, "_vector_store") and hasattr(index._vector_store, "_collection"):
+        stats["num_vectors"] = index._vector_store._collection.count()
+    stats["embed_model"] = str(index.embed_model)
+    return stats
 
-# 查看报告
-python -m json.tool results/comparison.json | head -30
-# 输出: {"langchain": {"p50_ms": 1275, "p95_ms": 1890, "recall@4": 0.762},
-#        "llamaindex": {"p50_ms": 1280, "p95_ms": 1910, "recall@4": 0.771}}</code></pre></div>
-    </div>
-    <div class="section-block">
-      <h3>代码结构差异</h3>
-      <div class="mermaid-wrap"><h5>双框架代码组织对比</h5><pre class="mermaid">flowchart TD
-    subgraph LANG[LangChain 代码结构]
-      VC[VectorStore] -->|as_retriever| RET[Retriever]
-      RET -->|RunnableParallel| CTX[Context 拼装]
-      CTX -->|ChatPromptTemplate| PR[Prompt]
-      PR -->|LLM| OUT[Output]
-    end
-    subgraph LLAMA[LlamaIndex 代码结构]
-      IDX[VectorStoreIndex] -->|as_query_engine| QE[QueryEngine]
-      QE -->|response_mode| RES[Response]
-      QE -->|similarity_top_k| SN[SourceNodes]
-    end</pre></div>
-      <p>两框架在代码组织哲学上有根本差异：<strong>LangChain 强调「链」的显式组装</strong>，每一环节可观测、可替换；<strong>LlamaIndex 强调「索引」的智能封装</strong>，常用场景开箱即用。CorpAssist 项目中，Python 侧的索引任务使用 LlamaIndex 的 Index 抽象更高效，但查询链与 Spring 对齐的部分仍用 LangChain 的 LCEL 便于两侧对照调试。</p>
-      <div class="learn-compare">
-        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">LangChain 适用</span><ul><li>需精细控制 Prompt 模板</li><li>链中插入自定义 callback/logging</li><li>与 LangSmith 深度集成</li><li>需要 handoff/human-in-loop 节点</li></ul></div>
-        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">LlamaIndex 适用</span><ul><li>快速原型验证 RAG 场景</li><li>需要 RouterQueryEngine / SubQuestionQueryEngine</li><li>处理复杂文档（PDF 表格、多级标题）</li><li>倾向更少样板代码的团队</li></ul></div>
+if __name__ == "__main__":
+    index = load_or_create_index()
+    stats = get_index_stats(index)
+    for k, v in stats.items():
+        print(f"{k}: {v}")</code></pre>
       </div>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-python"># LlamaIndex RouterQueryEngine — 内置意图路由
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>每次重建索引，无缓存机制</li>
+            <li>全局默认切分器，忽略文档格式差异</li>
+            <li>同一 embedding 模型不设 dimensions 参数</li>
+            <li>不保留原始节点元数据</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>IngestionPipeline 自动缓存已处理的文档</li>
+            <li>使用专为中英文设计的 SentenceSplitter</li>
+            <li>显式设置 dimensions=512 降维提效</li>
+            <li>保留 source/date/author 元数据</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Query Engine：检索与生成的组合</h3>
+
+      <p>LlamaIndex 的 <span class="term" data-term-id="llamaindex-rag" tabindex="0">Query Engine</span> 是检索与生成的组合层。它将 retriever、response synthesizer 和 postprocessor 组合为一个可调用的接口。与 LangChain 不同，LlamaIndex 将「检索什么」和「如何生成」分离为独立配置的 RetrieverMode 和 ResponseMode。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>组件</th><th>LangChain 对应</th><th>LlamaIndex 对应</th><th>核心差异</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>检索器</td>
+            <td><code>BaseRetriever</code></td>
+            <td><code>BaseRetriever</code> / <code>RetrieverMode</code></td>
+            <td>LlamaIndex 检索器与 Index 强绑定</td>
+          </tr>
+          <tr>
+            <td>响应合成</td>
+            <td><code>StuffDocumentsChain</code></td>
+            <td><code>ResponseSynthesizer</code> + <code>ResponseMode</code></td>
+            <td>LlamaIndex 5 种 mode：compact/refine/tree/accumulate/compact_accumulate</td>
+          </tr>
+          <tr>
+            <td>后处理</td>
+            <td>cust om callback</td>
+            <td><code>BaseNodePostprocessor</code></td>
+            <td>内置 SimilarityPostprocessor, KeywordPostprocessor</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>Query Engine 完整实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># query_engine.py — 多种 Query Engine 配置
+from llama_index.core import VectorStoreIndex, Settings
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.response_synthesizers import ResponseMode
+from llama_index.core.postprocessor import (
+    SimilarityPostprocessor,
+    MetadataReplacementPostProcessor,
+)
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.indices.query.query_transform.base import (
+    HyDEQueryTransform,
+)
+from llama_index.core.query_engine import TransformQueryEngine
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+
+Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0.1)
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small", dimensions=512)
+
+def create_basic_query_engine(index: VectorStoreIndex) -> RetrieverQueryEngine:
+    """基础 Query Engine：similarity 检索 + compact 合成"""
+    retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=5,
+    )
+    return RetrieverQueryEngine(
+        retriever=retriever,
+        response_synthesizer=index.as_response_synthesizer(
+            response_mode=ResponseMode.COMPACT,
+            verbose=True,
+        ),
+        node_postprocessors=[
+            SimilarityPostprocessor(similarity_cutoff=0.7),
+        ],
+    )
+
+def create_advanced_query_engine(index: VectorStoreIndex) -> RetrieverQueryEngine:
+    """进阶 Query Engine：HyDE + tree_summarize"""
+    # 基础检索
+    base_retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=10,
+    )
+    base_engine = RetrieverQueryEngine(
+        retriever=base_retriever,
+        response_synthesizer=index.as_response_synthesizer(
+            response_mode=ResponseMode.TREE_SUMMARIZE,
+        ),
+        node_postprocessors=[
+            SimilarityPostprocessor(similarity_cutoff=0.6),
+        ],
+    )
+    # 使用 HyDE (Hypothetical Document Embeddings) 改进查询
+    hyde = HyDEQueryTransform(llm=Settings.llm, include_original=True)
+    engine = TransformQueryEngine(base_engine, hyde)
+    return engine
+
+def query_corpassist(index: VectorStoreIndex, question: str) -> str:
+    """使用 advanced engine 查询"""
+    engine = create_advanced_query_engine(index)
+    response = engine.query(question)
+    return str(response)
+
+if __name__ == "__main__":
+    from index_utils import load_or_create_index
+    index = load_or_create_index()
+    answer = query_corpassist(index, "员工休假政策有哪些更新？")
+    print(f"Answer:\n{answer}")
+    print(f"\nSource nodes: {len(answer.source_nodes)}")</code></pre>
+      </div>
+
+      <h4>5 种 ResponseMode 对比</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>Mode</th><th>说明</th><th>Token 效率</th><th>适合场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>COMPACT</td><td>将 top-k node 拼接后一次 LLM 调用</td><td>高</td><td>默认首选</td></tr>
+          <tr><td>REFINE</td><td>逐 node 迭代精炼答案</td><td>中</td><td>需要逐段校对</td></tr>
+          <tr><td>TREE_SUMMARIZE</td><td>对 node 分组递归摘要后合成</td><td>低</td><td>大量分散片段</td></tr>
+          <tr><td>ACCUMULATE</td><td>每个 node 独立回答再拼接</td><td>低</td><td>多维度问题</td></tr>
+          <tr><td>COMPACT_ACCUMULATE</td><td>拼接后分段独立回答</td><td>中</td><td>平衡效率与覆盖</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>Router：多策略查询路由</h3>
+
+      <p>当 CorpAssist 需要同时处理多种查询类型（如 FAQ 检索、IT 工单查询、政策文档摘要），<span class="term" data-term-id="llamaindex-rag" tabindex="0">Router</span> 可以根据问题内容自动选择合适的 Index 或 Query Engine。这是 LlamaIndex 相比 LangChain 更成熟的特性。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># router.py — LlamaIndex Router 实现多策略路由
+from llama_index.core import VectorStoreIndex
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.query_engine import RouterQueryEngine
+from llama_index.core.selectors import LLMSingleSelector, PydanticSingleSelector
+from llama_index.llms.openai import OpenAI
 
-# 为不同知识库创建专用查询引擎
-hr_engine = hr_index.as_query_engine(similarity_top_k=4)
-legal_engine = legal_index.as_query_engine(similarity_top_k=3)
+def build_router_engine(
+    hr_index: VectorStoreIndex,
+    it_index: VectorStoreIndex,
+    policy_index: VectorStoreIndex,
+) -> RouterQueryEngine:
+    """构建多策略路由引擎"""
+    llm = OpenAI(model="gpt-4o-mini", temperature=0)
 
-router = RouterQueryEngine.from_defaults(
-    llm=Settings.llm,
-    query_engine_tools=[
-        QueryEngineTool(
-            query_engine=hr_engine,
-            metadata=ToolMetadata(
-                name="hr_policy",
-                description="HR政策相关查询（年假、考勤、薪酬、福利）",
-            ),
+    # 每个子索引对应一个工具
+    hr_tool = QueryEngineTool(
+        query_engine=hr_index.as_query_engine(
+            similarity_top_k=3,
+            response_mode="compact",
         ),
-        QueryEngineTool(
-            query_engine=legal_engine,
-            metadata=ToolMetadata(
-                name="legal_compliance",
-                description="合规与法务相关查询（竞业限制、合同条款）",
-            ),
+        metadata=ToolMetadata(
+            name="hr_knowledge",
+            description="员工手册、休假政策、薪酬福利等人力资源相关问题。",
         ),
-    ],
-    verbose=True,
-)
+    )
+    it_tool = QueryEngineTool(
+        query_engine=it_index.as_query_engine(
+            similarity_top_k=5,
+            response_mode="tree_summarize",
+        ),
+        metadata=ToolMetadata(
+            name="it_support",
+            description="IT 运维、工单系统、网络故障、设备申请等技术支持问题。",
+        ),
+    )
+    policy_tool = QueryEngineTool(
+        query_engine=policy_index.as_query_engine(
+            similarity_top_k=3,
+            response_mode="compact",
+        ),
+        metadata=ToolMetadata(
+            name="company_policy",
+            description="公司制度、合规要求、安全规范、数据保护等政策文档。",
+        ),
+    )
 
-# 自动路由到正确知识库
-resp = router.query("竞业限制补偿金标准")
-print(resp.metadata["selector_result"])  # 查看路由选择</code></pre></div>
+    router = RouterQueryEngine(
+        selector=PydanticSingleSelector.from_defaults(llm=llm),
+        query_engine_tools=[hr_tool, it_tool, policy_tool],
+        verbose=True,
+    )
+    return router
+
+if __name__ == "__main__":
+    # 模拟三个索引
+    from llama_index.core import Document
+    from llama_index.core import VectorStoreIndex
+
+    hr_docs = [Document(text="年假政策：员工每年享有15天带薪年假。")]
+    it_docs = [Document(text="IT 工单流程：通过 ServiceNow 提交。")]
+    policy_docs = [Document(text="数据保护政策：禁止将客户数据上传至非授权平台。")]
+
+    hr_index = VectorStoreIndex.from_documents(hr_docs)
+    it_index = VectorStoreIndex.from_documents(it_docs)
+    policy_index = VectorStoreIndex.from_documents(policy_docs)
+
+    router = build_router_engine(hr_index, it_index, policy_index)
+
+    # 测试路由
+    for question in [
+        "我今年还剩几天年假？",
+        "怎么提交网络故障工单？",
+        "客户数据能发给第三方吗？",
+    ]:
+        print(f"\nQ: {question}")
+        response = router.query(question)
+        print(f"Selected: {response.metadata.get('selector_result', 'unknown')}")
+        print(f"A: {response}")</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Router 的 LLM 选择器和关键词匹配选择器各有什么优劣？</summary>
+        <p>LLM 选择器（如 PydanticSingleSelector）理解语义，但引入额外延迟和成本。关键词选择器更快但需要预定义规则。CorpAssist 混合场景建议：高频常见问题用关键词，复杂模糊问题用 LLM 选择。</p>
+      </details>
     </div>
+
     <div class="section-block">
-      <h3>选择建议与迁移路径</h3>
-      <p>基于 CorpAssist 项目实际数据（双框架并行运行 6 个月）：</p>
-      <table class="outline-table"><thead><tr><th>决策场景</th><th>推荐框架</th><th>理由</th></tr></thead>
-      <tbody>
-        <tr><td>简单 RAG（单知识库问答）</td><td>均可</td><td>代码量差异 < 30 行，性能无差异</td></tr>
-        <tr><td>多知识库路由</td><td>LlamaIndex</td><td>内置 RouterQueryEngine，节省 100+ 行路由代码</td></tr>
-        <tr><td>需要自定义 Agent 行为</td><td>LangChain</td><td>LangGraph 支持图状编排、循环、条件边</td></tr>
-        <tr><td>与 Spring AI 对接</td><td>LangChain</td><td>LCEL 和 Advisor 抽象更接近，便于双栈对照</td></tr>
-        <tr><td>PDF/表格密集场景</td><td>LlamaIndex</td><td>内置 PDF 解析与 RecursiveRetriever</td></tr>
-        <tr><td>已有 LangSmith 监控</td><td>LangChain</td><td>无缝集成 trace/eval/dataset</td></tr>
-      </tbody></table>
-      <details class="learn-faq"><summary>FAQ：如果团队已深入 LangChain，迁移到 LlamaIndex 的成本多大？</summary>
-      <p>迁移成本取决于依赖深度。若仅用基础 RAG，重构约 1~2 人天（替换索引构建 + 查询调用）。若使用了 LangGraph Agent、LangSmith 评测、自定义 Callback，迁移成本升至 1~2 周。建议新场景直接用 LlamaIndex 验证原型，存量 LangChain 场景逐步并行。</p>
-      <p>分步迁移路径建议：第 1 步（1 天），在新知识库上使用 LlamaIndex 做索引和查询原型验证；第 2 步（2 天），与 LangChain 管线并行运行，确认输出一致性（answer + sources 字段逐条对比）；第 3 步（1 天），将 RouterQueryEngine 替换手写路由逻辑；第 4 步（2 天），迁移自定义 Callback（LangSmith → LlamaIndex CallbackManager），配置 LlamaTrace。核心原则：查询链不要同时维护两套实现，应彻底替换。</p>
-      <p>作为补充对比，以下是两框架在功能点层面的逐一对比：对于流式输出，LangChain 通过 <code>chain.stream()</code> 返回逐 token 生成器，LlamaIndex 通过 <code>query_engine.aquery(stream=True)</code> 返回异步生成器。对于回调系统，LangChain 的 CallbackHandler 基于事件驱动（on_llm_start/on_retriever_end），LlamaIndex 通过 Event 机制发送每个步骤的通知。对于缓存策略，LangChain 提供 <code>Runnable.cache()</code> 装饰器自动缓存，LlamaIndex 需要手动实现 <code>NodeParser</code> 级别的缓存。对于并行处理，LangChain 的 <code>batch()</code> 方法可以并行处理多条输入，LlamaIndex 的 <code>process_documents_async()</code> 支持异步批量索引。对于错误处理，LangChain 的 <code>with_fallbacks()</code> 可以为 Runnable 配置降级方案，LlamaIndex 的 ErrorHandler 插件可配置重试逻辑。</p>
-      </details>
-      <details class="learn-micro-check"><summary>自检：在什么场景下 LlamaIndex 比 LangChain 更适合 CorpAssist？</summary>
-      <p>当需要快速接入多种知识库并自动路由时（如 HR + Legal + IT 三个知识库），LlamaIndex 的 RouterQueryEngine 可省去手写意图分类和工具绑定逻辑。此外处理 PDF 采购合同时，LlamaIndex 的 PDF 解析和 RecursiveRetriever 能自动拆解表格和层级标题。</p>
-      </details>
+      <h3>LangChain 与 LlamaIndex 对照</h3>
+
+      <p>下表从架构哲学、开发体验、生产特性三个维度对比两大框架，帮助你在 CorpAssist 场景中做出合理选择。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>LangChain</th><th>LlamaIndex</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>设计哲学</td><td>「管线」优先，组件可任意组合</td><td>「索引」优先，能力围绕 Index 展开</td></tr>
+          <tr><td>RAG 构建</td><td>LCEL: retriever → prompt → llm → parser</td><td>Index → Query Engine → response</td></tr>
+          <tr><td>文档处理</td><td>Document Loader + Text Splitters (灵活但手动)</td><td>IngestionPipeline (ETL 一体化，带缓存)</td></tr>
+          <tr><td>检索多样性</td><td>5+ Retriever 类型，通过 Ensemble/MMR 组合</td><td>内置 VectorIndexRetriever + 多种 postprocessor</td></tr>
+          <tr><td>路由能力</td><td>RunnableBranch, 需手写路由逻辑</td><td>RouterQueryEngine, 内置 LLM/KB 选择器</td></tr>
+          <tr><td>流式输出</td><td>原生 LCEL .stream(), .astream()</td><td>aquery() 支持 stream，但响应体复杂</td></tr>
+          <tr><td>生态广度</td><td>超 700+ 集成，Agent/Tool 丰富</td><td>200+ 集成，侧重数据索引与检索</td></tr>
+          <tr><td>学习曲线</td><td>中（LCEL 概念多但灵活）</td><td>低（索引→引擎概念统一）</td></tr>
+        </tbody>
+      </table>
+
+      <div class="notice">
+        <strong>CorpAssist 选型建议</strong>
+        <ul>
+          <li><strong>纯知识库问答</strong> → LlamaIndex（索引管理方便，IngestionPipeline 开箱即用）</li>
+          <li><strong>多工具 Agent 场景</strong> → LangChain（Tool/Agent 生态更成熟）</li>
+          <li><strong>已有 LangChain 基础设施</strong> → 继续用 LangChain 加 LlamaIndex 作为文档预处理补充</li>
+          <li><strong>两者不互斥</strong>：很多生产系统用 LlamaIndex 管理索引，用 LangChain 构建 Agent</li>
+        </ul>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>LangChain vs LlamaIndex 场景选型图谱</h5>
+        <pre class="mermaid">flowchart TB
+    Query[查询类型] --> Simple[简单事实问答]
+    Query --> Complex[复杂多步推理]
+    Query --> Multi[多源知识路由]
+
+    Simple -->|索引优先| Llama[推荐 LlamaIndex]
+    Complex -->|Agent 生态| Lang[推荐 LangChain]
+    Multi -->|路由能力| Llama2[推荐 LlamaIndex Router]
+
+    Llama -->|也可集成| Lang2[作为文档预处理补充]
+    Lang -->|也可用| Llama3[LlamaIndex 管理索引]
+
+    style Llama fill:#2E8B57,color:#fff
+    style Lang fill:#4A90D9,color:#fff
+    style Llama2 fill:#2E8B57,color:#fff</pre>
+        <p class="diagram-caption">选型不是二选一，两大框架可互补使用。</p>
+      </div>
     </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li><strong>双框架等效性</strong>：LangChain 和 LlamaIndex 在基础 RAG 场景下性能差异 < 2%，代码量 LlamaIndex 少 46%</li>
-        <li><strong>RouterQueryEngine</strong>：LlamaIndex 内置路由省去手写意图分类，适合多知识库 CorpAssist 场景</li>
-        <li><strong>代码哲学差异</strong>：LangChain 显式链式组装适合调试与自定义，LlamaIndex Index 封装适合快速原型</li>
-        <li><strong>延迟瓶颈相同</strong>：两框架端到端 P95 约 1.9s，其中 LLM 推理占 ~70%，检索仅占 ~3%</li>
-        <li><strong>迁移建议</strong>：新场景用 LlamaIndex 原型，存量 LangChain 逐步并行，CorpAssist 双栈可共存</li>
+        <li><strong>IngestionPipeline 是 ETL 核心</strong>：文档解析→切分→嵌入→索引的全流程自动化，支持缓存和增量更新。</li>
+        <li><strong>Query Engine 封装检索与生成</strong>：5 种 ResponseMode 适应不同场景，HyDE 变换可提升检索质量。</li>
+        <li><strong>Router 实现多策略路由</strong>：按问题类型自动路由到不同索引，LLM/Pydantic 选择器各有优劣。</li>
+        <li><strong>LangChain vs LlamaIndex</strong>：索引管理 LlamaIndex 胜出，Agent/Tool 生态 LangChain 更丰富。</li>
+        <li><strong>两者可互补</strong>：生产环境常见组合 LlamaIndex 索引 + LangChain Agent 管线。</li>
       </ul>
     </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist"><h4>过关清单</h4><ul>
-        <li><label><input type="checkbox"> 能用 LlamaIndex 完成等效于 LangChain 的 RAG 管线</label></li>
-        <li><label><input type="checkbox"> 能跑基准测试并解读两框架的性能差异</label></li>
-        <li><label><input type="checkbox"> 能说出 RouterQueryEngine 适用的业务场景</label></li>
-        <li><label><input type="checkbox"> 能基于决策表给出框架选型建议</label></li>
-        <li><label><input type="checkbox"> 能估算从 LangChain 迁移到 LlamaIndex 的成本</label></li>
-      </ul></div>
-      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
-        <tr><td>VectorStoreIndex</td><td>LlamaIndex 核心索引抽象，封装嵌入+存储+检索</td></tr>
-        <tr><td>QueryEngine</td><td>查询执行引擎，含检索+合成</td></tr>
-        <tr><td>RouterQueryEngine</td><td>基于 LLM 选择子查询引擎的路由器</td></tr>
-        <tr><td>similarity_top_k</td><td>检索返回 TopK 文档数</td></tr>
-        <tr><td>node_postprocessors</td><td>检索后处理器（rerank、过滤）</td></tr>
-        <tr><td>response_mode</td><td>compact/tree_summarize/refine 合成策略</td></tr>
-        <tr><td>Settings</td><td>全局配置（embed_model、llm、chunk_size）</td></tr>
-        <tr><td>SubQuestionQueryEngine</td><td>复杂问题拆子问题分别查询合并</td></tr>
-      </table></div>
-      <div class="learn-interview"><h4>面试可能问</h4><details><summary>LlamaIndex 的 Index 和 LangChain 的 VectorStore 在设计理念上有什么本质不同？</summary>
-      <p>Index 是「有状态的智能对象」—— 它记录了文档结构、节点关系、嵌入模型引用，查询时自动编排；VectorStore 是「无状态的存储抽象」—— 只负责向量存储和检索，查询编排由上层链完成。LlamaIndex 的 Index 更接近 ORM 思想，LangChain 的 VectorStore 更接近 DAO 思想。</p>
-      </details>
-      <details><summary>为什么在 CorpAssist 中 LangChain 和 LlamaIndex 可以共存？</summary>
-      <p>两者抽象层次不同：LangChain 用于查询链编排（与 Spring AI 对齐），LlamaIndex 用于索引构建和复杂文档解析。Python 侧内部调用无冲突，输出统一为 answer+sources 契约。共存策略让各框架发挥各自优势。</p>
-      </details>
-      <details><summary>RouterQueryEngine 的底层实现原理是什么？</summary>
-      <p>它本质上是 LLM 驱动的选择器：将每个 QueryEngineTool 的 name+description 拼入 system prompt，LLM 根据用户输入选择最匹配的工具。选择结果作为 metadata 返回，再调用对应 QueryEngine。类似 ReAct Agent 的单步路由变体。</p>
-      </details></div>
+      <div class="learn-checklist" data-storage-key="rag-system-py_practice02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="ingestion" /> 能用 IngestionPipeline 构建从文档到索引的完整流程</label></li>
+          <li><label><input type="checkbox" data-id="query-engine" /> 能配置 RetrieverQueryEngine 并选择合适 ResponseMode</label></li>
+          <li><label><input type="checkbox" data-id="router" /> 能使用 RouterQueryEngine 实现多策略查询路由</label></li>
+          <li><label><input type="checkbox" data-id="compare" /> 能说清 LangChain 和 LlamaIndex 各 3 个主要差异</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>IngestionPipeline</td><td>文档 ETL 管线：加载→转换→索引，支持缓存</td></tr>
+                <tr><td>Node</td><td>LlamaIndex 的文档片段单位，携带元数据</td></tr>
+                <tr><td>Query Engine</td><td>封装检索+生成，5 种 ResponseMode</td></tr>
+                <tr><td>ResponseMode.COMPACT</td><td>拼接 top-k node 后单次 LLM 调用，默认模式</td></tr>
+                <tr><td>RouterQueryEngine</td><td>按问题语义路由到不同 Index/Tool</td></tr>
+                <tr><td>HyDE</td><td>假设性文档嵌入，改进零样本检索</td></tr>
+                <tr><td>SimilarityPostprocessor</td><td>按相似度阈值过滤低质量检索结果</td></tr>
+                <tr><td>VectorStoreIndex</td><td>LlamaIndex 的核心索引类型</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>LlamaIndex 的 IngestionPipeline 中 transformations 的执行顺序如何影响索引质量？如果先 Embedding 再切分会怎样？</li>
+              <li>CorpAssist 场景中，如果公司政策经常更新，如何设计索引的增量更新策略？</li>
+              <li>LangChain 的 LCEL 和 LlamaIndex 的 Query Engine 在设计哲学上有何本质不同？什么场景下你应该选择其中一个而不是另一个？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-practice-03-hybrid-retrieval">混合检索实现</a> 将结合 BM25 与向量检索实现混合检索策略。</p>
     </div>
   </div>
-  <div class="official-links content-section"><h3>官方参考</h3><ul>
-    <li><a href="https://docs.llamaindex.ai/en/stable/" target="_blank" rel="noopener">LlamaIndex 官方文档</a></li>
-    <li><a href="https://docs.llamaindex.ai/en/stable/examples/low_level/oss_ingestion/retriever/" target="_blank" rel="noopener">LlamaIndex Retriever 指南</a></li>
-    <li><a href="https://docs.llamaindex.ai/en/stable/examples/query_engine/RouterQueryEngine/" target="_blank" rel="noopener">RouterQueryEngine 示例</a></li>
-    <li><a href="https://python.langchain.com/docs/concepts/lcel/" target="_blank" rel="noopener">LangChain LCEL（对照学习）</a></li>
-  </ul></div>
-  <div class="chapter-practice"><h3>动手练习</h3>
-    <div class="steps-operate"><ol>
-      <li>在 <code>demos/practice-02-llamaindex-rag-lab/</code> 中运行 <code>python llamaindex_hr.py</code>，确认输出 answer + source_nodes</li>
-      <li>修改 <code>similarity_top_k</code> 从 2 升至 8，记录 answer 质量变化和延迟变化</li>
-      <li>为 Legal 知识库创建第二个 QueryEngine，配置 RouterQueryEngine 并测试路由效果</li>
-      <li>运行 <code>python benchmark.py</code> 生成双框架对比报告，解读延迟和召回差异</li>
-    </ol></div>
-    <div class="steps-judgment-list"><details><summary>场景 1：HR 政策查询返回的 answer 准确但缺少引用来源，应如何配置 QueryEngine？</summary>
-      <p>设置 <code>response_mode="compact"</code> 并确保 <code>similarity_top_k>=3</code>。在 response 中通过 <code>source_nodes</code> 字段获取引用。若仍需更详细的引用格式，配置 <code>CitationQueryEngine</code> 或自定义 node_postprocessors。</p>
-    </details>
-    <details><summary>场景 2：RouterQueryEngine 总是路由到同一个知识库不切换，如何调试？</summary>
-      <p>启用 <code>verbose=True</code> 查看 selector 日志，检查 ToolMetadata 的 description 是否包含足够区分度。若 LLM 始终选同一工具，可尝试在 description 中加入反例描述（如「不要用于节假日查询」）缩小分类边界。</p>
-    </details></div>
-    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/practice-02-llamaindex-rag-lab/</p><ul class="demo-acceptance">
-      <li>LlamaIndex QueryEngine 返回非空 response 和 source_nodes</li>
-      <li>基准测试输出含两框架的 P50/P95 延迟对比</li>
-      <li>RouterQueryEngine 至少正确路由 2 个不同知识库</li>
-    </ul></div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/getting_started/starter_example.html" target="_blank" rel="noopener">LlamaIndex 快速入门 — Starter Example</a></li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/loading/ingestion_pipeline/" target="_blank" rel="noopener">IngestionPipeline 官方文档 — 完整配置参考</a></li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/deploying/query_engine/" target="_blank" rel="noopener">Query Engine 指南 — 模式与参数</a></li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/low_level/router/" target="_blank" rel="noopener">Router Query Engine 示例 — 多策略路由</a></li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/querying/response_synthesizers/" target="_blank" rel="noopener">Response Synthesizer 对比 — 5 种模式详解</a></li>
+    </ul>
   </div>
-  <div class="resources content-section"><h3>延伸阅读</h3><ul>
-    <li><a href="#ch-practice-03-hybrid-retrieval">下一章：混合检索接入</a></li>
-    <li><a href="https://docs.llamaindex.ai/en/stable/optimizing/production_rag/">LlamaIndex 生产化指南</a></li>
-    <li><a href="https://blog.llamaindex.ai/">LlamaIndex 博客</a></li>
-  </ul></div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">使用 LlamaIndex 为 CorpAssist 构建索引并配置 Query Engine（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>运行 <code>ingestion.py</code> 构建 CorpAssist 文档索引，观察 IngestionPipeline 的缓存机制。</li>
+      <li>用 <code>query_engine.py</code> 测试 COMPACT 和 TREE_SUMMARIZE 两种 ResponseMode 的答案差异。</li>
+      <li>构建至少 3 个子索引（HR/IT/政策），用 <code>router.py</code> 配置 RouterQueryEngine 并测试路由准确性。</li>
+      <li>对比 LlamaIndex 和 LangChain 下相同问题的答案质量和首 token 延迟。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">IngestionPipeline 处理 1000 份 PDF 耗时 15 分钟。第二天新增了 50 份文档。需要重新处理全部 1050 份吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不需要</strong>。IngestionPipeline 支持缓存和增量：设置 <code>IngestionCache</code> 后只有新文档会被处理。需确保文档的 hash 或 mod_time 可唯一标识。增量模式只需处理新增 50 份文档，耗时约 1 分钟。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Router 把 HR 问题错误路由到了 IT 索引。如何改进？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>1) 优化 ToolMetadata 的 description 字段</strong>，提供更明确的关键词和排除词；2) 切换 selector 为 <code>LLMSingleSelector</code> 提高语义理解；3) 在 Router 前加一级关键词预分类器（如「年假/考勤→HR」「故障→IT」），降低 LLM 路由错误率。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：LlamaIndex RAG 实战实验室</h4>
+      <p>目录：<code>demos/practice-02-llamaindex-rag-lab/</code>。<strong>验收</strong>：问答端点返回包含引用来源的回答，Router 能正确区分 HR/IT/政策三类问题。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-hybrid-retrieval">混合检索实现</a> — BM25 + 语义向量融合</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/understanding/comparing_llamaindex_and_langchain/" target="_blank" rel="noopener">LlamaIndex 官方对比 — LlamaIndex vs LangChain</a></li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/loading/node_parsers/" target="_blank" rel="noopener">Node Parser 配置 — 切分策略详解</a></li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/understanding/putting_it_all_together/q_and_a/" target="_blank" rel="noopener">LlamaIndex Q&A 模式 — 全场景示例</a></li>
+    </ul>
+  </div>
 </section>

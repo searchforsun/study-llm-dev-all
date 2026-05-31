@@ -6,7 +6,7 @@
 
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产部署</strong> · 能力：推理 <span class="term" data-term-id="deploy-manifest" tabindex="0">deploy manifest</span>（Service / Ingress / 监控）</p>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产部署</strong> · 能力：推理 <span class="term" data-term-id="deploy-manifest" tabindex="0">deploy manifest</span>（Service / Ingress / 监控）</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
         <p>Compose 适合单机 capstone；CorpAssist 生产多副本 vLLM 要上 K8s。<span class="term" data-term-id="k8s-serve" tabindex="0">k8s serve</span> 要求应用工程师读懂 <span class="term" data-term-id="service-infer" tabindex="0">service infer</span>、<span class="term" data-term-id="ingress-llm" tabindex="0">ingress llm</span> 与 <span class="term" data-term-id="infer-monitor" tabindex="0">infer monitor</span>，并与 <a href="#ch-practice-04-gray">灰度</a> 策略对齐。</p>
@@ -30,64 +30,206 @@
     </div>
 
     <div class="section-block">
-      <h3>Service</h3>
+      <h3>Deployment</h3>
+      <p><span class="term" data-term-id="k8s-serve" tabindex="0">K8s serve</span> 的核心是 Deployment 清单，需声明 GPU 资源请求与节点调度：</p>
+
+      <div class="mermaid-wrap">
+        <h5>K8s 推理访问路径</h5>
+        <pre class="mermaid">flowchart LR
+          IDE[IDE / 用户] --> Ing[Ingress infer.corp.internal]
+          Ing --> Svc[Service vllm-infer]
+          Svc --> Pod1[Pod vLLM]
+          Svc --> Pod2[Pod vLLM]
+          Pod1 --> GPU[GPU Node]
+          Pod2 --> GPU
+          GPU --> N1[NVIDIA A10]
+          GPU --> N2[NVIDIA A10]</pre>
+        <p class="diagram-caption">监控应打在 Ingress 与 Pod 两侧，区分网关排队与 GPU 算力瓶颈。</p>
+      </div>
+
       <div class="code-block">
         <div class="code-toolbar">
           <span class="lang-tag">yaml</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-yaml">apiVersion: v1
+        <pre><code class="language-yaml"># vllm-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-coder
+  namespace: corpassist
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vllm-coder
+  template:
+    metadata:
+      labels:
+        app: vllm-coder
+    spec:
+      nodeSelector:
+        accelerator: nvidia-a10      # 调度到带 GPU 的节点
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          command:
+            - python
+            - -m
+            - vllm.entrypoints.openai.api_server
+          args:
+            - --model
+            - /models/Qwen2.5-Coder-7B-Instruct-AWQ
+            - --quantization
+            - awq
+            - --served-model-name
+            - corp-coder-7b
+            - --max-model-len
+            - "8192"
+            - --gpu-memory-utilization
+            - "0.9"
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: 1        # GPU 资源申请
+              memory: "32Gi"
+              cpu: "8"
+            requests:
+              nvidia.com/gpu: 1
+              memory: "24Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+          livenessProbe:
+            httpGet:
+              path: /v1/models
+              port: 8000
+            initialDelaySeconds: 120   # 冷启动时间长
+            periodSeconds: 30
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: 8000
+            initialDelaySeconds: 60
+            failureThreshold: 30       # 最多等 5 分钟
+      volumes:
+        - name: models
+          hostPath:
+            path: /data/models
+            type: Directory</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="liveness-infer" tabindex="0">liveness infer</span> 启动慢（加载权重），<code>initialDelaySeconds</code> 要大于冷启动时间，避免误杀 Pod。对于 7B AWQ 权重，建议 120s 以上。更稳妥的方式是使用 <code>startupProbe</code>。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>livenessProbe initialDelaySeconds=10，冷启动被误杀</li>
+            <li>不设 nodeSelector，Pod 调度到无 GPU 的节点</li>
+            <li>requests == limits 不留弹性</li>
+            <li>权重通过 initContainer 从外网拉取（离线环境失败）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>startupProbe 宽容（30 次失败），livenessProbe 严格</li>
+            <li>nodeSelector 锁定 GPU 节点池</li>
+            <li>requests &lt; limits 留调度弹性</li>
+            <li>权重通过 hostPath / PV 预先部署</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Pod 一直 CrashLoopBackOff 但手动进入容器 curl 正常，为什么？</summary>
+        <p>liveness 探针配置不当：初始延迟太短或探针间隔太短，导致在模型加载完成前就判定失败。应使用 startupProbe 或加长 initialDelaySeconds。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Service</h3>
+      <p><span class="term" data-term-id="service-infer" tabindex="0">service infer</span> 为双栈客户端提供稳定的集群内 DNS：</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># vllm-service.yaml
+apiVersion: v1
 kind: Service
 metadata:
   name: vllm-infer
   namespace: corpassist
+  labels:
+    app: vllm-coder
 spec:
   selector:
     app: vllm-coder
   ports:
-    - port: 8000
+    - name: http
+      port: 8000
       targetPort: 8000
-  type: ClusterIP</code></pre>
+  type: ClusterIP   # 集群内访问</code></pre>
       </div>
-      <p>双栈客户端：<code>http://vllm-infer.corpassist.svc:8000/v1</code>。多版本灰度时可拆 <code>vllm-v1</code> / <code>vllm-v2</code> 两个 Service，由 Ingress 加权（见 practice-04）。</p>
 
-      <h4>Deployment 片段（GPU）</h4>
+      <p>双栈客户端配置：</p>
       <div class="code-block">
         <div class="code-toolbar">
           <span class="lang-tag">yaml</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-yaml">resources:
-  limits:
-    nvidia.com/gpu: 1
-nodeSelector:
-  accelerator: nvidia-a10
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 120
-  periodSeconds: 30</code></pre>
+        <pre><code class="language-yaml"># Spring AI 指向 K8s Service
+spring:
+  ai:
+    openai:
+      base-url: http://vllm-infer.corpassist.svc.cluster.local:8000/v1
+      api-key: EMPTY
+      chat:
+        options:
+          model: corp-coder-7b</code></pre>
       </div>
-      <p><span class="term" data-term-id="liveness-infer" tabindex="0">liveness infer</span> 启动慢（加载权重），<code>initialDelaySeconds</code> 要大于冷启动时间，避免误杀 Pod。</p>
+
+      <p>多版本灰度时可拆 <code>vllm-v1</code> / <code>vllm-v2</code> 两个 Service，由 Ingress 加权（见 practice-04）。</p>
     </div>
 
     <div class="section-block">
       <h3>Ingress</h3>
-      <p><span class="term" data-term-id="ingress-llm" tabindex="0">Ingress LLM</span> 需放宽<strong>读超时</strong>以支撑 stream； CorpAssist S4 长生成常见 60～180s。</p>
+      <p><span class="term" data-term-id="ingress-llm" tabindex="0">Ingress LLM</span> 需放宽<strong>读超时</strong>以支撑 stream；CorpAssist S4 长生成常见 60～180s。</p>
+
       <div class="code-block">
         <div class="code-toolbar">
           <span class="lang-tag">yaml</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-yaml">apiVersion: networking.k8s.io/v1
+        <pre><code class="language-yaml"># vllm-ingress.yaml
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: infer-gateway
+  namespace: corpassist
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # 灰度发布（配合 practice-04）
+    nginx.ingress.kubernetes.io/canary-by-header: "X-Infer-Canary"
+    nginx.ingress.kubernetes.io/canary-by-header-value: "1"
+    nginx.ingress.kubernetes.io/canary-weight: "5"
 spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - infer.corp.internal
+      secretName: infer-tls
   rules:
     - host: infer.corp.internal
       http:
@@ -101,32 +243,110 @@ spec:
                   number: 8000</code></pre>
       </div>
 
-      <div class="mermaid-wrap">
-        <h5>K8s 推理访问路径</h5>
-        <pre class="mermaid">flowchart LR
-  IDE[IDE / 用户] --> Ing[Ingress infer.corp.internal]
-  Ing --> Svc[Service vllm-infer]
-  Svc --> Pod1[Pod vLLM]
-  Svc --> Pod2[Pod vLLM]
-  Pod1 --> GPU[GPU Node]</pre>
-        <p class="diagram-caption">监控应打在 Ingress 与 Pod 两侧，区分网关排队与 GPU 算力瓶颈。</p>
-      </div>
+      <p>关键注解说明：</p>
+      <ul>
+        <li><code>proxy-read-timeout: 180</code> — SSE 流式等待 180s 不超时</li>
+        <li><code>proxy-body-size: 10m</code> — 长 prompt 请求体可能较大</li>
+        <li><code>canary-weight: 5</code> — 5% 流量导向金丝雀版本后端</li>
+      </ul>
     </div>
 
     <div class="section-block">
       <h3>监控</h3>
       <p><span class="term" data-term-id="infer-monitor" tabindex="0">Infer monitor</span> 最小集：</p>
       <ul>
-        <li>GPU：利用率、显存、温度（DCGM / exporter）</li>
-        <li>API：QPS、P95 TTFT、5xx 率（按 model 版本标签）</li>
-        <li>vLLM：队列长度、KV cache 使用率（若 exporter 可用）</li>
+        <li><strong>GPU</strong>：利用率、显存、温度（DCGM / nvidia-dcgm-exporter）</li>
+        <li><strong>API</strong>：QPS、P95 TTFT、5xx 率（按 model 版本标签）</li>
+        <li><strong>vLLM</strong>：队列长度、KV cache 使用率（<code>/metrics</code> 端点）</li>
+        <li><strong>Pod</strong>：重启次数、OOM 事件</li>
       </ul>
+
       <p><span class="term" data-term-id="hpa-infer" tabindex="0">hpa infer</span> 对 LLM 往往<strong>不灵敏</strong>：GPU 副本扩容慢、权重加载贵。更常见是固定副本 + <a href="#ch-advanced-03-capacity">容量规划</a>，或按队列深度定制 scaler。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># Prometheus ServiceMonitor 采集 vLLM 指标
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm-monitor
+  namespace: corpassist
+spec:
+  selector:
+    matchLabels:
+      app: vllm-coder
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 从 vLLM metrics 读取关键推理指标
+import requests
+
+def get_infer_metrics(base_url="http://vllm:8000"):
+    resp = requests.get(f"{base_url}/metrics")
+    lines = resp.text.split("\n")
+    metrics_of_interest = [
+        "vllm:num_requests_running",
+        "vllm:num_requests_waiting",
+        "vllm:kv_cache_usage",
+        "vllm:prompt_tokens_total",
+        "vllm:generation_tokens_total",
+    ]
+    for line in lines:
+        for metric in metrics_of_interest:
+            if line.startswith(metric) and not line.startswith("#"):
+                print(f"  {line}")
+                break
+
+if __name__ == "__main__":
+    print("vLLM 推理指标:")
+    get_infer_metrics()</code></pre>
+      </div>
 
       <details class="learn-faq">
         <summary>FAQ：HPA 按 CPU 扩容 vLLM 有用吗？</summary>
-        <p>通常无效：瓶颈在 GPU 与 KV 显存。CPU HPA 可能在 GPU 已饱和时仍扩容，浪费调度。</p>
+        <p>通常无效：瓶颈在 GPU 与 KV 显存。CPU HPA 可能在 GPU 已饱和时仍扩容，浪费调度。建议固定副本 + 手动扩容，或基于 vLLM 排队长度定制 scaler。</p>
       </details>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>K8s 部署 vLLM 和 Compose 部署的核心区别是什么？</summary>
+          <div class="learn-faq-body">
+            K8s 提供多副本、自动扩缩容、灰度发布、配置管理（ConfigMap）等高级能力。CorpAssist 生产用 K8s，开发/测试用 Compose。K8s 下 GPU 资源通过 <code>nvidia.com/gpu</code> 调度。
+          </div>
+        </details>
+        <details>
+          <summary>Ingress 超时设 180s 会不会太长？</summary>
+          <div class="learn-faq-body">
+            对于流式场景，180s 是合理的。每次 SSE chunk 间隔通常在 50-200ms，180s 足够生成很长的回答。如果担心连接长期占用，可以在应用层设更短的 idle timeout。
+          </div>
+        </details>
+        <details>
+          <summary>没有 GPU Operator 怎么调度 GPU？</summary>
+          <div class="learn-faq-body">
+            没有 GPU Operator 时，需要手动安装 NVIDIA device plugin。最简单的方式是使用 DaemonSet 部署 nvidia-device-plugin。GPU Operator 提供了更完整的生命周期管理。
+          </div>
+        </details>
+        <details>
+          <summary>如何在 K8s 中做 vLLM 的金丝雀发布？</summary>
+          <div class="learn-faq-body">
+            使用 Nginx Ingress 的 canary 注解（如正文所示），或 Service Mesh 的流量分割（如 Istio VirtualService）。将新版本 vLLM 部署为独立 Deployment，通过 Ingress 权重分发流量。
+          </div>
+        </details>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -140,6 +360,52 @@ spec:
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="llm-serving-for-applications_advanced02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="deployment-yaml" /> 能写出 vLLM Deployment 关键字段</label></li>
+          <li><label><input type="checkbox" data-id="service-dns" /> 能写出 Spring base-url 的 K8s Service DNS 格式</label></li>
+          <li><label><input type="checkbox" data-id="ingress-stream" /> 能配置 Ingress 流式超时和灰度权重</label></li>
+          <li><label><input type="checkbox" data-id="gpu-monitor" /> 能列出 3 个 GPU 推理关键监控指标</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td><span class="term" data-term-id="k8s-serve" tabindex="0">k8s serve</span></td><td>K8s 上部署推理服务</td></tr>
+                <tr><td><span class="term" data-term-id="service-infer" tabindex="0">service infer</span></td><td>集群内推理 Service 稳定 DNS</td></tr>
+                <tr><td><span class="term" data-term-id="ingress-llm" tabindex="0">ingress llm</span></td><td>推理 Ingress，需长超时</td></tr>
+                <tr><td><span class="term" data-term-id="infer-monitor" tabindex="0">infer monitor</span></td><td>推理服务监控</td></tr>
+                <tr><td><span class="term" data-term-id="gpu-node" tabindex="0">gpu node</span></td><td>带 GPU 的 K8s 节点</td></tr>
+                <tr><td><span class="term" data-term-id="hpa-infer" tabindex="0">hpa infer</span></td><td>推理 HPA 扩缩容（LLM 有限适用）</td></tr>
+                <tr><td><span class="term" data-term-id="liveness-infer" tabindex="0">liveness infer</span></td><td>推理服务存活探针</td></tr>
+                <tr><td><span class="term" data-term-id="deploy-manifest" tabindex="0">deploy manifest</span></td><td>K8s 部署清单</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>K8s 上部署 vLLM 推理服务需要哪些核心清单？写关键字段。</li>
+              <li>流式推理场景下 Ingress 需要什么特殊配置？为什么？</li>
+              <li>为什么 HPA 对 LLM 推理扩缩容不灵敏？生产上有什么替代方案？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一章 <a href="#ch-advanced-03-capacity">容量规划入门</a>：副本数与显存粗算。</p>
     </div>
   </div>
@@ -150,6 +416,7 @@ spec:
       <li><a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">Kubernetes Service</a></li>
       <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/" target="_blank" rel="noopener">Kubernetes Ingress</a></li>
       <li><a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/" target="_blank" rel="noopener">NVIDIA GPU Operator</a></li>
+      <li><a href="https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/" target="_blank" rel="noopener">NGINX Ingress Annotations</a></li>
     </ul>
   </div>
 
@@ -159,9 +426,9 @@ spec:
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
       <li>写出 CorpAssist 集群内 Spring 的 <code>base-url</code>（Service DNS 形式）。</li>
-      <li>为 Ingress 设 read-timeout 并说明与 <a href="#ch-practice-03-stream">流式</a> 的关系。</li>
-      <li>列出 3 个应接入 Prometheus 的推理指标名（可自定义）。</li>
-      <li>完成测验 lsfa-a02。</li>
+      <li>为 Ingress 设 read-timeout 并说明与流式的关系。</li>
+      <li>列出 3 个应接入 Prometheus 的推理指标名。</li>
+      <li>编写一个 Python 脚本读取 vLLM metrics 数据。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
@@ -170,9 +437,16 @@ spec:
         <div class="learn-practice-answer">
           <details>
             <summary>参考答案</summary>
-            <div class="learn-practice-answer-body">
-              <p>initialDelay 过短、探针路径错误（应用无 /health）、启动中 GPU 初始化慢；应调 probe 或改用 startupProbe。</p>
-            </div>
+            <div class="learn-practice-answer-body"><p>initialDelay 过短、探针路径错误、启动中 GPU 初始化慢；应调 probe 或改用 startupProbe。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">两个 vLLM Pod 部署在不同 GPU 节点上，但只有一个接收请求。可能原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>Service 的 selector 没有匹配到第二个 Pod（标签不一致），或第二个 Pod 未通过 readiness probe。检查 Pod 标签和探针状态。</p></div>
           </details>
         </div>
       </li>

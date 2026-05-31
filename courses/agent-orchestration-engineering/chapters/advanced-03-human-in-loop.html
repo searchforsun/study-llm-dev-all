@@ -1,0 +1,305 @@
+<section id="ch-advanced-03-human-in-loop" class="chapter" data-chapter="advanced-03-human-in-loop">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>人机协作模式</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-human-in-loop" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产级 Agent</strong> · 能力：设计人机协作系统</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>不是所有决策都应该让 Agent 自己做。涉及资金、合规、用户隐私的操作需要人工确认。<span class="term" data-term-id="human-in-loop" tabindex="0">human in loop</span> 让 Agent 在关键节点暂停，等待人工审批后再继续。LangGraph 的 <code>interrupt_before</code> 机制为此提供了原生支持。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>使用 LangGraph Interrupt/Resume 实现人机协作</li>
+          <li>设计审批流程和审批节点</li>
+          <li>实现审计追踪记录所有决策</li>
+          <li>设计人工转接策略</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Interrupt = 暂停</strong>：在指定节点前暂停执行，等待外部输入。</li>
+          <li><strong>Resume = 恢复</strong>：人工确认后，从暂停点继续执行。</li>
+          <li><strong>审计追踪</strong>：所有中断和恢复操作都需要完整记录。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Interrupt/Resume 机制</h3>
+
+      <p>LangGraph 的 <span class="term" data-term-id="human-in-loop" tabindex="0">human in loop</span> 通过 <code>interrupt_before</code> 参数实现：在执行到指定节点前暂停，保存当前状态，等待外部输入后从断点继续。</p>
+
+      <div class="mermaid-wrap">
+        <h5>人机协作流程图</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant Agent as Agent
+    participant Human as 审批人
+    participant System as 系统
+
+    Agent->>Agent: 思考：需要执行 refund 工具
+    Agent->>System: interrupt_before("tools")
+    System->>Human: 发送审批请求\n[工具: refund, 参数: T001]
+    Human-->>System: 审批通过
+    System->>Agent: resume() 继续执行
+    Agent->>Agent: 执行 refund 工具
+    Agent-->>Human: 退款成功</pre>
+        <p class="diagram-caption">Agent 在高危工具前中断，等待人工审批通过后继续执行。</p>
+      </div>
+
+      <h4>Python：Interrupt/Resume 实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from langgraph.graph import StateGraph, END
+from langgraph.checkpoint import MemorySaver
+
+# 定义需要审批的工具
+APPROVAL_REQUIRED_TOOLS = ["refund_order", "delete_order", "transfer_money"]
+
+def tool_node_with_approval(state: AgentState) -> AgentState:
+    """需要审批的工具节点"""
+    last_message = state["messages"][-1]
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call["name"]
+        if tool_name in APPROVAL_REQUIRED_TOOLS:
+            # 保存审批请求信息到 state
+            state["pending_approval"] = {
+                "tool": tool_name,
+                "args": tool_call["args"],
+                "status": "pending"
+            }
+            # 触发 interrupt_before 会在此处暂停
+            # 等待人工审批
+        result = execute_tool(tool_call)
+        state["messages"].append({"role": "tool", "content": str(result)})
+    return state
+
+# 构建图，设置中断
+graph = StateGraph(AgentState)
+graph.add_node("agent", agent_node)
+graph.add_node("tools", tool_node_with_approval)
+graph.set_entry_point("agent")
+graph.add_conditional_edges(
+    "agent",
+    should_continue,
+    {"tools": "tools", "end": END}
+)
+graph.add_edge("tools", "agent")
+
+# 编译时指定中断位置
+app = graph.compile(
+    checkpointer=MemorySaver(),
+    interrupt_before=["tools"]  # 在 tools 节点前中断
+)
+
+# 执行
+config = {"configurable": {"thread_id": "session_001"}}
+# 第一次 invoke：Agent 思考后会中断在 tools 前
+result = app.invoke({"messages": [user_msg]}, config)
+
+# 查看中断状态
+pending = result.get("pending_approval")
+if pending:
+    print(f"等待审批：{pending['tool']} - {pending['args']}")
+    # 人工审批通过后
+    app.update_state(config, {"pending_approval": {"status": "approved"}})
+    # 恢复执行
+    result = app.invoke(None, config)</pre>
+      </div>
+
+      <h4>审批流程设计</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>审批级别</th><th>触发条件</th><th>审批人</th><th>超时处理</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>L1 自动审批</td><td>查询类操作、非敏感信息</td><td>无需审批</td><td>-</td></tr>
+          <tr><td>L2 快速审批</td><td>退款 < 100 元、创建工单</td><td>值班客服</td><td>5 分钟超时自动拒绝</td></tr>
+          <tr><td>L3 高级审批</td><td>退款 > 1000 元、删除数据</td><td>部门经理</td><td>30 分钟超时转备选</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>审计追踪</h3>
+
+      <p>每一次人机交互都需要完整记录，用于合规审查和问题追溯。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">class AuditLogger:
+    """审计日志记录器"""
+
+    def log_interrupt(self, session_id: str, node: str, state: dict):
+        """记录中断事件"""
+        audit_entry = {
+            "event_type": "interrupt",
+            "session_id": session_id,
+            "node": node,
+            "state_snapshot": state,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self._write(audit_entry)
+
+    def log_resume(self, session_id: str, decision: str, reviewer: str):
+        """记录恢复事件"""
+        audit_entry = {
+            "event_type": "resume",
+            "session_id": session_id,
+            "decision": decision,  # approved / rejected
+            "reviewer": reviewer,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self._write(audit_entry)
+
+    def _write(self, entry: dict):
+        # 写入数据库或日志系统
+        audit_db.insert(entry)
+        logger.info(f"AUDIT: {json.dumps(entry, ensure_ascii=False)}")</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>人工转接策略</h3>
+
+      <p>当 Agent 无法处理用户请求时，需要智能地转接人工。以下策略决定何时转接：</p>
+
+      <div class="mermaid-wrap">
+        <h5>转人工决策树</h5>
+        <pre class="mermaid">flowchart TD
+    Q1[Agent 是否能理解用户意图？] -->|否| Transfer[转人工]
+    Q1 -->|是| Q2[是否在已有工具能力范围内？]
+    Q2 -->|否| Transfer
+    Q2 -->|是| Q3[工具调用是否连续失败？]
+    Q3 -->|是| Transfer
+    Q3 -->|否| Q4[用户是否要求转人工？]
+    Q4 -->|是| Transfer
+    Q4 -->|否| Continue[Agent 继续处理]</pre>
+        <p class="diagram-caption">转人工决策树确保 Agent 在能力不足时及时升级，避免让用户等待过久。</p>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Agent 耗尽步数后直接报错</li>
+            <li>所有操作都要求人工确认</li>
+            <li>无审计日志，无法追溯决策过程</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Agent 无法处理时优雅转人工</li>
+            <li>仅高危操作需人工确认</li>
+            <li>全量审计日志可追溯</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>中断后 Agent 的状态会丢失吗？</summary>
+          <div class="learn-faq-body">不会。LangGraph 的 Checkpoint 机制在中断时自动保存完整状态。恢复时从 Checkpoint 加载状态，从断点继续执行。即使进程重启，只要使用持久化 Checkpoint（如 SqliteSaver、RedisSaver），状态也不会丢失。</div>
+        </details>
+        <details>
+          <summary>审批超时后应该怎么处理？</summary>
+          <div class="learn-faq-body">超时策略取决于业务场景：① 查询类操作可以自动超时通过（返回已存在的数据）；② 资金类操作应该超时拒绝并通知用户；③ 关键操作可以升级到更高审批层级。建议在审批请求中明确标注超时策略。</div>
+        </details>
+        <details>
+          <summary>转人工时如何保证上下文完整传递？</summary>
+          <div class="learn-faq-body">转人工时需要将完整对话历史、Agent 推理轨迹、已调用的工具结果打包传递给人工客服。可以序列化为 JSON 格式，在客服系统中展示 Agent 的决策链。建议包含 Agent 的思考过程，帮助客服快速理解背景。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Interrupt/Resume</strong>：LangGraph 原生支持，在高危操作前中断等待审批。</li>
+        <li><strong>审批分级</strong>：L1 自动、L2 快速、L3 高级，根据操作风险级别设置。</li>
+        <li><strong>审计追踪</strong>：完整记录每次中断和恢复操作，用于合规审查。</li>
+        <li><strong>转人工策略</strong>：决策树决定何时转接，保证上下文完整传递。</li>
+        <li><strong>Checkpoint</strong>：中断时保存完整状态，恢复时不丢失上下文。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_advanced03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="interrupt-resume" /> 能实现 Interrupt/Resume 机制</label></li>
+          <li><label><input type="checkbox" data-id="approval-flow" /> 能设计审批分级流程</label></li>
+          <li><label><input type="checkbox" data-id="audit-log" /> 能实现审计日志记录</label></li>
+          <li><label><input type="checkbox" data-id="transfer-strategy" /> 能设计转人工策略</label></li>
+          <li><label><input type="checkbox" data-id="state-restore" /> 理解中断恢复的状态保存机制</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Interrupt</td><td>Agent 执行过程中暂停等待外部输入</td></tr>
+                <tr><td>Resume</td><td>从中断点恢复执行</td></tr>
+                <tr><td>Human Approval</td><td>人工审批确认操作</td></tr>
+                <tr><td>Audit Trail</td><td>完整的人机交互记录</td></tr>
+                <tr><td>Escalation</td><td>升级到人工处理</td></tr>
+                <tr><td>Approval Gate</td><td>审批关卡节点</td></tr>
+                <tr><td>Pending State</td><td>等待审批的状态</td></tr>
+                <tr><td>Context Transfer</td><td>转人工时上下文传递</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>LangGraph 的 Interrupt/Resume 机制是如何工作的？和传统的工作流引擎有什么不同？</li>
+              <li>设计一个包含三级审批的人机协作系统，要求说明每级的触发条件和超时策略。</li>
+              <li>转人工时如何保护用户隐私的同时又能让客服快速理解上下文？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-04-mcp-a2a">MCP 与 A2A 协议</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://langchain-ai.github.io/langgraph/how-tos/human_in_the_loop/" target="_blank" rel="noopener">LangGraph Human-in-the-Loop</a></li>
+      <li><a href="https://java2ai.com/docs/dev/agents/interrupt/" target="_blank" rel="noopener">Spring AI Alibaba Interrupt</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p>目录：<code>demos/advanced-03-human-in-loop-lab/</code>。<strong>验收</strong>：Agent 在高危工具前正确中断，审批通过后恢复执行。</p>
+  </div>
+</section>

@@ -1,46 +1,344 @@
 <section id="ch-practice-06-production-pitfalls" class="chapter" data-chapter="practice-06-production-pitfalls">
-  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>生产坑：DST、确定性与高并发</h2>
-  <button type="button" class="btn-mark-done" data-chapter="practice-06-production-pitfalls" aria-label="标记本章完成">标记完成</button></header>
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>生产坑：DST、确定性与高并发</h2><button type="button" class="btn-mark-done" data-chapter="practice-06-production-pitfalls">标记完成</button></header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：DST 双校验、意图→API 不回写幻觉、截图分级、缓存小模型</p>
-      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>S2 四大生产坑专章；面试必考。</p></div>
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>双栈落地实战</strong> · 能力：DST 双校验、API 不回写幻觉、截图分级路由、缓存与小模型</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>S2 四大生产坑：纯 LLM 管状态幻觉改单、意图→API 结果 LLM 编造、截图全量调 VL 模型烧钱、高 QPS 直通大模型排队。每个坑都会在生产环境造成真金白银的损失。CorpAssist 上线第一周就踩了其中三个，本章复盘这些坑的根因和修复方案。</p></div>
       <div class="notice notice-outcome"><strong>学完你能</strong><ul>
-        <li>在 CorpAssist S2 智能客服场景端到端落地</li>
-        <li>贯通意图路由、工具、转人工与评测</li>
-        <li>完成 Demo 与测验</li></ul></div>
+        <li>用 <span class="term" data-term-id="dst-dual-check" tabindex="0">DST 双校验</span> 防止 LLM 幻觉改单（规则 + LLM 双重提取）</li>
+        <li>强制 API 结果写回而非 LLM 编造，消除 tool call hallucination</li>
+        <li>用 <span class="term" data-term-id="screenshot-tier" tabindex="0">截图分级路由</span> 节省 70% 视觉模型成本</li>
+        <li>用 <span class="term" data-term-id="cache-small-model" tabindex="0">缓存 + 小模型</span> 应对高并发冲击</li>
+      </ul></div>
+      <div class="notice"><strong>本章先记住 3 件事</strong><ul>
+        <li><strong>DST 不能只靠 LLM</strong>：规则校验每一轮 LLM 提取的槽位，intent 变更时清理旧槽位。</li>
+        <li><strong>API 结果写回，不是 LLM 复述</strong>：<span class="term" data-term-id="api-not-hallucinate" tabindex="0">api not hallucinate</span> 要求工具调用的结果以模板格式化后直接展示。</li>
+        <li><strong>高并发靠缓存 + 小模型</strong>：FAQ 语义缓存 ≥60% 命中率，小模型处理 80% 请求。</li>
+      </ul></div>
     </div>
-    <div class="section-block"><h3>DST 与确定性</h3><p>slots 规则校验；API 结果写回 state 非 LLM 编造。 关联：<span class="term" data-term-id="dst-dual-check" tabindex="0">dst dual check</span>、<span class="term" data-term-id="api-not-hallucinate" tabindex="0">api not hallucinate</span>。</p></div>
-    <div class="section-block"><h3>截图与高并发</h3><p>截图先分类再选模型；FAQ 缓存+turbo。 关联：<span class="term" data-term-id="screenshot-tier" tabindex="0">screenshot tier</span>、<span class="term" data-term-id="cache-small-model" tabindex="0">cache small model</span>。</p></div>
-    <div class="section-block"><h3>关键术语</h3><p><span class="term" data-term-id="dst-dual-check" tabindex="0">dst dual check</span> · <span class="term" data-term-id="api-not-hallucinate" tabindex="0">api not hallucinate</span> · <span class="term" data-term-id="screenshot-tier" tabindex="0">screenshot tier</span> · <span class="term" data-term-id="cache-small-model" tabindex="0">cache small model</span> · <span class="term" data-term-id="pitfall-s2" tabindex="0">pitfall s2</span> · <span class="term" data-term-id="deterministic-slot" tabindex="0">deterministic slot</span> · <span class="term" data-term-id="vision-routing" tabindex="0">vision routing</span> · <span class="term" data-term-id="high-qps-cs" tabindex="0">high qps cs</span></p></div>
-    <div class="section-block"><h3>示例</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-      <pre><code class="language-markdown">## S2 生产坑
-1. 纯 LLM 管状态 → 结构化 DST
-2. 幻觉改单 → 工具真执行+回写
-3. 截图直接 VL → 分级路由
-4. 高 QPS → 语义缓存+小模型</code></pre></div>
-      <div class="mermaid-wrap"><h5>生产坑：DST、确定性与高并发</h5>
-      <pre class="mermaid">flowchart LR
-  User --> Intent[意图路由]
-  Intent --> Agent[客服 Agent]
-  Agent --> Tools[订单工具]
-  Agent --> Human[人工坐席]</pre></div>
+
+    <div class="section-block">
+      <h3>四大生产坑详解</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 生产事故复盘</span>
+        上线第一周，用户说「改地址」→ Agent 收集了 order_id 和 new_address → 用户下一个问题说「其实钱怎么退」→ Agent 的 DST 没清理旧槽位，把「退款」意图和「改地址」的槽位混在一起，调用 refund 工具时传错了参数。这就是典型的幻觉改单。
+      </aside>
+
+      <table class="outline-table"><thead><tr><th>坑</th><th>现象</th><th>根因</th><th>解决方案</th></tr></thead>
+      <tbody>
+        <tr><td>DST 幻觉改单</td><td>用户说改地址后问退款，intent 变了但旧槽位没清</td><td>纯 LLM 提取槽位无规则校验</td><td><span class="term" data-term-id="deterministic-slot" tabindex="0">确定性槽位</span> + intent 变更时清理全部旧槽位</td></tr>
+        <tr><td>API 结果被 LLM 重写</td><td>工具返回「退款成功」但 LLM 说「退款已驳回」</td><td>LLM 基于前文编造了结果</td><td>API 结果强制写回，LLM 只做格式化不修改内容</td></tr>
+        <tr><td>截图无差别调 VL</td><td>所有图片都调 qwen-vl-max 分析</td><td>未按复杂度分级选模型</td><td><span class="term" data-term-id="vision-routing" tabindex="0">视觉路由</span>：分类 → 按复杂度选模型</td></tr>
+        <tr><td>高 QPS 无缓存</td><td>相同 FAQ 每次重新调 LLM</td><td>无语义缓存</td><td>FAQ 语义缓存 + qwen-turbo 处理 80% 请求</td></tr>
+      </tbody></table>
+
+      <div class="mermaid-wrap"><h5>四大坑的症状与修复</h5><pre class="mermaid">flowchart TB
+    subgraph DST["坑1: DST 幻觉改单"]
+        A1[用户切换意图] --> B1[旧槽位残留]
+        B1 --> C1[工具调用参数错误]
+    end
+    subgraph API["坑2: API 结果被重写"]
+        A2[ERP 返回成功] --> B2[LLM 说失败]
+        B2 --> C2[用户投诉/工单错误]
+    end
+    subgraph VL["坑3: 截图烧钱"]
+        A3[所有图片] --> B3[qwen-vl-max]
+        B3 --> C3[成本飙升 5x]
+    end
+    subgraph QPS["坑4: 高并发"]
+        A4[1k QPS] --> B4[大模型排队]
+        B4 --> C4[延迟 10s+]
+    end
+    DST & API & VL & QPS</pre><p class="diagram-caption">四大坑都源于对 LLM 能力的过度信任。修复的核心思路：用确定性逻辑约束 LLM 的输出。</p></div>
+
+      <h4>Python：DST 双校验实现</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy">复制</button></div>
+<pre><code class="language-python"># dst_validator.py — DST 双校验：LLM 提取 + 规则校验
+import re
+from typing import Dict, Any
+
+class DSTValidator:
+    """DST 双校验器：LLM 提取槽位后，用规则校验合法性"""
+
+    INTENT_SCHEMA = {
+        "refund": {"required": ["order_id", "amount"], "optional": ["reason"]},
+        "change_address": {"required": ["order_id", "new_address"], "optional": ["contact_phone"]},
+        "query_order": {"required": ["order_id"], "optional": []},
+    }
+
+    def __init__(self):
+        self.current_intent = None
+        self.slots = {}
+        self.last_intent = None
+
+    def update(self, new_intent: str, new_slots: Dict[str, Any]) -> Dict[str, Any]:
+        """更新 DST 状态，含意图切换检测和槽位校验"""
+        # 意图切换检测
+        if self.current_intent and new_intent != self.current_intent:
+            print(f"[DST] 意图切换: {self.current_intent} → {new_intent}")
+            self._clear_slots_for_intent(new_intent)
+
+        self.last_intent = self.current_intent
+        self.current_intent = new_intent
+
+        # 合并新槽位
+        for k, v in new_slots.items():
+            self.slots[k] = v
+
+        # 校验合法性
+        self._validate()
+
+        return self.slots
+
+    def _clear_slots_for_intent(self, new_intent: str):
+        """切换意图时清理无关槽位"""
+        required_for_new = self.INTENT_SCHEMA.get(new_intent, {}).get("required", [])
+        optional_for_new = self.INTENT_SCHEMA.get(new_intent, {}).get("optional", [])
+        allowed = set(required_for_new + optional_for_new)
+        self.slots = {k: v for k, v in self.slots.items() if k in allowed}
+        print(f"[DST] 清理槽位，保留: {allowed}")
+
+    def _validate(self):
+        """规则校验槽位值"""
+        for k, v in self.slots.items():
+            if k == "order_id" and not re.match(r"^O\d{8}$", str(v)):
+                print(f"[DST] 警告: order_id 格式异常 {v}")
+                del self.slots[k]
+            if k == "amount":
+                try:
+                    amt = float(v)
+                    if amt <= 0 or amt > 99999.99:
+                        del self.slots[k]
+                except (ValueError, TypeError):
+                    del self.slots[k]
+            if k == "contact_phone" and not re.match(r"^1\d{10}$", str(v)):
+                del self.slots[k]
+
+    def get_required_missing(self) -> list:
+        """返回缺失的必填字段"""
+        schema = self.INTENT_SCHEMA.get(self.current_intent, {})
+        required = schema.get("required", [])
+        return [f for f in required if f not in self.slots]
+
+    def is_ready(self) -> bool:
+        """所有必填字段是否已收集"""
+        return len(self.get_required_missing()) == 0
+
+
+validator = DSTValidator()
+# 模拟场景：用户先改地址，后切换退款
+validator.update("change_address", {"order_id": "O2025001", "new_address": "北京朝阳"})
+print(f"当前槽位: {validator.slots}")  # 含 order_id, new_address
+validator.update("refund", {"amount": 299})
+print(f"意图切换后槽位: {validator.slots}")  # 不含 new_address
+print(f"缺失字段: {validator.get_required_missing()}")
+
+# API 结果强制写回
+def tool_result_formatter(tool_name: str, result: dict) -> str:
+    """工具结果模板化写回，LLM 不修改内容"""
+    templates = {
+        "refund": "退款成功：订单 {order_id}，金额 ¥{amount}，预计 {days} 个工作日到账。",
+        "address": "地址修改成功：{order_id} → {new_address}",
+    }
+    tmpl = templates.get(tool_name, str(result))
+    return tmpl.format(**result)
+
+print(tool_result_formatter("refund", {"order_id": "O2025001", "amount": 299, "days": 3}))</code></pre></div>
+
+      <h4>Java Spring 侧：截图分级路由</h4>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy">复制</button></div>
+<pre><code class="language-java">// VisionRouter.java — 截图分级路由
+@Component
+public class VisionRouter {
+
+    enum Complexity { SIMPLE, MEDIUM, COMPLEX }
+    enum ModelTier { TURBO, PLUS, MAX }
+
+    private final Map&lt;ModelTier, String&gt; modelMap = Map.of(
+        ModelTier.TURBO, "qwen-vl-turbo",
+        ModelTier.PLUS, "qwen-vl-plus",
+        ModelTier.MAX, "qwen-vl-max"
+    );
+
+    public ModelTier route(String imageUrl) {
+        Complexity complexity = classifyComplexity(imageUrl);
+        return switch (complexity) {
+            case SIMPLE -> ModelTier.TURBO;   // ¥0.003/次，60% 流量
+            case MEDIUM -> ModelTier.PLUS;    // ¥0.008/次，30% 流量
+            case COMPLEX -> ModelTier.MAX;    // ¥0.02/次，10% 流量
+        };
+    }
+
+    private Complexity classifyComplexity(String imageUrl) {
+        // 简化版：按图片尺寸分类（生产用更复杂的分类器）
+        // SIMPLE: 文字截图 &lt; 200KB
+        // MEDIUM: 含简单表格 200KB-1MB
+        // COMPLEX: 复杂场景图 &gt; 1MB
+        return Complexity.SIMPLE;  // 示例返回
+    }
+
+    public String analyze(String imageUrl) {
+        ModelTier tier = route(imageUrl);
+        String model = modelMap.get(tier);
+        // 调用 VL 模型
+        return String.format("使用 %s 分析，成本 ¥%.3f", model, tier.ordinal() == 0 ? 0.003 : tier.ordinal() == 1 ? 0.008 : 0.02);
+    }
+}
+
+// CacheConfig.java — 语义缓存配置
+@Configuration
+public class CacheConfig {
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory factory) {
+        RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofHours(1))
+            .prefixCacheNameWith("faq:");
+        return RedisCacheManager.builder(factory).cacheDefaults(config).build();
+    }
+}</code></pre></div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>纯 LLM 管理全部 DST 状态，无规则约束</li>
+            <li>LLM 无约束地转述工具调用结果</li>
+            <li>所有图片用最强模型分析</li>
+            <li>FAQ 请求全部走 gpt-4o 推理</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>LLM 提取 + 规则校验 + intent 变更清旧槽</li>
+            <li>工具结果模板化，LLM 仅做格式编排</li>
+            <li>截图分级：简单用 turbo (60%)，复杂用 max (10%)</li>
+            <li>缓存 + qwen-turbo 处理 80% 请求</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：生产环境中 intent 变更检测的准确率怎么保证？</summary>
+        <p>不能只靠 LLM 自己说「intent 变了」。CorpAssist 的做法是：1) 规则层检测关键词变化（如新消息中出现「退款」但之前是「改地址」→ 标记变更）；2) 模型层对比新旧消息的 embedding 相似度，骤降说明 topic shift；3) 坐席确认——intent 变更时主动问用户「您是要切换到另一个问题吗？」。</p>
+      </details>
     </div>
-    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3>
-    <ul class="chapter-conclusions-list"><li>DST 双校验、意图→API 不回写幻觉、截图分级、缓存小模型</li>
-    <li>下一步：网关、限流与 7×24 运维</li></ul></div>
+
+    <div class="section-block">
+      <h3><span class="term" data-term-id="pitfall-s2" tabindex="0">Pitfall S2</span> 上线检查清单</h3>
+      <p><span class="term" data-term-id="pitfall-s2" tabindex="0">pitfall s2</span> 是 CorpAssist 要求新版本上线前必须走完的四项检查清单，覆盖本章的四个坑。</p>
+      <table class="outline-table">
+        <thead><tr><th>检查项</th><th>检查内容</th><th>验收标准</th></tr></thead>
+        <tbody>
+          <tr><td>DST 双校验</td><td>规则层校验每轮提取的槽位格式；intent 变更时清旧槽</td><td>测试 10 次 intent 变更，均正确清理</td></tr>
+          <tr><td>API 不重写</td><td>工具结果模板化写回，LLM 不修改结果内容</td><td>对比 50 条工具结果的 LLM 输出和原始结果</td></tr>
+          <tr><td>截图分级</td><td>按复杂度选择 VL 模型，跟踪各级别占比</td><td>turbo ≥60%, plus ≤30%, max ≤10%</td></tr>
+          <tr><td>缓存 + 小模型</td><td>FAQ 语义缓存命中率 ≥60%，小模型占比 ≥80%</td><td>P99 延迟 &lt; 2s, 单次成本 &lt; ¥0.005</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>DST 双校验和纯规则 DST 有什么区别？</summary>
+          <div class="learn-faq-body">纯规则 DST 要求每条规则精确匹配，覆盖率低。双校验是「LLM 提取 + 规则验证」：LLM 负责从自然语言中提取槽位（高召回），规则负责校验槽位格式和业务逻辑（高精度），两者互补。</div>
+        </details>
+        <details>
+          <summary>截图分级会不会漏掉重要的视觉信息？</summary>
+          <div class="learn-faq-body">分级的目标是「大多数用便宜模型，少数复杂场景用贵模型」。分级分类器本身会用 qwen-vl-plus 做校准：如果 turbo 模型的输出置信度低于 0.7，自动升级到 plus 或 max 重新分析。确保不会因为省钱而降低质量。</div>
+        </details>
+        <details>
+          <summary>语义缓存的相似度阈值设多少合适？</summary>
+          <div class="learn-faq-body">CorpAssist 的实践是 0.92。太高（如 0.98）命中率太低，太低（如 0.85）容易命中语义相近但答案不同的内容。建议在生产用 0.90-0.95 之间调试，同时缓存 key 包含意图标签以减少误命中。</div>
+        </details>
+        <details>
+          <summary>高 QPS 场景下如果缓存全失效怎么办？</summary>
+          <div class="learn-faq-body">缓存雪崩是真实风险。防护措施：1) 缓存 key 的 TTL 加随机偏移（±10% 避免同时过期）；2) 本地缓存兜底（Caffeine，1000 条容量）；3) 如果 QPS 超过模型配额，开启弹性降级——转人工而非排队等待模型。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>DST 双校验</strong>：LLM 提取 + 规则校验双保险，intent 变更时清理旧槽位。</li>
+        <li><strong>API 不重写</strong>：工具结果模板化写回，消除 LLM 转述幻觉。</li>
+        <li><strong>截图分级</strong>：turbo 60% + plus 30% + max 10%，节省 70% 视觉成本。</li>
+        <li><strong>缓存 + 小模型</strong>：语义缓存 ≥60% 命中率，小模型处理 ≥80% 请求。</li>
+        <li><strong>上线检查清单</strong>：四项检查覆盖四大坑，每次上线前必须走完。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <div class="learn-checklist" data-storage-key="scenario-enterprise-customer-service_practice06">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="dst-trap" /> 知道 DST 幻觉改单的根因和双校验方案</label></li>
+          <li><label><input type="checkbox" data-id="api-truth" /> 知道 API 结果强制写回的控制方法</label></li>
+          <li><label><input type="checkbox" data-id="screenshot" /> 知道截图三级分级策略和成本对比</label></li>
+          <li><label><input type="checkbox" data-id="cache" /> 知道语义缓存 + 本地缓存 + 弹性降级的雪崩应对</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet"><details><summary>本章速查卡</summary><div class="learn-cheat-body"><table>
+        <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+        <tbody>
+          <tr><td>DST Dual Check</td><td>LLM 提取 + 规则校验双保险</td></tr>
+          <tr><td>API Not Hallucinate</td><td>工具结果模板化写回，LLM 不修改</td></tr>
+          <tr><td>Screenshot Tier</td><td>截图分级：turbo/plus/max 三级</td></tr>
+          <tr><td>Cache Small Model</td><td>语义缓存 + qwen-turbo 分流</td></tr>
+          <tr><td>Pitfall S2</td><td>四大生产坑上线检查清单</td></tr>
+          <tr><td>Deterministic Slot</td><td>确定性槽位校验：格式 + 业务规则</td></tr>
+          <tr><td>Vision Routing</td><td>视觉路由：按复杂度选 VL 模型</td></tr>
+          <tr><td>High QPS CS</td><td>高并发方案：缓存 → 小模型 → 弹性降级</td></tr>
+        </tbody>
+      </table></div></details></div>
+
+      <div class="learn-interview">
+        <details><summary>答辩 / 面试口述题</summary><div class="learn-interview-body"><ol>
+          <li>客服系统中最容易出现的三类生产事故是什么？请描述各自的根因和修复方案。</li>
+          <li>意图切换时 DST 状态如何管理？如果不清空旧槽位会有什么后果？请用具体例子说明。</li>
+          <li>高 QPS 场景下如何保证客服 Bot 的响应延迟不超标？请从缓存、模型选择、降级三个角度回答。</li>
+        </ol></div></details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；下一章 <a href="#ch-advanced-01-gateway">网关、限流与 7x24 运维</a> 将学习生产化运维。</p>
+    </div>
   </div>
-  <div class="official-links content-section"><h3>官方文档</h3><ul>
-    <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a></li>
-    <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI Tools</a></li>
-  </ul></div>
+
   <div class="chapter-practice"><h3>动手练习</h3>
-  <ol class="steps steps-operate"><li>完成 <code>demos/practice-06-production-pitfalls-lab/</code></li>
-  <li>写一条 S2 客服落地笔记</li><li>完成测验</li></ol>
-  <div class="demo-box"><h4 class="demo-box-title">Demo：生产坑：DST、确定性与高并发</h4>
-  <p><code>demos/practice-06-production-pitfalls-lab/</code> — 填两行 pitfall</p></div></div>
+    <p class="steps-intro">用 CorpAssist 生产坑场景，完成各项修复实现（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>实现 DSTValidator，验证 intent 变更时自动清理旧槽位。</li>
+      <li>实现 tool_result_formatter，确保工具结果模板化写回。</li>
+      <li>设计截图分级策略（turbo/plus/max 三级），估算成本节省。</li>
+      <li>实现 SemanticCache 类，设置 0.92 相似度阈值。</li>
+      <li>走完 Pitfall S2 上线检查清单的四项验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+    <li>
+      <p class="judgment-stem">生产监控发现截图分析日均成本从 ¥200 涨到 ¥800，你怎么排查？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p><strong>三步排查</strong>：1) 检查截图分级各级流量占比——如果 max 从 10% 涨到 50%，说明分级分类器有问题；2) 检查是否有新的截图来源（如新功能上传了高清图片）；3) 检查是否有攻击——恶意用户上传超大图片耗尽配额。修复：升级分级分类器 + 限制单图大小 + 限流。</p></div>
+        </details>
+      </div>
+    </li>
+    </ol>
+    <div class="demo-box"><h4 class="demo-box-title">Demo：生产坑</h4><p>目录：<code>demos/practice-06-production-pitfalls-lab/</code>。<strong>验收</strong>：DST 双校验通过测试、截图分级成本降低 70%。</p></div>
+  </div>
+
   <div class="resources content-section"><h3>延伸学习</h3><ul>
-    <li><a href="#ch-advanced-01-gateway">网关、限流与 7×24 运维</a></li>
+    <li><strong>下一章</strong>：<a href="#ch-advanced-01-gateway">网关、限流与 7x24 运维</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/Cache_stampede" target="_blank" rel="noopener">Wikipedia — 缓存雪崩与穿透</a></li>
+    <li><a href="https://semgrep.dev/docs/" target="_blank" rel="noopener">Semgrep — 代码安全扫描</a></li>
   </ul></div>
 </section>

@@ -1,5 +1,12 @@
-# Demo：路由效果评测
+# Demo: 路由效果评测
 
-[章节](../../index.html#ch-basics-04-eval-routing)
+关联章节: [路由效果评测](../chapters/basics-04-eval-routing.html)
 
-勾选 eval-checklist
+## 场景
+用 Golden Set 评测路由策略。
+
+## 文件
+- `eval-checklist.md` — 评测清单
+
+## 验证
+设计 5 条 Golden Set prompt, 运行评测脚本记录通过率和成本。

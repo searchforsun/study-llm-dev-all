@@ -1,0 +1,370 @@
+<section id="ch-advanced-01-observability" class="chapter" data-chapter="advanced-01-observability">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent 可观测性</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-observability" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>生产级 Agent</strong> · 能力：建立 Agent 可观测体系</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 的决策过程是非确定性的——同样的输入可能产生不同的输出。传统的日志监控无法捕捉 Agent 的推理轨迹。<span class="term" data-term-id="observability" tabindex="0">observability</span> 通过 Trace、Metrics 和 Logging 三大支柱让 Agent 的内部决策过程透明化，是生产 Agent 不可或缺的基础设施。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>使用 LangSmith 和 OpenTelemetry 追踪 Agent 执行轨迹</li>
+          <li>设计 Agent 的可观测性指标</li>
+          <li>实现 Agent 执行回放用于调试</li>
+          <li>通过 Trace 定位 Agent 故障根因</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Trace = 调用链</strong>：记录 LLM 调用、工具调用、推理步骤的完整轨迹。</li>
+          <li><strong>Span = 调用单元</strong>：每个 LLM 调用或工具调用是一个 Span，包含耗时和元数据。</li>
+          <li><strong>Metrics = 聚合指标</strong>：延迟、Token 消耗、错误率的聚合视图。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Agent 可观测性三大支柱</h3>
+
+      <div class="mermaid-wrap">
+        <h5>可观测性三大支柱</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Tracing[Tracing 追踪]
+        T1[Agent Step 1] --> T2[LLM Call]
+        T1 --> T3[Tool Call]
+        T2 --> T4[Agent Step 2]
+    end
+    subgraph Metrics[指标]
+        M1[延迟 P50/P99]
+        M2[Token 消耗]
+        M3[错误率]
+    end
+    subgraph Logging[日志]
+        L1[Agent 决策日志]
+        L2[工具调用参数]
+        L3[异常堆栈]
+    end
+    Tracing -->|关联| Logging
+    Metrics -->|聚合| Dashboard[监控看板]</pre>
+        <p class="diagram-caption">三大支柱协同工作：Trace 记录单次完整执行，Metrics 聚合全局趋势，Logging 提供细节。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>支柱</th><th>工具</th><th>解决的问题</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Tracing</td><td>LangSmith、OpenTelemetry</td><td>Agent 的每一步做了什么？为什么调用这个工具？</td></tr>
+          <tr><td>Metrics</td><td>Prometheus、Grafana</td><td>Agent 今天延迟高吗？Token 消耗是否异常？</td></tr>
+          <tr><td>Logging</td><td>ELK、Loki</td><td>这个 Agent 报了什么错？工具的入参和出参是什么？</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>LangSmith Trace 集成</h3>
+
+      <p>LangSmith 是 LangGraph/LangChain 生态的官方可观测平台，自动捕获 Agent 的每一步执行。在 LangChain 集成下，只需配置 API Key 即可启用。</p>
+
+      <h4>Python：LangSmith 配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import os
+from langsmith import traceable
+from langchain_core.tracers import LangSmithTracer
+
+# 配置环境变量
+os.environ["LANGSMITH_TRACING"] = "true"
+os.environ["LANGSMITH_API_KEY"] = "ls__your_key"
+os.environ["LANGSMITH_PROJECT"] = "corpassist-s2"
+
+# 手动追踪特定函数
+@traceable(name="query_order_tool", run_type="tool")
+def query_order(order_id: str) -> str:
+    result = order_service.query(order_id)
+    return f"订单 {order_id}: {result.status}"
+
+# 追踪 Agent 执行
+@traceable(name="s2_agent_run", run_type="chain")
+def run_agent(user_input: str) -> str:
+    response = agent.invoke({"messages": [HumanMessage(content=user_input)]})
+    return response["messages"][-1].content
+
+# 在 LangSmith 中可以看到：
+# - 每次 LLM 调用的输入输出和 Token 数
+# - 每次工具调用的参数和结果
+# - 完整的推理链和步数
+# - 执行时间和延迟分布</pre>
+      </div>
+
+      <h4>Python：自定义 Span</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from langsmith import traceable
+from langsmith.run_trees import RunTree
+
+# 手动创建追踪树
+def trace_agent_execution(user_input: str):
+    root = RunTree(
+        name="agent_execution",
+        run_type="chain",
+        inputs={"input": user_input}
+    )
+
+    # LLM 调用 Span
+    llm_span = root.create_child(
+        name="llm_call",
+        run_type="llm",
+        inputs={"messages": [...]}
+    )
+    llm_span.end(outputs={"response": "..."})
+    llm_span.post()
+
+    # 工具调用 Span
+    tool_span = root.create_child(
+        name="tool_call",
+        run_type="tool",
+        inputs={"tool": "query_order", "args": {"order_id": "T001"}}
+    )
+    tool_span.end(outputs={"result": "已发货"})
+    tool_span.post()
+
+    root.end(outputs={"final_response": "..."})
+    root.post()</pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无 Trace，出问题只能看日志猜</li>
+            <li>只采集错误不采集成功 Trace</li>
+            <li>不关联 LLM 调用和工具调用</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>全量 Trace 自动采集</li>
+            <li>成功 + 失败 Trace 都采集</li>
+            <li>父子 Span 关联完整调用链</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OpenTelemetry 集成</h3>
+
+      <p>如果使用 Java 技术栈或不依赖 LangChain，可以通过 OpenTelemetry 实现 Agent 可观测性。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class AgentObservability {
+    private static final Tracer tracer =
+        GlobalOpenTelemetry.getTracer("corpassist-agent");
+
+    public String executeWithTrace(String userId, String message) {
+        Span span = tracer.spanBuilder("agent.execute")
+            .setAttribute("user.id", userId)
+            .setAttribute("message.length", message.length())
+            .startSpan();
+
+        try (Scope scope = span.makeCurrent()) {
+            // LLM 调用子 Span
+            Span llmSpan = tracer.spanBuilder("agent.llm_call")
+                .setAttribute("model", "qwen-max")
+                .startSpan();
+            String llmResponse = chatModel.call(message);
+            llmSpan.end();
+
+            // 工具调用子 Span
+            Span toolSpan = tracer.spanBuilder("agent.tool_call")
+                .setAttribute("tool", "query_order")
+                .setAttribute("args", "T001")
+                .startSpan();
+            String toolResult = queryOrder("T001");
+            toolSpan.end();
+
+            return llmResponse;
+        } catch (Exception e) {
+            span.recordException(e);
+            span.setStatus(StatusCode.ERROR);
+            throw e;
+        } finally {
+            span.end();
+        }
+    }
+}</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>关键指标与监控</h3>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>含义</th><th>告警阈值</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Agent 执行延迟 P50</td><td>50% 的执行在多少毫秒内完成</td><td>> 5s 告警</td></tr>
+          <tr><td>Agent 执行延迟 P99</td><td>99% 的执行在多少毫秒内完成</td><td>> 15s 告警</td></tr>
+          <tr><td>每执行 Token 消耗</td><td>平均每次执行消耗多少 Token</td><td>日环比 > 20% 告警</td></tr>
+          <tr><td>工具调用失败率</td><td>工具调用失败的百分比</td><td>> 5% 告警</td></tr>
+          <tr><td>死循环触发率</td><td>达到 max_steps 的执行比例</td><td>> 10% 告警</td></tr>
+          <tr><td>平均步数</td><td>每次执行的平均 ReAct 步数</td><td>日均变化 > 1 步</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>调试与回放</h3>
+
+      <p>Trace 不仅用于监控，还可以用于调试。通过回放 Trace 可以重现 Agent 的执行过程，定位问题步骤。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from langsmith import Client
+
+client = Client()
+
+# 根据条件查询 Trace
+runs = client.list_runs(
+    project_name="corpassist-s2",
+    execution_order="desc",
+    limit=10
+)
+
+for run in runs:
+    print(f"Run ID: {run.id}")
+    print(f"Input: {run.inputs}")
+    print(f"Output: {run.outputs}")
+    print(f"Error: {run.error}")
+    print(f"Latency: {run.latency_ms}ms")
+    print(f"Token Usage: {run.prompt_tokens + run.completion_tokens}")
+
+    # 获取子 Span
+    child_runs = client.list_runs(
+        parent_run_id=run.id,
+        execution_order="asc"
+    )
+    for child in child_runs:
+        print(f"  - {child.name}: {child.latency_ms}ms")</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>全量 Trace 会不会影响性能？</summary>
+          <div class="learn-faq-body">Trace 采集是异步的，通常不会阻塞 Agent 执行。LangSmith 的 Python SDK 使用后台线程发送数据，延迟增加在毫秒级。如果对性能要求极高，可以采样（如 10% 的请求采集 Trace）或只采集异常 Trace。</div>
+        </details>
+        <details>
+          <summary>Trace 数据量太大怎么办？</summary>
+          <div class="learn-faq-body">LangSmith 和 OpenTelemetry 都支持采样策略。建议：成功 Trace 采样 10%，失败 Trace 全量采集。也可以通过分级存储——热数据存 7 天，冷数据归档到 S3。Trace 的保留策略需要根据合规要求确定。</div>
+        </details>
+        <details>
+          <summary>Spring AI Alibaba 怎么集成 Trace？</summary>
+          <div class="learn-faq-body">Spring AI Alibaba 支持 Micrometer 和 OpenTelemetry 集成。通过添加 micrometer-registry-prometheus 和 opentelemetry-spring-boot-starter 依赖，自动采集指标和 Trace。默认集成了 LLM 调用和工具调用的 Span。参考 <a href="#ch-advanced-02-reliability">可靠性工程</a>。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>三大支柱</strong>：Trace 记录轨迹、Metrics 聚合趋势、Logging 提供细节。</li>
+        <li><strong>LangSmith</strong>：LangChain/LangGraph 生态官方可观测平台，零配置集成。</li>
+        <li><strong>OpenTelemetry</strong>：Java 栈标准可观测方案，Spring AI Alibaba 原生支持。</li>
+        <li><strong>关键指标</strong>：延迟、Token、错误率、步数、死循环触发率。</li>
+        <li><strong>调试回放</strong>：通过 Trace 回放 Agent 执行过程，定位故障步骤。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agent-orchestration-engineering_advanced01">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="three-pillars" /> 能说出可观测性三大支柱</label></li>
+          <li><label><input type="checkbox" data-id="langsmith-trace" /> 能配置 LangSmith Trace</label></li>
+          <li><label><input type="checkbox" data-id="otel-span" /> 能创建自定义 Span</label></li>
+          <li><label><input type="checkbox" data-id="metrics" /> 能列出关键监控指标</label></li>
+          <li><label><input type="checkbox" data-id="replay" /> 能通过 Trace 回放调试 Agent</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Trace</td><td>一次 Agent 执行的完整调用链</td></tr>
+                <tr><td>Span</td><td>Trace 中的单个调用单元</td></tr>
+                <tr><td>LangSmith</td><td>LangChain 生态的可观测平台</td></tr>
+                <tr><td>OpenTelemetry</td><td>厂商无关的可观测标准</td></tr>
+                <tr><td>Parent Span</td><td>上层调用 Span</td></tr>
+                <tr><td>Child Span</td><td>子调用 Span，建立调用树</td></tr>
+                <tr><td>Sampling</td><td>采样策略减少 Trace 数据量</td></tr>
+                <tr><td>Trace Replay</td><td>回放 Trace 重现 Agent 执行</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 的可观测性和传统微服务的可观测性有什么不同？</li>
+              <li>如何通过 Trace 定位 Agent 死循环的原因？请画出排查流程图。</li>
+              <li>如果 Agent 执行延迟突然从 2s 升到 10s，你会怎么排查？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-02-reliability">Agent 可靠性工程</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.smith.langchain.com/" target="_blank" rel="noopener">LangSmith 文档</a></li>
+      <li><a href="https://opentelemetry.io/docs/" target="_blank" rel="noopener">OpenTelemetry 官方文档</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/observability.html" target="_blank" rel="noopener">Spring AI Observability</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p>目录：<code>demos/advanced-01-observability-lab/</code>。<strong>验收</strong>：Agent 执行轨迹可追溯，关键指标在监控看板可见。</p>
+  </div>
+</section>
