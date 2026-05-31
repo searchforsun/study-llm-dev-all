@@ -107,9 +107,16 @@ const prevPath = path.join(root, 'courses.json');
 const prev = fs.existsSync(prevPath)
   ? JSON.parse(fs.readFileSync(prevPath, 'utf8'))
   : { courses: [] };
-const published = Object.fromEntries(
+const prevPublished = Object.fromEntries(
   prev.courses.map((c) => [c.slug, c.stats?.publishedChapters ?? 0])
 );
+// Count actual chapter HTML files on disk for each course
+const published = {};
+for (const slug of Object.keys(specFinal.courses)) {
+  const chDir = path.join(root, slug, 'chapters');
+  const onDisk = fs.existsSync(chDir) ? fs.readdirSync(chDir).filter(f => f.endsWith('.html')).length : 0;
+  published[slug] = Math.max(prevPublished[slug] ?? 0, onDisk);
+}
 
 const accents = {
   'llm-application-fundamentals': { light: '#1565c0', dark: '#64b5f6' },
