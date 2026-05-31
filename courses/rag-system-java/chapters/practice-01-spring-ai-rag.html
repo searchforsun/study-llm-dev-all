@@ -1,0 +1,361 @@
+<section id="ch-practice-01-spring-ai-rag" class="chapter" data-chapter="practice-01-spring-ai-rag">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Spring AI RAG Pipeline</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-spring-ai-rag" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Spring RAG 实践</strong> · 能力：用 Spring AI 构建完整 RAG Pipeline（DocumentReader → Splitter → VectorStore → QuestionAnswerAdvisor）</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>CorpAssist 的对外 BFF 采用 Java/Spring Boot 实现，所有生产环境的 RAG 查询都经过 Spring AI 管线。Python 侧负责离线索引和原型验证，但线上查询由 Spring AI 承载。不和 Spring AI 的 DocumentReader、TokenTextSplitter、QuestionAnswerAdvisor 组件衔接，RAG 管线将停留在理论层面。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>配置 DocumentReader 解析 PDF/Word/TXT 文档，选型 TokenTextSplitter 参数并配合同一 VectorStore，串联 QuestionAnswerAdvisor 实现检索增强生成，输出与 Python LCEL 链一致的 <code>answer+sources</code> JSON 响应。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>Spring AI Pipeline = DocumentReader → DocumentTransformer(Splitter) → VectorStore → QuestionAnswerAdvisor</li><li>TokenTextSplitter 默认 chunkSize=800, chunkOverlap=200，需按文档类型调优</li><li>QuestionAnswerAdvisor 自动拼接 context 到 Prompt，等效 Python LCEL 的 RunnableParallel</li><li>响应通过 AbstractMemoryAdvisor 实现引用溯源，sources 格式与 Python 侧对齐</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>DocumentReader 配置</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · PDF 政策文档入库</span>HR 部每月发布《员工手册》PDF 版，含表格和多级标题。DocumentReader 需正确解析章节结构和表格内容，乱码或丢表将导致检索结果残缺。</aside>
+      <p>Spring AI 提供多种 DocumentReader 实现：<code>PagePdfDocumentReader</code>（PDF）、<code>TextDocumentReader</code>（TXT/CSV）、<code>JsonDocumentReader</code>（JSON）、<code>WordDocumentReader</code>（DOCX）。每个 Reader 将原始文件转为 <code>Document</code> 对象列表，含 <code>content</code> 和 <code>metadata</code>。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// DocumentReader 配置 — PDF 解析
+@Configuration
+public class DocumentReaderConfig {
+
+    @Bean
+    public PdfDocumentReader pdfReader() {
+        var resource = new FileSystemResource("classpath:docs/hr_policy_2024.pdf");
+        var config = PdfDocumentReaderConfig.builder()
+            .withPageExtractedTextFormatter(page -> {
+                // 保留章节标题格式，去掉页眉页脚
+                return page.getText()
+                    .replaceAll("CorpAssist Confidential", "")
+                    .replaceAll("第 \\d+ 页", "");
+            })
+            .withPagesPerDocument(1)  // 每页作为一个 Document
+            .build();
+        return new PagePdfDocumentReader(resource, config);
+    }
+
+    @Bean
+    public WordDocumentReader wordReader() {
+        var resource = new FileSystemResource("classpath:docs/轮岗管理办法.docx");
+        return new WordDocumentReader(resource);
+    }
+
+    @Bean
+    public JsonDocumentReader jsonReader() {
+        var resource = new FileSystemResource("classpath:docs/faq_hr.json");
+        return new JsonDocumentReader(resource, "question", "answer");
+    }
+}</code></pre></div>
+      <table class="outline-table"><thead><tr><th>Reader 类型</th><th>适用场景</th><th>输出 Document 粒度</th><th>注意事项</th></tr></thead>
+      <tbody>
+        <tr><td>PagePdfDocumentReader</td><td>政策 PDF、合同扫描</td><td>每页一个 Document</td><td>表格可能丢失行列结构，建议转 Markdown 再解析</td></tr>
+        <tr><td>WordDocumentReader</td><td>Word 格式的 SOP、制度</td><td>按段落拆分</td><td>嵌入图片丢失，仅提取文字</td></tr>
+        <tr><td>JsonDocumentReader</td><td>FAQ 库、结构化数据</td><td>每个 JSON 对象一个 Document</td><td>需指定 content 字段名</td></tr>
+        <tr><td>TextDocumentReader</td><td>纯文本日志、存档</td><td>整个文件</td><td>文件过大会超出 token 限制，需配合 splitter</td></tr>
+      </tbody></table>
+    </div>
+    <div class="section-block">
+      <h3>Splitter 选型与参数</h3>
+      <p>DocumentReader 输出的 Document 粒度通常不适合直接存入 VectorStore（PDF 每页可能 500~2000 token，超出 embedding 模型上下文窗口或降低检索精度）。Spring AI 提供 <code>DocumentTransformer</code> 接口用于拆分。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// TokenTextSplitter 配置与参数调优
+@Configuration
+public class SplitterConfig {
+
+    @Bean
+    public TokenTextSplitter tokenSplitter() {
+        return TokenTextSplitter.builder()
+            .withChunkSize(800)          // 每个 chunk 的 token 数上限
+            .withChunkOverlap(200)       // 相邻 chunk 重叠 token 数
+            .withTokensPerWord(1.3f)     // 中文占 token 比例修正
+            .build();
+    }
+
+    // 按文档类型选择 splitter
+    public DocumentTransformer selectSplitter(String docType) {
+        return switch (docType) {
+            case "policy" -> TokenTextSplitter.builder()
+                .withChunkSize(600).withChunkOverlap(150).build();  // 政策条款宜小
+            case "faq" -> TokenTextSplitter.builder()
+                .withChunkSize(300).withChunkOverlap(50).build();   // FAQ 问答对独立
+            case "manual" -> TokenTextSplitter.builder()
+                .withChunkSize(1200).withChunkOverlap(300).build(); // 操作手册宜保持上下文
+            default -> tokenSplitter();
+        };
+    }
+}</code></pre></div>
+      <table class="outline-table"><thead><tr><th>文档类型</th><th>chunkSize</th><th>chunkOverlap</th><th>理由</th><th>CorpAssist 效果</th></tr></thead>
+      <tbody>
+        <tr><td>政策条款（Policy）</td><td>600</td><td>150</td><td>条款短且独立，交叉引用少</td><td>recall@4=78%</td></tr>
+        <tr><td>FAQ 问答</td><td>300</td><td>50</td><td>问答对通常<200 token，需保持完整性</td><td>recall@4=91%</td></tr>
+        <tr><td>操作手册（Manual）</td><td>1200</td><td>300</td><td>操作步骤需连续上下文</td><td>faithfulness=0.88</td></tr>
+        <tr><td>默认</td><td>800</td><td>200</td><td>通用平衡</td><td>综合最优</td></tr>
+      </tbody></table>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 完整索引流程：Read → Split → Store
+@Service
+public class IngestionService {
+
+    private final VectorStore vectorStore;
+    private final TokenTextSplitter splitter;
+
+    public void ingest(String filePath, String kb, String tenantId) {
+        // 1. 读取
+        var resource = new FileSystemResource(filePath);
+        var reader = new PagePdfDocumentReader(resource);
+        List<Document> docs = reader.get();
+
+        // 2. 拆分
+        List<Document> chunks = splitter.apply(docs);
+
+        // 3. 注入元数据
+        chunks.forEach(doc -> {
+            doc.getMetadata().put("tenant_id", tenantId);
+            doc.getMetadata().put("kb", kb);
+            doc.getMetadata().put("doc_id", UUID.randomUUID().toString());
+            doc.getMetadata().put("ingested_at", Instant.now().toString());
+        });
+
+        // 4. 写入 VectorStore
+        vectorStore.add(chunks);
+        System.out.printf("Ingested %d chunks from %s%n", chunks.size(), filePath);
+    }
+}</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>QuestionAnswerAdvisor 链路</h3>
+      <p>Spring AI 的 <code>QuestionAnswerAdvisor</code> 等价于 Python LCEL 中的 <code>RunnableParallel(context=retriever, question=passthrough) | prompt | llm</code>。它接收用户问题，自动调用 VectorStore 检索相关文档，将 context 拼入 Prompt，最后用 LLM 生成回答。</p>
+      <div class="mermaid-wrap"><h5>Spring AI RAG Pipeline 拓扑</h5><pre class="mermaid">flowchart LR
+  USER[User Query] --> RA[ChatMemory<br/>Advisor chain]
+  RA --> QAA[QuestionAnswerAdvisor]
+  QAA --> RET[VectorStore<br/>similarity search]
+  RET --> QAA
+  QAA --> LLM[ChatModel<br/>gpt-4o-mini]
+  LLM --> OUT[Response<br/>answer + sources]</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// Spring AI RAG Pipeline 完整配置
+@Configuration
+public class RagPipelineConfig {
+
+    @Bean
+    public ChatClient ragChatClient(
+            ChatModel chatModel,
+            VectorStore vectorStore,
+            TokenTextSplitter splitter) {
+
+        var advisor = new QuestionAnswerAdvisor(
+            vectorStore,
+            SearchRequest.builder()
+                .query("")
+                .topK(4)
+                .similarityThreshold(0.45)
+                .build()
+        );
+
+        return ChatClient.builder(chatModel)
+            .defaultSystem("""
+                你是 CorpAssist AI 助手。严格根据提供的 context 回答问题。
+                若 context 中找不到依据，请回答"无法从现有知识库中找到答案"。
+                在回答末尾列出引用来源 doc_id。
+                """)
+            .defaultAdvisors(advisor)
+            .build();
+    }
+}
+
+// Controller — 与 Python LCEL 对齐的 API
+@RestController
+@RequestMapping("/v1/rag")
+public class RagController {
+
+    private final ChatClient chatClient;
+
+    @PostMapping("/ask")
+    public AskResponse ask(@RequestBody AskRequest request) {
+        var response = chatClient.prompt()
+            .user(request.question())
+            .advisors(a -> a.param("tenant_id", request.tenantId()))
+            .call()
+            .content();
+
+        // 从 advisor context 提取 sources
+        List<SourceRef> sources = extractSources(response);
+        return new AskResponse(response, sources);
+    }
+
+    @PostMapping("/ask/stream")
+    public Flux<String> askStream(@RequestBody AskRequest request) {
+        return chatClient.prompt()
+            .user(request.question())
+            .advisors(a -> a.param("tenant_id", request.tenantId()))
+            .stream()
+            .content();
+    }
+}
+
+// DTO — 与 Python 侧一致的 JSON 契约
+public record AskRequest(String question, String tenantId, String kb) {}
+public record SourceRef(String docId, String snippet, double score) {}
+public record AskResponse(String answer, List<SourceRef> sources) {}</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>完整 Pipeline 代码与引用溯源</h3>
+      <div class="mermaid-wrap"><h5>Spring AI 引用溯源数据流</h5><pre class="mermaid">sequenceDiagram
+    participant CTRL as RagController
+    participant ADV as TraceableAdvisor
+    participant VS as VectorStore
+    participant LLM as ChatModel
+    CTRL->>ADV: aroundCall(question)
+    ADV->>VS: similaritySearch(query, filter)
+    VS-->>ADV: List&lt;Document&gt; + metadata
+    ADV->>ADV: Build context with doc_id refs
+    ADV->>LLM: Enhanced prompt with context
+    LLM-->>ADV: Generated answer
+    ADV->>ADV: Extract SourceRef from docs
+    ADV-->>CTRL: Answer + Context(rag_sources)
+    CTRL->>CTRL: Build AskResponse(answer, sources)</pre></div>
+      <p>完整的 RAG Pipeline 需要将 <strong>索引</strong> 和 <strong>查询</strong> 两个阶段串联。引用溯源的实现方案是：在 <code>QuestionAnswerAdvisor</code> 的回调中捕获检索到的 Document 列表，将其转为 <code>SourceRef</code> 附加到响应中。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 自定义 Advisor — 带引用溯源的 QuestionAnswerAdvisor
+@Component
+public class TraceableQuestionAnswerAdvisor implements CallAroundAdvisor {
+
+    private final VectorStore vectorStore;
+    private final int topK;
+
+    @Override
+    public AdvisorResponse aroundCall(AdvisorChain chain, UserMessage userMsg,
+                                      Map<String, Object> context) {
+        // 1. 检索阶段
+        String query = userMsg.getText();
+        var searchRequest = SearchRequest.builder()
+            .query(query)
+            .topK(topK)
+            .similarityThreshold(0.45)
+            .filterExpression("tenant_id == '" + context.get("tenant_id") + "'")
+            .build();
+
+        List<Document> docs = vectorStore.similaritySearch(searchRequest);
+
+        // 2. 将检索文档注入 user message 的 context
+        String contextStr = docs.stream()
+            .map(d -> "[doc_id=" + d.getMetadata().get("doc_id") + "] " + d.getContent())
+            .collect(Collectors.joining("\n---\n"));
+        String enhancedPrompt = """
+            请根据以下文档内容回答问题。若文档中无答案请说不知道。
+
+            参考文档：
+            %s
+
+            问题：%s
+            """.formatted(contextStr, query);
+
+        // 3. 继续链式调用（后续可能还有别的 advisor）
+        AdvisorResponse response = chain.nextAroundCall(
+            new UserMessage(enhancedPrompt), context);
+
+        // 4. 将 sources 写入 context 供 controller 提取
+        List<SourceRef> sources = docs.stream()
+            .map(d -> new SourceRef(
+                (String) d.getMetadata().get("doc_id"),
+                d.getContent().substring(0, Math.min(100, d.getContent().length())),
+                (double) d.getMetadata().getOrDefault("distance", 0.0)
+            ))
+            .toList();
+        context.put("rag_sources", sources);
+
+        return response;
+    }
+}</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># curl 验收 Spring AI RAG（与 Python 端点对齐）
+curl -s -X POST http://localhost:8080/v1/rag/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假几天","tenantId":"corp-a","kb":"hr"}' | jq .
+
+# 期望输出:
+# {
+#   "answer": "根据员工手册，年假最低天数为5天。",
+#   "sources": [
+#     {"docId": "hr-policy-2024-04", "snippet": "第四条 年假标准：工龄满1年未满10年者...", "score": 0.832}
+#   ]
+# }</code></pre></div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">常见陷阱</span><ul><li>未在检索时加 tenant_id filter，跨租户数据泄漏</li><li>Splitter 参数未按文档类型调优，chunk 过大或过小</li><li>未实现自定义 Advisor，sources 引用无法透传到 controller</li><li>默认 SystemPrompt 未约束「仅根据 context」，模型可能虚构</li></ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐实践</span><ul><li>检索 filter 表达式硬编码 tenant_id</li><li>文档类型路由到专属 splitter 配置</li><li>实现 TraceableQuestionAnswerAdvisor 捕获 sources</li><li>system prompt 使用否定约束（不可、禁止）</li></ul></div>
+      </div>
+      <details class="learn-micro-check"><summary>自检：Spring AI 的 QuestionAnswerAdvisor 与 Python LCEL 的 RunnableParallel 有何异同？</summary>
+      <p>相同：两者都实现了「检索 → 拼 context → 注入 Prompt → 调 LLM」的 RAG 核心流程。不同：QuestionAnswerAdvisor 是 ChatClient 的 advisor（类似拦截器/中间件），可组合多个 advisor；RunnableParallel 是链式管道的组成节点，通过 | 连接。Spring AI advisor 模式更接近 AOP，LCEL 管道模式更接近函数组合。</p>
+      </details>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>DocumentReader</strong>：Spring AI 支持 PDF/Word/JSON/TXT 四种 Reader，PDF 每页产出一个 Document，Word 按段落拆分</li>
+        <li><strong>Splitter 选型</strong>：TokenTextSplitter 默认 800/200，Policy 文档宜用 600/150，FAQ 宜用 300/50</li>
+        <li><strong>QuestionAnswerAdvisor</strong>：自动完成检索+拼装增强，等价 Python LCEL 的 RunnableParallel+Prompt+LLM</li>
+        <li><strong>引用溯源</strong>：通过自定义 Advisor 捕获检索文档列表，转为 SourceRef 写入 context 供 API 响应</li>
+        <li><strong>契约对齐</strong>：Spring AI 端 <code>AskResponse(answer, sources[])</code> 与 Python LCEL 端 JSON 字段名一致</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能配置 PagePdfDocumentReader 并解析 HR 政策 PDF</label></li>
+        <li><label><input type="checkbox"> 能为不同文档类型配置不同的 TokenTextSplitter 参数</label></li>
+        <li><label><input type="checkbox"> 能串联 QuestionAnswerAdvisor 实现 RAG Pipeline</label></li>
+        <li><label><input type="checkbox"> 能通过自定义 Advisor 捕获 sources 引用</label></li>
+        <li><label><input type="checkbox"> curl 验证 Spring AI API 返回与 Python 侧一致的结构</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>DocumentReader</td><td>文件解析器，输出 Document 列表</td></tr>
+        <tr><td>TokenTextSplitter</td><td>基于 token 计数的文档拆分器</td></tr>
+        <tr><td>QuestionAnswerAdvisor</td><td>RAG 核心 advisor，自动检索增强</td></tr>
+        <tr><td>VectorStore</td><td>向量数据库抽象接口</td></tr>
+        <tr><td>ChatClient</td><td>LLM 调用客户端，支持 advisor 链</td></tr>
+        <tr><td>CallAroundAdvisor</td><td>自定义拦截器接口</td></tr>
+        <tr><td>SearchRequest</td><td>向量检索请求（query, topK, filter）</td></tr>
+        <tr><td>chunkSize</td><td>拆分后每个 chunk 的 token 上限</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>Spring AI 的 Advisor 链和 Python LangChain 的 Chain 模式在设计上有什么不同？</summary>
+      <p>Spring AI Advisor 模式基于 AOP 思想——每个 Advisor 包装（wrap）在被调用方法周围，形成一个洋葱模型。便于横切关注点如日志、鉴权、引用提取。LangChain Chain 模式基于组合模式——通过 | 运算符将多个 Runnable 连接成有向图。两者模式不同但都是装饰器变体。Spring AI 更擅长在 Java 生态中与其他 Spring AOP 组件集成。</p>
+      </details>
+      <details><summary>如果 PDF 中有表格，PagePdfDocumentReader 解析后表格会变成什么？如何处理？</summary>
+      <p>PagePdfDocumentReader 基于 Apache PDFBox，默认将表格渲染为纯文本（单元格内容按坐标拼成行，丢失表格结构）。处理方案有两层：1) 在 PDF 解析前先用 OCR+表格识别工具（如 Camelot/Tabula）将表格转为 Markdown 再喂入 Reader；2) 在 withPageExtractedTextFormatter 中自定义行列拼接逻辑。CorpAssist 对含表格的 PDF 先使用 Python Pandas 转为 CSV 再入库。</p>
+      </details>
+      <details><summary>如何测试 Spring AI Pipeline 的每个环节是否正常工作？</summary>
+      <p>分段测试：1) DocumentReader — 单测验证 Document 数量和 metadata；2) Splitter — 验证 chunk token 数在 chunkSize 范围内；3) VectorStore — 写入后 similaritySearch 验证返回预期文档；4) Advisor — Mock VectorStore 验证 Prompt 拼装是否正确；5) Controller — MockMvc 验证 JSON 响应结构。Spring AI 提供 TestAdvisors 和 MockVectorStore 辅助测试。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmentation.html" target="_blank" rel="noopener">Spring AI RAG 文档</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html" target="_blank" rel="noopener">Spring AI ETL Pipeline</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient</a></li>
+    <li><a href="https://python.langchain.com/docs/concepts/lcel/" target="_blank" rel="noopener">Python LCEL（对照学习）</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/practice-01-spring-ai-rag-lab/</code> 中完成 <code>DocumentReaderConfig</code>，解析提供的 HR 政策 PDF</li>
+      <li>为 policy/faq/manual 三种文档类型配置对应的 TokenTextSplitter</li>
+      <li>实现 <code>TraceableQuestionAnswerAdvisor</code>，使 API 返回 sources 数组</li>
+      <li>用 curl 验证 <code>/v1/rag/ask</code> 返回 <code>answer + sources</code>，与 Python 侧端到端比对</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：分块后的 Document 数量远少于预期（500 页 PDF 只产出 30 个 chunk），应排查什么？</summary>
+      <p>可能原因：1) chunkSize 设置过大（如 4000），每个 Document（一页）显著小于一个 chunk 大小，splitter 无需拆分；2) PDF 的文本内容被渲染为图片，PDFBox 提取不出文字，reader 读取为空。验证方法：检查 reader.get().size() 的原始 Document 数，以及每个 Document 的内容长度。</p>
+    </details>
+    <details><summary>场景 2：Spring AI API 返回了 answer 但 sources 为空数组，引用提取环节出了什么问题？</summary>
+      <p>可能性：1) 自定义 Advisor 未正确捕获 VectorStore 的检索结果——检查 aroundCall 中 vectorStore.similaritySearch 是否被调用；2) 检索结果未写入 context map——context.put("rag_sources", sources) 必须在 response 返回前执行；3) Controller 中未从 context 读取 rag_sources——确认 Advisor 和 Controller 使用同一个 context 实例。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/practice-01-spring-ai-rag-lab/</p><ul class="demo-acceptance">
+      <li>DocumentReader 能正确解析 PDF/Word/TXT 三种格式</li>
+      <li>TokenTextSplitter 按文档类型选择不同 chunkSize</li>
+      <li>curl /v1/rag/ask 返回含 sources 的响应，与 Python LCEL 端格式一致</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-practice-02-vectorstore-practice">下一章：VectorStore 实战</a></li>
+    <li><a href="https://spring.io/projects/spring-ai">Spring AI 官方项目</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html">Spring AI VectorStore 支持列表</a></li>
+  </ul></div>
+</section>

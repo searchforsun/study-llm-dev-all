@@ -1,0 +1,375 @@
+<section id="ch-advanced-02-graphrag-java" class="chapter" data-chapter="advanced-02-graphrag-java">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>GraphRAG Java 消费</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-graphrag-java" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Java RAG 进阶</strong> · 能力：消费 GraphRAG 索引输出（Parquet）、集成 HTTP 客户端查询、合并多源结果、做出 GraphRAG 场景决策</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>GraphRAG 索引在 Python 侧完成（advanced-01），但 Java 侧 BFF 需要消费图索引结果对外提供服务。CorpAssist 的 Java 服务不能因为 Python 侧 GraphRAG 索引的存在而改变接口契约——必须通过同样的 <code>/v1/rag/ask</code> 端点处理基于图的查询。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>在 Spring AI 中读取 GraphRAG 索引输出的 Parquet 文件建立本地查询索引，集成 GraphRAG HTTP API 实现 Local/Global Search，将图查询结果与向量检索结果合并排序，并能向面试官清晰解释何时应该上 GraphRAG。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>GraphRAG 索引由 Python 侧产出（.parquet），Java 侧通过本地缓存或 HTTP API 消费</li><li>Local Search 用于具体问题，Global Search 用于总结性问题</li><li>图查询结果与向量检索结果通过 RRF 合并</li><li>GraphRAG 适用于跨文档推理场景（35% 的 CorpAssist 查询），Naive RAG 覆盖剩余 65%</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>GraphRAG 索引消费契约</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · Java 消费 GraphRAG</span>Python 侧运行完 GraphRAG 索引后产出 <code>entities.parquet</code>、<code>relationships.parquet</code>、<code>communities.parquet</code>。Java BFF 需要读取这些文件并提供查询 API。</aside>
+      <p>GraphRAG 索引输出存储在共享文件系统或对象存储（S3/MinIO）中。Java 侧通过读取 Parquet 文件加载实体和社区数据，构建查询索引。Spring AI 不直接提供 GraphRAG 集成，需要自行实现 Parquet 读取和查询逻辑。</p>
+      <div class="mermaid-wrap"><h5>Python → Java GraphRAG 消费架构</h5><pre class="mermaid">flowchart LR
+  PY[Python GraphRAG Index] --> PARQUET[Parquet Artifacts<br/>entities/relationships/communities]
+  PARQUET --> S3[Shared Storage<br/>S3 / MinIO]
+  S3 --> JV_LOAD[Java Loader<br/>读取 Parquet]
+  JV_LOAD --> MEM_CACHE[JVM Local Cache<br/>实体字典+社区摘要]
+  MEM_CACHE --> GRAPH_API[GraphRAG HTTP API<br/>Local/Global Search]
+  GRAPH_API --> MERGE[Result Merger<br/>RRF Fusion]
+  MERGE --> API["/v1/rag/ask<br/>uniform response"]</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 读取 GraphRAG Parquet 工件
+@Component
+public class GraphRagIndexReader {
+
+    public GraphIndex loadIndex(String basePath) throws IOException {
+        var entities = readParquet(basePath + "/entities.parquet");
+        var relationships = readParquet(basePath + "/relationships.parquet");
+        var communities = readParquet(basePath + "/communities.parquet");
+
+        return new GraphIndex(entities, relationships, communities);
+    }
+
+    private List<Map<String, Object>> readParquet(String path) throws IOException {
+        var records = new ArrayList<Map<String, Object>>();
+        try (var reader = ParquetReader.builder(new GroupReadSupport(),
+                new Path(path)).build()) {
+            Group group;
+            while ((group = reader.read()) != null) {
+                var record = new HashMap<String, Object>();
+                for (int i = 0; i < group.getType().getFieldCount(); i++) {
+                    var fieldName = group.getType().getFieldName(i);
+                    var value = group.getValueToString(i, 0);
+                    record.put(fieldName, value);
+                }
+                records.add(record);
+            }
+        }
+        return records;
+    }
+}
+
+// 实体数据模型
+public record GraphEntity(
+    String id, String name, String type,
+    String description, double rank,
+    Map<String, Object> attributes
+) {}
+
+public record GraphRelationship(
+    String id, String source, String target,
+    String description, double weight
+) {}
+
+public record GraphCommunity(
+    String id, int level, String title,
+    String summary, List<String> entityIds
+) {}
+
+public class GraphIndex {
+    private final List<Map<String, Object>> entities;
+    private final List<Map<String, Object>> relationships;
+    private final List<Map<String, Object>> communities;
+
+    public GraphIndex(List<Map<String, Object>> entities,
+                      List<Map<String, Object>> relationships,
+                      List<Map<String, Object>> communities) {
+        this.entities = entities;
+        this.relationships = relationships;
+        this.communities = communities;
+    }
+
+    // 根据实体名搜索关联社区
+    public List<String> searchCommunities(String entityName) {
+        return communities.stream()
+            .filter(c -> c.get("entityIds").toString().contains(entityName))
+            .map(c -> c.get("summary").toString())
+            .toList();
+    }
+}</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>HTTP 客户端集成</h3>
+      <div class="mermaid-wrap"><h5>GraphRAG HTTP 查询流程</h5><pre class="mermaid">sequenceDiagram
+    participant JAVA as Java BFF
+    participant PY as Python GraphRAG
+    participant LLM as OpenAI LLM
+    JAVA->>PY: POST /v1/graphrag/local_search
+    Note over JAVA: {query, tenant_id, community_level=2}
+    PY->>PY: Local Search: find entities → traverse relations → rank
+    PY->>LLM: Generate answer from community context
+    LLM-->>PY: answer + context_data
+    PY-->>JAVA: {response, contextData[], metadata}
+    JAVA->>JAVA: Convert to SourceRef list
+    JAVA->>JAVA: Merge with Naive RAG via RRF</pre></div>
+      <p>GraphRAG 提供了 Local Search 和 Global Search 的 REST API。Java 侧通过 HTTP 客户端调用，注意请求体格式和对齐搜索参数。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// GraphRAG HTTP 客户端
+@Service
+public class GraphRagHttpClient {
+
+    private final RestTemplate restTemplate;
+    private final String graphRagEndpoint;
+
+    public GraphRagHttpClient(
+            @Value("${graphrag.endpoint:http://graphrag-python:8001}") String endpoint) {
+        this.restTemplate = new RestTemplate();
+        this.graphRagEndpoint = endpoint;
+    }
+
+    // Local Search — 面向具体问题
+    public GraphRagResult localSearch(String query, String tenantId) {
+        var request = Map.of(
+            "query", query,
+            "tenant_id", tenantId,
+            "community_level", 2,
+            "response_type", "multiple pages",
+            "stream", false
+        );
+        var response = restTemplate.postForObject(
+            graphRagEndpoint + "/v1/graphrag/local_search",
+            request, GraphRagResponse.class);
+        return convertToResult(response);
+    }
+
+    // Global Search — 面向全局总结
+    public GraphRagResult globalSearch(String query, String tenantId) {
+        var request = Map.of(
+            "query", query,
+            "tenant_id", tenantId,
+            "community_level", 2,
+            "response_type", "multiple pages",
+            "stream", false
+        );
+        var response = restTemplate.postForObject(
+            graphRagEndpoint + "/v1/graphrag/global_search",
+            request, GraphRagResponse.class);
+        return convertToResult(response);
+    }
+
+    private GraphRagResult convertToResult(GraphRagResponse resp) {
+        if (resp == null) return new GraphRagResult("", List.of());
+
+        var sources = resp.contextData().stream()
+            .map(d -> new SourceRef(
+                d.docId(), d.text().substring(0, Math.min(100, d.text().length())), 0.0))
+            .toList();
+
+        return new GraphRagResult(resp.response(), sources);
+    }
+
+    public record GraphRagResponse(
+        String response,
+        List<ContextData> contextData,
+        Map<String, Object> metadata
+    ) {}
+    public record ContextData(String docId, String text, String sourceType) {}
+    public record GraphRagResult(String answer, List<SourceRef> sources) {}
+}
+
+// Python GraphRAG API 侧实现（参考）
+// @app.post("/v1/graphrag/local_search")
+// async def local_search(request: GraphRagRequest):
+//     result = graphrag.local_search(request.query)
+//     return GraphRagResponse(
+//         response=result.response,
+//         context_data=[ContextData(doc_id=d.id, text=d.text, source_type="entity")
+//                       for d in result.context_docs],
+//         metadata={"community_level": request.community_level}
+//     )</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># 测试 GraphRAG HTTP API
+curl -s -X POST http://localhost:8001/v1/graphrag/local_search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"工程部轮岗到产品部年假怎么算","tenant_id":"corp-a","community_level":2}' | jq .
+
+# 期望输出:
+# {
+#   "response": "跨部门轮岗期间年假按原部门标准计算...",
+#   "contextData": [
+#     {"docId": "hr-policy-轮岗管理办法", "text": "轮岗期超过3个月需重新注册假期额度...", "sourceType": "community"},
+#     {"docId": "hr-policy-员工手册", "text": "年假折算基数=月薪/21.75...", "sourceType": "entity"}
+#   ],
+#   "metadata": {"community_level": 2, "search_type": "local"}
+# }</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>结果合并与排序</h3>
+      <p>Java BFF 同时维护两套检索路径：<strong>Naive RAG（向量检索）</strong>和 <strong>GraphRAG（图查询）</strong>。当路由器标记查询为多知识库关联问题时，并行执行两路检索并通过 RRF 合并。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 统一检索服务 — 合并 Naive RAG + GraphRAG
+@Service
+public class UnifiedRetrievalService {
+
+    @Autowired private VectorStore vectorStore;
+    @Autowired private GraphRagHttpClient graphRagClient;
+    @Autowired private IntentRouter intentRouter;
+
+    public UnifiedResult retrieve(String query, String tenantId, String userRole) {
+        var route = intentRouter.route(query);
+
+        // 向量检索 (Naive RAG)
+        var vecRequest = SearchRequest.builder()
+            .query(query)
+            .topK(6)
+            .filterExpression("tenant_id == '" + tenantId
+                + "' && allowed_roles CONTAINS '" + userRole + "'")
+            .build();
+        var vecDocs = vectorStore.similaritySearch(vecRequest);
+
+        // 仅当跨文档查询时调用 GraphRAG
+        GraphRagResult graphResult = null;
+        if (route.confidence() > 0.7 || route.kb().equals("multi")) {
+            graphResult = graphRagClient.localSearch(query, tenantId);
+        }
+
+        // 合并结果
+        return mergeResults(vecDocs, graphResult, query);
+    }
+
+    private UnifiedResult mergeResults(
+            List<Document> vecDocs, GraphRagResult graphResult, String query) {
+
+        var allSources = new ArrayList<SourceRef>();
+
+        // 向量结果
+        for (int i = 0; i < vecDocs.size(); i++) {
+            var d = vecDocs.get(i);
+            double rrfScore = 1.0 / (60 + i + 1);
+            allSources.add(new SourceRef(
+                (String) d.getMetadata().get("doc_id"),
+                d.getContent().substring(0, Math.min(100, d.getContent().length())),
+                rrfScore
+            ));
+        }
+
+        // GraphRAG 结果
+        if (graphResult != null && graphResult.sources() != null) {
+            int offset = vecDocs.size();
+            for (int i = 0; i < graphResult.sources().size(); i++) {
+                var s = graphResult.sources().get(i);
+                double rrfScore = 0.5 * (1.0 / (60 + i + 1));  // GraphRAG 权重减半
+                allSources.add(new SourceRef(s.docId(), s.snippet(), rrfScore));
+            }
+        }
+
+        // 按 RRF 分数排序，取 Top-6
+        allSources.sort(Comparator.comparing(SourceRef::score).reversed());
+        var topSources = allSources.stream()
+            .limit(6)
+            .peek(s -> s = new SourceRef(s.docId(), s.snippet(), Math.round(s.score() * 10000) / 10000.0))
+            .toList();
+
+        return new UnifiedResult(topSources, graphResult != null);
+    }
+
+    public record UnifiedResult(List<SourceRef> sources, boolean graphRagUsed) {}
+}</code></pre></div>
+      <table class="outline-table"><thead><tr><th>维度</th><th>Naive RAG（向量）</th><th>GraphRAG（图）</th><th>合并策略</th></tr></thead>
+      <tbody>
+        <tr><td>检索对象</td><td>文档分块</td><td>实体+关系+社区摘要</td><td>互补</td></tr>
+        <tr><td>延迟</td><td>45~78ms</td><td>1.5~3.5s</td><td>GraphRAG 并行不阻塞主路径</td></tr>
+        <tr><td>单文档问答</td><td>87% 准确率</td><td>91% 但成本高</td><td>仅用 Naive</td></tr>
+        <tr><td>跨文档推理</td><td>52% 准确率</td><td>85% 准确率</td><td>GraphRAG 优先</td></tr>
+        <tr><td>结果融合</td><td>RRF-based</td><td>RRF-based, 权重*0.5</td><td>最终 Top-6</td></tr>
+      </tbody></table>
+    </div>
+    <div class="section-block">
+      <h3>面试：何时上 GraphRAG</h3>
+      <p>面试中高频问题：「为什么你们用了 Naive RAG 还要上 GraphRAG？」 和 「GraphRAG 的 ROI 如何衡量？」。以下是 CorpAssist 的决策框架：</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不应该上 GraphRAG</span><ul><li>知识库 < 100 篇文档，文档间无交叉引用</li><li>查询主要是事实性单文档问答（「年假几天」）</li><li>团队无 LLM 编排经验，GraphRAG 索引调优困难</li><li>索引成本（$12+/次）超过业务预算</li></ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">应该上 GraphRAG</span><ul><li>跨文档推理查询占比 > 30%（日志分析确认）</li><li>知识库 > 500 篇文档且文档间有密集引用</li><li>Naive RAG 的 context_recall < 0.75 且调参无效</li><li>合规审计需要答案覆盖多源文档</li></ul></div>
+      </div>
+      <table class="outline-table"><thead><tr><th>决策因素</th><th>阈值</th><th>验证方法</th></tr></thead>
+      <tbody>
+        <tr><td>跨文档查询比例</td><td>> 30%</td><td>分析 7 天用户日志，标记需 2+ 文档回答的 query</td></tr>
+        <tr><td>Naive RAG context_recall</td><td>< 0.75</td><td>RAGAS 评测的 context_recall 指标</td></tr>
+        <tr><td>知识库规模</td><td>> 500 篇 or > 100K tokens</td><td>统计索引数据量</td></tr>
+        <tr><td>月索引预算</td><td>> $200/月</td><td>按每周重索引 + 增量更新频率估</td></tr>
+        <tr><td>启动成本</td><td>2~3 周 PoC</td><td>10 篇文档小规模验证准确率提升</td></tr>
+      </tbody></table>
+      <details class="learn-faq"><summary>FAQ：上 GraphRAG 后的典型效果预期（基于 CorpAssist 经验）</summary>
+      <p>索引阶段：500 篇文档 → $12.45 + 18 分钟（gpt-4o）。查询阶段：跨文档推理准确率从 52% 升至 85%（+33%），单文档问答从 87% 升至 91%（+4%）。索引成本增加 44 倍，查询成本增加 2.5 倍。ROI 体现在：用户满意度提升（CSAT +8%）、人工转接率从 22% 降至 15%（跨文档 query 减少转人工）。</p>
+      </details>
+      <details class="learn-micro-check"><summary>自检：如果要向你的 tech lead 证明需要上 GraphRAG，你会提供哪 3 个数据点？</summary>
+      <p>1) 用户日志分析：跨文档查询占比（示例：35% 的 query 隐含引用 2+ 文档）；2) 当前评测：Naive RAG 跨文档场景准确率仅 52%，用户投诉中 40% 来自跨文档问题未满意解决；3) 小规模验证：10 篇关联文档的 GraphRAG PoC 将跨文档准确率提升至 80%+。提供这三点足以让 tech lead 支持 PoC 资源投入。</p>
+      </details>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>索引消费</strong>：Java 侧通过读取 Parquet 工件或调用 HTTP API 消费 Python GraphRAG 索引结果</li>
+        <li><strong>HTTP 集成</strong>：Local Search 用于具体问题，Global Search 用于全局总结，通过 RestTemplate/WebClient 调用</li>
+        <li><strong>结果合并</strong>：Naive RAG + GraphRAG 通过 RRF 融合，GraphRAG 权重重减半（0.5x）避免噪声主导</li>
+        <li><strong>决策框架</strong>：跨文档 query > 30% + Naive RAG recall < 0.75 + 知识库 > 500 篇 → 值得上 GraphRAG</li>
+        <li><strong>ROI 数据</strong>：跨文档准确率 +33%，CSAT +8%，转人工率 -7%，索引成本 +$12.45/次</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能读取 GraphRAG Parquet 工件并在 Java 中建立索引</label></li>
+        <li><label><input type="checkbox"> 能调用 GraphRAG Local/Global Search HTTP API</label></li>
+        <li><label><input type="checkbox"> 能实现 Naive RAG + GraphRAG 的结果合并排序</label></li>
+        <li><label><input type="checkbox"> 能给出是否上 GraphRAG 的数据驱动决策（4 个因素）</label></li>
+        <li><label><input type="checkbox"> 能回答面试中关于 GraphRAG ROI 的问题</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>Parquet</td><td>列式存储格式，GraphRAG 索引输出</td></tr>
+        <tr><td>Local Search</td><td>以实体为中心的图检索</td></tr>
+        <tr><td>Global Search</td><td>以社区摘要为中心的全局检索</td></tr>
+        <tr><td>Community Level</td><td>层次化社区等级（2 为推荐）</td></tr>
+        <tr><td>GraphRAG HTTP API</td><td>Python GraphRAG 暴露的 REST 接口</td></tr>
+        <tr><td>RRF 融合</td><td>多路检索结果合并排序</td></tr>
+        <tr><td>跨文档推理</td><td>需要 2+ 文档综合回答的查询</td></tr>
+        <tr><td>CSAT</td><td>用户满意度评分</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>Java 侧为什么不直接运行 GraphRAG 索引而要依赖 Python 侧产出？</summary>
+      <p>原因：1) 微软 GraphRAG 的实体抽取使用 LLM 逐 chunk 处理，Python 的 asyncio + LangChain 生态更适合此模式（Java 虚拟线程虽好但生态不成熟）；2) GraphRAG 社区检测依赖 Python 科学计算栈（NetworkX、Leidenalg），Java 无等效库；3) 索引是非实时离线任务，Python 脚本更灵活。Java 侧专注于在线查询（低延迟、高并发），索引交给 Python 批处理。</p>
+      </details>
+      <details><summary>List 出至少 3 个 GraphRAG 查询不如直接向量检索的场景。</summary>
+      <p>1) 事实性单文档问答（「我们公司年假最低几天」）——向量检索 45ms 完成，GraphRAG 需要 2s+ 走整个图查询流程，准确率差异 < 5%；2) 实时更新场景（「今天下午的会议取消了吗」）——GraphRAG 索引更新需重新运行整个管线（18 分钟），向量库可以实时 upsert；3) 低成本场景（免费 tier 用户）——GraphRAG 每次查询 $0.005 vs 向量 $0.002，索引成本更相差 44 倍。</p>
+      </details>
+      <details><summary>如果 GraphRAG 服务不可用，你的降级策略是什么？</summary>
+      <p>CorpAssist 的降级策略分三级：1) 熔断：检测到 GraphRAG API 连续 3 次超时（>5s），启动熔断器（Resilience4j CircuitBreaker），后续查询仅走 Naive RAG；2) 半熔断：5 分钟后尝试半开，发 1 条探测请求，成功后逐步恢复 10% 流量；3) 降级通知：在响应 metadata 中添加 <code>{"degraded": true, "reason": "graphrag_unavailable"}</code>，前端可显示「部分检索源不可用」提示。熔断期间 Naive RAG 召回率从 93% 降至 76%（跨文档场景），但核心功能可用。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://microsoft.github.io/graphrag/" target="_blank" rel="noopener">微软 GraphRAG 文档</a></li>
+    <li><a href="https://github.com/microsoft/graphrag" target="_blank" rel="noopener">GitHub: microsoft/graphrag</a></li>
+    <li><a href="https://parquet.apache.org/docs/file-format/" target="_blank" rel="noopener">Apache Parquet 格式</a></li>
+    <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j CircuitBreaker</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/advanced-02-graphrag-java-lab/</code> 中完成 <code>GraphRagIndexReader</code> 读取 Python 侧产出的 Parquet 文件</li>
+      <li>完成 <code>GraphRagHttpClient</code> 的 Local Search 和 Global Search 方法</li>
+      <li>在 <code>UnifiedRetrievalService</code> 中实现 Naive RAG + GraphRAG 的 RRF 合并</li>
+      <li>为 GraphRAG 客户端配置 Resilience4j 熔断器（超时 5s，熔断阈值 3 次）</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：GraphRAG HTTP 调用返回空结果，但索引 Parquet 中有数据，排查步骤？</summary>
+      <p>1) 确认 Python GraphRAG 服务是否已加载索引（检查服务启动日志）；2) 检查请求的 tenant_id 是否匹配索引数据路径；3) community_level 参数是否合理（level=0 粒度过细可能无社区，level=3 摘要过粗；推荐 level=2）；4) 确认 Python 侧 GraphRAG API 的 query 路由是否正确（local vs global，选错会返回空）。</p>
+    </details>
+    <details><summary>场景 2：合并结果中 GraphRAG 的 source 排名远低于向量 source，即使 GraphRAG 内容更相关。如何优化？</summary>
+      <p>当前 GraphRAG 的 RRF 权重为 0.5 倍（减半），这可能是原因。建议：1) 对跨文档查询场景，将 GraphRAG 权重从 0.5 提升至 0.8；2) 使用 BGE-Reranker 对合并结果重排而非 RRF 融合；3) 如果向量检索噪声大，降低 TopK 或在 RRF 中对向量侧加 penalty。调优方法类似 practice-03 的 ablation 实验。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/advanced-02-graphrag-java-lab/</p><ul class="demo-acceptance">
+      <li>GraphRagIndexReader 成功读取实体/关系/社区三张表</li>
+      <li>HTTP 客户端调用 Python GraphRAG 返回非空结果</li>
+      <li>UnifiedRetrievalService 合并返回含两种来源 sources 的 AnswerResponse</li>
+      <li>熔断器在 GraphRAG 不可用时自动降级</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-practice-01-spring-ai-rag">返回 Spring AI RAG Pipeline</a></li>
+    <li><a href="https://neo4j.com/developer-blog/graphrag-patterns/">Neo4j GraphRAG 模式比较</a></li>
+    <li><a href="https://resilience4j.readme.io/docs/getting-started">Resilience4j 使用指南</a></li>
+  </ul></div>
+</section>

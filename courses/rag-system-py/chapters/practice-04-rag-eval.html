@@ -1,0 +1,299 @@
+<section id="ch-practice-04-rag-eval" class="chapter" data-chapter="practice-04-rag-eval">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>RAG 评测闭环（RAGAS）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-rag-eval" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Python RAG 实践</strong> · 能力：用 RAGAS 搭建评测管线，集成 CI 闸门并建立坏例归因流程</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>不谈评测的 RAG 是盲人摸象。CorpAssist 在 2026 年 Q1 曾因一次 embedding 模型升级导致 recall 下降 12%，直到用户投诉才被发现。RAGAS 提供标准化评测框架，能在 PR 合并前自动闸门拦截质量退化。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>配置 RAGAS 六大指标的评测管线，编写自动化评测脚本并在 CI 中设置质量闸门（faithfulness >= 0.85，recall >= 0.80），建立坏例归因流程将失败用例分类到具体组件。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>RAGAS 六大指标：faithfulness、answer_relevancy、context_precision、context_recall、answer_correctness、aspect_critique</li><li>评测集最少需 100 条 question+answer+ground_truth 三元组</li><li>CI 闸门：PR 合并前 run，faithfulness≥0.85，recall≥0.80，fail fast</li><li>坏例归因三分类：检索遗漏、检索噪声、生成偏离</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>RAGAS 指标详解</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · HR 评测场景</span>用户问「绩效改善计划（PIP）的持续时间是多久？」，系统应回答「通常 30~90 天」。评测需要验证：答案是否基于检索文档（faithfulness）、是否回答了问题（relevancy）、检索文档是否包含必要信息（context_recall）。</aside>
+      <p>RAGAS（RAG Assessment）是目前最成熟的 RAG 评测框架。其核心指标分为 <strong>检索质量</strong> 和 <strong>生成质量</strong> 两个维度。每个指标通过 LLM-as-judge 或规则引擎自动计算，无需人工标注。</p>
+      <table class="outline-table"><thead><tr><th>指标</th><th>维度</th><th>评测方式</th><th>CorpAssist 门禁</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>faithfulness</td><td>生成</td><td>LLM 逐句检查是否源于 context</td><td>≥ 0.85</td><td>防止幻觉核心指标</td></tr>
+        <tr><td>answer_relevancy</td><td>生成</td><td>答案与问题的语义一致性</td><td>≥ 0.90</td><td>防止答非所问</td></tr>
+        <tr><td>context_precision</td><td>检索</td><td>检索文档中相关片段比例</td><td>≥ 0.75</td><td>噪声控制</td></tr>
+        <tr><td>context_recall</td><td>检索</td><td>ground_truth 可追溯至检索的文档</td><td>≥ 0.80</td><td>覆盖度</td></tr>
+        <tr><td>answer_correctness</td><td>综合</td><td>答案与 ground_truth 的事实一致性</td><td>≥ 0.80</td><td>事实准确性</td></tr>
+        <tr><td>aspect_critique</td><td>生成</td><td>自定义维度（安全性/专业性）</td><td>pass</td><td>需定制 rubric</td></tr>
+      </tbody></table>
+      <div class="mermaid-wrap"><h5>RAGAS 评测流程</h5><pre class="mermaid">flowchart TD
+  DS[Dataset<br/>100+ QA pairs] --> PIP[Pipeline<br/>Invoke chain]
+  PIP --> RES[Response<br/>answer + context]
+  RES --> MET[RAGAS Metrics]
+  DS --> MET
+  MET --> REPORT[Report JSON]
+  REPORT --> GATE{Critical metrics<br/>pass gate?}
+  GATE -->|Yes| MERGE[PR merge allowed]
+  GATE -->|No| BLOCK[Block + notify<br/>Slack alert]</pre></div>
+    </div>
+    <div class="section-block">
+      <h3>评测脚本自动化</h3>
+      <p>评测管线使用 <code>ragas</code> 库，核心输入为 Hugging Face Dataset 格式的 QA 三元组（question, answer, contexts, ground_truth）。CorpAssist 维护一个版本化的评测集 <code>corpassist_eval_v2.jsonl</code>，每次评测前拉取最新版本。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-python"># 自动化评测脚本
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness, answer_relevancy,
+    context_precision, context_recall, answer_correctness
+)
+import json, os
+
+def run_eval(chain, eval_path: str, threshold: dict):
+    with open(eval_path) as f:
+        records = [json.loads(line) for line in f]
+
+    answers, contexts = [], []
+    for rec in records:
+        result = chain.invoke(rec["question"])
+        answers.append(result["answer"])
+        contexts.append([c.page_content for c in result["context_docs"]])
+
+    ds = Dataset.from_dict({
+        "question": [r["question"] for r in records],
+        "answer": answers,
+        "contexts": contexts,
+        "ground_truth": [r.get("ground_truth", "") for r in records],
+    })
+
+    scores = evaluate(ds, metrics=[
+        faithfulness, answer_relevancy,
+        context_precision, context_recall, answer_correctness
+    ])
+
+    report = {k: float(v) for k, v in scores.items()}
+    with open("eval_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+
+    passed = all(report[k] >= threshold[k] for k in threshold)
+    if not passed:
+        failed = {k: report[k] for k in threshold if report[k] < threshold[k]}
+        raise RuntimeError(f"Eval gate failed: {failed}")
+    return report
+
+if __name__ == "__main__":
+    from chain_stub import chain
+    gate = {"faithfulness": 0.85, "context_recall": 0.80}
+    report = run_eval(chain, "eval/corpassist_eval_v2.jsonl", gate)
+    print(f"Eval passed: {json.dumps(report, indent=2)}")</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># 本地运行评测
+cd demos/practice-04-rag-eval-lab
+
+# 安装 RAGAS
+pip install ragas datasets
+
+# 运行评测
+python run_eval.py --dataset eval/corpassist_eval_v2.jsonl --output eval_report.json
+
+# 查看报告
+cat eval_report.json | python -m json.tool
+# 输出:
+# {
+#   "faithfulness": 0.892,
+#   "answer_relevancy": 0.935,
+#   "context_precision": 0.782,
+#   "context_recall": 0.851,
+#   "answer_correctness": 0.823
+# }</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>CI 集成与闸门</h3>
+      <p>在 GitHub Actions 中集成 RAGAS 评测，每次 PR 触发时运行。评测集选择仅执行与 PR 改动相关的子集（通过 <code>changed_files</code> 推断影响的知识库）。若关键指标低于阈值，CI 直接 FAIL 并 Slack 通知。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-yaml"># .github/workflows/rag-eval.yml
+name: RAG Eval Gate
+on:
+  pull_request:
+    paths:
+      - 'rag_service/**'
+      - 'eval/**'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install deps
+        run: |
+          pip install -r rag_service/requirements.txt
+          pip install ragas datasets
+      - name: Run eval
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python eval/run_eval.py \
+            --dataset eval/corpassist_eval_v2.jsonl \
+            --threshold '{"faithfulness":0.85,"context_recall":0.80}' \
+            --output eval_report.json
+      - name: Post report
+        if: always()
+        run: python eval/post_report.py --report eval_report.json --pr ${{ github.event.number }}</code></pre></div>
+      <table class="outline-table"><thead><tr><th>闸门等级</th><th>条件</th><th>动作</th></tr></thead>
+      <tbody>
+        <tr><td>Blocking</td><td>faithfulness < 0.85 或 context_recall < 0.80</td><td>CI FAIL + @责任人 Slack</td></tr>
+        <tr><td>Warning</td><td>answer_relevancy < 0.90</td><td>CI pass + PR comment 提醒</td></tr>
+        <tr><td>Info</td><td>context_precision < 0.75</td><td>记录趋势图，不进闸门</td></tr>
+      </tbody></table>
+    </div>
+    <div class="section-block">
+      <h3>坏例归因流程</h3>
+      <p>当评测不通过或用户反馈 bad case 时，需要系统化归因。CorpAssist 定义了 <strong>三级归因流程</strong>，每个 bad case 最终归入三类之一。</p>
+      <div class="mermaid-wrap"><h5>坏例归因决策树</h5><pre class="mermaid">flowchart TD
+  BC[Bad Case] --> Q1{context 包含<br/>正确答案?}
+  Q1 -->|否| RET[检索遗漏<br/>→ 查 chunk/embedding]
+  Q1 -->|是| Q2{答案与 context<br/>事实一致?}
+  Q2 -->|否| GEN[生成偏离<br/>→ 查 prompt/LLM]
+  Q2 -->|是| Q3{为什么用户<br/>认为不好?}
+  Q3 --> NOISE[检索噪声过多<br/>→ 提 k/加 rerank]
+  Q3 --> FORMAT[格式/语气不符<br/>→ 调 prompt 模板]</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-python"># 坏例归因脚本
+def classify_bad_case(question: str, answer: str, contexts: list, ground_truth: str):
+    """自动归因 bad case"""
+    # Step 1: 检查 context 是否包含 ground_truth
+    gt_in_context = any(gt_phrase in ctx for gt_phrase in split_sentences(ground_truth) for ctx in contexts)
+
+    if not gt_in_context:
+        return {
+            "category": "检索遗漏",
+            "action": "检查 chunk 粒度、embedding 模型、filter 配置",
+            "severity": "high"
+        }
+
+    # Step 2: 检查答案是否与 context 一致
+    from ragas.metrics import faithfulness
+    score = faithfulness.score((answer, contexts))
+    if score < 0.7:
+        return {
+            "category": "生成偏离",
+            "action": "检查 prompt 约束、温度参数、是否绕过了 context",
+            "severity": "high"
+        }
+
+    # Step 3: 检查噪声比例
+    from ragas.metrics import context_precision
+    precision = context_precision.score((question, contexts, ground_truth))
+    if precision < 0.6:
+        return {
+            "category": "检索噪声",
+            "action": "降低 k、增加 score_threshold、加 reranker",
+            "severity": "medium"
+        }
+
+    return {
+        "category": "格式/体验",
+        "action": "检查 prompt 模板、输出格式、语气",
+        "severity": "low"
+    }</code></pre></div>
+      <p>坏例归因自动化：在 CI 闸门失败后，自动触发的归因脚本将每条失败用例分类并生成归因报告。报告按检索遗漏/生成偏离/检索噪声/格式体验四类统计，并给出 Top-3 建议操作。CorpAssist 的归因流程已被集成到工单系统，当归因脚本发现某类 bad case 比例超过 30% 时自动创建 Jira 可执行任务。</p>
+      <details class="learn-micro-check"><summary>自检：如果 faithfulness 从 0.89 降至 0.72，你第一步查什么？</summary>
+      <p>第一步查 context 是否仍然是相关文档。可能原因：1) 检索配置被意外修改（filter 放行、k 被调大引入噪声）；2) embedding 模型版本变更导致检索质量下降；3) Prompt 被修改移除了「仅根据 context」约束。通过比较最近两次评测的上下文分布可快速定位。</p>
+      </details>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># 坏例归因报告生成
+cd demos/practice-04-rag-eval-lab
+
+# 运行归因脚本
+python classify_bad_cases.py \
+  --dataset eval/corpassist_eval_v2.jsonl \
+  --eval-report eval_report.json \
+  --output attribution_report.json
+
+# 查看归因统计
+python -m json.tool attribution_report.json | head -20
+# {
+#   "total_bad_cases": 23,
+#   "by_category": {
+#     "检索遗漏": 8,
+#     "生成偏离": 6,
+#     "检索噪声": 7,
+#     "格式/体验": 2
+#   },
+#   "top_actions": [
+#     "检查 hr 知识库的 k 值配置（当前=4，建议=6）",
+#     "检查 legal 知识库的 embedding 模型版本",
+#     "检查 system prompt 的 '仅根据 context' 约束"
+#   ]
+# }</pre></code></div>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>RAGAS 六指标</strong>：覆盖检索质量（context_precision/recall）和生成质量（faithfulness/relevancy/correctness），门禁以 faithfulness + context_recall 为核心</li>
+        <li><strong>评测自动化</strong>：Dataset 格式输入 QA 三元组，evaluate() 自动计算，输出 JSON 报告</li>
+        <li><strong>CI 闸门</strong>：Blocking（faithfulness<0.85 或 recall<0.80）→ CI FAIL；Warning/Info 仅通知</li>
+        <li><strong>三级归因</strong>：检索遗漏 → 查 chunk/embedding；生成偏离 → 查 prompt/LLM；检索噪声 → 降低 k/加 rerank</li>
+        <li><strong>评测集维护</strong>：版本化管理 QA 三元组，每次评测拉取最新版本，覆盖所有知识库</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能解释 RAGAS 六个指标的评估维度和计算方式</label></li>
+        <li><label><input type="checkbox"> 能编写自动化评测脚本并配置阈值门禁</label></li>
+        <li><label><input type="checkbox"> 能在 GitHub Actions 中配置 RAG eval 工作流</label></li>
+        <li><label><input type="checkbox"> 能按三级归因流程分析 bad case 根因</label></li>
+        <li><label><input type="checkbox"> 能维护评测集版本并做 regression test</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>faithfulness</td><td>答案是否严格基于 context，防幻觉</td></tr>
+        <tr><td>answer_relevancy</td><td>答案与问题语义一致性</td></tr>
+        <tr><td>context_precision</td><td>检索文档中相关片段比例，越低噪声越大</td></tr>
+        <tr><td>context_recall</td><td>ground_truth 可追溯至检索文档的比例</td></tr>
+        <tr><td>answer_correctness</td><td>答案与 ground_truth 事实一致性</td></tr>
+        <tr><td>aspect_critique</td><td>自定义维度评测（安全性、专业性）</td></tr>
+        <tr><td>LLM-as-judge</td><td>用 LLM 自动评分替代人工标注</td></tr>
+        <tr><td>三元组</td><td>question + answer + ground_truth 最小评测单元</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>RAGAS 的 faithfulness 是如何计算的？有什么局限性？</summary>
+      <p>详细说明步骤如下：第一步，将 answer 拆分为独立陈述（atomic claims）；第二步，对每个陈述，用 LLM 判断是否可从 context 中推断（true/false/unverifiable）；第三步，faithfulness = true_claims / (true_claims + false_claims)。局限性：LLM-as-judge 的评判本身可能有偏差；对长 answer 中 claims 的拆分会漏掉隐含断言；对专业领域术语的理解可能不够准确。</p>
+      </details>
+      <details><summary>评测集应该怎么构建和维护？</summary>
+      <p>构建：从用户日志采样真实问题（~60%），基于知识库关键内容由专家编写覆盖性题目（~30%），补充边界情况（~10%）。维护：每个版本标注 ground_truth；每次 embedding 模型升级、chunk 策略变更后重新评测；定期盲测（人工评分 vs RAGAS 评分偏差 < 0.1 时 confidence 足够）。</p>
+      </details>
+      <details><summary>CI 中运行完整评测集耗时较长，有什么加速策略？</summary>
+      <p>1) 基于 PR 改动范围选择子集（改 HR 知识库只跑 HR 评测集）；2) 缓存最近一次通过的评测结果，仅运行 diff 影响的相关指标；3) 先快速过滤（样本量 20 条快筛），通过后再全量验证；4) 使用全局评测结果缓存，同一 commit 不重复评测。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.ragas.io/en/latest/" target="_blank" rel="noopener">RAGAS 官方文档</a></li>
+    <li><a href="https://docs.ragas.io/en/latest/concepts/metrics/index.html" target="_blank" rel="noopener">RAGAS Metrics 详解</a></li>
+    <li><a href="https://github.com/explodinggradients/ragas">RAGAS GitHub 仓库</a></li>
+    <li><a href="https://docs.github.com/en/actions/using-workflows/about-workflows">GitHub Actions 工作流</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/practice-04-rag-eval-lab/</code> 中完成 <code>run_eval.py</code>，使其能加载评测集并调用 chain</li>
+      <li>运行 <code>python run_eval.py</code> 生成评测报告，确认 faithfulness >= 0.85</li>
+      <li>修改 <code>chain_stub.py</code> 中的 k（从 4 改为 2），观察 context_recall 的变化幅度</li>
+      <li>配置 <code>.github/workflows/rag-eval.yml</code> 闸门工作流，提交 PR 验证阻塞效果</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：用户反馈 HR 政策查询答非所问，但 RAGAS 评分全部通过。怎么排查？</summary>
+      <p>可能性：1) 评测集 ground_truth 已过时（政策更新后未同步）；2) 问题属于评测集未覆盖的新场景；3) RAGAS LLM-as-judge 对专业领域的判断不够准确。建议将用户 bad case 加入评测集并手动复审 RAGAS 评分与人工评分的一致性。</p>
+    </details>
+    <details><summary>场景 2：CI 评测经常因高延迟超时失败，但 recall 正常，如何优化？</summary>
+      <p>1) 评测集过大（>500 条），每个 query 触发完整的 embed+retrieve+llm 管线。建议按知识库分流并行评测；2) 对 LLM 调用的评测环节（faithfulness、relevancy）使用更小模型（gpt-4o-mini 替代 gpt-4o）；3) 设置评测 timeout 为 30 分钟，超过则自动 fail 并重试。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/practice-04-rag-eval-lab/</p><ul class="demo-acceptance">
+      <li>run_eval.py 可生成完整 RAGAS 评测报告</li>
+      <li>修改 k 值后 context_recall 变化 >= 5%</li>
+      <li>CI 工作流能在 PR 提交时自动触发评测</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-advanced-01-graphrag-hands-on">下一章：GraphRAG 实操</a></li>
+    <li><a href="https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/">RAGAS Metrics 完整列表</a></li>
+    <li><a href="https://arxiv.org/abs/2309.15217">RAGAS: Automated Evaluation of RAG（论文）</a></li>
+  </ul></div>
+</section>

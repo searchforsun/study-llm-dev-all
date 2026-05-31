@@ -1,0 +1,372 @@
+<section id="ch-practice-02-vectorstore-practice" class="chapter" data-chapter="practice-02-vectorstore-practice">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>VectorStore 实战</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-vectorstore-practice" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>Spring RAG 实践</strong> · 能力：在 Milvus/Redis/Simple 间切换 VectorStore，设计元数据 Schema，实现多模态 Embedding 存储与连接池调优</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>CorpAssist 生产环境最初使用 SimpleVectorStore（内存），数据量超过 10 万 chunk 后查询延迟从 20ms 飙升至 850ms。迁移到 Milvus 后延迟降至 12ms，但运维成本增加。不同 VectorStore 在性能、成本、运维复杂度上各有取舍，选型直接影响系统 SLA。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>在 Milvus/Redis/Simple 三种 VectorStore 间切换配置，设计含 tenant_id、kb、doc_id 的元数据 Schema，存储同一文档的多个 Embedding 版本（不同模型），配置连接池参数将 P99 延迟控制在 30ms 内。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>SimpleVectorStore：适合开发/测试，<10K 文档，重启丢失</li><li>Milvus：适合生产，>100K 文档，需独立部署，P99=12ms</li><li>Redis：适合缓存+向量混合，<50K 文档，无需额外基础设施</li><li>元数据 filter 是检索隔离的关键，必须在 VectorStore 配置层而非应用层</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>Milvus/Redis/Simple 切换</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · 向量库选型</span>HR 知识库从 1 万 chunk 增长到 30 万 chunk，SimpleVectorStore P99 延迟从 28ms 飙升至 820ms，需要迁移到 Milvus。切换需保证零停机、索引数据不丢、API 层不改代码。</aside>
+      <p>Spring AI 通过 <code>VectorStore</code> 接口统一了所有向量数据库的操作。切换后端只需更换 Bean 实现，业务代码零改动。Spring AI 3.0 支持 SimpleVectorStore、MilvusVectorStore、RedisVectorStore、PgVectorStore、QdrantVectorStore、PineconeVectorStore、WeaviateVectorStore 等。</p>
+      <div class="mermaid-wrap"><h5>VectorStore 切换架构</h5><pre class="mermaid">flowchart LR
+  APP[Application<br/>RAG Pipeline] --> VS[VectorStore<br/>interface]
+  VS --> SIMP[SimpleVectorStore<br/>内存/开发]
+  VS --> MIL[MilvusVectorStore<br/>生产/大数据量]
+  VS --> RED[RedisVectorStore<br/>缓存场景]
+  VS --> PG[PgVectorStore<br/>复用 PostgreSQL]
+  style VS stroke-width:3px</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 通过 @Profile 实现零代码切换
+@Configuration
+public class VectorStoreConfig {
+
+    @Bean
+    @Profile("dev")
+    public VectorStore simpleVectorStore(EmbeddingModel embeddingModel) {
+        // 开发环境：SimpleVectorStore，重启即失
+        return new SimpleVectorStore(embeddingModel);
+    }
+
+    @Bean
+    @Profile("prod-milvus")
+    public VectorStore milvusVectorStore(EmbeddingModel embeddingModel) {
+        // 生产环境：Milvus，需独立部署
+        var config = MilvusVectorStoreConfig.builder()
+            .withUri("http://milvus-corp:19530")
+            .withCollectionName("corpassist_docs")
+            .withDatabaseName("rag")
+            .withIndexType(IndexType.IVF_FLAT)   // IVF_FLAT: 精度与速度平衡
+            .withMetricType(MetricType.COSINE)     // COSINE: 与 OpenAI embedding 一致
+            .withIndexParameters(Map.of("nlist", 1024))
+            .build();
+        return new MilvusVectorStore(embeddingModel, config);
+    }
+
+    @Bean
+    @Profile("prod-redis")
+    public VectorStore redisVectorStore(EmbeddingModel embeddingModel,
+                                        RedisConnectionFactory factory) {
+        // Redis 场景：适合已有 Redis 基础设施的团队
+        var config = RedisVectorStoreConfig.builder()
+            .withIndexName("corpassist_idx")
+            .withPrefix("rag:")
+            .withMetadataFields(
+                "tenant_id", "kb", "doc_id", "doc_version"
+            )
+            .build();
+        return new RedisVectorStore(embeddingModel, config, factory);
+    }
+}</code></pre></div>
+      <table class="outline-table learn-decision-table"><thead><tr><th>特性</th><th>SimpleVectorStore</th><th>MilvusVectorStore</th><th>RedisVectorStore</th></tr></thead>
+      <tbody>
+        <tr><td>部署方式</td><td>内嵌内存</td><td>独立集群</td><td>Redis 模块</td></tr>
+        <tr><td>最大容量</td><td>~10K docs</td><td>100M+ docs</td><td>~50K docs</td></tr>
+        <tr><td>P99 查询（10K）</td><td>28ms</td><td>8ms</td><td>15ms</td></tr>
+        <tr><td>P99 查询（100K）</td><td>820ms</td><td>12ms</td><td>120ms</td></tr>
+        <tr><td>持久化</td><td>无</td><td>磁盘+WAL</td><td>RDB/AOF</td></tr>
+        <tr><td>元数据过滤</td><td>内存级过滤</td><td>ScalarField 索引</td><td>二级索引</td></tr>
+        <tr><td>运维成本</td><td>$0</td><td>中（需独立运维）</td><td>低（复用 Redis）</td></tr>
+        <tr><td>适用场景</td><td>开发/测试</td><td>生产大规模</td><td>中小规模生产</td></tr>
+      </tbody></table>
+    </div>
+    <div class="section-block">
+      <h3>Schema 设计与元数据</h3>
+      <p>VectorStore 不仅是向量+ID 的存储，还需要元数据字段支持过滤和溯源。CorpAssist 定义了标准化的向量库 Schema：</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// CorpAssist 标准化 VectorStore Schema
+public class VectorStoreSchema {
+
+    public static final String FIELD_DIMENSION = "1536";  // text-embedding-3-small
+
+    // 元数据字段定义
+    public static final String META_TENANT_ID = "tenant_id";    // 租户隔离
+    public static final String META_KB = "kb";                   // 知识库（hr/legal/it）
+    public static final String META_DOC_ID = "doc_id";          // 文档唯一标识
+    public static final String META_DOC_VERSION = "doc_version"; // 文档版本
+    public static final String META_TITLE = "title";             // 文档标题
+    public static final String META_LOCATION = "location";       // 条款位置
+    public static final String META_CHUNK_INDEX = "chunk_idx";   // 块序号
+    public static final String META_EMBED_MODEL = "embed_model"; // Embedding 模型名
+    public static final String META_INGESTED_AT = "ingested_at"; // 入库时间
+    public static final String META_IS_LATEST = "is_latest";     // 是否最新版本
+
+    // Milvus 集合创建语句等效
+    public static String createMilvusCollection(String collectionName) {
+        return """
+            CREATE TABLE %s (
+                id INT64 PRIMARY KEY,
+                vector FLOAT_VECTOR(%s),
+                tenant_id VARCHAR(64),
+                kb VARCHAR(32),
+                doc_id VARCHAR(128),
+                doc_version VARCHAR(16),
+                title VARCHAR(256),
+                location VARCHAR(256),
+                chunk_idx INT64,
+                embed_model VARCHAR(64),
+                ingested_at VARCHAR(32),
+                is_latest BOOLEAN
+            );
+            CREATE INDEX idx_tenant ON %s(tenant_id);
+            CREATE INDEX idx_kb ON %s(kb);
+            CREATE INDEX idx_doc ON %s(doc_id);
+            """.formatted(
+                collectionName, FIELD_DIMENSION,
+                collectionName, collectionName, collectionName, collectionName
+            );
+    }
+
+    // 为文档注入标准化元数据
+    public static Document enrichMetadata(Document doc, String tenantId,
+                                          String kb, String docId) {
+        doc.getMetadata().put(META_TENANT_ID, tenantId);
+        doc.getMetadata().put(META_KB, kb);
+        doc.getMetadata().put(META_DOC_ID, docId);
+        doc.getMetadata().put(META_DOC_VERSION, "v1.0");
+        doc.getMetadata().put(META_CHUNK_INDEX, 0);
+        doc.getMetadata().put(META_EMBED_MODEL, "text-embedding-3-small");
+        doc.getMetadata().put(META_INGESTED_AT, Instant.now().toString());
+        doc.getMetadata().put(META_IS_LATEST, true);
+        return doc;
+    }
+}</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 元数据过滤查询
+@Service
+public class SearchService {
+
+    private final VectorStore vectorStore;
+
+    public List<Document> search(String query, String tenantId, String kb) {
+        var request = SearchRequest.builder()
+            .query(query)
+            .topK(6)
+            .similarityThreshold(0.45)
+            // 元数据表达式过滤 — 租户+知识库双层隔离
+            .filterExpression(
+                "tenant_id == '" + tenantId + "' && kb == '" + kb + "' && is_latest == true"
+            )
+            .build();
+        return vectorStore.similaritySearch(request);
+    }
+
+    // 按文档版本精确查询
+    public List<Document> searchByVersion(String query, String docVersion) {
+        var request = SearchRequest.builder()
+            .query(query)
+            .topK(10)
+            .filterExpression("doc_version == '" + docVersion + "'")
+            .build();
+        return vectorStore.similaritySearch(request);
+    }
+}</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>多模态 Embedding 存储</h3>
+      <div class="mermaid-wrap"><h5>多 Embedding 模型路由策略</h5><pre class="mermaid">flowchart TD
+    Q[Query] --> STRAT{Select Strategy}
+    STRAT -->|query.length>50| LARGE[text-embedding-3-large<br/>3072 dim]
+    STRAT -->|kb=legal| LARGE
+    STRAT -->|default| SMALL[text-embedding-3-small<br/>1536 dim]
+    LARGE --> VS_L[corpassist_large collection]
+    SMALL --> VS_S[corpassist_small collection]
+    VS_L --> FILTER_L[filter: embed_model]
+    VS_S --> FILTER_S[filter: embed_model]</pre></div>
+      <p>CorpAssist 在不同阶段可能使用不同 Embedding 模型（text-embedding-3-small、bge-m3、m3e-large）。Schema 中 <code>embed_model</code> 字段记录每个 chunk 使用的模型，支持在同一集合中混合存储不同模型的向量。</p>
+      <table class="outline-table"><thead><tr><th>Embedding 模型</th><th>维度</th><th>单文档 100chunk 成本</th><th>CorpAssist 召回率@10</th><th>适用场景</th></tr></thead>
+      <tbody>
+        <tr><td>text-embedding-3-small</td><td>1536</td><td>$0.001</td><td>76.2%</td><td>通用默认</td></tr>
+        <tr><td>text-embedding-3-large</td><td>3072</td><td>$0.013</td><td>79.8%</td><td>精度优先场景</td></tr>
+        <tr><td>bge-m3（本地）</td><td>1024</td><td>$0（GPU）</td><td>74.1%</td><td>离线/内网部署</td></tr>
+        <tr><td>m3e-large（本地）</td><td>1024</td><td>$0（GPU）</td><td>72.5%</td><td>中文优化场景</td></tr>
+      </tbody></table>
+      <p>多模型混合存储时，查询需指定 <code>embed_model</code> 过滤条件，确保 query vector 与索引向量使用同一模型。Spring AI 的 <code>EmbeddingModel</code> 接口允许在运行时切换模型实例。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 多 Embedding 模型切换
+@Service
+public class MultiEmbeddingService {
+
+    private final Map<String, EmbeddingModel> models;
+
+    public MultiEmbeddingService(
+            @Qualifier("openaiSmall") EmbeddingModel openaiSmall,
+            @Qualifier("openaiLarge") EmbeddingModel openaiLarge,
+            @Qualifier("bgeM3") EmbeddingModel bgeM3) {
+        this.models = Map.of(
+            "text-embedding-3-small", openaiSmall,
+            "text-embedding-3-large", openaiLarge,
+            "bge-m3", bgeM3
+        );
+    }
+
+    // 按策略选择 embedding 模型
+    public String selectModel(String kb, String query) {
+        if (query.length() > 50) return "text-embedding-3-large";  // 长查询高精度
+        if ("legal".equals(kb)) return "text-embedding-3-large";   // 法务需高精度
+        return "text-embedding-3-small";   // 默认小模型
+    }
+
+    public List<Document> searchWithModel(String query, String kb,
+                                          String tenantId, String modelName) {
+        var embeddingModel = models.get(modelName);
+        var vectorStore = createStore(embeddingModel, modelName);
+        var request = SearchRequest.builder()
+            .query(query)
+            .topK(4)
+            .filterExpression("tenant_id == '" + tenantId + "' && kb == '" + kb
+                + "' && embed_model == '" + modelName + "'")
+            .build();
+        return vectorStore.similaritySearch(request);
+    }
+
+    private VectorStore createStore(EmbeddingModel model, String name) {
+        var config = MilvusVectorStoreConfig.builder()
+            .withCollectionName("corpassist_" + name.replace("-", "_"))
+            .build();
+        return new MilvusVectorStore(model, config);
+    }
+}</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>连接池与性能</h3>
+      <p>生产环境 VectorStore 的连接池配置直接影响 P99 延迟。以 Milvus 为例，Spring AI 使用 gRPC 连接，需配置连接池参数避免在高并发下连接阻塞。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// Milvus 连接池与性能调优
+@Configuration
+public class MilvusPerformanceConfig {
+
+    @Bean
+    public MilvusVectorStore optimizedMilvusStore(EmbeddingModel embeddingModel) {
+        var config = MilvusVectorStoreConfig.builder()
+            .withUri("http://milvus-corp:19530")
+            .withCollectionName("corpassist_docs")
+            .withDatabaseName("rag")
+            // 索引参数
+            .withIndexType(IndexType.IVF_FLAT)
+            .withIndexParameters(Map.of(
+                "nlist", 1024,          // 聚类中心数，越大精度越高但建索引慢
+                "nprobe", 16            // 查询时搜索的聚类数，越大召回越高但慢
+            ))
+            // gRPC 连接池
+            .withGrpcClientConfig(GrpcClientConfig.builder()
+                .withConnectTimeout(Duration.ofSeconds(10))
+                .withKeepAliveTime(Duration.ofSeconds(30))
+                .withKeepAliveTimeout(Duration.ofSeconds(10))
+                .withIdleTimeout(Duration.ofSeconds(60))
+                .withMaxRetries(3)
+                .build())
+            .build();
+        return new MilvusVectorStore(embeddingModel, config);
+    }
+}
+
+// 性能 benchmark
+@Component
+public class VectorStoreBenchmark {
+
+    public void runBenchmark(VectorStore store, List<String> queries) {
+        var times = new ArrayList<Long>();
+        for (String q : queries) {
+            long start = System.nanoTime();
+            store.similaritySearch(SearchRequest.builder().query(q).topK(4).build());
+            long elapsed = (System.nanoTime() - start) / 1_000_000;
+            times.add(elapsed);
+        }
+        Collections.sort(times);
+        System.out.printf("P50=%dms P95=%dms P99=%dms%n",
+            times.get(times.size() / 2),
+            times.get((int)(times.size() * 0.95)),
+            times.get((int)(times.size() * 0.99))
+        );
+    }
+}</code></pre></div>
+      <table class="outline-table"><thead><tr><th>调优参数</th><th>Milvus</th><th>Redis</th><th>效果</th></tr></thead>
+      <tbody>
+        <tr><td>连接超时</td><td>10s</td><td>5s</td><td>防止雪崩</td></tr>
+        <tr><td>keepalive</td><td>30s</td><td>—</td><td>维持长连接</td></tr>
+        <tr><td>nprobe</td><td>16（默认 8）</td><td>—</td><td>召回率 +4%，延迟 +8ms</td></tr>
+        <tr><td>nlist</td><td>1024（默认 128）</td><td>—</td><td>精度提升但建索引慢 3x</td></tr>
+        <tr><td>连接池大小</td><td>20</td><td>10</td><td>支持 200 QPS 不排队</td></tr>
+        <tr><td>批量写入</td><td>batchSize=100</td><td>pipeline=50</td><td>写入吞吐 +5x</td></tr>
+      </tbody></table>
+      <details class="learn-micro-check"><summary>自检：P99 延迟从 12ms 飙升到 200ms，应该优先排查哪些方面？</summary>
+      <p>1) Milvus 集群负载：CPU/内存是否打满，是否有慢查询在排队；2) gRPC 连接池是否耗尽（连接数不足导致等待）；3) nprobe 是否被意外调大（如从 16 改为 256）；4) 集合数据量是否超出索引段容量（需手动 compact）；5) 网络延迟（跨可用区调用）。</p>
+      </details>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>VectorStore 选型</strong>：Simple(dev) < 10K docs → Redis(小生产) < 50K → Milvus(大生产) 100M+；切换只需换 Bean</li>
+        <li><strong>元数据 Schema</strong>：tenant_id + kb + doc_id + doc_version + embed_model + is_latest 六字段保证检索隔离与版本管理</li>
+        <li><strong>多模型共存</strong>：embed_model 元数据字段区分不同 Embedding 模型向量，查询时过滤防止维度冲突</li>
+        <li><strong>连接池</strong>：Milvus gRPC 需配 keepalive/nprobe/batch；P99 从 820ms（10K Simple）降至 12ms（100K Milvus）</li>
+        <li><strong>性能与精度平衡</strong>：nprobe=16 召回 +4% 但延迟 +8ms；批量写入 batch=100 吞吐 +5x</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能在 dev/prod-milvus/prod-redis 三个 profile 间切换 VectorStore</label></li>
+        <li><label><input type="checkbox"> 能设计含 tenant_id+kb+doc_version 的元数据 Schema</label></li>
+        <li><label><input type="checkbox"> 能配置元数据 filterExpression 实现租户隔离</label></li>
+        <li><label><input type="checkbox"> 能实现多 Embedding 模型切换策略</label></li>
+        <li><label><input type="checkbox"> 能解释 nprobe/nlist/batchSize 等调优参数的作用</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>SimpleVectorStore</td><td>内存向量库，开发/测试用</td></tr>
+        <tr><td>MilvusVectorStore</td><td>独立部署的生产级向量库</td></tr>
+        <tr><td>RedisVectorStore</td><td>基于 Redis 的向量库</td></tr>
+        <tr><td>IVF_FLAT</td><td>倒排文件索引，精度与速度平衡</td></tr>
+        <tr><td>nlist</td><td>IVF 聚类中心数</td></tr>
+        <tr><td>nprobe</td><td>检索时搜索的聚类数</td></tr>
+        <tr><td>filterExpression</td><td>元数据过滤表达式</td></tr>
+        <tr><td>embed_model</td><td>Embedding 模型名元数据</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>Milvus 的 IVF_FLAT 和 HNSW 索引有什么区别？你如何选型？</summary>
+      <p>IVF_FLAT：聚类划分搜索空间，构建快（小时级/百万）、内存占用低，但精度受聚类数影响。HNSW：分层导航小世界图，构建慢（天级/百万）、内存高（是 IVF 的 3~5 倍），但查询快且精度高。CorpAssist 选择 IVF_FLAT（nlist=1024）的理由：数据集百亿级以下 IVF 精度可接受（recall@10=0.95）、构建速度快（500 篇文档索引创建 < 1 分钟）、资源消耗低（适合容器化部署）。</p>
+      </details>
+      <details><summary>如何在不停机的情况下将 SimpleVectorStore 迁移到 Milvus？</summary>
+      <p>方案：1) 在应用层实现双写模式——同时写入 Simple 和 Milvus（Feature Flag 控制）；2) 后台跑数据复制任务，将已有 Simple 数据批量迁入 Milvus；3) 灰度切换查询——先 10% 查询走 Milvus，验证准确率无差异后逐步放大流量；4) 切完后移除 SimpleVectorStore 的写路径和 Bean 声明。整体迁移窗口约 1~2 天。</p>
+      </details>
+      <details><summary>多 Embedding 模型混合存储时，检索精度是否有损失？</summary>
+      <p>如果查出的文档使用了不同模型，向量相似度的绝对分数不可比——text-embedding-3-small 的 0.85 分和 bge-m3 的 0.72 分不代表语义相似度差异。有两种策略：1) 分集合存储每个模型的向量（推荐），查询时指定对应集合；2) 同一集合用 embed_model 字段过滤（需确保 filter 生效，否则混合分数排序会失真）。CorpAssist 使用策略 1，集合命名 <code>corpassist_{model_name}</code>。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/milvus.html" target="_blank" rel="noopener">Spring AI Milvus VectorStore</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/redis.html" target="_blank" rel="noopener">Spring AI Redis VectorStore</a></li>
+    <li><a href="https://milvus.io/docs/index.md" target="_blank" rel="noopener">Milvus 索引类型文档</a></li>
+    <li><a href="https://redis.io/docs/latest/develop/modules/" target="_blank" rel="noopener">Redis 向量检索模块</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/practice-02-vectorstore-practice-lab/</code> 中配置三个 profile（dev/prod-milvus/prod-redis）的 VectorStore</li>
+      <li>定义 <code>VectorStoreSchema</code> 常量类，包含 10 个元数据字段</li>
+      <li>在检索方法中添加 <code>filterExpression</code> 实现 tenant_id+kb 双层过滤</li>
+      <li>运行 <code>VectorStoreBenchmark</code> 对比三种 VectorStore 的 P50/P95/P99</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：生产环境 Milvus 查询偶发返回空结果，但集合中有数据，排查方向？</summary>
+      <p>可能原因：1) filterExpression 的字段名与存入时不一致（如代码中写 tenantId 但元数据存 tenant_id）；2) 集合有多个 segment 但查询未合并（需要手动 loadCollection 或 compact）；3) Milvus 连接超时导致静默降级（检查 gRPC keepalive 配置）；4) query vector 使用的 embedding 模型与索引数据不同。</p>
+    </details>
+    <details><summary>场景 2：需要将 50 万条向量从 Milvus 迁移到新集群，最小停机时间方案？</summary>
+      <p>推荐 Milvus 的备份恢复工具（milvus-backup）：先全量备份旧集群，恢复到新集群，然后增量同步（milvus-cdc 组件）。CorpAssist 方案：在旧集群降权为只读，开启新集群双写，CDC 追平后 DNS 切流，总停机 < 3 分钟。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/practice-02-vectorstore-practice-lab/</p><ul class="demo-acceptance">
+      <li>三种 VectorStore 通过 profile 切换且业务代码不变</li>
+      <li>元数据 filter 查询返回预期结果（不跨租户）</li>
+      <li>Benchmark 输出显示 Milvus P99 < 30ms</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-practice-03-hybrid-rerank">下一章：混合检索 + Rerank</a></li>
+    <li><a href="https://milvus.io/docs/build_index.md">Milvus 索引构建指南</a></li>
+    <li><a href="https://redis.io/blog/redis-as-a-vector-database/">Redis 向量数据库实战</a></li>
+  </ul></div>
+</section>

@@ -1,0 +1,221 @@
+<section id="ch-advanced-01-graphrag-hands-on" class="chapter" data-chapter="advanced-01-graphrag-hands-on">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>GraphRAG 实操</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-graphrag-hands-on" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>Python RAG 进阶</strong> · 能力：部署微软 GraphRAG、理解实体关系抽取管线、评估成本与效果</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>CorpAssist 在处理跨文档推理问题（如「A 部门员工去 B 部门轮岗半年，期间年假怎么算？」）时，Naive RAG 因缺乏跨 chunk 关系理解而回答片面。GraphRAG 通过构建实体-关系知识图谱显式建模文档间的关联，能将这类跨文档问答的准确率提升 30%+。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>部署微软 GraphRAG 索引管线（文档 → entity extraction → community detection → summary），运行实体关系抽取流程，量化 GraphRAG 的 Token/时间成本，并在 CorpAssist 数据集上与 Naive RAG 做效果对比。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>GraphRAG 索引成本是 Naive RAG 的 50~100 倍（以 Token 计），主要耗在实体抽取</li><li>实体抽取阶段使用 GPT-4o 以 gpt-4o-mini 的 6 倍成本换取 +12% 准确率</li><li>Local Search 模式对单文档查询 vs Global Search 模式对跨文档总结适用不同</li><li>CorpAssist HR 知识库（500 文档）GraphRAG 索引成本约 $15，纯 RAG 约 $0.30</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>微软 GraphRAG 部署</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · 跨文档推理</span>员工问「如果我从工程部轮岗到产品部半年，年假和绩效怎么算？」——答案需要关联 HR 政策（年假折算）、部门轮岗条例、绩效评估办法三份文档，Naive RAG 通常只检到其中 1~2 份。</aside>
+      <p>微软 GraphRAG 是学术的 GraphRAG 概念的一个工业化实现。其核心创新在于 <strong>自动化的实体-关系-社区抽取</strong>：将文档分块后，使用 LLM 抽取实体（Entity）、关系（Relation）、声明（Claim），然后通过层次化社区检测（Leiden 算法）组织社区摘要。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># GraphRAG 部署与索引
+cd demos/advanced-01-graphrag-hands-on-lab
+
+# Step 1: 安装 graphrag
+pip install graphrag
+
+# Step 2: 初始化工作区
+mkdir -p graphrag_input graphrag_output
+# 将 CorpAssist HR 文档放入 graphrag_input/
+cp ../../datasets/hr_policies/*.md graphrag_input/
+
+# Step 3: 初始化配置
+python -m graphrag.index --init --root .
+# 生成 settings.yaml，需配置 LLM 和 Embedding 的 API key
+
+# Step 4: 运行索引（耗时约 5~10 分钟/100 文档）
+python -m graphrag.index --root . --resume graphrag_output
+
+# 索引完成后输出结构:
+# graphrag_output/artifacts/
+#   - entities.parquet  (实体表)
+#   - relationships.parquet  (关系表)
+#   - communities.parquet  (社区表)
+#   - text_units.parquet  (文本单元)</code></pre></div>
+      <p>配置文件关键参数（<code>settings.yaml</code>）：</p>
+      <table class="outline-table"><thead><tr><th>参数</th><th>建议值</th><th>影响</th></tr></thead>
+      <tbody>
+        <tr><td>chunk_size</td><td>1200 tokens</td><td>太小实体抽取不全；太大超出 LLM 上下文</td></tr>
+        <tr><td>chunk_overlap</td><td>200 tokens</td><td>避免边界实体被截断</td></tr>
+        <tr><td>entity_extraction_max_gleanings</td><td>2</td><td>每篇文档抽取后 LLM 二次验证</td></tr>
+        <tr><td>community_level</td><td>2</td><td>层次化社区，2 级在粒度与性能间平衡</td></tr>
+        <tr><td>claim_extraction_enabled</td><td>true</td><td>抽取声明（如「年假≥5 天」）</td></tr>
+        <tr><td>encoding_model</td><td>text-embedding-3-small</td><td>社区摘要的向量化</td></tr>
+      </tbody></table>
+    </div>
+    <div class="section-block">
+      <h3>实体关系抽取流程</h3>
+      <p>GraphRAG 索引的核心是 <strong>LLM 驱动的实体关系抽取</strong>。每个文本块被送入 LLM 并结构化输出 JSON 格式的实体与关系。抽取 prompt 示例及输出如下：</p>
+      <div class="mermaid-wrap"><h5>GraphRAG 索引管线</h5><pre class="mermaid">flowchart LR
+  DOC[Documents] --> CHUNK[Chunk & Clean]
+  CHUNK --> ENT[Entity Extraction<br/>LLM per chunk]
+  ENT --> MERGE[Merge Entities<br/>resolve duplicates]
+  MERGE --> LEIDEN[Leiden Community Detection]
+  LEIDEN --> SUM[Community Summarization]
+  SUM --> STORE[Knowledge Graph<br/>+ Vector Index]
+  STORE --> QLOCAL[Local Search]
+  STORE --> QGLOBAL[Global Search]</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-python"># 查看抽取结果
+import pandas as pd
+
+entities = pd.read_parquet("graphrag_output/artifacts/entities.parquet")
+relationships = pd.read_parquet("graphrag_output/artifacts/relationships.parquet")
+
+print(f"实体数: {len(entities)}, 关系数: {len(relationships)}")
+print("\n=== 实体样例 ===")
+print(entities[["name", "type", "description"]].head(5).to_dict(orient="records"))
+# 输出: [{"name": "年假", "type": "policy", "description": "员工年度带薪休假"},
+#        {"name": "绩效改善计划", "type": "program", "description": "PIP 30-90天"},
+#        {"name": "工程部", "type": "department", "description": "软件开发核心部门"}]
+
+print("\n=== 关系样例 ===")
+print(relationships[["source", "target", "description"]].head(5).to_dict(orient="records"))
+# 输出: [{"source": "年假", "target": "工程部", "description": "工程部员工适用标准年假政策"},
+#        {"source": "绩效改善计划", "target": "年假", "description": "PIP期间年假累计暂停"}]</code></pre></div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">Naive RAG 的局限</span><ul><li>每个 chunk 独立检索，无跨 chunk 关系建模</li><li>「PIP 期间年假怎么算」此类跨主题查询需手动拼接</li><li>每个 chunk 内容碎片化，LLM 难以综合推理</li></ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">GraphRAG 的优势</span><ul><li>实体-关系图显式建模跨文档关联</li><li>社区摘要在检索前已综合多个文档要点</li><li>Local Search 返回实体+关联关系+声明</li></ul></div>
+      </div>
+    </div>
+    <div class="section-block">
+      <h3>成本实测（Token/时间）</h3>
+      <div class="mermaid-wrap"><h5>GraphRAG vs Naive RAG 索引成本对比（对数尺度）</h5><pre class="mermaid">flowchart LR
+    subgraph GRAPH[GraphRAG Index $12.45]
+      EEE[Entity Extraction 70%] --> CCS[Community Summaries 29%]
+      CCS --> OTH[Other 1%]
+    end
+    subgraph NAIVE[Naive RAG Index $0.28]
+      CHK[Chunk & Embed 98%] --> STO[Store 2%]
+    end
+    GRAPH -.->|44x cost| NAIVE</pre></div>
+      <p>GraphRAG 的最大权衡是成本。在 CorpAssist HR 知识库（500 篇文档，约 450K tokens）上的实测数据：</p>
+      <table class="outline-table"><thead><tr><th>阶段</th><th>输入 Token（K）</th><th>输出 Token（K）</th><th>模型</th><th>估计成本</th><th>耗时</th></tr></thead>
+      <tbody>
+        <tr><td>文本分块清洗</td><td>0</td><td>0</td><td>—</td><td>$0</td><td>2s</td></tr>
+        <tr><td>实体抽取（每块）</td><td>450K</td><td>120K</td><td>gpt-4o</td><td>$8.70</td><td>12min</td></tr>
+        <tr><td>实体合并（去重）</td><td>25K</td><td>8K</td><td>gpt-4o-mini</td><td>$0.15</td><td>1min</td></tr>
+        <tr><td>社区检测（Leiden）</td><td>0</td><td>0</td><td>—</td><td>$0</td><td>0.5s</td></tr>
+        <tr><td>社区摘要</td><td>180K</td><td>45K</td><td>gpt-4o</td><td>$3.60</td><td>5min</td></tr>
+        <tr><td>向量化嵌入</td><td>30K</td><td>0</td><td>text-embedding-3-small</td><td>$0.005</td><td>10s</td></tr>
+        <tr><td><strong>总计</strong></td><td>685K</td><td>173K</td><td>—</td><td><strong>$12.45</strong></td><td><strong>~18min</strong></td></tr>
+      </tbody></table>
+      <p>对比 Naive RAG 索引：相同 500 篇文档，仅需 $0.28（chunk + embed + store）。GraphRAG 成本约 44 倍。查询阶段：GraphRAG Local Search 每次约 1850 输入 token + 350 输出 token（约 $0.005/次），Naive RAG 约 1200+200 token（$0.002/次）。</p>
+      <p>成本节省策略：若使用 gpt-4o-mini 替代 gpt-4o 做实体抽取，索引成本可从 $12.45 降至 $3.20，但实体准确率从 89% 降至 77%。CorpAssist 的折中方案为：首次使用 gpt-4o 全量建索引，增量更新使用 gpt-4o-mini 并做实体合并去重。若关闭 claim_extraction（声明抽取），索引成本再降 $1.80。查询阶段也可优化：对于简单单文档查询直接走 Naive RAG 避免 GraphRAG 的推理开销。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># GraphRAG 查询（Local Search — 面向具体问题）
+python -m graphrag.query \
+  --root . \
+  --method local \
+  "我从工程部轮岗到产品部半年，年假怎么算？"
+
+# 输出摘要示例:
+# 根据公司政策，跨部门轮岗期间年假按原部门标准计算，
+# 轮岗期超过3个月需在目标部门重新注册假期额度。
+# 具体条款参考: 员工手册第四章第2条、轮岗管理办法第8条。
+
+# GraphRAG 查询（Global Search — 面向全局总结）
+python -m graphrag.query \
+  --root . \
+  --method global \
+  "公司有哪些与休假相关的政策？"</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>与 Naive RAG 效果对比</h3>
+      <p>在 CorpAssist 跨文档 QA 测试集（100 条需要 2+ 文档才能回答的问题）上对比：</p>
+      <table class="outline-table"><thead><tr><th>指标</th><th>Naive RAG</th><th>GraphRAG Local</th><th>GraphRAG Global</th></tr></thead>
+      <tbody>
+        <tr><td>准确率（人工评估）</td><td>52.3%</td><td>84.7%</td><td>78.2%</td></tr>
+        <tr><td>faithfulness（RAGAS）</td><td>0.87</td><td>0.91</td><td>0.88</td></tr>
+        <tr><td>答案完整性（1~5）</td><td>2.4</td><td>4.1</td><td>3.8</td></tr>
+        <tr><td>P95 查询延迟</td><td>1.3s</td><td>2.1s</td><td>3.5s</td></tr>
+        <tr><td>单次查询成本</td><td>$0.002</td><td>$0.005</td><td>$0.008</td></tr>
+        <tr><td>索引成本（500 文档）</td><td>$0.28</td><td colspan="2">$12.45</td></tr>
+      </tbody></table>
+      <p>结论：对于单文档问答（占 CorpAssist 总查询的 65%），Naive RAG 已足够，准确率 87% vs GraphRAG 91% 差异不大。对于跨文档推理（占 35%），GraphRAG Local Search 准确率 84.7% 显著优于 Naive RAG 的 52.3%。建议 CorpAssist 采用 <strong>Hybrid 策略</strong>：先用 RAGAS 评测自动判断问题是否需要跨文档推理，再选择性路由到 GraphRAG。</p>
+      <p>Hybrid 路由的具体实现：在 RAGAS 评测管线中增加一个「cross_doc_score」分类器，基于问题中出现的实体数量（如问题中的命名实体 ≥ 3 个则大概率需要跨文档推理）。CorpAssist 日志分析显示：问题中含 1~2 个实体时仅 18% 需要跨文档，含 3~4 个实体时 62% 需要跨文档，含 5+ 实体时 89% 需要跨文档。基于该规则可实现一个零成本的路由器，无需额外 LLM 调用。</p>
+      <details class="learn-faq"><summary>FAQ：什么时候不应该用 GraphRAG？</summary>
+      <p>1) 知识库 < 100 篇文档或文档间无交叉引用关系 — 图结构信息量低；2) 查询主要是单文档事实问答（「今年的年假天数」）— Naive RAG 成本更低且延迟更短；3) 对索引成本敏感且更新频率高（每周更新）— 每次索引重新运行成本 $10+；4) 对 P95 延迟要求 < 1.5s — GraphRAG Local Search P95=2.1s 超出。</p>
+      </details>
+      <details class="learn-micro-check"><summary>自检：GraphRAG 索引中最耗时的环节是哪个？如何优化？</summary>
+      <p>最耗时的是实体抽取环节（占总时间的 ~67%），因为每个 chunk 需调用 LLM 提取实体+关系+声明。优化方向：1) 使用 gpt-4o-mini 替代 gpt-4o（成本降 6 倍，但实体准确率从 89% 降至 77%）；2) 增大 chunk_size 减少调用次数；3) 使用模型并行（多个 chunk 同时抽取）。</p>
+      </details>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>GraphRAG 部署</strong>：微软 GraphRAG 索引管线分四步：chunk → entity extraction → community detection → summary，500 文档约 18 分钟完成</li>
+        <li><strong>实体抽取成本</strong>：索引阶段 Token 消耗约 858K（输入+输出），成本 $12.45（Naive RAG 仅 $0.28）</li>
+        <li><strong>查询效果</strong>：跨文档推理准确率 84.7% vs Naive RAG 52.3%，单文档查询差距不大</li>
+        <li><strong>Hybrid 策略</strong>：CorpAssist 应选择性路由跨文档问题到 GraphRAG，其余走 Naive RAG</li>
+        <li><strong>适用场景</strong>：文档间关联密集、跨文档推理频繁的知识库才值得 GraphRAG 的索引成本</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能独立部署微软 GraphRAG 并完成索引管线</label></li>
+        <li><label><input type="checkbox"> 能解释实体抽取、社区检测、社区摘要各环节的作用</label></li>
+        <li><label><input type="checkbox"> 能估算 GraphRAG 索引和查询阶段的 Token/成本</label></li>
+        <li><label><input type="checkbox"> 能区分 Local Search 与 Global Search 的适用场景</label></li>
+        <li><label><input type="checkbox"> 能基于查询类型决策走 GraphRAG 还是 Naive RAG</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>GraphRAG</td><td>微软基于图的 RAG 实现</td></tr>
+        <tr><td>Entity Extraction</td><td>LLM 从 chunk 提取实体名称+类型+描述</td></tr>
+        <tr><td>Leiden 算法</td><td>层次化社区检测，自动发现实体聚类</td></tr>
+        <tr><td>Community Summary</td><td>LLM 对每个社区的关联文档做摘要</td></tr>
+        <tr><td>Local Search</td><td>以实体为中心检索关联信息</td></tr>
+        <tr><td>Global Search</td><td>以社区摘要为中心全局总结</td></tr>
+        <tr><td>gleanings</td><td>实体抽取后 LLM 二次验证次数</td></tr>
+        <tr><td>Naive RAG</td><td>标准向量检索+生成</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>GraphRAG 的社区检测是如何实现的？为什么用了 Leiden 算法而非 Louvain？</summary>
+      <p>Leiden 算法在 Louvain 基础上增加了 refine 阶段，保证社区连通性，避免 Louvain 可能产生的断连社区。GraphRAG 层次化社区检测：先构建实体图（节点=实体，边=关系强度），然后逐层应用 Leiden 算法形成多尺度社区，上层社区包含下层社区，形成金字塔结构。层次化使得 Local Search 和 Global Search 可在不同粒度检索。</p>
+      </details>
+      <details><summary>List 出 3 个你可能在 CorpAssist 考虑使用 GraphRAG 的信号？</summary>
+      <p>1) 用户频繁问「A 政策对 B 流程有什么影响」类问题（跨文档推理占查询 > 30%）；2) 知识库超过 500 篇且文档间有密集引用关系（如「详见第四章」）；3) Bad case 分析显示 Naive RAG 因 chunk 碎片化导致答案不完整（context_recall < 0.70）。</p>
+      </details>
+      <details><summary>如何降低 GraphRAG 索引成本？</summary>
+      <p>1) 实体抽取使用 gpt-4o-mini 替代 gpt-4o（成本降 6 倍，准确率从 89%→77%）；2) 增加 chunk_size 从 1200 到 2400 减少调用次数（但可能漏掉细粒度实体）；3) 关闭 claim_extraction（占 15% 成本）；4) 对更新文档使用增量索引（目前 graphrag 不支持，需自研 diff 策略）。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://microsoft.github.io/graphrag/" target="_blank" rel="noopener">微软 GraphRAG 官方文档</a></li>
+    <li><a href="https://github.com/microsoft/graphrag" target="_blank" rel="noopener">GitHub: microsoft/graphrag</a></li>
+    <li><a href="https://arxiv.org/abs/2404.16130">GraphRAG 论文（微软）</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/Leiden_algorithm">Leiden 算法详解</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/advanced-01-graphrag-hands-on-lab/</code> 初始化 GraphRAG 工作区</li>
+      <li>将 <code>hr_policies/</code> 目录的 50 篇文档放入输入目录，运行索引</li>
+      <li>查询「工程部轮岗到产品部年假计算」，记录完整回答</li>
+      <li>在相同查询上对比 Naive RAG 的回答，分析差异</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：知识库 200 篇文档，月更新 2 次，GraphRAG 索引成本月均 $50，ROI 怎么看？</summary>
+      <p>先评估跨文档查询占比：如果 < 20%，建议维持 Naive RAG。如果 > 50%，$50/月的成本在 CorpAssist 场景中可接受（对比工程师人工处理跨文档查询的人力成本）。建议先对 1 个月的用户 query 做日志分析，统计需要跨文档推理的 query 比例再决策。</p>
+    </details>
+    <details><summary>场景 2：索引运行中遇到 rate limit（429），如何配置重试策略？</summary>
+      <p>在 settings.yaml 中设置 <code>max_retries: 10</code> 和 <code>retry_delay: 30</code>（秒）。若仍频繁触发，降低 parallelism 参数（默认 25→10）。GraphRAG 内部使用 tenacity 库进行指数退避重试，可在日志中观察 retry 次数。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/advanced-01-graphrag-hands-on-lab/</p><ul class="demo-acceptance">
+      <li>GraphRAG 索引成功完成并输出 .parquet 工件</li>
+      <li>Local Search 查询返回跨文档推理的完整答案</li>
+      <li>与 Naive RAG 的对比分析文档（graph-vs-hybrid.md）</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-advanced-02-grounding-citation">下一章：Grounding/Citation 工程实践</a></li>
+    <li><a href="https://medium.com/data-science-at-microsoft/graphrag-results-3-research-insights-9d0e0a0b6e8a">GraphRAG 效果分析博客</a></li>
+    <li><a href="https://neo4j.com/developer-blog/graphrag-patterns/">Neo4j GraphRAG 模式对比</a></li>
+  </ul></div>
+</section>

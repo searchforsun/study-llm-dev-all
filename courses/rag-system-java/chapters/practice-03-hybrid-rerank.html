@@ -1,0 +1,371 @@
+<section id="ch-practice-03-hybrid-rerank" class="chapter" data-chapter="practice-03-hybrid-rerank">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>混合检索 + Rerank</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-hybrid-rerank" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>Spring RAG 实践</strong> · 能力：在 Spring AI 中实现 BM25+向量混合检索、集成 BGE-Reranker、权重调优与延迟基准测试</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>纯向量检索对专有名词、缩写、条款编号召回不充分。CorpAssist Java 侧的 BFF 需要与 Python 侧混合检索（practice-03）对齐效果，但 Java BM25 生态与 Python 不同。Spring AI 原生不提供 BM25，需使用 Lucene 或 Elasticsearch 实现。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>在 Spring AI 中集成 Lucene BM25 实现混合检索，调用 BGE-Reranker 对初检结果重排序，通过 ablation 实验确定最优融合权重，将 P95 延迟控制在 350ms 内。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>Spring AI 无内置 BM25，通过 Lucene MemoryIndex 或 Elasticsearch 实现</li><li>RRF 融合用 rank 而非 score，解决跨模型分数不可比</li><li>BGE-Reranker 需独立部署（HTTP/gRPC），不可内嵌 JVM</li><li>CorpAssist 最优 alpha=0.3（向量权重），与 Python 侧一致</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>BM25 + 向量融合实现</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · 法务条款检索</span>法务查询「依据 2024 年劳动合同法第 18 条解答」需精确命中「第18条」关键词。向量检索可能匹配到「第17条」「第19条」的语义相似片段，需 BM25 精确词匹配纠正排名。</aside>
+      <p>Spring AI 的 VectorStore 接口只定义了向量检索方法。要实现 BM25 混合，需要在应用中单独集成全文检索引擎。CorpAssist Java 侧选择 Lucene MemoryIndex（适用于集合量 < 10 万篇）或 Elasticsearch（适用于大规模），通过 RRF 算法融合两路结果。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// Lucene BM25 实现 — 内存全文索引
+@Component
+public class LuceneBm25Indexer {
+
+    private final Analyzer analyzer = new IKAnalyzer();  // 中文分词
+    private IndexWriter writer;
+    private IndexReader reader;
+
+    @PostConstruct
+    public void init() throws IOException {
+        var config = new IndexWriterConfig(analyzer);
+        config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+        writer = new IndexWriter(new RAMDirectory(), config);
+    }
+
+    public void addDocument(String docId, String content, Map<String, String> metadata) {
+        try {
+            var doc = new Document();
+            doc.add(new StringField("doc_id", docId, Field.Store.YES));
+            doc.add(new TextField("content", content, Field.Store.YES));
+            metadata.forEach((k, v) ->
+                doc.add(new StringField(k, v, Field.Store.YES)));
+            writer.addDocument(doc);
+            writer.commit();
+        } catch (IOException e) {
+            throw new RuntimeException("BM25 index error", e);
+        }
+    }
+
+    public List<Bm25Result> search(String query, int topK, String tenantId) {
+        try {
+            reader = DirectoryReader.open(writer);
+            var searcher = new IndexSearcher(reader);
+            var parser = new QueryParser("content", analyzer);
+            var boolQuery = new BooleanQuery.Builder()
+                .add(parser.parse(query), BooleanClause.Occur.MUST)
+                .add(new TermQuery(new Term("tenant_id", tenantId)),
+                     BooleanClause.Occur.FILTER)
+                .build();
+            var hits = searcher.search(boolQuery, topK * 2);
+            var results = new ArrayList<Bm25Result>();
+            for (var hit : hits.scoreDocs) {
+                var doc = searcher.doc(hit.doc);
+                results.add(new Bm25Result(
+                    doc.get("doc_id"), hit.score,
+                    doc.get("content").substring(0, Math.min(100, doc.get("content").length()))
+                ));
+            }
+            return results;
+        } catch (IOException e) {
+            throw new RuntimeException("BM25 search error", e);
+        }
+    }
+}
+
+public record Bm25Result(String docId, double score, String snippet) {}
+
+// RRF 融合器
+@Component
+public class RrfFusion {
+
+    private static final int RRF_CONSTANT = 60;
+
+    public List<FusedResult> fuse(
+            List<VectorResult> vectorResults,
+            List<Bm25Result> bm25Results,
+            double alpha,
+            int finalK) {
+
+        Map<String, Double> fused = new HashMap<>();
+        Set<String> allIds = new HashSet<>();
+
+        // 向量结果
+        for (int i = 0; i < vectorResults.size(); i++) {
+            var r = vectorResults.get(i);
+            allIds.add(r.docId());
+            double rrf = alpha * (1.0 / (RRF_CONSTANT + i + 1));
+            fused.merge(r.docId(), rrf, Double::sum);
+        }
+
+        // BM25 结果
+        for (int i = 0; i < bm25Results.size(); i++) {
+            var r = bm25Results.get(i);
+            allIds.add(r.docId());
+            double rrf = (1 - alpha) * (1.0 / (RRF_CONSTANT + i + 1));
+            fused.merge(r.docId(), rrf, Double::sum);
+        }
+
+        return fused.entrySet().stream()
+            .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+            .limit(finalK)
+            .map(e -> new FusedResult(e.getKey(), e.getValue()))
+            .toList();
+    }
+}
+
+public record FusedResult(String docId, double rrfScore) {}</code></pre></div>
+      <div class="mermaid-wrap"><h5>Spring 混合检索管线</h5><pre class="mermaid">flowchart LR
+  Q[Query] --> VEC[VectorStore<br/>similaritySearch]
+  Q --> BM[Lucene BM25<br/>全文检索]
+  VEC --> RRF[RRF Fusion<br/>alpha=0.3]
+  BM --> RRF
+  RRF --> RER[BGE-Reranker<br/>交叉编码排序]
+  RER --> FINAL[Top-k Results<br/>recall@10=93%]</pre></div>
+    </div>
+    <div class="section-block">
+      <h3>BGE-Reranker 调用</h3>
+      <p>RRF 融合后，Top-30 结果再经 BGE-Reranker（BAAI/bge-reranker-v2-m3）交叉编码排序。BGE-Reranker 基于 transformer 交叉编码架构，对 (query, doc) 对计算相关性分数，精度高于向量相似度。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// BGE-Reranker HTTP 客户端（服务端独立部署）
+@Component
+public class BgeRerankerClient {
+
+    private final RestTemplate restTemplate;
+    private final String endpoint;
+
+    public BgeRerankerClient(
+            @Value("${reranker.bge.endpoint}") String endpoint) {
+        this.restTemplate = new RestTemplate();
+        this.restTemplate.setMessageConverter(
+            new StringHttpMessageConverter(StandardCharsets.UTF_8));
+        this.endpoint = endpoint;
+    }
+
+    public List<RerankedResult> rerank(String query,
+                                       List<FusedResult> candidates) {
+        var request = Map.of(
+            "query", query,
+            "documents", candidates.stream()
+                .map(FusedResult::docId).toList(),
+            "top_k", Math.min(candidates.size(), 10)
+        );
+
+        var response = restTemplate.postForObject(
+            endpoint + "/rerank", request, RerankResponse.class);
+
+        if (response == null || response.results() == null) {
+            return candidates.stream()
+                .map(c -> new RerankedResult(c.docId(), 0.0))
+                .toList();
+        }
+
+        return response.results().stream()
+            .map(r -> new RerankedResult(
+                candidates.get(r.index()).docId(), r.relevanceScore()))
+            .sorted(Comparator.comparing(RerankedResult::score).reversed())
+            .toList();
+    }
+
+    // BGE 服务端 API 协议
+    public record RerankRequest(String query, List<String> documents, int topK) {}
+    public record RerankResponse(List<RerankItem> results) {}
+    public record RerankItem(int index, double relevanceScore) {}
+    public record RerankedResult(String docId, double score) {}
+}
+
+// Docker 部署 BGE-Reranker 服务
+// docker run -p 8081:80 -e MODEL=BAAI/bge-reranker-v2-m3 \
+//   ghcr.io/huggingface/text-embeddings-inference:cpu-latest</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># BGE-Reranker 服务部署（Docker）
+docker run -d --name bge-reranker \
+  -p 8081:80 \
+  -e MODEL=BAAI/bge-reranker-v2-m3 \
+  -e MAX_BATCH_SIZE=64 \
+  -e MAX_CLIENT_BATCH_SIZE=128 \
+  ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+
+# 测试 rerank API
+curl -s -X POST http://localhost:8081/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "年假折算规则",
+    "documents": ["年假最低5天", "PIP流程30天", "轮岗期间年假暂停"],
+    "top_k": 3
+  }' | jq .
+# 输出: {"results":[{"index":0,"relevanceScore":0.892},{"index":2,"relevanceScore":0.761},{"index":1,"relevanceScore":0.324}]}</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>权重调优与 Ablation</h3>
+      <p>在 CorpAssist 法务测试集（200 条需精确条款匹配的查询）上对 alpha 和 rerank 策略进行 ablation 实验。</p>
+      <table class="outline-table"><thead><tr><th>实验配置</th><th>recall@10</th><th>MRR</th><th>P95 延迟</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>纯向量搜索</td><td>71.8%</td><td>0.421</td><td>45ms</td><td>基准线</td></tr>
+        <tr><td>纯 BM25</td><td>65.3%</td><td>0.385</td><td>12ms</td><td>词匹配但无语义</td></tr>
+        <tr><td>混合 RRF alpha=0.3</td><td>89.7%</td><td>0.638</td><td>68ms</td><td>核心方案</td></tr>
+        <tr><td>混合 RRF alpha=0.5</td><td>87.2%</td><td>0.612</td><td>68ms</td><td>均衡方案</td></tr>
+        <tr><td>混合 RRF alpha=0.7</td><td>82.4%</td><td>0.581</td><td>68ms</td><td>向量主导</td></tr>
+        <tr><td>混合 + Rerank（Top30→5）</td><td><strong>94.1%</strong></td><td><strong>0.721</strong></td><td>320ms</td><td>精度最高</td></tr>
+        <tr><td>混合 + Rerank（Top15→5）</td><td>92.3%</td><td>0.695</td><td>185ms</td><td>速度与精度平衡</td></tr>
+      </tbody></table>
+      <p>Ablation 结论：1) 仅 BM25 或仅向量召回均不足（~70%），RRF 融合提升至 ~90%；2) Rerank 将 Top30 候选重排至高精度 Top5，recall@10 再提升 4.4 个百分点；3) Rerank 候选数从 30 降至 15，延迟从 320ms 降至 185ms（降 42%），而 recall 仅降 1.8%。CorpAssist 采用混合 RRF(alpha=0.3) + Rerank(Top15→5) 作为默认生产配置。</p>
+      <details class="learn-micro-check"><summary>自检：为什么 CorpAssist 中 BM25 权重（1-alpha）高于向量权重（alpha）？</summary>
+      <p>在 CorpAssist 法务/政策场景中，精确的条款匹配（「第18条」「竞业限制」）比语义匹配更关键。BM25 精确命中这些关键词的文档应该排在向量语义相似但未命中关键词的文档之前。所以 alpha=0.3（BM25 占 0.7 权重）是合理的。如果是语义搜索场景（如「描述一下公司文化」），则应调高 alpha 至 0.6~0.7。</p>
+      </details>
+    </div>
+    <div class="section-block">
+      <h3>延迟基准测试</h3>
+      <div class="mermaid-wrap"><h5>检索阶段延迟分解（P50）</h5><pre class="mermaid">flowchart LR
+    subgraph RETRIEVAL[检索阶段 162ms]
+      VEC[Vector Store<br/>42ms 26%] --> RRF[RRF Fusion<br/>2ms 1%]
+      BM[BM25 Lucene<br/>8ms 5%] --> RRF
+      RRF --> RER[BGE-Reranker<br/>110ms 68%]
+    end
+    RER --> LLM[LLM Generation<br/>890ms]
+    LLM --> TOTAL[End2End<br/>1052ms]</pre></div>
+      <p>在 CorpAssist 性能测试环境（4C8G JVM, Milvus 集群, BGE GPU 节点）上，对完整管线进行延迟基准测试：</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 完整管线延迟基准测试
+@Component
+public class FullPipelineBenchmark {
+
+    @Autowired private VectorStore vectorStore;
+    @Autowired private LuceneBm25Indexer bm25Indexer;
+    @Autowired private RrfFusion rrfFusion;
+    @Autowired private BgeRerankerClient reranker;
+
+    public Map<String, Object> benchmark(List<String> queries, int warmup, int runs) {
+        // Warmup
+        for (int i = 0; i < warmup; i++) {
+            runPipeline(queries.get(i % queries.size()));
+        }
+
+        var vecTimes = new ArrayList<Long>();
+        var bmTimes = new ArrayList<Long>();
+        var totalTimes = new ArrayList<Long>();
+
+        for (int i = 0; i < runs; i++) {
+            long start = System.nanoTime();
+            var result = runPipeline(queries.get(i % queries.size()));
+            long total = (System.nanoTime() - start) / 1_000_000;
+            totalTimes.add(total);
+            vecTimes.add((long) result.get("vecMs"));
+            bmTimes.add((long) result.get("bmMs"));
+        }
+
+        return Map.of(
+            "vector_only_p50", percentile(vecTimes, 50),
+            "vector_only_p95", percentile(vecTimes, 95),
+            "bm25_p50", percentile(bmTimes, 50),
+            "bm25_p95", percentile(bmTimes, 95),
+            "total_p50", percentile(totalTimes, 50),
+            "total_p95", percentile(totalTimes, 95)
+        );
+    }
+
+    private Map<String, Object> runPipeline(String query) {
+        long vecStart = System.nanoTime();
+        var vecResults = vectorStore.similaritySearch(
+            SearchRequest.builder().query(query).topK(30).build());
+        long vecEnd = System.nanoTime();
+
+        long bmStart = System.nanoTime();
+        var bmResults = bm25Indexer.search(query, 30, "corp-a");
+        long bmEnd = System.nanoTime();
+
+        var fused = rrfFusion.fuse(
+            vecResults.stream().map(d -> new VectorResult(
+                (String) d.getMetadata().get("doc_id"), 0.0)).toList(),
+            bmResults, 0.3, 15);
+
+        var reranked = reranker.rerank(query, fused);
+
+        return Map.of(
+            "vecMs", (vecEnd - vecStart) / 1_000_000,
+            "bmMs", (bmEnd - bmStart) / 1_000_000,
+            "fusedCount", fused.size(),
+            "finalCount", reranked.size()
+        );
+    }
+}</code></pre></div>
+      <table class="outline-table"><thead><tr><th>阶段</th><th>P50 延迟</th><th>P95 延迟</th><th>占比</th></tr></thead>
+      <tbody>
+        <tr><td>向量检索（Milvus）</td><td>42ms</td><td>78ms</td><td>24%</td></tr>
+        <tr><td>BM25 检索（Lucene）</td><td>8ms</td><td>15ms</td><td>5%</td></tr>
+        <tr><td>RRF 融合</td><td>2ms</td><td>3ms</td><td>1%</td></tr>
+        <tr><td>BGE-Reranker（Top15）</td><td>110ms</td><td>185ms</td><td>60%</td></tr>
+        <tr><td>LLM 生成</td><td>890ms</td><td>1200ms</td><td>—（与检索并行）</td></tr>
+        <tr><td><strong>检索阶段总计</strong></td><td>162ms</td><td>281ms</td><td>—</td></tr>
+        <tr><td><strong>端到端</strong></td><td>1052ms</td><td>1481ms</td><td>—</td></tr>
+      </tbody></table>
+      <p>瓶颈分析：BGE-Reranker 占检索阶段延迟的 60%，主要耗时在模型推理和 HTTP 传输。优化方向：1) 将候选数从 15 降至 10（延迟降 30%，recall 降 1.2%）; 2) 使用 gRPC 替代 HTTP 传输（延迟降 15%）；3) 对简单查询跳过 Rerank（基于 query 长度分类）。</p>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>BM25 实现</strong>：Spring AI 无内置 BM25，通过 Lucene MemoryIndex（< 10 万文档）或 Elasticsearch（大规模）实现</li>
+        <li><strong>RRF 融合</strong>：Rank-based 融合避免跨模型分数不可比问题，alpha=0.3 在 CorpAssist 法务场景最优</li>
+        <li><strong>BGE-Reranker</strong>：交叉编码重排显著提升排序精度（recall@10 从 89.7% 升至 94.1%），但延迟从 68ms 增至 320ms</li>
+        <li><strong>Ablation 结论</strong>：混合 RRF（alpha=0.3） + Rerank（Top15→5）是精度与速度的最优平衡</li>
+        <li><strong>瓶颈管理</strong>：Rerank 占检索延迟 60%，根据查询复杂度动态降级可进一步优化</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能用 Lucene MemoryIndex 实现 BM25 全文检索</label></li>
+        <li><label><input type="checkbox"> 能实现 RRF 融合算法并解释常数 60 的作用</label></li>
+        <li><label><input type="checkbox"> 能部署并调用 BGE-Reranker REST API</label></li>
+        <li><label><input type="checkbox"> 能运行 ablation 实验确定最优 alpha 和 Rerank 策略</label></li>
+        <li><label><input type="checkbox"> 能分析延迟基准数据并定位瓶颈</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>BM25</td><td>Okapi BM25 概率检索模型</td></tr>
+        <tr><td>Lucene MemoryIndex</td><td>JVM 内存全文索引</td></tr>
+        <tr><td>RRF</td><td>Reciprocal Rank Fusion 倒数排名融合</td></tr>
+        <tr><td>alpha</td><td>向量权重（1-alpha 为 BM25 权重）</td></tr>
+        <tr><td>BGE-Reranker</td><td>BAAI 交叉编码重排模型</td></tr>
+        <tr><td>Ablation 实验</td><td>逐层移除组件分析贡献</td></tr>
+        <tr><td>IKAnalyzer</td><td>中文分词器</td></tr>
+        <tr><td>交叉编码</td><td>query+doc 拼接输入 transformer 计算相关性</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>RRF 的常数 k（通常 60）如果改大会有什么影响？</summary>
+      <p>RRF 公式：score = sum(1/(k + rank))。k 越大，排名差异对分数的贡献越小（所有文档的 RRF score 趋近于相近值），融合结果接近等权平均。k 越小，第一名文档的 RRF 分数优势越大，Top-1 权重极高。k=60 是一个经验值：当排名从第 1 降到第 10 时，分数从 1/61≈0.0164 降到 1/70≈0.0143，降幅 13%，保持了排名差异但不过度极端。</p>
+      </details>
+      <details><summary>为什么不在 Milvus 里用内置的 hybrid_search 而是自己实现 RRF？</summary>
+      <p>Milvus 2.4+ 支持 hybrid_search 但需要同时配置向量索引和 scalar 倒排索引。限制：1) BM25 的全文检索能力有限（不支持中文分词自定义）；2) alpha 权重只能在集合级别配置，无法按查询动态调整；3) RRF 的常数固定不可调。自实现 RRF 更灵活：可按知识库调 alpha、可动态切换融合策略、可独立升级 BM25 组件。</p>
+      </details>
+      <details><summary>BGE-Reranker 的交叉编码与向量相似度的双编码（bi-encoder）有什么本质区别？</summary>
+      <p>双编码（bi-encoder）：query 和 doc 分别编码成独立向量，用余弦相似度计算相关分数。query 编码后固定，与所有 doc 向量做点积即可，计算量 O(N)。交叉编码（cross-encoder）：query 和 doc 拼接成一个序列送入 transformer 计算相关性分数。每个 (query, doc) 对需要一次完整前向推理，计算量 O(N*T^2)，精度更高但速度慢 10~100 倍。BGE-Reranker 属于交叉编码，所以需要对 Top-15 做 15 次推理，不能像 bi-encoder 那样批量点积。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://lucene.apache.org/core/documentation.html" target="_blank" rel="noopener">Apache Lucene 文档</a></li>
+    <li><a href="https://huggingface.co/BAAI/bge-reranker-v2-m3" target="_blank" rel="noopener">BAAI BGE-Reranker 模型</a></li>
+    <li><a href="https://github.com/huggingface/text-embeddings-inference" target="_blank" rel="noopener">HuggingFace Text Embeddings Inference</a></li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/milvus.html" target="_blank" rel="noopener">Spring AI Milvus VectorStore</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/practice-03-hybrid-rerank-lab/</code> 中完成 <code>LuceneBm25Indexer</code> 的 BM25 搜索方法</li>
+      <li>在 <code>RrfFusion</code> 中实现带 alpha 参数的 RRF 融合，并测试 alpha=0.3 vs alpha=0.7 的效果差异</li>
+      <li>启动 BGE-Reranker Docker 容器，在 Java 中调用 <code>/rerank</code> 接口</li>
+      <li>运行 <code>FullPipelineBenchmark</code> 生成延迟报告，分析各阶段占比</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：混合检索后 recall 反而低于纯向量检索，如何排查？</summary>
+      <p>可能原因：1) BM25 索引中 tenant_id filter 与向量库 filter 不一致，检索到不同租户的数据；2) BM25 中文分词效果差（IKAnalyzer 词典未更新），专业名词被错误切分；3) alpha 设置不合理——如果向量召回已足够好（>85%），BM25 的低质量结果拉低了整体排名。验证方法：单独跑 BM25+RRF(alpha=0) 看 BM25 单路召回率。</p>
+    </details>
+    <details><summary>场景 2：Rerank 阶段 P95 延迟达到 450ms，如何在不显著降低召回率的前提下优化？</summary>
+      <p>策略：1) 减少 Rerank 候选数（Top15→Top10），延迟约降 33%，recall 降 < 2%；2) 对简单查询（长度 < 8 字）跳过 Rerank，仅对复杂查询执行；3) 使用 ASR（Adaptive Scaling）——当 rerank 排队超过 5 个时自动降级为不 rerank；4) 升级 GPU 实例或使用批量推理（batch_size=32 比串行推理快 8 倍）。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/practice-03-hybrid-rerank-lab/</p><ul class="demo-acceptance">
+      <li>Lucene BM25 搜索返回正确的 doc_id 和 BM25 分数</li>
+      <li>RRF 融合后 Top-5 结果比两路单独检索的任意一路都好（凭经验判断）</li>
+      <li>Benchmark 报告显示各阶段 P50/P95 延迟</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-practice-04-rag-eval">下一章：RAG 评测实战</a></li>
+    <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/hybrid-search.html">Elasticsearch Hybrid Search</a></li>
+    <li><a href="https://www.sbert.net/examples/applications/cross-encoder/README.html">SBERT Cross-Encoder</a></li>
+  </ul></div>
+</section>

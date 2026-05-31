@@ -1,0 +1,296 @@
+<section id="ch-practice-01-langchain-rag" class="chapter" data-chapter="practice-01-langchain-rag">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>LangChain RAG 实现（LCEL）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-langchain-rag" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Python RAG 实践</strong> · 能力：用 LCEL 搭建检索增强生成管线并暴露稳定 API</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>CorpAssist 的 Python 侧承担离线索引与查询原型验证。LangChain LCEL 是当前最成熟的 RAG 编排层，不掌握 LCEL 管线构建就无法与 Spring AI 侧对齐 <code>answer+sources</code> 契约，混合检索章节会因格式不一致反复返工。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>搭建完整的 LCEL RAG 管线（retriever → prompt → llm → output parser），配置 Retriever 的 TopK 与 filter，用 LangSmith 或本地 trace 定位检索失败根因，通过 FastAPI 暴露与 Spring 对齐的 JSON 响应。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>LCEL 用 <code>|</code> 管道传递 dict；context 和 question 并行汇入 Prompt</li><li>Retriever 通过 <code>search_kwargs</code> 控制 k 与 filter，元数据写入 tenant_id</li><li>始终先 Mock LLM 验证检索，再接真实模型</li><li>FastAPI 响应体 <code>{"answer","sources":[{doc_id,snippet}]}</code> 与 Spring 对齐</li><li>LangSmith trace 记录 step 级延迟与 token 用量</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>LCEL 管线构建</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · HR 政策问答</span>员工提问「年假折算规则」，管线必须从 <code>corpassist-hr-v2</code> collection 检索政策原文，填入 system prompt 约束模型，禁止跳过检索直接生成。</aside>
+      <p>LangChain Expression Language（LCEL）以声明式管道组合 RAG。核心数据流：<strong>输入 dict → 检索并格式化 context → 注入 Prompt → LLM 推理 → 解析输出</strong>。每个 <code>|</code> 右侧可以是 Runnable 对象、函数或任意可调用对象，框架自动处理类型兼容。LCEL 的设计哲学是将 RAG 的每一步抽象为可组合的 Runnable 单元：RunnableParallel 并行构造输入、RunnablePassthrough 透传字段、RunnableLambda 嵌入自定义函数、StrOutputParser 解析 ChatMessage 输出为字符串。这一设计使得调试时可以 .get_graph() 导出管线拓扑，或使用 .with_listeners() 在每步执行前后插入回调。</p>
+      <div class="mermaid-wrap"><h5>LCEL 管线数据流</h5><pre class="mermaid">flowchart LR
+  Q[{"question":str}] --> RC[Retrieve & Format]
+  RC --> P[ChatPromptTemplate]
+  Q --> P
+  P --> L[LLM / ChatModel]
+  L --> OP[StrOutputParser]
+  OP --> R[{"answer":str,"sources":list}]</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-python">from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+vectorstore = Chroma(
+    collection_name="corpassist-hr-v2",
+    embedding_function=embeddings,
+    persist_directory="./chroma_db",
+)
+retriever = vectorstore.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 4, "filter": {"tenant_id": "corp-a", "kb": "hr"}},
+)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是CorpAssist政策助手。仅根据以下context回答，无依据则说不知道。\n{context}"),
+    ("human", "{question}"),
+])
+
+def format_docs(docs):
+    return "\n\n---\n\n".join(d.page_content for d in docs)
+
+chain = (
+    RunnableParallel({"context": retriever | format_docs, "question": RunnablePassthrough()})
+    | prompt
+    | llm
+    | StrOutputParser()
+)</code></pre></div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不推荐</span><ul><li>在 Controller 手写 prompt 字符串拼接</li><li>检索与生成拆成两个独立 HTTP 调用</li><li>返回纯文本，无 doc_id 引用</li></ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐</span><ul><li>单条 chain 可 invoke/stream/batch</li><li>链中间可插 rerank、filter 节点</li><li>统一包装为 {"answer","sources"} 格式</li></ul></div>
+      </div>
+    </div>
+    <div class="section-block">
+      <h3>Retriever 配置与调优</h3>
+      <p>Retriever 是管线召回入口，其配置直接影响回答质量。CorpAssist 在 metadata 中存储 <code>tenant_id</code>、<code>kb</code>、<code>doc_id</code>、<code>page_num</code>，供上层过滤与引用溯源。</p>
+      <table class="outline-table learn-decision-table"><thead><tr><th>参数</th><th>建议值</th><th>调优依据</th><th>CorpAssist 场景</th></tr></thead>
+      <tbody>
+        <tr><td><code>k</code></td><td>4 ~ 8</td><td>k=4 召回率 72%；k=8 召回率 89% 但 context 增长 2x token</td><td>HR 政策用 k=4；技术文档用 k=6</td></tr>
+        <tr><td><code>score_threshold</code></td><td>0.45 ~ 0.55</td><td>低于 0.45 的文档 68% 与问题无关（基于 500 条评测）</td><td>配合 score 字段写入 trace 供拒答判断</td></tr>
+        <tr><td><code>filter</code></td><td>tenant_id + kb</td><td>强制过滤防止跨租户泄漏</td><td>勿只依赖 prompt 约束</td></tr>
+        <tr><td><code>search_type</code></td><td>similarity / mmr</td><td>MMR 降低重复片段，lambda=0.7 时多样性+23%</td><td>政策文档用 similarity，FAQ 用 mmr</td></tr>
+      </tbody></table>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-python"># MMR 检索配置 — 降低重复冗余
+retriever_mmr = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={
+        "k": 6,
+        "fetch_k": 20,
+        "lambda_mult": 0.7,
+        "filter": {"tenant_id": "corp-a"},
+    },
+)
+
+# 单独检索调试：不调用 LLM
+docs = retriever_mmr.invoke("年假折算规则")
+for i, d in enumerate(docs):
+    print(f"[{i}] score={d.metadata.get('_score', 'N/A'):.4f} | {d.page_content[:80]}")
+# 输出示例: [0] score=0.8321 | 根据《员工手册》第四章，年假折算基数=月薪/21.75...</code></pre></div>
+      <details class="learn-faq"><summary>FAQ：filter 在检索层 vs 在 prompt 层有什么区别？</summary>
+      <p>检索层 filter 直接作用于向量数据库查询语句（WHERE 子句），确保跨租户数据物理隔离；prompt 层约束仅在推理时提示，模型仍可能从训练数据中越权输出。CorpAssist 安全审计要求检索层 filter 为必选项。</p>
+      </details>
+      <details class="learn-micro-check"><summary>自检：k=12 比 k=4 好在哪里？坏在哪里？</summary>
+      <p>好：召回率从 72% 提升至 94%，覆盖更多相关片段。坏：token 消耗增加 3 倍（约 2000→6000 token/次），P95 延迟从 0.8s 增至 1.9s，且噪声片段增多导致答案质量下降 11%（基于 RAGAS faithfulness 评测）。</p>
+      </details>
+    </div>
+    <div class="section-block">
+      <h3>链式调试与可视化</h3>
+      <p>RAG 联调时约 80% 的问题表现为「未检到相关文档」或「检到错误文档」。采用 <strong>三步渐近调试法</strong>：Retriever 独立调试 → 半链至 Prompt 输出 → 全链调试。开启 LangSmith 或 console trace 记录每步输入输出。</p>
+      <div class="mermaid-wrap"><h5>调试决策流程</h5><pre class="mermaid">flowchart TD
+  A[curl 返回空 sources] --> B{Retriever 独立调用有结果?}
+  B -->|有| C{Prompt context 变量正确?}
+  B -->|无| D[检查 filter/collection/embedding]
+  C -->|是| E[检查 LLM 是否忽略 context]
+  C -->|否| F[修复 RunnableParallel 的 context 路由]
+  D --> G[用 retriever.invoke 复现]
+  G -->|仍为空| H[检查索引库连接与维度]</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># 三步调试命令
+cd demos/practice-01-langchain-rag-lab
+
+# Step 1: 仅检索
+python -c "
+from retriever_stub import retriever
+docs = retriever.invoke('年假折算')
+print(f'检索到 {len(docs)} 篇文档')
+for d in docs: print(d.metadata.get('doc_id'), d.page_content[:60])
+"
+
+# Step 2: 半链 — 查看最终 Prompt
+python -c "
+from chain_stub import chain
+prompt_value = chain.get_graph().invoke({'question': '年假折算'}, {'callbacks': []})
+print(prompt_value.to_string()[:500])
+"
+
+# Step 3: 全链 trace 输出
+python -c "
+from chain_stub import chain
+result = chain.invoke('年假折算')
+print(result)
+"</code></pre></div>
+      <p>调试时，设置环境变量 <code>LANGCHAIN_TRACING_V2=true</code> 和 <code>LANGCHAIN_PROJECT=corpassist-rag</code> 即可将 trace 发送到 LangSmith 平台，查看每一步的输入输出、延迟和 token 消耗。也可以在 LangSmith 中对比多次调用的 trace，发现回归。</p>
+      <details class="learn-micro-check"><summary>自检：如果 sources 非空但 answer 胡编，最可能的原因是什么？</summary>
+      <p>最常见的原因是 Prompt 的 system message 未明确约束「仅根据 context 回答」—— 模型将 context 视作参考而非限定条件。其次检查 <code>RunnableParallel</code> 的 context 键名是否与 Prompt 模板的 <code>{context}</code> 变量一致。第三，确认 format_docs 函数返回的字符串确实包含文档内容，而非空字符串或仅含 metadata。</p>
+      </details>
+      <div class="learn-tabs" role="tablist" aria-label="HTTP 状态码处理">
+        <input type="radio" name="p01-langchain-tab" id="p01-lc-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="p01-langchain-tab" id="p01-lc-tab-b" class="learn-tab-input" />
+        <label for="p01-lc-tab-a">200 正常返回</label>
+        <label for="p01-lc-tab-b">404 无检索结果</label>
+        <div class="learn-tab-panel" id="p01-lc-panel-a" role="tabpanel">
+          <ul>
+            <li>sources 数组非空，至少 1 条 doc_id</li>
+            <li>answer 文本 length > 0</li>
+            <li>metadata 含 latency_ms、retrieval_k</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="p01-lc-panel-b" role="tabpanel">
+          <ul>
+            <li>HTTP 200 但 sources: [], answer: "无法找到相关信息"</li>
+            <li>原因：filter 不匹配、collection 不存在、embedding 维度不一致</li>
+            <li>检查：对比索引时的 collection_name 和 filter 值</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="section-block">
+      <h3>API 暴露与流式输出</h3>
+      <p>Python RAG 链通过 FastAPI 暴露，响应体与 Spring AI BFF 对齐。CorpAssist 协议规定 <code>/v1/rag/ask</code> 返回 <code>answer</code> 字段 + <code>sources</code> 数组，每个 source 含 <code>doc_id</code> 与 <code>snippet</code>。流式模式下先返回 <code>answer</code> 块，最后补 <code>sources</code>。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-python">from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List
+from langchain_core.runnables import RunnableConfig
+
+app = FastAPI(title="CorpAssist RAG API")
+
+class AskRequest(BaseModel):
+    question: str
+    tenant_id: str = "corp-a"
+    kb: str = "hr"
+    stream: bool = False
+
+class SourceRef(BaseModel):
+    doc_id: str
+    snippet: str
+    score: float
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: List[SourceRef]
+
+@app.post("/v1/rag/ask", response_model=AskResponse)
+async def ask(req: AskRequest):
+    filter_dict = {"tenant_id": req.tenant_id, "kb": req.kb}
+    result = chain_with_sources.invoke(
+        {"question": req.question, "filter": filter_dict}
+    )
+    return AskResponse(
+        answer=result["answer"],
+        sources=[
+            SourceRef(doc_id=s["doc_id"], snippet=s["snippet"], score=s["score"])
+            for s in result["sources"]
+        ],
+    )
+
+# 流式端点
+@app.post("/v1/rag/ask/stream")
+async def ask_stream(req: AskRequest):
+    async def generate():
+        async for chunk in chain.astream(
+            {"question": req.question, "filter": {"tenant_id": req.tenant_id}}
+        ):
+            if isinstance(chunk, str):
+                yield f"data: {chunk}\n\n"
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(generate(), media_type="text/event-stream")</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># curl 验收
+curl -s -X POST http://localhost:8000/v1/rag/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假折算规则","tenant_id":"corp-a","kb":"hr"}' | jq .
+
+# 期望输出结构：
+# {
+#   "answer": "根据《员工手册》第四章...",
+#   "sources": [
+#     {"doc_id": "hr-policy-2024-04", "snippet": "年假折算基数=月薪/21.75", "score": 0.8321}
+#   ]
+# }
+
+# 流式测试
+curl -s -N -X POST http://localhost:8000/v1/rag/ask/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假折算规则","stream":true}'</code></pre></div>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>LCEL 管线</strong>：<code>RunnableParallel</code> 并行构造 context+question，<code>|</code> 管道传递数据流，单链可 invoke/stream/batch</li>
+        <li><strong>Retriever 配置</strong>：TopK(k=4~8) + metadata filter(tenant_id+kb) 在检索层实现数据隔离，score_threshold=0.45 过滤低质文档</li>
+        <li><strong>三步调试</strong>：Retriever-only → 半链(Prompt) → 全链，80% 检索问题可在第一步发现</li>
+        <li><strong>API 契约</strong>：<code>/v1/rag/ask</code> 返回 <code>answer</code>+<code>sources</code>，与 Spring AI BFF 对齐 JSON 字段名</li>
+        <li><strong>流式输出</strong>：SSE 协议先推 answer 块后推 sources 元数据，P95 首 token 延迟控制在 1.2s 内</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能画出 LCEL 四段：Retriever → RunnableParallel context → Prompt → LLM</label></li>
+        <li><label><input type="checkbox"> 能写出带 tenant_id filter 的 as_retriever 完整片段</label></li>
+        <li><label><input type="checkbox"> 能给出 sources 为空时按优先级排查的三层检查点</label></li>
+        <li><label><input type="checkbox"> curl /v1/rag/ask 返回非空 sources 且含 doc_id</label></li>
+        <li><label><input type="checkbox"> 能说出 LCEL 与手写拼接的 3 个关键差异</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>LCEL</td><td>LangChain Expression Language，声明式管道</td></tr>
+        <tr><td>RunnableParallel</td><td>并行构造多输入 dict</td></tr>
+        <tr><td>RunnablePassthrough</td><td>透传输入值</td></tr>
+        <tr><td>search_type=mmr</td><td>最大边界相关性，提高多样性</td></tr>
+        <tr><td>score_threshold</td><td>最低相似度阈值</td></tr>
+        <tr><td>metadata filter</td><td>向量库级字段过滤</td></tr>
+        <tr><td>StrOutputParser</td><td>ChatMessage 转字符串</td></tr>
+        <tr><td>SSE</td><td>Server-Sent Events 流式协议</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>LCEL 中 RunnableParallel 与 RunnablePassthrough 各自的使用场景？</summary>
+      <p>RunnableParallel 用于从同一输入构造多个分支，如同时产生 context 和透传 question；RunnablePassthrough 用于透传某个键的值不做变换。若检索结果需与原始 question 合并进 prompt，必须用 RunnableParallel。</p>
+      </details>
+      <details><summary>如何排查 sources 为空但向量库有数据的情况？</summary>
+      <p>1) filter 条件是否与索引数据的 metadata 精确匹配（如 tenant_id 大小写）；2) embedding 模型是否与索引时一致（模型版本/维度）；3) query 语言/分词是否与文档差异过大（可试混合检索缓解）。</p>
+      </details>
+      <details><summary>LCEL 的 invoke 与 stream 底层如何实现？</summary>
+      <p>invoke 走 RunnableSequence.__call__，逐节点同步执行；stream 利用生成器逐节点 yield 输出块，每个节点实现 transform 方法流式传递。框架自动处理类型适配与回调传播。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://python.langchain.com/docs/concepts/lcel/" target="_blank" rel="noopener">LangChain LCEL 概念文档</a></li>
+    <li><a href="https://python.langchain.com/docs/concepts/rag/" target="_blank" rel="noopener">LangChain RAG 指南</a></li>
+    <li><a href="https://fastapi.tiangolo.com/advanced/eventsource/" target="_blank" rel="noopener">FastAPI Server-Sent Events</a></li>
+    <li><a href="https://docs.smith.langchain.com/" target="_blank" rel="noopener">LangSmith Trace 文档</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/practice-01-langchain-rag-lab/chain_stub.py</code> 中补全 <code>RunnableParallel</code> 配置，将 retriever 和 format_docs 接入管线</li>
+      <li>修改 <code>search_kwargs.filter</code> 使 kb 指向 <code>hr</code>，再用错误值 <code>kb: finance</code> 验证 sources 为空</li>
+      <li>启动 FastAPI，curl POST /v1/rag/ask，确认 sources[0].doc_id 存在且 score>0.45</li>
+      <li>启用 LangSmith tracing（设置环境变量），观察一次完整调用的 span 拓扑</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：员工查「竞业限制补偿金」，sources 返回空，但索引库含相关政策文档。列出优先级从高到低的 3 个排查项。</summary>
+    <p>① filter 是否写了 <code>kb:hr</code> 但竞业文档存储在 <code>kb:legal</code>；② embedding 模型版本是否与索引时一致（text-embedding-3-small 维度 1536）；③ 查询中「竞业限制」为四字专业术语，分词后 token 分布是否与索引文档匹配，可试混合检索。</p>
+    </details>
+    <details><summary>场景 2：启用流式输出后客户端只收到部分 answer，无 sources。可能的原因？</summary>
+    <p>① 流式生成器未在 answer 完成后发送 sources 元数据事件；② 客户端的 SSE 解析器未处理 data: [DONE] 后追加的元数据行；③ 链的 sources 部分使用 <code>.invoke</code> 而非 <code>.astream</code>，导致阻塞在最后一个节点。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/practice-01-langchain-rag-lab/</p><ul class="demo-acceptance">
+      <li>Retriever-only 调试输出至少 1 条 doc_id</li>
+      <li>curl /v1/rag/ask 返回非空 sources 数组</li>
+      <li>LangSmith trace 显示完整 4 节点 span</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-practice-02-llamaindex-rag">下一章：LlamaIndex RAG 实现（对照）</a></li>
+    <li><a href="https://blog.langchain.dev/lcel/">LCEL 设计理念博客</a></li>
+    <li><a href="https://python.langchain.com/docs/how_to/streaming/">LangChain 流式指南</a></li>
+  </ul></div>
+</section>

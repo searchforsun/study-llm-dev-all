@@ -1,0 +1,378 @@
+<section id="ch-advanced-01-multi-kb-routing" class="chapter" data-chapter="advanced-01-multi-kb-routing">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多知识库与路由</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-multi-kb-routing" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>Java RAG 进阶</strong> · 能力：实现意图路由、行级权限过滤、多租户索引隔离、动态配置管理</p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>CorpAssist 在 2026 年 Q1 服务 5 个租户（corp-a ~ corp-e），每个租户有 HR/Legal/IT 三个知识库，共 15 个索引空间。简单 Single-KB 架构无法满足隔、路由和动态配置需求。若不正确实现多知识库架构，数据隔离审计失败风险极高。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>通过 LLM 或规则实现意图路由（判断用户输入属于哪个知识库），在检索层实现行级权限过滤（按角色/部门限制文档可见性），配置多租户索引隔离（每个租户独立集合），构建动态配置中心管理知识库切换。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>意图路由：LLM Router（灵活）vs 规则 Router（精确），CorpAssist 采用规则优先+LLM 兜底</li><li>行级权限：元数据字段写入 allowed_roles，检索时 filterExpression 过滤</li><li>多租户隔离：方案一（同集合 tenant_id 过滤）vs 方案二（每租户独立集合）</li><li>动态配置：Nacos/Consul 管理知识库切换，无需重启</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>意图路由实现</h3>
+      <aside class="learn-scenario" aria-label="业务情境"><span class="learn-scenario-title">CorpAssist · 用户意图识别</span>用户输入「竞业限制补偿金标准」应路由到 Legal 知识库；「年假几天」路由到 HR 知识库；「VPN 连不上」路由到 IT 知识库。路由错误将导致检索不到相关文档。</aside>
+      <p>意图路由是 RAG 系统中用户问题到知识库的映射层。CorpAssist 实现 <strong>规则 + LLM 双级路由</strong>：先试用关键词规则匹配（延迟 < 5ms），规则未命中时降级到 LLM 分类（延迟 ~200ms）。</p>
+      <div class="mermaid-wrap"><h5>意图路由决策流</h5><pre class="mermaid">flowchart TD
+  Q[User Query] --> RULE[Keyword Rules<br/>同义词词典]
+  RULE -->|命中| ROUTE[Route to KB]
+  RULE -->|未命中| LLM_CLASS[LLM Classify<br/>gpt-4o-mini]
+  LLM_CLASS -->|confidence>0.8| ROUTE
+  LLM_CLASS -->|confidence<=0.8| FALLBACK[Fallback Router<br/>检索所有KB取最高分]
+  ROUTE --> VEC[VectorStore<br/>指定 KB]</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 双级意图路由器
+@Component
+public class IntentRouter {
+
+    private final Map<String, List<String>> keywordRules;
+
+    public IntentRouter() {
+        this.keywordRules = Map.of(
+            "hr", List.of("年假", "考勤", "薪酬", "绩效", "PIP", "招聘", "社保", "公积金",
+                          "加班", "请假", "工伤", "产假", "婚假"),
+            "legal", List.of("竞业限制", "劳动合同", "第.*条", "合规", "保密协议",
+                            "劳动仲裁", "赔偿金", "N\\+1", "经济补偿"),
+            "it", List.of("VPN", "SSO", "LDAP", "密码重置", "网络故障", "邮箱",
+                         "OA系统", "WiFi", "打印机", "软件安装")
+        );
+    }
+
+    public RouteResult route(String query) {
+        // 第一级: 关键词规则
+        long start = System.nanoTime();
+        for (var entry : keywordRules.entrySet()) {
+            for (String keyword : entry.getValue()) {
+                if (query.contains(keyword) || query.matches(keyword)) {
+                    return new RouteResult(entry.getKey(), "rule", 0.95,
+                        (System.nanoTime() - start) / 1_000_000);
+                }
+            }
+        }
+
+        // 第二级: LLM 分类（仅在规则未命中时）
+        return llmClassify(query);
+    }
+
+    private RouteResult llmClassify(String query) {
+        long start = System.nanoTime();
+        var classification = callClassifierLLM(query);
+        double latency = (System.nanoTime() - start) / 1_000_000;
+        return new RouteResult(classification.kb(), "llm",
+            classification.confidence(), latency);
+    }
+
+    private Classification callClassifierLLM(String query) {
+        // 调用小模型 (gpt-4o-mini) 进行意图分类
+        // Prompt: "将以下问题分类到 [hr, legal, it] 之一，输出 JSON:
+        //          {\"kb\": \"hr\", \"confidence\": 0.92}"
+        // 实现略...
+        return new Classification("hr", 0.92);
+    }
+
+    public record RouteResult(String kb, String method,
+                              double confidence, double latencyMs) {}
+    public record Classification(String kb, double confidence) {}
+}
+
+// 使用路由器
+@Service
+public class MultiKbRagService {
+
+    @Autowired private IntentRouter router;
+    @Autowired private VectorStore vectorStore;
+
+    public AskResponse ask(String question, String tenantId) {
+        // 1. 路由到指定知识库
+        var route = router.route(question);
+        var kb = route.kb();
+
+        // 2. 检索指定知识库
+        var request = SearchRequest.builder()
+            .query(question)
+            .topK(4)
+            .filterExpression("tenant_id == '" + tenantId
+                + "' && kb == '" + kb + "'")
+            .build();
+        var docs = vectorStore.similaritySearch(request);
+
+        // 3. 组装回答
+        return buildResponse(question, docs, route);
+    }
+}</code></pre></div>
+    </div>
+    <div class="section-block">
+      <h3>行级权限过滤</h3>
+      <div class="mermaid-wrap"><h5>行级权限过滤流程</h5><pre class="mermaid">flowchart LR
+    DOC[Document] --> ACL[ACL Engine]
+    ACL -->|content 含"薪酬"| R1[allowed_roles: hr_specialist]
+    ACL -->|content 含"全员"| R2[allowed_roles: employee]
+    ACL -->|content 含"高管"| R3[allowed_roles: executive]
+    R1 --> STORE[VectorStore<br/>metadata.allowed_roles]
+    R2 --> STORE
+    R3 --> STORE
+    QUERY[User Query] --> FILTER[filterExpression<br/>CONTAINS userRole]
+    STORE --> FILTER
+    FILTER --> RESULT[Permission-filtered Docs]</pre></div>
+      <p>CorpAssist 中不同角色（HR 专员、部门经理、普通员工）可见的文档范围不同。行级权限通过文档 metadata 中的 <code>allowed_roles</code> 字段实现，在检索时用 filterExpression 过滤。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 行级权限过滤 — 写入时标记角色
+@Service
+public class AccessControlIngestionService {
+
+    public Document applyAcl(Document doc, String role) {
+        var metadata = doc.getMetadata();
+        // 根据内容自动推断允许的角色
+        String content = doc.getContent();
+        Set<String> allowedRoles = new HashSet<>(Set.of("employee")); // 全员可见
+
+        if (content.contains("薪酬") || content.contains("绩效等级")) {
+            allowedRoles.add("hr_specialist");
+            allowedRoles.add("manager");
+        }
+        if (content.contains("高管") || content.contains("股权")) {
+            allowedRoles.add("executive");  // 仅高管可见
+        }
+        if (content.contains("竞业") || content.contains("仲裁")) {
+            allowedRoles.add("legal_team");
+        }
+
+        metadata.put("allowed_roles", String.join(",", allowedRoles));
+        return doc;
+    }
+}
+
+// 查询时过滤
+@Service
+public class AclSearchService {
+
+    public List<Document> searchWithAcl(String query, String tenantId,
+                                        String userRole, String kb) {
+        var request = SearchRequest.builder()
+            .query(query)
+            .topK(6)
+            .filterExpression(
+                "tenant_id == '" + tenantId + "'"
+                + " && kb == '" + kb + "'"
+                + " && allowed_roles CONTAINS '" + userRole + "'"
+            )
+            .build();
+        return vectorStore.similaritySearch(request);
+    }
+}</code></pre></div>
+      <table class="outline-table"><thead><tr><th>角色</th><th>可见文档范围</th><th>filter 条件</th></tr></thead>
+      <tbody>
+        <tr><td>employee（员工）</td><td>全员制度、年假政策</td><td>allowed_roles CONTAINS 'employee'</td></tr>
+        <tr><td>manager（经理）</td><td>员工可见 + 薪酬范围、绩效评估</td><td>allowed_roles CONTAINS 'manager'</td></tr>
+        <tr><td>hr_specialist（HR）</td><td>经理可见 + 人事调整、离职面谈</td><td>allowed_roles CONTAINS 'hr_specialist'</td></tr>
+        <tr><td>legal_team（法务）</td><td>所有法务文档</td><td>allowed_roles CONTAINS 'legal_team'</td></tr>
+        <tr><td>executive（高管）</td><td>所有文档</td><td>allowed_roles CONTAINS 'executive'</td></tr>
+      </tbody></table>
+    </div>
+    <div class="section-block">
+      <h3>多租户索引隔离</h3>
+      <p>多租户隔离有两种方案：<strong>文档级隔离</strong>（同集合，metadata tenant_id 过滤）和 <strong>集合级隔离</strong>（每租户独立集合）。CorpAssist 使用方案二的变体——每租户每知识库独立集合。</p>
+      <table class="outline-table learn-decision-table"><thead><tr><th>方案</th><th>实现</th><th>隔离级别</th><th>运维复杂度</th><th>查询延迟</th><th>CorpAssist 选择</th></tr></thead>
+      <tbody>
+        <tr><td>文档级（同集合）</td><td>一个集合，tenant_id 字段</td><td>软隔离（靠 filter）</td><td>低</td><td>随租户数线性增长</td><td>—</td></tr>
+        <tr><td>集合级（每租户）</td><td>corp-a-hr, corp-b-hr 等命名</td><td>物理隔离</td><td>中</td><td>恒定</td><td>√ 默认方案</td></tr>
+        <tr><td>数据库级（集群）</td><td>每租户独立 Milvus 集群</td><td>完全隔离</td><td>高</td><td>恒定</td><td>仅合规要求极高时</td></tr>
+      </tbody></table>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 多租户集合管理 — 集合级隔离
+@Component
+public class TenantCollectionManager {
+
+    private final MilvusVectorStoreConfig defaultConfig;
+    private final Map<String, MilvusVectorStore> stores = new ConcurrentHashMap<>();
+
+    public TenantCollectionManager(MilvusVectorStoreConfig config) {
+        this.defaultConfig = config;
+    }
+
+    public VectorStore getStore(String tenantId, String kb) {
+        var key = tenantId + ":" + kb;
+        return stores.computeIfAbsent(key, k -> {
+            var collectionName = "corp_" + tenantId + "_" + kb;
+            var config = MilvusVectorStoreConfig.builder()
+                .withUri(defaultConfig.getUri())
+                .withCollectionName(collectionName)
+                .withDatabaseName("rag_" + tenantId)
+                .withIndexType(IndexType.IVF_FLAT)
+                .withMetricType(MetricType.COSINE)
+                .build();
+            return new MilvusVectorStore(embeddingModel, config);
+        });
+    }
+
+    public void ensureCollection(String tenantId, String kb) {
+        var store = getStore(tenantId, kb);
+        // MilvusVectorStore 在 add 时自动创建集合
+        // 此处可预创建索引、设置分区等
+    }
+
+    // 租户数据删除（离职/合规）
+    public void deleteTenantData(String tenantId) {
+        for (String kb : List.of("hr", "legal", "it")) {
+            var key = tenantId + ":" + kb;
+            var store = stores.get(key);
+            if (store != null) {
+                store.delete(List.of()); // 删除集合所有数据
+                stores.remove(key);
+            }
+        }
+    }
+}</code></pre></div>
+      <details class="learn-micro-check"><summary>自检：集合级隔离有什么缺点？什么场景下应该考虑文档级隔离？</summary>
+      <p>集合级隔离缺点：1) 集合数随租户*知识库增长，运维成本高（如 50 租户*3KB=150 个集合）；2) 跨知识库查询需要并行查多个集合再合并结果。文档级隔离更适合租户数 > 100 的场景。缺点是 filter 遗漏会导致数据泄漏风险。CorpAssist 当前 5 个租户，集合级隔离更安全。</p>
+      </details>
+    </div>
+    <div class="section-block">
+      <h3>动态配置管理</h3>
+      <p>知识库配置（路由规则、索引参数、检索参数）需要在运行时动态调整，无需重启 JVM。CorpAssist 基于 Nacos 实现配置中心。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-java">// 动态配置管理 — Nacos 集成
+@Component
+@RefreshScope  // Spring Cloud 动态刷新
+public class DynamicKbConfig {
+
+    @Value("${rag.routing.default-strategy:rule_first}")
+    private String routingStrategy;
+
+    @Value("${rag.retrieval.default-top-k:4}")
+    private int defaultTopK;
+
+    // 知识库开关 (Nacos 中 JSON 格式)
+    private volatile Map<String, KbConfig> kbConfigs;
+
+    @PostConstruct
+    public void init() {
+        this.kbConfigs = loadKbConfigs();
+    }
+
+    // Nacos 监听配置变更
+    @NacosConfigListener(dataId = "rag-kb-config.yaml", groupId = "RAG")
+    public void onConfigChange(String newConfig) {
+        this.kbConfigs = parseKbConfig(newConfig);
+        System.out.printf("[DynamicConfig] KB config refreshed: %d KBs%n",
+            kbConfigs.size());
+    }
+
+    public KbConfig getKbConfig(String kb) {
+        return kbConfigs.getOrDefault(kb, KbConfig.DEFAULT);
+    }
+
+    public record KbConfig(
+        String kbName,
+        String description,
+        int topK,
+        double similarityThreshold,
+        String embeddingModel,
+        boolean rerankEnabled,
+        double alphaHybrid,
+        List<String> keywords,
+        List<String> allowedRoles
+    ) {
+        static final KbConfig DEFAULT = new KbConfig("default", "",
+            4, 0.45, "text-embedding-3-small", false, 0.3,
+            List.of(), List.of("employee"));
+    }
+}
+
+// Nacos 配置文件内容（YAML）
+//
+// rag:
+//   kb-configs:
+//     hr:
+//       topK: 4
+//       embeddingModel: "text-embedding-3-small"
+//       rerankEnabled: false
+//       alphaHybrid: 0.3
+//       keywords: ["年假","考勤","绩效"]
+//     legal:
+//       topK: 3
+//       embeddingModel: "text-embedding-3-large"
+//       rerankEnabled: true
+//       alphaHybrid: 0.4</code></pre></div>
+      <p>动态配置使 CorpAssist 可以在不重启服务的情况下：1) 调整检索参数（TopK、threshold、alpha）；2) 开关 Rerank 功能；3) 新增/停用某个知识库；4) 切换 Embedding 模型。配置变更通过 Nacos Web UI 或 API 推送，服务侧在 3 秒内生效。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+      <pre><code class="language-bash"># Nacos 配置更新
+curl -X POST "http://nacos-corp:8848/nacos/v1/cs/configs" \
+  -d "dataId=rag-kb-config.yaml&group=RAG&content=$(cat kb-config.yaml | base64)"
+
+# 验证：服务日志应显示配置刷新
+# [DynamicConfig] KB config refreshed: 3 KBs</code></pre></div>
+    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>双级路由</strong>：规则（5ms, 精准）优先 + LLM（200ms, 灵活）兜底，命中率 96%，路由错误率 < 2%</li>
+        <li><strong>行级权限</strong>：metadata allowed_roles 字段 + filterExpression CONTAINS 实现检索层权限过滤</li>
+        <li><strong>多租户隔离</strong>：集合级隔离（每租户每知识库独立集合），物理隔离安全但运维成本随租户增长</li>
+        <li><strong>动态配置</strong>：Nacos 管理 KB 参数，Runtime 刷新无需重启，PV 级流量下 3s 内生效</li>
+        <li><strong>租户数据清理</strong>：通过 TenantCollectionManager 提供租户级别的数据生命周期管理</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 能实现规则+LLM 双级意图路由器</label></li>
+        <li><label><input type="checkbox"> 能设计 allowed_roles 元数据实现行级权限</label></li>
+        <li><label><input type="checkbox"> 能说出集合级 vs 文档级隔离的取舍</label></li>
+        <li><label><input type="checkbox"> 能配置 Nacos 动态刷新 KB 配置</label></li>
+        <li><label><input type="checkbox"> 能实现租户数据的创建和删除生命周期</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table">
+        <tr><td>意图路由</td><td>将用户问题映射到知识库</td></tr>
+        <tr><td>规则路由</td><td>关键词/正则匹配，低延迟</td></tr>
+        <tr><td>LLM 路由</td><td>小模型分类，高灵活度</td></tr>
+        <tr><td>行级权限</td><td>文档级角色可见性控制</td></tr>
+        <tr><td>多租户隔离</td><td>租户间数据不可见</td></tr>
+        <tr><td>集合级隔离</td><td>每租户独立 Milvus 集合</td></tr>
+        <tr><td>文档级隔离</td><td>同集合 metadata 字段过滤</td></tr>
+        <tr><td>动态配置</td><td>运行时配置，无需重启</td></tr>
+      </table></div>
+      <div class="learn-interview"><h4>面试可能问</h4><details><summary>规则路由和 LLM 路由各自的优缺点？你如何组合？</summary>
+      <p>规则路由优点：低延迟（< 5ms）、零成本、可解释、无 API 依赖。缺点：对未见变体敏感（用户说「年假折算」但规则只配了「年假」）、正则维护成本高。LLM 路由优点：语义理解、泛化好。缺点：延迟高（200ms）、成本（每次 $0.0002）、依赖外部 API。CorpAssist 组合策略：规则优先级高（命中则直接返回），全部规则未命中才降级到 LLM。命中率 85% 走规则，15% 走 LLM。平均路由延迟：2ms * 85% + 200ms * 15% ≈ 32ms。</p>
+      </details>
+      <details><summary>allowed_roles 字段在 delete/update 操作时，角色映射关系如何维护？</summary>
+      <p>角色映射关系应该由统一的 IAM 系统维护，RAG 服务仅在检索时使用当前用户的角色。文档的 allowed_roles 在入库时基于内容自动推断，定期由审计任务校验。若某个文档被修改，重新走 ingestion pipeline 更新 allowed_roles。不支持运行时动态修改——因为需要重新 embedding 整个文档。</p>
+      </details>
+      <details><summary>多租户场景下，如何在应用层实现跨知识库的查询（如同时查 HR 和 Legal）？</summary>
+      <p>实现方式：1) 将问题同时发往多个知识库的 VectorStore；2) 合并检索结果（RRF 融合）；3) 用 LLM 对合并结果重排。注意跨集合向量相似度分数不可比（不同集合的向量分布不同），建议使用 rank-based 的 RRF 融合而不是 score-based 的加权和。CorpAssist 的路由器可在配置中将部分查询标记为「multi_kb」，自动走并行检索路径。</p>
+      </details></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs/milvus.html" target="_blank" rel="noopener">Spring AI Milvus 多集合</a></li>
+    <li><a href="https://nacos.io/docs/latest/what-is-nacos/" target="_blank" rel="noopener">Nacos 配置中心</a></li>
+    <li><a href="https://spring.io/projects/spring-cloud-config">Spring Cloud Config</a></li>
+    <li><a href="https://github.com/milvus-io/milvus-sdk-java">Milvus Java SDK</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>在 <code>demos/advanced-01-multi-kb-routing-lab/</code> 中实现 <code>IntentRouter</code>，添加 10 条 HR/5 条 Legal/5 条 IT 关键词规则</li>
+      <li>实现 <code>AccessControlIngestionService</code>，为测试文档自动推断 allowed_roles</li>
+      <li>在 <code>TenantCollectionManager</code> 中实现集合级隔离的 getStore 方法</li>
+      <li>配置 Nacos 本地实例并推送 <code>rag-kb-config.yaml</code>，验证配置动态刷新</li>
+    </ol></div>
+    <div class="steps-judgment-list"><details><summary>场景 1：用户输入跨领域问题（如「竞业限制期间年假怎么算」），路由到单一 KB 都不合适。如何处理？</summary>
+      <p>策略：1) 路由器检测到涉及多个 KB 的关键词（legal: 竞业限制 + hr: 年假），标记为 multi_kb；2) 并行查询 legal 和 hr 两个集合；3) 合并检索结果后让 LLM 综合两个知识库的 context 回答。在 IntentRouter 中增加 <code>multiKbKeywords</code> 配置，匹配时返回 <code>RouteResult.multiKb=true</code>。</p>
+    </details>
+    <details><summary>场景 2：新入职一名 legal_team 角色的用户，发现他能看到所有 HR 文档？如何修复？</summary>
+      <p>问题在 allowed_roles 的 filterExpression：CONTAINS 'legal_team' 条件匹配了 allowed_roles 中包含 legal_team 的文档。但 HR 文档的 allowed_roles 包含了 "employee","hr_specialist","manager" 但不包含 legal_team。排查步骤：1) 检查测试文档的 allowed_roles 值是否正确设置；2) 检查 filterExpression 语法——Milvus 的 CONTAINS 是数组包含，但不是所有版都支持。Milvus 2.3+ 用 json_contains 函数：<code>json_contains(allowed_roles, 'legal_team')</code>。</p>
+    </details></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 demos/advanced-01-multi-kb-routing-lab/</p><ul class="demo-acceptance">
+      <li>IntentRouter 规则路由命中率 > 85%（基于测试集）</li>
+      <li>行级权限 filter 正确返回角色可见文档</li>
+      <li>TenantCollectionManager 为不同 tenant+kb 创建独立集合</li>
+      <li>Nacos 配置变更后动态生效</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li><a href="#ch-advanced-02-graphrag-java">下一章：GraphRAG Java 消费</a></li>
+    <li><a href="https://milvus.io/docs/multi_tenancy.md">Milvus 多租户最佳实践</a></li>
+    <li><a href="https://nacos.io/docs/latest/guide/user/dynamic-config/">Nacos 动态配置指南</a></li>
+  </ul></div>
+</section>
