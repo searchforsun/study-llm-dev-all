@@ -5,156 +5,392 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S2</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>客服系统从 MVP 到生产化需要解决网关路由、限流熔断和 SSO 集成三大基础问题。这些能力直接决定了系统能否承载真实用户流量。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能配置 Spring Cloud Gateway + Resilience4j 限流熔断；能配置 SSE 流式的全链路超时；能实现 JWT + Spring Security 鉴权；能制定 7x24 运维值班手册。</p></div>
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S2 智能客服</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>开发环境的智能客服和线上生产环境的智能客服是完全两回事——线上要应对突发流量、恶意攻击、LLM API 抖动、以及企业级 SSO 鉴权。CorpAssist 上线第一天就因为没有限流导致 LLM API 被瞬间 QPS 打爆（用户集中提问），P99 延迟从 2s 飙升到 30s。这章的实战经验能让你避免「上线即翻车」的尴尬。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring Cloud Gateway + Resilience4j 搭建三层限流架构（IP 级/用户级/后端连接级）；能配置 SSE 流式连接的超时和重连参数，确保长连接可靠性；能实现 JWT + Spring Security OAuth2 的 SSO 鉴权流程，支持多端登录统一认证；能制定 7×24 运维值班手册，设置关键告警规则和故障恢复 SOP。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul>
+        <li><strong>三层限流：</strong>IP 级别（RequestRateLimiter 10 req/s）+ 用户级别（30 req/min）+ LLM 连接池级别（20 并发），突发流量整体回退到规则引擎模式</li>
+        <li><strong>SSE 连接管理：</strong>连接超时 60s、空闲超时 30s、重连间隔 3s，Nginx proxy_read_timeout 120s 防止反向代理提前断开</li>
+        <li><strong>JWT + OAuth2 SSO：</strong>Spring Security OAuth2 Resource Server 配置，JWT 包含 userId/sessionId/roles Claims，Gateway 透传鉴权到下游服务</li>
+        <li><strong>运维告警规则：</strong>5 类关键告警：P99 延迟 > 8s（Critical）、解决率 < 60%（Warning）、LLM API 错误率 > 10%（Critical）、队列深度 > 100（Warning）、熔断触发（Critical）</li>
+      </ul></div>
     </div>
 
     <div class="section-block">
-      <h3>Spring Cloud Gateway + Resilience4j 限流</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml">spring:
-  cloud:
-    gateway:
-      default-filters:
-        - name: RequestRateLimiter
-          args:
-            redis-rate-limiter:
-              replenishRate: 100   # 每秒 100 个请求
-              burstCapacity: 200   # 突发 200
-              requestedTokens: 1
-        - name: CircuitBreaker
-          args:
-            name: csServiceCB
-            fallbackUri: forward:/fallback/cs
-
-resilience4j:
-  circuitbreaker:
-    instances:
-      csChatEngineCB:
-        sliding-window-size: 10
-        failure-rate-threshold: 50
-        wait-duration-in-open-state: 30s
-        permitted-number-of-calls-in-half-open-state: 3
-  timelimiter:
-    instances:
-      csChatEngineTL:
-        timeout-duration: 30s</code></pre></div>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@RestController
-@RequestMapping("/fallback")
-public class FallbackController {
-
-    @PostMapping("/cs")
-    public Mono<ServerSentEvent<String>> fallback() {
-        return Mono.just(ServerSentEvent.<String>builder()
-            .event("error")
-            .data("系统繁忙，请稍后再试。或直接联系人工客服电话 400-xxx-xxxx。")
-            .build());
-    }
-}</code></pre></div>
-    </div>
-
-    <div class="section-block">
-      <h3>JWT + Spring Security 鉴权</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Configuration
-@EnableWebFluxSecurity
-public class SecurityConfig {
-
-    @Bean
-    public SecurityWebFilterChain securityWebFilterChain(
-            ServerHttpSecurity http) {
-        return http
-            .authorizeExchange(exchanges -> exchanges
-                .pathMatchers("/api/v1/cs/chat/**").authenticated()
-                .pathMatchers("/api/v1/cs/handoff/**").hasRole("AGENT")
-                .pathMatchers("/fallback/**").permitAll()
-                .anyExchange().authenticated()
-            )
-            .oauth2ResourceServer(oauth2 -> oauth2
-                .jwt(Customizer.withDefaults())
-            )
-            .build();
-    }
-
-    @Bean
-    public ReactiveJwtDecoder jwtDecoder() {
-        return NimbusReactiveJwtDecoder
-            .withJwkSetUri("https://auth.corp.example/.well-known/jwks.json")
-            .build();
-    }
-}</code></pre></div>
-    </div>
-
-    <div class="section-block">
-      <h3>SSE 全链路超时配置</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># Gateway 层
+      <h3>Spring Cloud Gateway + Resilience4j 的三层限流架构</h3>
+      <p>智能客服系统的流量模式与普通 Web 应用有很大不同：消息的产生是突发性的（用户可能同时涌来）、每条消息的处理时间不确定（LLM 推理 1-3s 加上工具调用）、流式连接会长时间保持。因此需要精细化的限流策略来保护后端服务。CorpAssist 的限流架构分为三层。第一层是 IP 级别限流，基于 Spring Cloud Gateway 的 RequestRateLimiter 过滤器 + Redis 实现，限制单个 IP 每秒最多 10 次请求，防止恶意刷接口。第二层是用户级别限流，在 Gateway 层解析 JWT Token 中的 userId 后，对每个用户每分钟最多 30 次对话请求进行限流（主动发消息而非接收 SSE）。第三层是后端连接级别限流，通过 Resilience4j Bulkhead 限制同时进行中的 LLM API 调用不超过 20 个，超过的请求在 Gateway 层直接返回 429 状态码和「系统繁忙，请稍后再试」的兜底话术，而不是在后端排队等待导致所有请求都变慢。</p>
+      <p>限流策略在实践中需要持续调优。上线初期我们将 IP 级别限流设为 5 req/s，但发现有些企业用户的出口 IP 是共享的（整栋办公楼共享一个公网 IP），5 req/s 的限制会误伤正常用户。解决方案是引入「动态限流」：基于历史流量模式自动调整阈值。在低峰期（0:00-8:00）限流阈值设为 5 req/s，高峰期（10:00-12:00, 14:00-17:00）动态提升到 15 req/s，并结合 Token Bucket 算法允许短时间突发（burstCapacity = 2x replenishRate）。另外重要的策略是「限流失效降级」——当限流触发时，不是简单的返回 429，而是告知用户「当前咨询量较大，您的消息已入队，预计等待 1 分钟后为您回复」，同时将消息放入 Redis 队列由 Agent 异步处理。此策略将限流后的用户放弃率从 45% 降到 12%。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># 三层限流配置 — application-gateway.yml
 spring:
   cloud:
     gateway:
       routes:
-        - id: cs-chat-stream
-          uri: lb://cs-chat-engine
+        - id: cs-chat-route
+          uri: lb://corpassist-conversation
           predicates:
-            - Path=/api/v1/cs/chat/stream
-          metadata:
-            response-timeout: 60000  # 60 秒 SSE 超时
+            - Path=/api/cs/chat
+          filters:
+            # 第一层：IP 级别限流
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@ipKeyResolver}"
+            # 第二层：用户级别限流
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 50
+                key-resolver: "#{@userKeyResolver}"
+            - StripPrefix=0
 
-# 应用层
-server:
-  reactive:
-    session:
-      timeout: 30m
-  netty:
-    max-keep-alive-requests: 1000
+resilience4j:
+  bulkhead:
+    instances:
+      llm-api-bulkhead:
+        max-concurrent-calls: 20
+        max-wait-duration: 5s
+  timelimiter:
+    instances:
+      llm-api-timeout:
+        timeout-duration: 15s
+  circuitbreaker:
+    instances:
+      llm-api-cb:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 动态限流 Key Resolver 和限流降级处理
+@Component
+public class DynamicRateLimiterConfig {
 
-# LLM 调用超时
-spring:
-  ai:
-    openai:
-      chat:
-        options:
-          timeout: 30s  # LLM 调用 30 秒超时</code></pre></div>
-      <p>SSE 超时策略的三层配置：Gateway 层 60s -> 应用层 30s(LIM) -> LLM 层 30s。任何一层超时都会返回友好错误给用户，并记录超时事件到监控系统。</p>
+    @Bean
+    public KeyResolver ipKeyResolver() {
+        return exchange -> {
+            String ip = exchange.getRequest().getHeaders()
+                    .getFirst("X-Forwarded-For");
+            if (ip == null) {
+                ip = exchange.getRequest().getRemoteAddress().getAddress().getHostAddress();
+            }
+            return Mono.just(ip);
+        };
+    }
+
+    @Bean
+    public KeyResolver userKeyResolver() {
+        return exchange -> {
+            // 从 JWT Token 中提取 userId
+            String token = exchange.getRequest().getHeaders()
+                    .getFirst("Authorization");
+            if (token != null && token.startsWith("Bearer ")) {
+                String jwtToken = token.substring(7);
+                // 解析 JWT 获取 userId（简化版，实际用 JwtDecoder）
+                String userId = extractUserIdFromToken(jwtToken);
+                return Mono.justOrEmpty(userId);
+            }
+            return Mono.just("anonymous");
+        };
+    }
+
+    // 限流响应降级处理
+    @Bean
+    public Map<String, Object> rateLimitFallback() {
+        return Map.of(
+            "status", 429,
+            "code", "RATE_LIMITED",
+            "message", "当前咨询量较大，您的消息已入队，预计等待 1 分钟后为您回复。请勿重复发送。",
+            "retryAfter", 60
+        );
+    }
+
+    private String extractUserIdFromToken(String token) {
+        // 实际使用 JwtDecoder 解析
+        return "user-from-token";
+    }
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>三层限流浪过滤和保护流程</h5>
+<pre class="mermaid">
+flowchart TB
+    A["用户请求"] --> B["L1: IP 级别限流<br/>10 req/s, burst=20"]
+    B --> C{"超过限额?"}
+    C -->|"是"| D["返回 429<br/>入队异步处理"]
+    C -->|"否"| E["L2: 用户级别限流<br/>30 req/min, burst=50"]
+    E --> F{"超过限额?"}
+    F -->|"是"| D
+    F -->|"否"| G["L3: LLM 连接池<br/>Bulkhead max=20"]
+    G --> H{"连接池满?"}
+    H -->|"是"| I["等待 max=5s<br/>仍无连接则429"]
+    H -->|"否"| J["调用 LLM API<br/>+ 工具执行"]
+    J --> K{"延迟 >15s<br/>或错误率>50%?"}
+    K -->|"是"| L["CircuitBreaker<br/>熔断 30s"]
+    L --> M["规则引擎回复<br/>降级模式"]
+    K -->|"否"| N["正常返回<br/>SSE 流式回复"]
+</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>SSE 流式连接的超时与重连配置</h3>
+      <p>SSE 长连接的可靠性是智能客服用户体验的关键。如果连接频繁断开，用户会看到「正在输入中...」然后突然停止——这会让用户感到困惑，不知道是 Agent 在思考还是连接断了。CorpAssist 对 SSE 连接做了三层超时/重连保护。客户端层：前端 EventSource 配置了自动重连（reconnectionTime=3000ms），当连接断开时 3 秒后自动重连，并发送新的会话请求带上原来的 sessionId，后端通过 AgentStateManager 恢复执行状态。反向代理层（Nginx）：配置 proxy_read_timeout=120s 和 proxy_buffering=off，确保 Nginx 不会因为长时间无数据而切断 SSE 流。服务端层：Spring WebFlux 的 SSE 超时设置在 ServerSentEventHttpMessageWriter 中——连接空闲超过 30 秒发送心跳事件，总连接时间超过 60 秒强制断开（避免用户忘记关闭页面导致资源泄漏）。</p>
+      <p>还有一个容易被忽视的问题：SSE 连接在浏览器打开新标签页或页面刷新时会触发「连接抢占」——新连接建立后旧连接没有及时关闭，导致同一个 sessionId 有两个活跃的 SSE 连接，Agent 的输出流被发送到两个地方（其中一个可能已经不再展示）。解决方案是在 Redis 中维护每个 sessionId 的连接计数器，当新连接建立时，检查是否有旧连接存在——如果有，通过 event 类型为「replaced」的消息通知旧连接关闭，然后旧连接执行 doFinally 清理资源。这个机制上线后，SSE 相关的用户投诉从月均 15 起降到了 1 起以下。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// SSE 连接管理和重连配置
+@Configuration
+public class SseConnectionConfig {
+
+    @Bean
+    public SseConnectionManager sseConnectionManager(StringRedisTemplate redisTemplate) {
+        return new SseConnectionManager(redisTemplate);
+    }
+}
+
+// SSE 连接管理器 — 处理连接抢占和重连
+public class SseConnectionManager {
+
+    private final StringRedisTemplate redisTemplate;
+    private static final String CONNECTION_KEY = "sse:conn:";
+    private static final Duration CONNECTION_TTL = Duration.ofSeconds(90);
+
+    // 连接唯一标识
+    public record ConnectionInfo(
+        String sessionId,
+        String connectionId,
+        Instant createdAt
+    ) {}
+
+    public SseConnectionManager(StringRedisTemplate redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    // 注册新连接，返回是否需要关闭旧连接
+    public boolean registerConnection(String sessionId, String connectionId) {
+        String key = CONNECTION_KEY + sessionId;
+        String previousConnectionId = redisTemplate.opsForValue().get(key);
+        redisTemplate.opsForValue().set(key, connectionId, CONNECTION_TTL);
+        return previousConnectionId != null && !previousConnectionId.equals(connectionId);
+    }
+
+    // 关闭连接时清理
+    public void unregisterConnection(String sessionId) {
+        redisTemplate.delete(CONNECTION_KEY + sessionId);
+    }
+
+    // SSE 心跳 Flux — 每 15 秒发送一次
+    public Flux<ServerSentEvent<String>> heartbeat(String sessionId) {
+        return Flux.interval(Duration.ofSeconds(15))
+                .map(i -> ServerSentEvent.<String>builder("ping")
+                        .event("heartbeat")
+                        .build())
+                .timeout(Duration.ofSeconds(70))
+                .onErrorResume(e -> Flux.just(
+                        ServerSentEvent.<String>builder("timeout")
+                                .event("connection-closed")
+                                .build()));
+    }
+}
+
+// 在 Controller 中使用连接管理
+@PostMapping("/api/cs/chat/stream")
+public Flux<ServerSentEvent<String>> streamChat(
+        @RequestBody ChatRequest request,
+        @RequestHeader("X-Connection-Id") String connectionId) {
+
+    String sessionId = request.sessionId();
+
+    // 检查是否有旧连接需要关闭
+    boolean hasPrevious = connectionManager.registerConnection(sessionId, connectionId);
+    if (hasPrevious) {
+        // 发送通知关闭旧连接（通过另一个 Channel）
+        redisTemplate.convertAndSend("sse:close:" + sessionId, connectionId);
+    }
+
+    return Flux.merge(
+            agentService.processMessage(sessionId, request.userId(), request.message()),
+            connectionManager.heartbeat(sessionId)
+    ).doFinally(signal -> connectionManager.unregisterConnection(sessionId));
+}
+</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>JWT + Spring Security OAuth2 鉴权流程</h3>
+      <p>企业级智能客服需要统一身份认证（SSO）支持：用户登录企业 OA 系统后，带有 JWT Token 访问客服页面，无需重新登录。CorpAssist 使用 Spring Security OAuth2 Resource Server 配置 JWT 鉴权。认证流程：用户在企业 IDP（如 Keycloak 或 Azure AD）登录，获取 JWT Token，Token 包含 userId、displayName、roles、sessionId 等 Claims。用户在客服前端发起 WebSocket 或 SSE 连接时，在请求头中携带 Authorization: Bearer <token>。Gateway 层通过 Spring Security 的 JwtAuthenticationToken 过滤器解析 Token，提取 Claims 并设置到 SecurityContext。下游服务通过 @AuthenticationPrincipal JwtAuthenticationToken 注解获取用户信息，无需再次解析 Token。Gateway 对 /api/cs/** 路径进行鉴权——Token 过期或无效的请求返回 401 状态码。</p>
+      <p>Token 的生命周期和刷新策略直接影响用户体验。JWT Token 的有效期一般为 1 小时（配合 Refresh Token 7 天有效）。客服 SSE 长连接可能持续 10-30 分钟，在 Token 过期前需要自动刷新。CorpAssist 的前端 SDK 在 Token 过期前 5 分钟自动使用 Refresh Token 刷新，并将新 Token 通过 SSE 的 auth 事件发送给后端更新连接认证。如果 Refresh Token 也过期了，连接断开返回 401，前端引导用户重新登录。Token 刷新流程的端到端耗时约 200ms，对用户体验几乎无影响。此外，服务端 Token 缓存可以减少每次请求的 JWT 解析开销——在 Gateway 层使用 Redis 缓存 Token Claims 30 分钟（小于 Token 有效期 1 小时），避免每次请求都调用解密算法。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Spring Security OAuth2 资源服务器配置
+@Configuration
+@EnableWebFluxSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        return http
+                .authorizeExchange(exchanges -> exchanges
+                        // 客服 API 需要认证
+                        .pathMatchers("/api/cs/**").authenticated()
+                        // 健康检查和内部接口免认证
+                        .pathMatchers("/api/cs/health", "/api/cs/internal/**").permitAll()
+                        // 其他所有请求
+                        .anyExchange().authenticated()
+                )
+                .oauth2ResourceServer(oauth2 -> oauth2
+                        .jwt(jwt -> jwt
+                                .jwtDecoder(jwtDecoder())
+                                .jwtAuthenticationConverter(jwtAuthConverter())
+                        )
+                )
+                .csrf(ServerHttpSecurity.CsrfSpec::disable)
+                .build();
+    }
+
+    @Bean
+    public ReactiveJwtDecoder jwtDecoder() {
+        // 使用 JWKS 端点自动获取公钥
+        return ReactiveJwtDecoders
+                .fromIssuerLocation("https://idp.company.com/auth/realms/corpassist");
+    }
+
+    @Bean
+    public Converter<Jwt, Mono<AbstractAuthenticationToken>> jwtAuthConverter() {
+        return new ReactiveJwtAuthenticationConverterAdapter(
+                new JwtGrantedAuthoritiesConverter());
+    }
+}
+
+// JWT Token 中提取用户信息的拦截器
+@Component
+public class UserContextFilter implements WebFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+        return exchange.getPrincipal()
+                .cast(JwtAuthenticationToken.class)
+                .map(auth -> {
+                    Jwt jwt = auth.getToken();
+                    String userId = jwt.getClaimAsString("sub");
+                    String displayName = jwt.getClaimAsString("name");
+                    String sessionId = jwt.getClaimAsString("session_id");
+
+                    // 设置请求头透传到下游服务
+                    ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+                            .header("X-User-Id", userId)
+                            .header("X-User-Name", displayName)
+                            .header("X-Session-Id", sessionId)
+                            .build();
+                    return exchange.mutate().request(mutatedRequest).build();
+                })
+                .defaultIfEmpty(exchange)
+                .flatMap(chain::filter);
+    }
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>JWT 鉴权和 SSO 流程</h5>
+<pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant FE as 前端 SPA
+    participant IDP as 企业 IDP<br/>Keycloak/Azure AD
+    participant GW as Spring Cloud Gateway
+    participant CS as Conversation Service
+
+    U->>FE: 打开客服页面
+    FE->>IDP: 302 重定向到登录页
+    U->>IDP: 输入企业账号密码
+    IDP-->>FE: 授权码 code
+    FE->>IDP: 换取 Token (code + client_secret)
+    IDP-->>FE: JWT Access Token (1h) + Refresh Token (7d)
+    FE->>GW: POST /api/cs/chat<br/>Authorization: Bearer <JWT>
+    GW->>GW: 验证 JWT 签名<br/>提取 Claims: sub/name/session_id
+    GW-->>FE: 401 (Token 无效或过期)
+    FE->>IDP: 刷新 Token (Refresh Token)
+    IDP-->>FE: 新 JWT Access Token
+    FE->>GW: 重试请求 (新 Token)
+    GW->>CS: 转发请求<br/>Headers: X-User-Id, X-Session-Id
+    CS-->>FE: SSE 流式回复
+</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>7×24 运维值班手册与告警规则</h3>
+      <p>智能客服系统上线后需要 7×24 小时运维保障。CorpAssist 制定了值班手册（Runbook），涵盖 5 类关键告警和对应的恢复 SOP。第一类告警是延迟告警：P99 端到端延迟 > 8s（Critical）需要在 5 分钟内响应。第一步检查 LLM API 的响应时间趋势（如果 API 本身变慢需要联系模型提供商），第二步检查 Gateway 连接池是否满（如果并发连接数接近上限需要扩容），第三步检查 Redis 操作是否变慢（如果 Redis 的 P99 延迟 > 50ms 需要排查 Redis 集群）。第二类告警是解决率告警：解决率 < 60%（Warning）触发，通常需要检查意图分类器准确率是否下降或知识库是否有更新。第三类告警是错误率告警：LLM API 返回非 200 状态码的比例 > 10%（Critical），自动触发熔断并切换到 L3 降级模式。第四类告警是队列深度告警：转人工排队队列深度 > 100（Warning），说明坐席处理不过来，需要通知运营团队动员更多坐席上线。第五类告警是熔断告警：CircuitBreaker 进入 OPEN 状态（Critical），需要立即排查 LLM API 的连通性。</p>
+      <p>值班手册除了告警响应步骤外，还包含了日常巡检清单和版本发布 checklist。日常巡检（每 4 小时）：检查 Dashboard 上的 P99 延迟、解决率、转接率、LLM API 健康状态 4 个核心指标是否正常。版本发布 checklist：A/B 实验是否验证了 24 小时？回滚方案是否就绪？是否通知了运营团队？灰度发布比例是否在控制范围内（先 10% -> 24h 后 50% -> 48h 后 100%）？这些规范确保了每次生产变更都有据可查、有备无患。以下表格汇总了 CorpAssist 的关键告警规则。</p>
+      <table class="outline-table">
+        <thead><tr><th>告警名称</th><th>指标</th><th>条件</th><th>严重级别</th><th>响应时间</th><th>恢复 SOP</th></tr></thead>
+        <tbody>
+          <tr><td>P99 延迟高</td><td>端到端延迟</td><td>> 8s 持续 5 分钟</td><td>Critical</td><td>5 分钟</td><td>检查 LLM API + Gateway 连接池 + Redis</td></tr>
+          <tr><td>解决率下降</td><td>解决率</td><td>< 60% 持续 30 分钟</td><td>Warning</td><td>15 分钟</td><td>检查意图分类 + 知识库 + 模型版本</td></tr>
+          <tr><td>LLM 错误率高</td><td>非 200 比例</td><td>> 10% 持续 2 分钟</td><td>Critical</td><td>2 分钟</td><td>熔断 -> 通知模型提供商 -> 切备选模型</td></tr>
+          <tr><td>排队队列深</td><td>队列长度</td><td>> 100 持续 10 分钟</td><td>Warning</td><td>10 分钟</td><td>通知运营增加坐席 -> 检查转接率异常</td></tr>
+          <tr><td>熔断触发</td><td>CircuitBreaker</td><td>进入 OPEN 状态</td><td>Critical</td><td>立即</td><td>确认 LLM API 状态 -> 降级到 L3 -> 排查根因</td></tr>
+          <tr><td>Token 费用异常</td><td>日 Token 消耗</td><td>日环比增长 > 50%</td><td>Warning</td><td>30 分钟</td><td>检查是否有异常流量 -> 排查 Prompt 长度突变</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li>Gateway + Resilience4j 限流(100 QPS) + 熔断(50% 失败率)</li>
-        <li>JWT + Spring Security OAuth2 鉴权，坐席角色额外权限</li>
-        <li>SSE 三层超时：Gateway 60s -> 应用 30s -> LLM 30s</li>
-        <li>熔断降级到 FallbackController 返回友好提示</li>
+        <li><strong>三层限流保护架构：</strong>IP 级（10 req/s）+ 用户级（30 req/min）+ 连接池级（20 并发），配合动态限流（高峰期自动提升阈值）和限流失效降级（入队异步处理），用户放弃率从 45% 降到 12%。</li>
+        <li><strong>SSE 连接管理三重超时：</strong>心跳 15s + 空闲超时 30s + 总超时 60s，Nginx proxy_read_timeout=120s，连接抢占通过 Redis 连接计数器处理，月均连接投诉从 15 起到 < 1 起。</li>
+        <li><strong>JWT + OAuth2 SSO：</strong>企业 IDP 统一认证，JWT Token 含 userId/sessionId/roles Claims，Gateway 透传鉴权到下游服务，Token 1h + Refresh Token 7d，自动刷新流程 200ms。</li>
+        <li><strong>运维告警 5 类 + 日常巡检：</strong>每 4 小时巡检 P99 延迟/解决率/转接率/LLM 健康 4 指标，5 类告警（Delay/Resolution/Error/Queue/Melting）各有独立响应时间和恢复 SOP。</li>
+        <li><strong>版本发布管控：</strong>灰度发布四阶段（10%->24h->50%->48h->100%），回滚方案上线前就绪，A/B 实验验证 24 小时，确保每次生产变更可追溯可回滚。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist">
-        <h4>过关清单</h4>
-        <ul>
-          <li><label><input type="checkbox" data-check-id="cs-advanced-01-1"> 能配置 Gateway 限流熔断</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-advanced-01-2"> 能配置 JWT 鉴权</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-advanced-01-3"> 能配置 SSE 三层超时</label></li>
-        </ul>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-advanced-01-1"> 能配置 Spring Cloud Gateway 的 RequestRateLimiter 多层限流，实现 IP 级别和用户级别的差异化限流规则</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-advanced-01-2"> 能实现 SSE 连接的自动重连和连接抢占检测，确保用户刷新页面时连接平滑切换</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-advanced-01-3"> 能配置 Spring Security OAuth2 Resource Server 的 JWT 鉴权，实现 Gateway 层统一认证和 Claims 下游透传</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-advanced-01-4"> 能制定 7×24 值班手册，覆盖 5 类关键告警的触发条件、响应时间和恢复 SOP</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-advanced-01-5"> 能设计灰度发布流程和回滚方案，确保生产变更安全可控</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话说明</th></tr></thead><tbody>
+        <tr><td>RequestRateLimiter</td><td>Spring Cloud Gateway 的限流过滤器，基于 Token Bucket 算法，配合 Redis 实现分布式限流</td></tr>
+        <tr><td>Resilience4j Bulkhead</td><td>隔离组件，限制 LLM API 的并发调用数（max=20），超过后在 Gateway 层快速失败返回 429</td></tr>
+        <tr><td>SSE 重连 / Reconnection</td><td>EventSource 自动重连机制，CorpAssist 设置 3s 重连间隔，配合 AgentStateManager 恢复执行状态</td></tr>
+        <tr><td>JWT / JSON Web Token</td><td>基于 JSON 的认证 Token，含签名和 Claims，CorpAssist 用于跨服务传递用户身份和会话信息</td></tr>
+        <tr><td>Spring Security OAuth2</td><td>Spring 的安全框架，CorpAssist 使用 Resource Server 模式验证 JWT Token</td></tr>
+        <tr><td>熔断 / CircuitBreaker</td><td>Resilience4j 的熔断器，LLM API 错误率 > 50% 时熔断 30s，触发 L3 降级模式</td></tr>
+        <tr><td>灰度发布 / Canary Release</td><td>逐步放量发布策略：10% -> 24h -> 50% -> 48h -> 100%，每阶段有回滚预案</td></tr>
+        <tr><td>Runbook / 值班手册</td><td>运维事故处理的标准操作流程文档，包含告警触发条件、响应时间和恢复步骤</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 智能客服系统的三层限流怎么设计？为什么需要三层？</summary><p>三层限流对应三种流量来源。第一层 IP 级别限流保护系统免遭恶意攻击和误刷——使用 RequestRateLimiter + Redis 按 IP 地址限流（10 req/s，burst=20），一台机器短时间内发送大量请求明显是非正常行为。第二层用户级别限流保护下游服务免遭单个用户过度使用——从 JWT Token 提取 userId 做限流（30 req/min，burst=50），防止某个用户因为前端 Bug 或异常行为产生大量请求。第三层连接池级别限流保护 LLM API 免遭过载——使用 Resilience4j Bulkhead 限制同时进行中的 LLM 调用不超过 20 个，这是最关键的一层。为什么需要三层？因为每一层的防护目标不同：IP 层防攻击、用户层防滥用、连接池层防雪崩。如果只有连接池层，LLM API 确实不会被打爆，但请求会在连接池排队等待，P99 延迟会飙升到 30s+，用户体验极差。有了前两层，大部分异常流量在 Gateway 层就被拒绝了（返回 429 或入队异步处理），不会进入连接池排队。三层配合实现了「上游快速失败、下游平稳运行」的目标。</p></details>
+        <details><summary>Q2: SSE 长连接在生产环境有什么坑？怎么解决连接断开问题？</summary><p>SSE 长连接有三大痛点。第一是反向代理超时——Nginx 默认的 proxy_read_timeout=60s 会导致 60 秒无数据时自动断开连接。解决方案是调大到 120s，并让服务端每 15 秒发送心跳保持连接活跃。第二是服务端进程重启——滚动更新或 Pod 重启时 SSE 连接全部断开。解决方案是在客户端配置自动重连（EventSource reconnectionTime=3000ms），并在重连时带上 sessionId，后端通过 AgentStateManager 恢复 Agent 的执行状态继续回复。第三是连接抢占——用户打开新标签页或刷新页面时，旧连接没有正常关闭，导致同一个 sessionId 有两个活跃连接。解决方案是用 Redis 的连接计数器：新连接建立时检查同一个 sessionId 是否有更旧的连接，如果有则发送「replaced」事件通知旧连接关闭。这第三种情况最难排查——你会看到用户收到重复的回复。我们花了 2 周才定位到根因，上线连接计数器后彻底解决。</p></details>
+        <details><summary>Q3: 运维值班遇到 P99 延迟从 2s 飙升到 15s，排查步骤是什么？</summary><p>排查步骤按分层隔离的方式进行。第一步确认影响范围——查看 Dashboard 的 P99 延迟趋势图，确认是整体上涨还是某个意图或用户的延迟高。第二步检查 Gateway 层——查看 Gateway 的 upstream_response_time 指标：如果转发延迟正常（< 10ms）但总延迟高，说明问题在下游服务。第三步检查 Conversation Service——检查 JVM GC 日志（GC 停顿是否频繁）、Redis 连接池利用率（是否达到上限）、线程池状态（是否有死锁或线程阻塞）。第四步检查 LLM API——查看 LLM API 的响应时间趋势图：如果是 API 本身变慢（从 1.5s 到 5s+），需要联系模型提供商排查。第五步检查工具调用——查看工具 API 的响应时间：如果 Tool Service 的 P99 从 500ms 飙升到 8s，问题可能在业务系统。通常在第三步或第四步就能找到根因。最常发生的情况是 LLM API 的某个实例出现故障导致局部延迟升高，或者是一次知识库更新导致的 Embedding 计算耗时增加。快速缓解措施：如果确认是 LLM API 问题，立即触发熔断切换到 L1 降级模式（规则引擎回复），保住基本的回复能力，等延迟恢复后再切回正常模式。</p></details>
       </div>
     </div>
   </div>
 
-  <div class="chapter-practice">
-    <h3>动手练习</h3>
-    <div class="steps-operate">
-      <h4>操作步骤</h4>
-      <ol>
-        <li>配置 application.yml Gateway 限流和熔断</li>
-        <li>配置 spring-security JWT 鉴权</li>
-        <li>配置 SSE 三层超时参数</li>
-      </ol>
-    </div>
-  </div>
-
-  <div class="resources content-section">
-    <h3>延伸阅读</h3>
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
     <ul>
-      <li>Next: <a href="#ch-advanced-02">业务数据叙事</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/docs/current/reference/html/#gateway-request-rate-limiter" target="_blank" rel="noopener">Spring Cloud Gateway RequestRateLimiter</a> — 基于 Redis 的令牌桶限流过滤器配置文档</li>
+      <li><a href="https://docs.spring.io/spring-security/reference/reactive/oauth2/resource-server/jwt.html" target="_blank" rel="noopener">Spring Security OAuth2 JWT 资源服务器</a> — Reactive JWT 鉴权的配置和自定义扩展指南</li>
+      <li><a href="https://resilience4j.readme.io/docs/bulkhead" target="_blank" rel="noopener">Resilience4j Bulkhead 文档</a> — 隔离模式的配置和与 Spring Cloud Gateway 集成的示例</li>
     </ul>
   </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>在 Spring Cloud Gateway 中配置 RequestRateLimiter：设置 IP 级别 5 req/s 和用户级别 20 req/min 的限流规则，通过 Redis + JMeter 验证限流生效。</li>
+      <li>配置 Spring Security OAuth2 Resource Server：使用本地启动的 Keycloak 实例作为 IDP，配置 JWT 鉴权，验证带有效 Token 可以访问 /api/cs/chat 而无效 Token 返回 401。</li>
+      <li>实现 SSE 连接管理器：使用 Redis 的 SET NX 命令维护 sessionId 到 connectionId 的映射，当新连接注册时如检测到旧连接则发送「replaced」事件。</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>场景题：你的同事说「限流阈值设得太低了，用户经常反馈被限流，把阈值调到 100 req/s 不就行了」。你同意吗？</summary><p>不同意。直接提高阈值是治标不治本的短期做法。限流的目的不是「防止用户正常使用」，而是「在资源有限的情况下保证服务的公平性和稳定性」。如果只是把阈值从 10 调到 100，但单个 IP 确实有合法的高并发场景（如企业出口共享 IP），那需要区分对待而不是整体提高。正确做法是分析被限流的用户数据：有多少是真正的误杀（合法用户被限流）？有多少是正常限流（确实超过了合理使用范围）？如果是误杀，可以调整限流维度——从 IP 级别改为 IP + Cookie 组合键，或者只对非登录用户限流（已登录用户走用户级别限流）。如果是正常限流，说明需要扩容而非提高阈值——容量规划和限流阈值是匹配的，提高不扩容意味着后端会过载。CorpAssist 的实践表明，80% 的限流触发来自 5% 的 IP（主要是爬虫和测试工具），对这部分 IP 应该单独拉黑或限流到更低阈值，而不是为 5% 的异常提高整体阈值连累 95% 的正常用户。</p></details>
+      <details><summary>场景题：生产环境 P99 延迟在平稳运行 2 个月后突然从 3s 升到 12s，排查发现 LLM API 的 P99 响应时间没有明显变化（还是 1.5s），Gateway 转发正常，Redis 正常。问题可能出在哪？</summary><p>LLM API 正常但总体延迟飙升 4 倍，说明延迟增加在下游的 Java 服务内部，而不是外部依赖。需要排查以下几方面：第一是 Agent 的步骤数是否增加了——如果 System Prompt 或工具注册的变更导致 Agent 在推理时选择了更多的步骤（例如从平均 2 步变成 4 步），总延迟会翻倍。查看 Agent 执行的 step count 指标。第二是工具调用的次数是否增加了——如果 Agent 决策逻辑变化导致它更频繁地调用工具（从每次对话 1.5 次变成 3 次），每次工具调用 + LLM 反馈会额外增加 1-2s。第三是 ChatMemory 的长度是否变大了——如果会话历史没有被正确压缩（摘要压缩触发的阈值从 10 轮被改成了 20 轮），每次 Prompt 的 Token 数翻倍会导致 LLM 推理时间线性增加。第四是 JVM 配置是否有变化——检查 GC 日志和堆内存使用率：如果内存泄漏导致频繁 Full GC，GC 停顿时间会大幅增加 P99。最常发生的是第四种情况——JVM 参数被意外修改或者内存泄漏。建议先用 jstat 和 GC 日志分析工具查看 GC 停顿时间。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/advanced-01-lab/</code></p><ul class="demo-acceptance">
+      <li>启动 Gateway 服务并配置 IP 级别限流 5 req/s，使用 curl 在 1s 内发送 6 个请求，第 6 个返回 429 状态码</li>
+      <li>启动 Keycloak 并配置 OAuth2 客户端，使用有效 JWT Token 访问 /api/cs/chat 返回 200，使用过期 Token 返回 401</li>
+      <li>SSE 连接管理器中，新连接注册时检测到同一 sessionId 的旧连接，通过 Redis Pub/Sub 发送「replaced」通知</li>
+    </ul></div>
+  </div>
+
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-advanced-02">业务数据叙事</a> — 学习如何用数据讲述解决率从 70% 到 85% 的优化故事，STAR 面试模板</li></ul></div>
 </section>

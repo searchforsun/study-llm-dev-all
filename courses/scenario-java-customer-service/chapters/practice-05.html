@@ -5,146 +5,440 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>客服效果评测比知识库更复杂——因为涉及多轮对话、工具调用和人工转接。没有系统的评测体系，无法量化优化效果。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能编写集成测试模拟完整客服对话；能使用 Advisor 断言验证工具调用行为；能通过 Spring Cloud LoadBalancer 实现 A/B 分流；能建立坏例库与回归测试机制。</p></div>
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2 智能客服</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服系统的效果评测比传统 API 测试复杂得多——你需要验证的不只是「接口返回 200」，而是「LLM 的回答是否准确」「工具调用是否在正确的时机触发」「多轮对话是否连贯」。没有系统化的测试策略，上线后才发现问题为时已晚。CorpAssist 上线前的一次模拟测试发现了一个严重问题：Agent 在特定对话流程中陷入死循环（连续调用同一个工具 7 次），如果线上发生，Token 费用会暴增 10 倍。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能设计模拟完整多轮对话的集成测试，包含意图识别、工具调用和合规审核的端到端验证；能使用 Spring AI Advisor 断言验证工具调用时机和引用准确性；能基于 Spring Cloud LoadBalancer 实现 A/B 实验流量分流；能构建坏例库（Bad Case Library）并配置自动化回归测试流水线。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul>
+        <li><strong>集成测试：</strong>使用 ChatClient + MockTool 模拟完整的多轮对话流程，验证意图切换、工具调用和错误恢复场景</li>
+        <li><strong>Advisor 断言：</strong>自定义 TestAdvisor 捕捉流式输出中的工具调用事件和引用内容，断言工具调用次数和引用来源</li>
+        <li><strong>A/B 实验：</strong>Spring Cloud LoadBalancer 的 ZonePreferenceServiceInstanceListSupplier 按规则权重分流，10% 流量的实验组 vs 90% 对照组</li>
+        <li><strong>坏例库 -> 回归测试：</strong>Git 仓库管理坏例（JSON 格式），CI/CD 流水线每次变更自动运行回归测试，失败率 > 5% 阻断发布</li>
+      </ul></div>
     </div>
 
     <div class="section-block">
-      <h3>集成测试：模拟完整对话</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@SpringBootTest
-class CustomerServiceIntegrationTest {
+      <h3>集成测试设计：模拟完整多轮对话</h3>
+      <p>智能客服的集成测试不能只测单轮对话的「请求-响应」。真正的测试需要模拟完整的用户旅程——用户可能先问好、再查订单、然后要求退款、最后转人工。每个环节的交互、上下文传递、意图切换和工具调用都需要验证。CorpAssist 使用 Spring Boot 的测试切片（@SpringBootTest + @AutoConfigureMockMvc）和 Mock 工具服务来构建集成测试。测试的核心是模拟 ChatClient 与 LLM 的交互：使用 MockChatClient（Spring AI 测试工具）替代真实 LLM 调用，预定义每个轮次的 LLM 响应——包括意图分类结果、工具调用请求和最终回复。这样测试不依赖外部 LLM API，可以在 CI/CD 流水线中快速执行。</p>
+      <p>多轮对话集成测试的用例设计遵循「正常流程 + 边界流程 + 异常流程」三层覆盖。正常流程——用户说「查物流」-> 系统查订单 -> 返回物流信息 -> 用户说「好的谢谢」-> 对话结束。边界流程——用户切换意图：「查物流」-> 查完后说「顺便退了这个」-> 系统切换到退货流程 -> 完成退款。异常流程——用户提供无效订单号 -> 系统校验失败 -> LLM 重新询问 -> 用户提供正确订单号 -> 成功查询。CorpAssist 的测试套件包含 50+ 个多轮测试用例，覆盖 8 种意图的 80 种组合场景。每次代码变更后运行全部测试约 3 分钟，比集成真实 LLM 的测试（约 30 分钟）快 10 倍。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 多轮对话集成测试
+@SpringBootTest(classes = CustomerServiceTestConfig.class)
+@AutoConfigureMockMvc
+class MultiTurnConversationTest {
 
     @Autowired
-    private CustomerServiceAgent agent;
+    private MockMvc mockMvc;
+    @Autowired
+    private ObjectMapper objectMapper;
 
-    @MockBean
-    private OrderApiClient orderApiClient;
+    private String sessionId;
 
-    @Test
-    void testOrderQueryFlow() {
-        // 模拟订单 API
-        when(orderApiClient.query("ORD-001", "13800138000"))
-            .thenReturn(new OrderResponse("ORD-001", "SHIPPED",
-                "顺丰快递", "SF123456", "2026-06-05"));
-
-        // 模拟完整对话
-        StepVerifier.create(
-            agent.chat("session-1", "查一下我的订单 ORD-001")
-        )
-        .expectNextMatches(token ->
-            token.contains("ORD-001") || token.contains("顺丰"))  // 工具调用正确
-        .thenCancel()
-        .verify();
-
-        // 验证工具被调用
-        verify(orderApiClient, times(1)).query("ORD-001", "13800138000");
+    @BeforeEach
+    void setUp() {
+        sessionId = "test-session-" + UUID.randomUUID().toString();
     }
 
     @Test
-    void testReturnFlow() {
-        // 模拟退货流程
-        when(returnApiClient.create(any()))
-            .thenReturn(new ReturnResult("RET-001", "APPROVED"));
+    void testOrderQueryThenRefund() throws Exception {
+        // 第一轮：查物流
+        String response1 = sendMessage("帮我查一下 ORD-20240501 的物流");
+        assertThat(response1).contains("已发货")
+                .contains("ORD-20240501");
 
-        // 用户要求退货
-        StepVerifier.create(
-            agent.chat("session-2", "我要退货，订单 ORD-002")
-        )
-        .expectNextMatches(token ->
-            token.contains("退货") || token.contains("原因"))
-        .thenCancel()
-        .verify();
+        // 第二轮：切换意图到退款
+        String response2 = sendMessage("我要退了这个订单");
+        assertThat(response2).contains("退款申请")
+                .contains("RF-");
+
+        // 第三轮：查询退款进度
+        String response3 = sendMessage("退款什么时候到账");
+        assertThat(response3).contains("3-5")
+                .contains("工作日");
+
+        // 验证上下文连贯性 — 系统记得订单号和退款单号
+        assertThat(response3).doesNotContain("请提供订单号");
     }
-}</code></pre></div>
-    </div>
 
-    <div class="section-block">
-      <h3>A/B 分流与坏例库回归</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// A/B 分流
-@Service
-public class ABTestRouter {
+    @Test
+    void testInvalidOrderIdThenCorrect() throws Exception {
+        // 第一轮：无效订单号
+        String response1 = sendMessage("查一下 order-xxx");
+        assertThat(response1).contains("格式错误")
+                .contains("ORD-");
 
-    private final LoadBalancer loadBalancer;
+        // 第二轮：提供正确订单号 — 系统应该记得之前的语境
+        String response2 = sendMessage("订单号是 ORD-20240501");
+        assertThat(response2).contains("已发货")
+                .contains("ORD-20240501");
+    }
 
-    public String selectModel(String userId, String experimentName) {
-        // 基于 userId 做一致性哈希，确保同一用户始终在 A/B 同一组
-        int hash = Math.abs(userId.hashCode());
-        boolean isTreatment = (hash % 100) < 20;  // 20% 流量到实验组
+    @Test
+    void testEscalateOnComplaint() throws Exception {
+        // 投诉场景 — 应该触发转人工
+        String response = sendMessage("你们什么破公司，我要投诉！");
+        assertThat(response).contains("转人工")
+                .contains("投诉");
+    }
 
-        if (isTreatment) {
-            metricRegistry.counter("ab.test", "experiment", experimentName,
-                "group", "treatment").increment();
-            return "gpt-4o-mini";  // 新模型
-        } else {
-            return "qwen-plus";     // 当前模型
-        }
+    private String sendMessage(String message) throws Exception {
+        String requestBody = objectMapper.writeValueAsString(
+                Map.of("sessionId", sessionId, "message", message));
+
+        MvcResult result = mockMvc.perform(post("/api/cs/chat")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        return result.getResponse().getContentAsString();
     }
 }
 
-// 坏例库与回归
-@Service
-public class RegressionTestSuite {
+// Mock 工具配置用于测试
+@TestConfiguration
+public class CustomerServiceTestConfig {
 
-    private final List<TestCase> badCaseLib = List.of(
-        new TestCase("订单还没到", "应该调用 query_order"),
-        new TestCase("我要退钱", "应该调用 create_return，不是 query_order"),
-        new TestCase("你们客服是机器人吗", "应该友好回应，不是转人工")
-    );
+    @Bean
+    @Primary
+    public OrderService mockOrderService() {
+        return mock(OrderService.class);
+    }
 
-    public TestReport run() {
-        int passed = 0;
-        int failed = 0;
+    @Bean
+    @Primary
+    public RefundService mockRefundService() {
+        return mock(RefundService.class);
+    }
+}
+</code></pre></div>
+    </div>
 
-        for (TestCase tc : badCaseLib) {
-            boolean result = runSingleTest(tc);
-            if (result) passed++; else failed++;
+    <div class="section-block">
+      <h3>Advisor 断言：验证工具调用与引用准确性</h3>
+      <p>Advisor 断言是 CorpAssist 测试框架的特色。它基于 Spring AI 的 Advisor 机制：自定义一个 TestValidationAdvisor 注册到测试用的 ChatClient 中，拦截所有 LLM 的生成请求和响应。在测试运行时，该 Advisor 记录每个步骤的详细信息——LLM 输入了多少 Tokens、调用了哪个工具、传入了什么参数、返回了什么结果。测试结束后，断言可以验证这些记录是否符合预期。例如，断言「queryOrder 工具被调用了 1 次，参数为 ORD-20240501」或「ComplianceAdvisor 没有拦截任何回复」。这种断言方式比简单的字符串匹配更精确——它能验证系统的行为（Agent 选择调用了正确的工具），而不仅仅是文本输出。</p>
+      <p>Advisor 断言的另一个重要用途是验证引用准确性。在政策 RAG 场景中，断言可以验证 LLM 的回复是否引用了正确的政策文档：通过解析回复中的引用标记（如「根据《退货政策 V3.2》第 4.1 条」），从 ReferenceAdvisor 的记录中查找该回复实际检索了哪些文档，断言两者匹配。如果断言失败（回复引用了一个未检索的文档版本），说明 LLM 在自由发挥而非基于检索结果回答。CorpAssist 发现没有引用准确性断言时，约 7% 的回复存在「引用幻觉」——提到了不存在的条款或版本。添加断言后，这类问题在测试阶段就被捕获了。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 工具调用和引用的 Advisor 断言
+public class ToolValidationAdvisor implements CallAroundAdvisor {
+
+    private final List<ToolCallRecord> toolCalls = new ArrayList<>();
+    private final List<ReferenceRecord> references = new ArrayList<>();
+
+    @Override
+    public String getName() { return "ToolValidationAdvisor"; }
+
+    @Override
+    public int getOrder() { return Integer.MAX_VALUE; }
+
+    @Override
+    public Response aroundCall(AdvisedRequest request, CallAroundAdvisorChain chain) {
+        // 记录工具调用前的上下文
+        String userMessage = request.userText();
+
+        Response response = chain.nextAroundCall(request);
+
+        // 记录工具调用（如果有）
+        if (response.getToolCalls() != null) {
+            for (ToolCall toolCall : response.getToolCalls()) {
+                toolCalls.add(new ToolCallRecord(
+                        toolCall.getName(),
+                        toolCall.getArguments(),
+                        response.getOutput().getContent(),
+                        Instant.now()
+                ));
+            }
         }
 
-        return new TestReport(passed, failed, badCaseLib.size());
+        return response;
     }
-}</code></pre></div>
+
+    // 断言工具被调用且参数正确
+    public void assertToolCalled(String toolName, int expectedCount) {
+        long actualCount = toolCalls.stream()
+                .filter(tc -> tc.toolName().equals(toolName))
+                .count();
+        assertThat(actualCount).as("Tool %s 应被调用 %d 次，实际 %d 次",
+                        toolName, expectedCount, actualCount)
+                .isEqualTo(expectedCount);
+    }
+
+    public void assertToolParameter(String toolName, String paramName, String expectedValue) {
+        toolCalls.stream()
+                .filter(tc -> tc.toolName().equals(toolName))
+                .findFirst()
+                .ifPresentOrElse(tc -> {
+                    String actualValue = tc.arguments().get(paramName);
+                    assertThat(actualValue).as("Tool %s 参数 %s 应为 %s",
+                                    toolName, paramName, expectedValue)
+                            .isEqualTo(expectedValue);
+                }, () -> fail("Tool %s 未被调用", toolName));
+    }
+
+    public record ToolCallRecord(
+        String toolName, Map<String, Object> arguments,
+        String responseContent, Instant timestamp
+    ) {}
+
+    public record ReferenceRecord(
+        String documentName, String clauseId, double similarity
+    ) {}
+}
+
+// 在测试中使用 Advisor 断言
+@Test
+void testOrderQueryToolCalledCorrectly() {
+    ToolValidationAdvisor validator = new ToolValidationAdvisor();
+
+    ChatClient testClient = ChatClient.builder(mockChatModel)
+            .defaultAdvisors(validator)
+            .build();
+
+    // 执行测试
+    testClient.prompt().user("查一下 ORD-20240501 的物流").call().content();
+
+    // 断言验证
+    validator.assertToolCalled("queryOrder", 1);
+    validator.assertToolParameter("queryOrder", "orderId", "ORD-20240501");
+}
+</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>A/B 实验框架（Spring Cloud LoadBalancer 流量分流）</h3>
+      <p>A/B 实验是持续优化智能客服效果的基石。任何 Prompt 修改、工具逻辑调整、模型升级都需要通过 A/B 实验验证才能全量发布，不能靠主观感受判断好坏。CorpAssist 的 A/B 实验框架基于 Spring Cloud LoadBalancer 的自定义规则实现流控分流：将流量按照预设比例分流到对照组（现有版本）和实验组（新版本），两个版本的服务同时运行，以不同的 Service ID 注册到 Nacos。Spring Cloud LoadBalancer 根据用户 ID 的哈希值决定路由到哪个版本，确保同一用户始终路由到同一版本（不会出现同一用户前半段对话在对照组、后半段在实验组的情况）。</p>
+      <p>实验指标的收集至关重要。CorpAssist 的 A/B 实验框架自动收集以下对比指标：解决率（用户是否在机器人内完成咨询而未转人工）、CSAT 评分（对话结束后的用户评价）、平均对话轮次（机器人处理的轮数）、工具调用成功率（工具执行的成功比例）、P95 延迟（用户感知的响应速度）。实验一般运行 7 天，目标样本量为每组 10,000 次对话（根据统计功效计算——80% 功效、95% 置信度、最小可检测效果 3%）。实验结果在 Dashboard 上实时展示，7 天后如果实验组在至少 2 个关键指标上显著优于对照组（p < 0.05），则全量发布；否则继续迭代或放弃。在 CorpAssist 的历史 A/B 实验中，约 40% 的实验获得了显著正向结果、30% 无显著差异、30% 负向结果被回滚。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// A/B 实验流量分流配置
+@Configuration
+public class AbTestConfig {
+
+    @Bean
+    @ConditionalOnProperty("abtest.enabled")
+    public ServiceInstanceListSupplier abTestSupplier(
+            ConfigurableApplicationContext context) {
+        // 对照组: corpassist-cs-v1 (90% 流量)
+        // 实验组: corpassist-cs-v2 (10% 流量)
+        return ServiceInstanceListSupplier.builder()
+                .withBlockingDiscoveryClient()
+                .withZonePreference()
+                .build(context);
+    }
+}
+
+// 基于用户 ID 的实验分组
+@Service
+public class AbTestService {
+
+    private static final double EXPERIMENT_TRAFFIC_RATIO = 0.10; // 10% 实验流量
+    private final MeterRegistry meterRegistry;
+
+    public AbTestService(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+
+    public String determineVersion(String userId, String experimentId) {
+        // 使用用户 ID 哈希保证一致性
+        int hash = (userId + experimentId).hashCode();
+        double normalized = (hash & Integer.MAX_VALUE) / (double) Integer.MAX_VALUE;
+
+        String version = normalized < EXPERIMENT_TRAFFIC_RATIO ? "v2-experiment" : "v1-control";
+        meterRegistry.counter("abtest.assignment",
+                "experiment", experimentId,
+                "version", version).increment();
+        return version;
+    }
+
+    // 记录实验结果指标
+    public void recordMetric(String experimentId, String version,
+                             String metricName, double value) {
+        meterRegistry.counter("abtest.metric",
+                "experiment", experimentId,
+                "version", version,
+                "metric", metricName).increment();
+        meterRegistry.gauge("abtest.value",
+                List.of(Tag.of("experiment", experimentId),
+                        Tag.of("version", version),
+                        Tag.of("metric", metricName)), value);
+    }
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>A/B 实验流量分流和评估流程</h5>
+<pre class="mermaid">
+flowchart TB
+    U["用户请求"] --> H{"用户ID<br/>hash % 100"}
+    H -->|"0-89 (90%)"| C["对照组 v1<br/>当前生产版本"]
+    H -->|"90-99 (10%)"| E["实验组 v2<br/>新版本"]
+    C --> M["指标收集<br/>解决率/CSAT/轮次/延迟"]
+    E --> M
+    M --> D["汇总 Dashboard<br/>实时展示"]
+    D --> A{"7天后<br/>p < 0.05 ?"}
+    A -->|"实验组显著优于对照"| R["全量发布 v2"]
+    A -->|"无显著差异/负向"| F["保留 v1<br/>继续迭代"]
+</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>坏例库构建与回归测试自动化</h3>
+      <p>坏例库（Bad Case Library）是持续改进客服系统质量的基石。每次线上发现 Agent 回答错误、工具调用失败或 CSAT 评分低的对话，都会被标记为「Bad Case」沉淀到坏例库中。坏例以标准 JSON 格式存储在 Git 仓库的 <code>test-resources/bad-cases/</code> 目录下，包含完整对话记录、期望结果和问题分类。CI/CD 流水线每次构建时自动运行坏例回归测试——用当前版本的 Agent 重新处理每个坏例，验证 Agent 是否给出了满意回复。如果失败率超过 5%，阻断发布并要求修复。这种「坏例即测试」的模式确保了每次代码变更不会退回过往已经修复的问题。</p>
+      <p>坏例库的管理需要定期维护——定期（每月）审查坏例库中的案例，剔除那些因为模型升级而自然修复的旧案例（模型升级后某些问题不再出现），添加新发现的坏例。CorpAssist 上线 6 个月后，坏例库从最初的 20 条增长到 350 条，坏例回归测试的通过率从 65% 提升到 97%。坏例的另一个用途是作为 Prompt 优化的训练数据：将高频坏例模式（如「退款金额计算错误」「物流状态更新延迟」）转化成 System Prompt 中的 Few-Shot 示例，从源头减少类似问题。以下代码展示了坏例的数据格式和回归测试框架。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-json">{
+  "badCases": [
+    {
+      "id": "BC-20240601-001",
+      "category": "INTENT_MISCLASSIFICATION",
+      "severity": "HIGH",
+      "description": "用户说要'退单'，系统归类为 REFUND_INQUIRY 而非 RETURN_REQUEST",
+      "conversation": [
+        {"role": "user", "content": "我要退单 #ORD-20240501"},
+        {"role": "assistant", "content": "好的，您是想咨询退款问题吗？"},
+        {"role": "user", "content": "不是咨询，我要退货！"}
+      ],
+      "expectedIntent": "RETURN_REQUEST",
+      "expectedBehavior": "系统应识别'退单'为退货申请，直接启动退货流程",
+      "rootCause": "规则引擎缺少'退单'关键词，LLM 分类器的 Few-Shot 缺少'退单'示例",
+      "fixApplied": "2024-06-02: 规则引擎增加'退单'->RETURN_REQUEST 映射",
+      "regressionTest": true
+    }
+  ]
+}
+</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Bad Case 回归测试框架
+@SpringBootTest
+class BadCaseRegressionTest {
+
+    @Autowired
+    private IntentClassifier intentClassifier;
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    private static List<BadCase> badCases;
+    private static int passed = 0;
+    private static int failed = 0;
+
+    @BeforeAll
+    static void loadBadCases() throws IOException {
+        // 加载所有坏例
+        Resource[] resources = new PathMatchingResourcePatternResolver()
+                .getResources("classpath:bad-cases/*.json");
+        badCases = new ArrayList<>();
+        for (Resource resource : resources) {
+            BadCase[] cases = new ObjectMapper()
+                    .readValue(resource.getInputStream(), BadCase[].class);
+            badCases.addAll(Arrays.asList(cases));
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("badCaseProvider")
+    void testBadCase(BadCase badCase) {
+        try {
+            // 重新运行坏例
+            String userMessage = badCase.conversation().get(0).content();
+            IntentResult result = intentClassifier.classify(userMessage);
+
+            // 验证意图匹配期望
+            boolean intentMatch = result.intent().name()
+                    .equals(badCase.expectedIntent());
+            if (intentMatch) {
+                passed++;
+            } else {
+                failed++;
+                log.warn("Bad case {} failed: expected {} but got {}",
+                        badCase.id(), badCase.expectedIntent(), result.intent());
+            }
+        } catch (Exception e) {
+            failed++;
+            log.error("Bad case {} threw exception: {}", badCase.id(), e.getMessage());
+        }
+    }
+
+    @AfterAll
+    static void report() {
+        double passRate = (double) passed / (passed + failed) * 100;
+        System.out.printf("Bad Case Regression: %d/%d passed (%.1f%%)%n",
+                passed, passed + failed, passRate);
+        if (passRate < 95) {
+            throw new RuntimeException("Bad case pass rate below 95% threshold!");
+        }
+    }
+
+    static Stream<BadCase> badCaseProvider() {
+        return badCases.stream().filter(BadCase::regressionTest);
+    }
+
+    public record BadCase(
+        String id, String category, String severity, String description,
+        List<Message> conversation, String expectedIntent,
+        String expectedBehavior, String rootCause, String fixApplied,
+        boolean regressionTest
+    ) {
+        public record Message(String role, String content) {}
+    }
+}
+</code></pre></div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li>集成测试模拟完整客服对话，验证工具调用行为</li>
-        <li>基于 userId 一致性哈希的 A/B 分流，20% 流量到实验组</li>
-        <li>坏例库驱动回归测试，确保每次迭代不退化</li>
-        <li>Advisor 断言验证意图识别和工具调用的正确性</li>
+        <li><strong>多轮集成测试：</strong>50+ 测试用例覆盖 80 种对话场景，MockChatClient 替代真实 LLM 调用使测试执行时间从 30 分钟降至 3 分钟，可在 CI/CD 流水线中按次执行。</li>
+        <li><strong>Advisor 断言精确验证：</strong>自定义 TestValidationAdvisor 捕获工具调用参数和引用来源，断言工具被准确调用的次数和参数正确性，捕获 7% 的「引用幻觉」测试阶段问题。</li>
+        <li><strong>A/B 实验框架：</strong>Spring Cloud LoadBalancer 按用户 ID 哈希分流（10% 实验组 vs 90% 对照组），7 天 10,000 样本量评估解决率/CSAT/轮次/延迟，40% 实验获得正向结果。</li>
+        <li><strong>坏例库回归测试：</strong>Git 仓库管理 JSON 格式的 350 个坏例，CI/CD 每次构建自动运行回归测试，通过率从 65% 提升到 97%，失败率 > 5% 阻断发布。</li>
+        <li><strong>测试闭环价值：</strong>集成测试 + Advisor 断言 + A/B 实验 + 坏例回归四层质量保障体系确保了系统每次变更的质量，上线 6 个月严重线上事故从月均 3 起降到 0 起。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist">
-        <h4>过关清单</h4>
-        <ul>
-          <li><label><input type="checkbox" data-check-id="cs-practice-05-1"> 能编写客服对话集成测试</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-05-2"> 能实现 A/B 分流配置</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-05-3"> 能维护坏例库和回归测试</label></li>
-        </ul>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-practice-05-1"> 能使用 MockMvc 编写多轮对话集成测试，覆盖正常流程、边界流程和异常流程三类场景</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-05-2"> 能实现 ToolValidationAdvisor 并编写断言验证工具调用的次数和参数正确性</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-05-3"> 能基于 Spring Cloud LoadBalancer 配置 A/B 实验流量分流，实现用户级一致性路由</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-05-4"> 能构建 JSON 格式的坏例库并实现回归测试自动化，设置通过率阈值阻断发布</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-05-5"> 能设计 A/B 实验的指标收集和评估流程，包括样本量计算和显著性检验</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话说明</th></tr></thead><tbody>
+        <tr><td>集成测试 / Integration Test</td><td>模拟完整多轮对话的端到端测试，验证意图识别、工具调用和上下文连贯性的正确性</td></tr>
+        <tr><td>Advisor 断言</td><td>基于 Spring AI Advisor 的测试工具，精确验证工具调用次数、参数和引用来源</td></tr>
+        <tr><td>引用幻觉</td><td>LLM 在回复中引用不存在的文档或条款的现象，CorpAssist 通过 Advisor 断言在测试阶段捕获</td></tr>
+        <tr><td>A/B 实验</td><td>对比两个版本的系统在同一指标上的表现，CorpAssist 用 10% 流量做实验 7 天评估效果</td></tr>
+        <tr><td>Spring Cloud LoadBalancer</td><td>Spring Cloud 的客户端负载均衡器，支持自定义路由规则，用于 A/B 实验流量分流</td></tr>
+        <tr><td>统计功效 / Statistical Power</td><td>检测到真实差异的概率，CorpAssist 设 80% 功效、95% 置信度、检测 3% 效果</td></tr>
+        <tr><td>坏例库 / Bad Case Library</td><td>Git 仓库管理的历史错误案例，JSON 格式含完整对话记录和期望结果，用于回归测试</td></tr>
+        <tr><td>回归测试 / Regression Test</td><td>每次代码变更后重新运行历史坏例，确保已修复的问题不会重新出现</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 智能客服和传统 API 的测试有什么不同？你们怎么测试多轮对话？</summary><p>智能客服测试比传统 API 测试复杂得多。传统 API 测试关注的是「给定输入 -> 期望输出」的确定性映射，而智能客服测试需要验证：意图识别的准确性（单条消息分类是否正确）、上下文连贯性（多轮对话中意图切换是否正确、指代消解是否准确）、工具调用的时机和参数（Agent 是否在正确的时候调用了正确的工具）、以及回答的合规性（是否包含违规承诺）。CorpAssist 的测试框架使用 MockChatClient 替代真实 LLM，预定义每轮的 LLM 行为，这样可以快速执行不依赖外部 API。多轮对话测试覆盖三种流程：正常流程（查物流 -> 查看结果 -> 结束）、边界流程（切换意图：查物流后马上要求退货）、异常流程（无效订单号 -> 修正 -> 成功）。测试用例使用 Advisor 断言精确验证工具调用的次数和参数——例如「queryOrder 工具被调用了 1 次，参数为 ORD-20240501」。</p></details>
+        <details><summary>Q2: A/B 实验在智能客服场景中怎么落地？流量怎么分？</summary><p>A/B 实验的落地关键是一致性分流和无偏指标收集。流量分流基于用户 ID 的哈希值：hash(userId + experimentId) % 100 决定用户进入对照组还是实验组，确保同一用户始终在同一个组中（避免跨组干扰）。分流比例通常为 10% 实验组 vs 90% 对照组——10% 足够检测出 3% 以上的效果差异（基于 80% 功效、95% 置信度、10,000 样本量计算）。指标收集自动化：实验系统自动监控解决率、CSAT、平均轮次、工具成功率、P95 延迟 5 个核心指标。实验运行 7 天，结束后用双样本 Z 检验比较两组指标：实验组在至少 2 个关键指标上显著优于对照组（p < 0.05）才能全量发布。约 40% 的实验获得正向结果、30% 无差异、30% 负向被回滚。最常见的实验内容有：Prompt 优化、特殊意图排序调整、知识库检索参数调整、工具调用描述优化。</p></details>
+        <details><summary>Q3: 坏例库怎么用？和回归测试怎么结合？</summary><p>坏例库是持续改进质量的数据基础。每个坏例以标准 JSON 格式记录：对话历史、期望结果、根因分析和修复方案。坏例的来源有三个：线上标注（人工审核团队每天标记 20-30 个低 CSAT 对话作为潜在坏例）、测试发现（集成测试覆盖不到的场景）、用户反馈（通过「反馈」按钮提交的不好体验）。坏例存储在 Git 仓库中，每次代码变更触发 CI/CD 流水线自动运行坏例回归测试——用当前版本的 Agent 重新处理每个坏例，验证是否给出满意回复。回归测试的通过率阈值设为 95%——如果低于此值阻断发布。坏例库的管理不是「只增不减」的：每月审查一次，剔除那些因为模型升级（如从 Qwen-72B 升级到 Qwen-110B）而自动修复的旧案例，同时补充新发现的坏例。CorpAssist 的坏例库经过 6 个月的迭代从 20 条增长到 350 条，回归通过率从 65% 提升到 97%。</p></details>
       </div>
     </div>
   </div>
 
-  <div class="chapter-practice">
-    <h3>动手练习</h3>
-    <div class="steps-operate">
-      <h4>操作步骤</h4>
-      <ol>
-        <li>编写 CustomerServiceIntegrationTest 模拟订单查询对话</li>
-        <li>实现 A/B 分流 LoadBalancer</li>
-        <li>建立 5 条坏例并编写回归测试</li>
-      </ol>
-    </div>
-  </div>
-
-  <div class="resources content-section">
-    <h3>延伸阅读</h3>
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
     <ul>
-      <li>Next: <a href="#ch-advanced-01">生产化：网关、限流与 SSO</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/testing.html" target="_blank" rel="noopener">Spring AI Testing 文档</a> — MockChatClient、MockChatModel 等测试工具的官方文档和示例</li>
+      <li><a href="https://docs.spring.io/spring-cloud-commons/docs/current/reference/html/#spring-cloud-loadbalancer" target="_blank" rel="noopener">Spring Cloud LoadBalancer 文档</a> — 自定义负载均衡规则配置，用于 A/B 实验流量分流</li>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/features.html#features.testing" target="_blank" rel="noopener">Spring Boot Testing 文档</a> — 集成测试、MockMvc、测试切片的官方指南</li>
     </ul>
   </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>编写一个多轮对话集成测试：模拟「查物流 -> 退款 -> 查退款进度」的三轮对话，使用 MockMvc 验证每轮回复包含的关键信息字段。</li>
+      <li>实现 ToolValidationAdvisor：编写断言方法 assertToolCalled() 和 assertToolParameter()，在测试中验证 queryOrder 工具被正确调用。</li>
+      <li>基于 Spring Cloud LoadBalancer 的 ZonePreferenceServiceInstanceListSupplier 配置 A/B 实验分流，在本地启动两个服务实例验证分流效果。</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>场景题：A/B 实验中实验组的转接率比对照组低了 5%（15% vs 20%），但 CSAT 也低了 0.3（3.9 vs 4.2）。你怎么判断实验结果是好是坏？</summary><p>这个实验结果看起来是「实验组减少了转接，但牺牲了满意度」。需要深入分析实验组的转接减少出现在哪里——如果减少的是「本不应转接」（如系统误判导致的转接），那 CSAT 不应该下降，反而可能上升。现在 CSAT 下降说明实验组可能把一些「应该转人工」的用户也强行留在了机器人侧。具体分析方向：第一，看实验组转人工的用户中，有多少是主动要求转人工的——如果主动转人工的比例上升可能说明用户不满意机器人的回复质量。第二，看实验组中「用户主动关闭对话」的比例——如果显著高于对照组，说明用户没有解决问题就直接离开了。第三，按意图分类分析——看哪个意图的 CSAT 下降最多：可能是某个特定意图的处理出了问题。综合建议：这个结果不宜直接发布。应该先分析子指标找到根因，修复问题后再重新实验。如果找不到根因，建议降低实验组的分流比例到 5% 并继续收集数据。</p></details>
+      <details><summary>场景题：你的同事说「我们的知识库更新了，但回归测试没覆盖到新知识库的准确率验证」。你怎么扩展测试来覆盖？</summary><p>这个问题触及了测试覆盖面的盲区——现有回归测试跑的是坏例库中的历史问题，但坏例库是固定的，不会自动追踪知识库的变更。解决方案是增加「知识库断言测试」：第一，为知识库中的每篇政策文档创建对应的测试用例——给定某个常见问题，期望 Agent 回答中引用该文档的正确条款。例如，如果退货政策更新了运费条款，就创建测试「问退货运费谁出 -> 预期引用《退货政策V3.3》第 5.1 条」。第二，在 CI/CD 流水线中增加一个步骤：当知识库 Git 仓库有变更时，自动触发测试套件运行——特别检查新版本对应的测试用例是否通过。第三，创建「对抗性测试」——针对知识库中容易混淆的条款（如「7 天退货」和「15 天换货」的区别），编写对比测试验证 Agent 能区分。第四，定期（每周）从生产日志中抽取与知识库相关的对话（通过意图 POLICY_QUERY 过滤），自动比对 LLM 回复与知识库原文的一致性，发现不一致的自动生成新的坏例。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-05-lab/</code></p><ul class="demo-acceptance">
+      <li>运行 MultiTurnConversationTest，三轮对话全部通过，控制台输出每一轮的验证结果「通过/失败」</li>
+      <li>ToolValidationAdvisor 在 queryOrder 工具调用后记录参数，测试断言 validateToolParameter("queryOrder", "orderId", "ORD-20240501") 通过</li>
+      <li>加载坏例库 JSON 运行回归测试，所有坏例通过，通过率 >= 95%</li>
+    </ul></div>
+  </div>
+
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-advanced-01">生产化：网关、限流与 SSO</a> — 进入生产化阶段：三层限流架构、SSE 超时配置和 JWT 鉴权流程</li></ul></div>
 </section>

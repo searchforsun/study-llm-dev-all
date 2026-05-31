@@ -5,171 +5,445 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>没有智能客服系统能 100% 解决问题。当机器人无法处理或用户要求转人工时，需要优雅的降级和转接策略。转接过程中必须保证上下文不丢失。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能配置置信度阈值触发人工转接；能实现转接时上下文移交；能通过 Redis 队列实现排队与坐席分配；能通过 Micrometer 监控转接率并配置 DashBoard。</p></div>
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2 智能客服</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>再好的 AI 客服也无法解决所有问题——当 LLM 不确定、工具调用失败、用户要求转人工、或检测到敏感场景时，系统必须优雅地降级并将用户转给人工坐席。不优雅的转接（用户需要重复描述问题、坐席没有上下文）是 CSAT 评分的头号杀手。CorpAssist 早期版本的人工转接体验很差——用户被转接后需要重述问题，CSAT 评分直接从 4.2 降到 3.1。优化转接体验后 CSAT 恢复到了 4.0。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能设计四级降级模型（L0-L3）和对应的触发条件；能实现在转人工时将完整上下文移交（对话历史 + 用户画像 + 当前意图 + 工具执行记录）；能使用 Redis 有序集合（ZSET）实现坐席分配和排队队列，支持优先级排队和排队位置预估；能搭建转接率 Dashboard 监控优化转接效果。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul>
+        <li><strong>四级降级：</strong>L0 正常运行 -> L1 降级（预设话术 + 规则引擎回复）-> L2 转接（上下文移交）-> L3 熔断（标准话术「系统维护中」）</li>
+        <li><strong>上下文移交包：</strong>HandoffContext 包含对话历史（最近 10 轮）+ 用户画像 + 当前意图 + 工具执行记录 + 失败原因，坐席接收到后无需用户重述</li>
+        <li><strong>Redis 坐席队列：</strong>ZADD 按时间戳和优先级排序，坐席空闲时 BLPOP 取下一个，排队时通过 ZRANK 告知用户位置</li>
+        <li><strong>转接率优化：</strong>将「本不应转接」的比例从 12% 降到 4%（通过优化置信度阈值和减少规则引擎误触），总体转接率目标 <= 25%</li>
+      </ul></div>
     </div>
 
     <div class="section-block">
-      <h3>置信度阈值 -> 人工转接</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
-public class HandoffDecider {
-
-    private static final double AUTO_HANDOFF_THRESHOLD = 0.30;
-    private static final double CLARIFY_FAIL_THRESHOLD = 0.50;
-
-    public HandoffDecision evaluate(String sessionId,
-                                     IntentResult intent,
-                                     int clarificationCount,
-                                     boolean userRequestedAgent) {
-
-        // 1. 用户主动要求转人工
-        if (userRequestedAgent) {
-            return HandoffDecision.immediate("用户主动要求转人工");
-        }
-
-        // 2. 置信度过低
-        if (intent.confidence() < AUTO_HANDOFF_THRESHOLD) {
-            return HandoffDecision.immediate("意图置信度低于阈值: " + intent.confidence());
-        }
-
-        // 3. 二次确认超过 2 次仍未澄清
-        if (clarificationCount >= 2) {
-            return HandoffDecision.immediate("二次确认超过 2 次未澄清");
-        }
-
-        // 4. 敏感场景
-        if (intent.intent() == Intent.COMPLAINT) {
-            return HandoffDecision.immediate("投诉类对话自动转人工");
-        }
-
-        return HandoffDecision.continueChat();
-    }
-}</code></pre></div>
-    </div>
-
-    <div class="section-block">
-      <h3>转接时上下文移交</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
-public class ContextHandoffService {
-
-    private final ChatMemory chatMemory;
-    private final MeterRegistry meterRegistry;
-
-    public HandoffPackage buildHandoffPackage(String sessionId,
-                                                String userId,
-                                                String reason) {
-        // 1. 获取完整对话历史
-        List<Message> history = chatMemory.get(sessionId, 50);
-
-        // 2. 获取意图判断和工具调用记录
-        // 3. 构建坐席工作台需要的上下文
-        HandoffPackage pkg = new HandoffPackage(
-            sessionId,
-            userId,
-            reason,
-            formatHistoryForAgent(history),
-            Instant.now()
-        );
-
-        meterRegistry.counter("cs.handoff", "reason", reason).increment();
-        return pkg;
-    }
-
-    private String formatHistoryForAgent(List<Message> history) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("--- 对话历史 (转人工) ---\n\n");
-        for (Message msg : history) {
-            String role = switch (msg.getMessageType()) {
-                case "user" -> "用户";
-                case "assistant" -> "机器人";
-                case "tool" -> "工具返回";
-                default -> "系统";
-            };
-            sb.append("[").append(role).append("] ")
-              .append(msg.getText()).append("\n\n");
-        }
-        return sb.toString();
-    }
+      <h3>四级降级触发条件（置信度/步数/超时/敏感场景）</h3>
+      <p>智能客服系统必须处理各种异常情况：LLM 不确定答案、工具调用失败、用户要求转人工、系统负载过高。CorpAssist 设计了四级降级模型（L0-L3），每级对应不同的系统状态和处理策略。L0（正常运行）——LLM 可用且置信度 >= 0.8，工具调用正常，无敏感场景触发，系统使用完整的 Agent 对话流程。L1（轻度降级）——LLM 延迟 > 5s 或单次工具调用超时，系统切换为规则引擎 + 预设话术回复模式，不调用 LLM，确保用户能收到响应（即使是模板化的）。L2（转接降级）——置信度 < 0.3、Agent 超 maxSteps=5、用户明确要求转人工、或敏感场景触发，系统收集完整上下文并发送 HandoffEvent。L3（熔断降级）——LLM API 不可用（连续 3 次调用失败或健康检查失败），系统返回标准话术「系统维护中，请稍后再试或致电 400-xxx-xxxx」并记录熔断事件。</p>
+      <p>降级级别的判断逻辑在 Gateway 层和 Conversation Service 层协同执行。Gateway 层监控 LLM API 的健康状态和延迟——如果连续 3 次健康检查失败，直接在 Gateway 层返回 L3 熔断话术，流量不进入下游服务。Conversation Service 层在每次 Agent 执行前检查降级级别，如果为 L1 则绕过 Agent 直接使用规则引擎回复。降级级别的切换是自动的，但会在 Dashboard 上标记当前降级状态并发送告警。CorpAssist 的线上数据显示：L0 占 87%（正常运行）、L1 占 8%（短时延迟波动）、L2 占 4.5%（需要转人工的）、L3 占 0.5%（极少发生，通常由 LLM API 升级引起）。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 四级降级级别和判断逻辑
+public enum DegradationLevel {
+    L0_NORMAL,      // 正常 — 完整 Agent + LLM 流程
+    L1_DEGRADED,    // 轻度降级 — 规则引擎 + 预设话术
+    L2_HANDOFF,     // 转接降级 — 上下文移交人工坐席
+    L3_CIRCUIT_BREAK // 熔断降级 — 标准维护话术
 }
 
-record HandoffPackage(
-    String sessionId,
-    String userId,
-    String reason,
-    String formattedHistory,
-    Instant timestamp
-) {}</code></pre></div>
+@Service
+public class DegradationManager {
+
+    private final HealthIndicator llmHealthIndicator;
+    private final MeterRegistry meterRegistry;
+
+    public DegradationManager(HealthIndicator llmHealthIndicator,
+                              MeterRegistry meterRegistry) {
+        this.llmHealthIndicator = llmHealthIndicator;
+        this.meterRegistry = meterRegistry;
+    }
+
+    public DegradationLevel evaluateDegradation(
+            IntentResult intent, int agentSteps, long llmLatencyMs) {
+
+        // L3: LLM API 不可用
+        Health health = llmHealthIndicator.health();
+        if (health.getStatus() == Status.DOWN) {
+            return DegradationLevel.L3_CIRCUIT_BREAK;
+        }
+
+        // L2: 触发转接条件
+        if (intent != null && intent.confidence() < 0.3) {
+            return DegradationLevel.L2_HANDOFF;
+        }
+        if (agentSteps >= 5) {
+            return DegradationLevel.L2_HANDOFF;
+        }
+        if (isSensitiveScenario(intent)) {
+            return DegradationLevel.L2_HANDOFF;
+        }
+
+        // L1: LLM 延迟高
+        if (llmLatencyMs > 5000) {
+            meterRegistry.counter("degradation.l1.latency").increment();
+            return DegradationLevel.L1_DEGRADED;
+        }
+
+        return DegradationLevel.L0_NORMAL;
+    }
+
+    private boolean isSensitiveScenario(IntentResult intent) {
+        return intent != null && (intent.intent() == Intent.COMPLAINT
+                || intent.intent() == Intent.UNKNOWN);
+    }
+}
+</code></pre></div>
+      <table class="outline-table">
+        <thead><tr><th>降级级别</th><th>触发条件</th><th>处理策略</th><th>线上占比</th></tr></thead>
+        <tbody>
+          <tr><td><strong>L0 正常</strong></td><td>LLM 可用 且 置信度 >= 0.8 且 无敏感场景 且 Agent 步数 <= 5</td><td>完整 Agent + LLM 流程 + 工具调用 + SSE 流式</td><td>87%</td></tr>
+          <tr><td><strong>L1 轻度降级</strong></td><td>LLM 延迟 > 5s 或 单次工具调用超时</td><td>规则引擎匹配关键词回复 + 预设话术模板，30s 后自动重试 LLM</td><td>8%</td></tr>
+          <tr><td><strong>L2 转接降级</strong></td><td>置信度 < 0.3 或 Agent 超 maxSteps=5 或 敏感场景或 用户要求转人工</td><td>收集 HandoffContext -> 发送 HandoffEvent -> Redis 排队 -> 坐席分配</td><td>4.5%</td></tr>
+          <tr><td><strong>L3 熔断降级</strong></td><td>LLM API 连续 3 次健康检查失败 或 返回 500 错误</td><td>标准话术「系统维护中，请稍后再试或致电 400-xxx-xxxx」，记录熔断时间戳</td><td>0.5%</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap"><h5>四级降级状态迁移图</h5>
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> L0_NORMAL: 系统启动
+    L0_NORMAL --> L1_DEGRADED: LLM延迟>5s
+    L0_NORMAL --> L2_HANDOFF: 置信度<0.3 / 超步数 / 敏感场景
+    L1_DEGRADED --> L0_NORMAL: 延迟恢复正常
+    L1_DEGRADED --> L2_HANDOFF: 置信度检测<0.3
+    L2_HANDOFF --> L0_NORMAL: 转人工完成/坐席接手
+    L0_NORMAL --> L3_CIRCUIT_BREAK: LLM连续3次失败
+    L1_DEGRADED --> L3_CIRCUIT_BREAK: LLM连续3次失败
+    L3_CIRCUIT_BREAK --> L0_NORMAL: 健康检查恢复(30s后)
+</pre></div>
     </div>
 
     <div class="section-block">
-      <h3>排队与坐席分配（Redis 队列）</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+      <h3>转接时的完整上下文移交（对话历史+用户画像+意图）</h3>
+      <p>转人工坐席时最核心的质量要求是：用户不需要重复描述问题。如果坐席打开对话时看到的是一个空白窗口，用户需要从头开始说一遍——这不仅让用户不满，也浪费了 AI 已经处理过的信息。CorpAssist 的 HandoffContext 数据结构确保所有必要的上下文信息都被完整传递并注入到坐席工作台中。HandoffContext 包含四部分信息：对话历史（最近 10 轮完整对话 + 系统已有摘要）、用户画像（姓名、等级、历史交互次数、未关闭工单）、当前意图（IntentResult + 置信度 + 已提取的 slots 实体）、工具执行记录（已成功执行的操作 + 失败操作及原因）。坐席工作台在打开对话时，自动在输入框上方展示一个「上下文摘要面板」，坐席一目了然地看到用户之前和 AI 说了什么、做了什么操作。</p>
+      <p>上下文移交的时机和方式也很重要。CorpAssist 支持两种转接时机：主动转接（AI 判断无法处理，立即转人工）和用户发起转接（用户发送「转人工」「找真人」等触发词）。两种时机的 HandoffContext 内容略有不同：主动转接时包含 AI 的失败原因和重试历史，帮助坐席定位问题根因；用户发起的转接在上下文包中增加一个「用户要求转接时的最后一句话」作为坐席开场白的切入点。坐席工作台在接收 HandoffContext 后，如果坐席在 30 秒内未响应，系统自动发送一条开场白「您好，我是坐席 XXX，您的问题我已经了解了，会尽快为您处理」，并附带之前 AI 回复的摘要。这个机制将转接后用户重复描述问题的比例从 68% 降到了 12%。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 转接上下文移交包
+public record HandoffContext(
+    String sessionId,
+    String userId,
+    UserProfileSnapshot userProfile,
+    IntentResult currentIntent,
+    List<ChatMessage> recentHistory,     // 最近 10 轮对话
+    String conversationSummary,         // LLM 生成的对话摘要
+    List<ToolExecutionRecord> toolRecords, // 工具执行记录
+    String handoffReason,               // 转接原因
+    Instant timestamp
+) {
+    public record UserProfileSnapshot(
+        String displayName,
+        String vipLevel,
+        int totalInteractions,
+        String openIssues,
+        String preferredContactMethod
+    ) {}
+
+    public record ToolExecutionRecord(
+        String toolName,
+        String parameters,
+        boolean success,
+        String result,
+        long durationMs
+    ) {}
+}
+
+// 上下文移交服务
+@Service
+public class HandoffContextService {
+
+    private final ChatMemory chatMemory;
+    private final UserProfileRepository profileRepository;
+    private final ChatClient summaryClient;
+
+    public HandoffContextService(ChatMemory chatMemory,
+                                 UserProfileRepository profileRepository,
+                                 ChatClient.Builder chatBuilder) {
+        this.chatMemory = chatMemory;
+        this.profileRepository = profileRepository;
+        this.summaryClient = chatBuilder.build();
+    }
+
+    public HandoffContext buildContext(String sessionId, String userId,
+                                       IntentResult intent, String reason) {
+        // 1. 获取对话历史
+        List<ChatMessage> history = chatMemory.get(sessionId, 20);
+
+        // 2. 获取用户画像
+        UserProfile profile = profileRepository.findByUserId(userId);
+        HandoffContext.UserProfileSnapshot profileSnapshot = new HandoffContext.UserProfileSnapshot(
+                profile != null ? profile.getDisplayName() : "用户",
+                profile != null ? profile.getVipLevel() : "普通",
+                profile != null ? profile.getTotalInteractions() : 0,
+                profile != null ? profile.getOpenIssues() : "无",
+                profile != null ? profile.getPreferredContactMethod() : "无偏好"
+        );
+
+        // 3. 生成对话摘要（用于坐席快速了解）
+        String summary = generateSummary(history, intent);
+
+        // 4. 构建完整上下文
+        return new HandoffContext(
+                sessionId, userId, profileSnapshot, intent,
+                history.subList(Math.max(0, history.size() - 10), history.size()),
+                summary,
+                List.of(), // 工具记录从事件存储获取
+                reason, Instant.now()
+        );
+    }
+
+    private String generateSummary(List<ChatMessage> history, IntentResult intent) {
+        if (history.isEmpty()) {
+            return "无历史对话";
+        }
+        String historyText = history.stream()
+                .map(m -> m.getMessageType() + ": " + m.getContent())
+                .collect(Collectors.joining("\n"));
+
+        return summaryClient.prompt()
+                .user(u -> u.text("请用中文摘要以下客服对话，突出用户的主要问题和已执行的操作：\n"
+                        + historyText + "\n当前识别意图: " + intent))
+                .call()
+                .content();
+    }
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>转人工上下文移交流程</h5>
+<pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant CS as Conversation Service
+    participant HC as HandoffContextService
+    participant MQ as RocketMQ
+    participant AW as Agent Workspace
+    participant AG as 人工坐席
+
+    U->>CS: "我要投诉！不解决问题就315了"
+    CS->>CS: 检测到COMPLAINT意图，置信度0.92
+    CS->>CS: 触发L2转接降级
+    CS->>HC: buildContext(sessionId, userId, intent, "敏感场景-投诉")
+    HC->>HC: 获取对话历史(10轮)+用户画像+生成摘要
+    HC-->>CS: HandoffContext(完整上下文)
+    CS->>MQ: 发送 HandoffEvent(context)
+    Note over MQ: 消息包含完整上下文包
+    MQ->>AW: 消费 HandoffEvent
+    AW->>AW: 坐席分配 + Redis排队
+    AW-->>U: "检测到您需要人工服务，正在为您排队，位次3"
+    AW->>AG: 坐席工作台弹出对话
+    Note over AG: 坐席看到上下文摘要面板<br/>包含: 对话历史、用户画像、<br/>已执行操作、转接原因
+    AG-->>U: "张先生您好，我是值班主管，<br/>已了解您的情况，请别着急"
+</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Redis 队列实现坐席分配与排队</h3>
+      <p>当多个用户同时需要转人工时，需要一个公平且高效的排队和分配机制。CorpAssist 使用 Redis 有序集合（ZSET）实现坐席请求队列，坐席空闲时从队列中取下一个请求。ZSET 的 Score 为时间戳 + 优先级权重：普通用户的 score = 时间戳（毫秒），VIP 用户的 score = 时间戳 - 600000（提前 10 分钟，相当于优先 10 分钟排队）。排队时，用户会实时看到自己的排队位置（通过 ZRANK 命令查询），每 5 秒轮询一次位置更新。坐席侧：每个坐席空闲时，通过 BLPOP（阻塞式弹出）从队列中获取分配给自己的对话，B 指令会阻塞等待直到有可分配的对话或超时（30 秒后重新轮询检测坐席在线状态）。</p>
+      <p>坐席分配的核心策略是「空闲坐席主动拉取」而非「系统推送」——坐席工作台通过 WebSocket 长连接与 Agent Workspace 保持通信，当坐席完成一个对话后，发送 ready 信号，服务端从队列头弹出一个等待的转接请求分配给他。这种拉模式的好处是：坐席的处理能力自然决定分配速度（不会出现推送过快坐席处理不过来的情况），且坐席可以控制自己的工作节奏。如果所有坐席都繁忙，新进入的转接请求在队列中等待，系统每 30 秒向用户发送一次排队位置更新（「您前面还有 N 位用户，请耐心等待」）。在 CorpAssist 的生产环境中，启动配置为 10 名在线坐席时，排队等待时间的中位数是 45 秒，P95 为 180 秒。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Redis 坐席分配和排队服务
+@Service
 public class AgentQueueService {
 
-    private static final String HANDOFF_QUEUE = "cs:handoff:queue";
-    private static final String AGENT_AVAILABLE = "cs:agent:available";
-    private static final String AGENT_SESSION = "cs:agent:session:";
+    private final StringRedisTemplate redisTemplate;
+    private static final String QUEUE_KEY = "queue:handoff";
+    private static final String AGENT_READY_KEY = "agent:ready";
+    private static final Duration QUEUE_TIMEOUT = Duration.ofSeconds(30);
 
-    public AgentAssignment assignAgent(HandoffPackage pkg) {
-        // 1. 找可用坐席
-        String agentId = redisTemplate.opsForSet()
-            .pop(AGENT_AVAILABLE);
+    public AgentQueueService(StringRedisTemplate redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
 
-        if (agentId == null) {
-            // 2. 没有可用坐席 -> 排队
-            long position = redisTemplate.opsForList()
-                .rightPush(HANDOFF_QUEUE, pkg.sessionId());
-            return AgentAssignment.queued(position, pkg);
+    // 用户加入排队队列
+    public QueuePosition enqueue(HandoffContext context) {
+        // VIP 用户优先级权重
+        boolean isVip = "VIP".equals(context.userProfile().vipLevel())
+                || "至尊VIP".equals(context.userProfile().vipLevel());
+        long baseScore = System.currentTimeMillis();
+        double score = isVip ? baseScore - 600_000 : baseScore;
+
+        redisTemplate.opsForZSet().add(QUEUE_KEY,
+                context.sessionId(), score);
+
+        // 存储上下文到单独的 Key 供坐席拉取
+        try {
+            String contextJson = new ObjectMapper().writeValueAsString(context);
+            redisTemplate.opsForValue()
+                    .set("handoff:context:" + context.sessionId(), contextJson,
+                            Duration.ofMinutes(30));
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialize handoff context", e);
         }
 
-        // 3. 分配坐席
-        redisTemplate.opsForValue()
-            .set(AGENT_SESSION + agentId, pkg.sessionId(),
-                 Duration.ofHours(2));
-        return AgentAssignment.assigned(agentId, pkg);
+        // 返回排队位置
+        Long rank = redisTemplate.opsForZSet().rank(QUEUE_KEY, context.sessionId());
+        return new QueuePosition(context.sessionId(),
+                rank != null ? rank.intValue() + 1 : 1,
+                estimateWaitTime(rank));
     }
-}</code></pre></div>
+
+    // 坐席空闲时拉取下一位用户
+    public Optional<HandoffContext> assignNextAgent(String agentId) {
+        // 获取队列中 score 最小的（最早排队的）会话
+        Set<String> sessions = redisTemplate.opsForZSet()
+                .range(QUEUE_KEY, 0, 0);
+        if (sessions == null || sessions.isEmpty()) {
+            return Optional.empty();
+        }
+
+        String sessionId = sessions.iterator().next();
+        // 移除队列
+        Long removed = redisTemplate.opsForZSet().remove(QUEUE_KEY, sessionId);
+        if (removed == null || removed == 0) {
+            return Optional.empty();
+        }
+
+        // 获取上下文并清理临时数据
+        String contextJson = redisTemplate.opsForValue()
+                .getAndDelete("handoff:context:" + sessionId);
+        if (contextJson == null) {
+            return Optional.empty();
+        }
+
+        try {
+            HandoffContext context = new ObjectMapper()
+                    .readValue(contextJson, HandoffContext.class);
+            log.info("Agent {} assigned to session {}", agentId, sessionId);
+            return Optional.of(context);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to deserialize handoff context", e);
+            return Optional.empty();
+        }
+    }
+
+    // 查询排队位置
+    public int getQueuePosition(String sessionId) {
+        Long rank = redisTemplate.opsForZSet().rank(QUEUE_KEY, sessionId);
+        return rank != null ? rank.intValue() + 1 : -1;
+    }
+
+    private String estimateWaitTime(Long rank) {
+        if (rank == null) return "未知";
+        // 假设每个坐席平均处理时间 5 分钟，10 个坐席
+        int estimatedMinutes = (rank.intValue() / 10) * 5;
+        return estimatedMinutes <= 1 ? "约1分钟" : "约" + estimatedMinutes + "分钟";
+    }
+
+    public record QueuePosition(String sessionId, int position, String estimatedWait) {}
+}
+</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>转接率 Dashboard 与持续优化策略</h3>
+      <p>转接率是一个需要精细管理的指标——过低的转接率意味着系统在强行拒绝用户（用户需要转人工但系统不给转），过高的转接率说明智能客服没有发挥应有作用。CorpAssist 的转接率目标为 <= 25%，其中「不应该被转接」的比例（即系统可以处理但因算法误判而转出的）应该 <= 5%。为了监控和优化转接率，我们建设了转接率 Dashboard，显示以下关键指标：总体转接率（时间趋势、分时段对比）、按转接原因分类（置信度低/超步数/敏感场景/用户要求/工具失败）、排队等待时间分布（P50/P95/P99）、坐席处理时间和 CSAT 评分按坐席分布、以及「本不应转接」的比率（由人工标注校准）。</p>
+      <p>持续优化策略基于 Dashboard 的数据驱动分析。定期回顾「本不应转接」的案例——例如，如果发现大量因置信度阈值过低导致的不必要转接，就调整意图级别的差异化阈值；如果发现特定意图（如 POLICY_QUERY）的转接率异常高，就增加该意图对应的知识库覆盖。CorpAssist 的优化实践：通过分析 Dashboard 数据，发现转接原因中「置信度低」占了 48%，其中一半来自 UNKNOWN 意图（用户说的确实是 LLM 无法理解的内容）。将 UNKNOWN 意图的置信度阈值从 0.5 降低到 0.3（低阈值更容易转人工），同时增加二次确认环节（「我理解您意思了吗？」），「本不应转接」的比例从 12% 降到 4%，同时整体转接率从 30% 降到 24%，CSAT 从 3.9 提升到 4.2。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 转接率 Dashboard 数据服务
+@RestController
+@RequestMapping("/api/cs/internal/dashboard")
+public class HandoffDashboardController {
+
+    private final MeterRegistry meterRegistry;
+    private final HandoffRecordRepository recordRepository;
+
+    public HandoffDashboardController(MeterRegistry meterRegistry,
+                                      HandoffRecordRepository recordRepository) {
+        this.meterRegistry = meterRegistry;
+        this.recordRepository = recordRepository;
+    }
+
+    @GetMapping("/handoff-metrics")
+    public ApiResponse<HandoffMetrics> getHandoffMetrics(
+            @RequestParam @DateTimeFormat(iso = ISO.DATE) LocalDate start,
+            @RequestParam @DateTimeFormat(iso = ISO.DATE) LocalDate end) {
+
+        List<HandoffRecord> records = recordRepository
+                .findByTimestampBetween(start.atStartOfDay(), end.atTime(LocalTime.MAX));
+
+        long total = records.size();
+        Map<String, Long> byReason = records.stream()
+                .collect(Collectors.groupingBy(
+                        HandoffRecord::getHandoffReason, Collectors.counting()));
+        Map<String, Double> avgWaitByReason = records.stream()
+                .collect(Collectors.groupingBy(
+                        HandoffRecord::getHandoffReason,
+                        Collectors.averagingLong(HandoffRecord::getWaitTimeSeconds)));
+
+        return ApiResponse.success(new HandoffMetrics(total, byReason, avgWaitByReason));
+    }
+
+    // Micrometer 实时指标
+    public void recordHandoff(String sessionId, String reason, long waitTimeSeconds) {
+        meterRegistry.counter("handoff.total",
+                "reason", reason).increment();
+        meterRegistry.timer("handoff.wait-time",
+                "reason", reason)
+                .record(Duration.ofSeconds(waitTimeSeconds));
+    }
+
+    public record HandoffMetrics(
+        long totalHandoffs,
+        Map<String, Long> byReason,
+        Map<String, Double> avgWaitByReason
+    ) {
+        public double overallHandoffRate() {
+            long totalConversations = byReason.values().stream()
+                    .mapToLong(Long::longValue).sum();
+            return totalConversations > 0
+                    ? (double) totalHandoffs / totalConversations * 100
+                    : 0;
+        }
+    }
+}
+</code></pre></div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li>四级转接触发条件：置信度 < 0.30、澄清失败 2 次、投诉场景、用户主动要求</li>
-        <li>转接时构建完整 HandoffPackage，坐席端获得全部对话上下文</li>
-        <li>Redis 队列实现排队和坐席分配，无可用坐席时自动排队</li>
+        <li><strong>四级降级模型：</strong>L0(87%) -> L1(8%) -> L2(4.5%) -> L3(0.5%)，每级有独立的触发条件和处理策略，降级级别在 Gateway 和 Conversation Service 协同判断。</li>
+        <li><strong>上下文移交包 HandoffContext：</strong>含 4 层信息（对话历史 10 轮 + 用户画像 + 意图 + 工具执行记录），坐席工作台展示上下文摘要面板，用户重复描述比例从 68% 降到 12%。</li>
+        <li><strong>Redis 坐席队列：</strong>ZSET 按时间戳 + VIP 优先级排序，坐席 BLPOP 主动拉取，VIP 提前 10 分钟排队。P50 等待 45s，P95 等待 180s（10 名坐席配置）。</li>
+        <li><strong>转接率优化：</strong>通过差异化阈值和二次确认将「本不应转接」的比例从 12% 降到 4%，整体转接率从 30% 降到 24%，CSAT 从 3.9 提升到 4.2。</li>
+        <li><strong>Dashboard 驱动优化：</strong>按转接原因分类监控，数据驱动调整阈值和知识库覆盖，每两周回顾一次转接案例并更新策略。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist">
-        <h4>过关清单</h4>
-        <ul>
-          <li><label><input type="checkbox" data-check-id="cs-practice-04-1"> 能实现四级转接触发逻辑</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-04-2"> 能实现上下文移交</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-04-3"> 能实现 Redis 排队分配</label></li>
-        </ul>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-1"> 能实现 DegradationManager 的四级降级判断逻辑，包含 LLM 健康检查、置信度评估、步数限制和敏感场景检测</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-2"> 能实现 HandoffContextService 构建完整上下文移交包，包含对话历史、用户画像、意图和工具记录 4 层信息</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-3"> 能使用 Redis ZSET 实现坐席排队队列，支持优先级排队和排队位置查询</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-4"> 能实现坐席工作台的上下文摘要面板，展示转接原因、用户画像和已执行操作</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-04-5"> 能建设转接率 Dashboard，按转接原因分类并识别「本不应转接」的比例，制定优化策略</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话说明</th></tr></thead><tbody>
+        <tr><td>L0-L3 降级</td><td>四级降级模型：正常->轻度降级（预设话术）->转接降级（上下文移交）->熔断降级（维护话术）</td></tr>
+        <tr><td>HandoffContext</td><td>转接时的完整上下文包，包含对话历史+用户画像+意图+工具执行记录，确保坐席无需用户重述</td></tr>
+        <tr><td>HandoffEvent</td><td>转人工触发时发送的异步事件，携带 HandoffContext，通过 RocketMQ 分发到 Agent Workspace</td></tr>
+        <tr><td>Redis ZSET</td><td>有序集合数据结构，用于坐席排队队列，score=时间戳-优先级偏移量，支持 ZRANK 查位置</td></tr>
+        <tr><td>BLPOP</td><td>Redis 阻塞式列表弹出命令，坐席空闲时阻塞等待下一个待分配对话</td></tr>
+        <tr><td>VIP 优先级</td><td>VIP 用户的 score=时间戳-600000（提前10分钟），在 ZSET 中自然排在普通用户前面</td></tr>
+        <tr><td>转接率 Dashboard</td><td>监控转接率、转接原因分布、排队等待时间的运营看板，数据驱动优化决策</td></tr>
+        <tr><td>「本不应转接」比率</td><td>系统可以处理但因算法误判而转出的比例，通过人工标注校准，目标 <= 5%</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 智能客服的降级策略怎么设计？降级和熔断的区别？</summary><p>降级策略按照严重程度从低到高设计为四级：L0 正常、L1 轻度降级、L2 转接降级、L3 熔断降级。L0 时系统完整运行 Agent + LLM 流程。L1 轻度降级针对 LLM 延迟高（>5s）的情况，切换到规则引擎 + 预设话术模式，确保用户能收到响应（虽然质量可能下降），30 秒后自动重试 LLM。L2 转接降级针对无法解决的用户问题——置信度低、超步数、敏感场景或用户要求，将完整上下文移交人工坐席。L3 熔断降级针对 LLM API 完全不可用（连续 3 次健康检查失败），直接返回标准话术「系统维护中」，不调用下游服务。降级和熔断的核心区别在于：降级是系统仍然运行但使用降级后的策略（规则引擎代替 LLM），而熔断是完全断开对 LLM 的调用。熔断后有一个半开状态（Half-Open），30 秒后尝试一次健康检查，如果恢复则回到正常状态。在 CorpAssist 的实践中，L1 占 8% 的请求、L2 占 4.5%、L3 占 0.5%。L3 的 0.5% 主要是 LLM API 版本升级时的短暂不可用导致的。</p></details>
+        <details><summary>Q2: 转人工时怎么确保坐席有足够的上下文？最关键的上下文是什么？</summary><p>坐席需要四层上下文才能无缝接手：第一层是对话历史（最近 10 轮完整消息）——让坐席知道用户和 AI 已经聊了什么。第二层是用户画像（姓名、VIP 等级、历史交互记录）——让坐席知道在跟谁说话、这个用户的特征和过往情况。第三层是当前意图和已提取的实体（IntentResult + slots）——让坐席知道 AI 已经识别出了用户的目的是什么。第四层是工具执行记录（已成功和失败的操作）——让坐席知道 AI 已经做了什么操作、哪些操作失败了、失败的原因。这四层中最关键的是第三和第四层——坐席需要知道「AI 现在遇到了什么困难」才能快速定位问题。仅仅知道对话历史是不够的（坐席需要自己从头分析出错原因）。CorpAssist 的坐席工作台将这些信息整合为一个上下文摘要面板，坐席打开对话时第一眼看到的是：「用户问题：退货退款 / 已执行：查物流(成功)、退款(失败-超过退货期限) / 用户等级：VIP / 转接原因：工具调用失败」。坐席据此可以在几秒内判断出接下来的处理方案，而不是从头阅读对话日志。</p></details>
+        <details><summary>Q3: 排队队列怎么实现公平性？VIP 优先是怎么做的？</summary><p>排队队列的公平性通过 Redis ZSET 的时间戳排序和 FIFO 原则保证。所有转接请求在加入队列时以当前系统时间戳（毫秒）作为 score，ZSET 会自动按 score 升序排列——先来的排在前面。VIP 优先的实现是通过修改 score 值实现的：VIP 用户的 score = 当前时间戳 - 600000（毫秒），相当于把 VIP 用户的时间戳往前拨了 10 分钟，使得他们在 ZSET 中的排序位置比同时进入的普通用户靠前。这种方法的好处是不需要独立的 VIP 队列，普通用户和 VIP 用户在同一个队列中按权重排序，公平性一目了然。但需要注意的边界情况：如果 VIP 用户数量太多（比如超过坐席处理能力的 50%），普通用户可能永远排不上队。我们的解决方案是为 VIP 优先设置上限——每个坐席在连续 3 次优先分配 VIP 后，下一次必须分配普通用户，确保普通用户不会被饿死。排队体验方面，用户每 5 秒轮询一次 ZRANK 获取当前位置，系统每 30 秒主动推送一次位置更新和预估等待时间。</p></details>
       </div>
     </div>
   </div>
 
-  <div class="chapter-practice">
-    <h3>动手练习</h3>
-    <div class="steps-operate">
-      <h4>操作步骤</h4>
-      <ol>
-        <li>实现 HandoffDecider 四级转接逻辑</li>
-        <li>实现 ContextHandoffService 上下文移交</li>
-        <li>实现 AgentQueueService 排队分配</li>
-      </ol>
-    </div>
-  </div>
-
-  <div class="resources content-section">
-    <h3>延伸阅读</h3>
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
     <ul>
-      <li>Next: <a href="#ch-practice-05">客服效果评测</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retry.html" target="_blank" rel="noopener">Spring AI Retry 和 Fallback</a> — Spring AI 的降级和重试机制配置文档</li>
+      <li><a href="https://redis.io/docs/data-types/sorted-sets/" target="_blank" rel="noopener">Redis Sorted Set 数据类型</a> — ZSET 的详细文档，包括 ZADD/ZRANK/ZRANGE/BLPOP 命令的使用和性能特性</li>
+      <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j CircuitBreaker</a> — 熔断器模式在 Java 应用中的实现，用于 L3 熔断降级的判断逻辑</li>
     </ul>
   </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>实现 DegradationManager：编写基于 LLM 健康检查、置信度、步数的四级降级判断逻辑，通过单元测试验证每种降级级别的触发条件。</li>
+      <li>实现 HandoffContextService：构建包含对话历史、用户画像、意图、工具记录的上下文包，验证坐席打开后可以不需要用户重述回答问题。</li>
+      <li>使用 Redis ZSET 实现排队队列：编写 enqueue() 和 assignNextAgent() 方法，通过 Redis CLI 的 ZRANGE 命令验证 VIP 用户的优先级排序正确。</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>场景题：你们系统的转接率突然从 25% 飙升到 45%，但 CSAT 不降反升（从 4.0 到 4.3）。这个现象合理吗？</summary><p>这个现象虽然反直觉，但可能是合理的。转接率飙升而 CSAT 也提升的情况通常意味着：之前不该转人工的用户被强制留在了机器人侧（产生不满意），现在系统更「谨慎」了，把更多不确定性大的问题转给了人工坐席。人工坐席处理得更好，所以 CSAT 反而提升了。但 45% 的转接率从成本角度看不可持续——人工成本会大幅增加。分析方向应该是：按转接原因拆分这 20% 的增量分别来自哪。如果是「置信度低」增加——可能是一次模型升级导致置信度分布整体下降，需要调整阈值；如果是「用户要求转人工」增加——需要排查是否有产品变更导致用户需求无法被满足；如果是「敏感场景」增加——检查是否最近出现了大量投诉（业务层面原因）。建议短期内接受 45% 的转接率（以保持 CSAT），但中长期优化目标应当将不必要的转接降回去：通过调优置信度阈值（每个意图独立调整）和补充知识库覆盖，争取将转接率降到 30% 以下同时保持 CSAT >= 4.2。</p></details>
+      <details><summary>场景题：VIP 用户等待了 10 分钟还没被分配坐席，普通用户反而先进去了。可能是什么问题？</summary><p>VIP 优先级逻辑失败的可能原因有几个。第一是 VIP 状态判断出了问题——检查 Redis 队列中该用户的 score 值：如果 score 等于普通用户的时间戳（没有减去 600000），说明 context.userProfile().vipLevel() 判断失败，用户画像加载没有正确返回 VIP 信息。第二种可能是坐席分配逻辑绕过了 ZSET 排序——如果 assignNextAgent() 不是 ZPOPMIN（取最小 score 用户），而是按其他方式（如 List 的 BLPOP），就不尊重 ZSET 顺序。第三种可能是 VIP 用户被分配了但坐席没有响应——坐席接了对话但没实际处理，导致被误认为「空闲」并分配了下一个用户。排查步骤：首先在 Redis 用 ZRANGE queue:handoff 0 -1 WITHSCORES 查看所有排队用户的 score，确认 VIP 用户的 score 是否确实比普通用户低。然后检查坐席分配日志——看 VIP 用户的 session 是否被分配给了坐席但坐席没有处理。最后检查坐席工作台的上下文加载——如果坐席打开对话后发现没有上下文摘要（空显示），坐席可能会挂起对话不处理。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-04-lab/</code></p><ul class="demo-acceptance">
+      <li>发送置信度 0.25 的用户消息，DegradationManager 判断为 L2_HANDOFF，触发转接流程</li>
+      <li>两个用户同时排队（一个 VIP、一个普通），Redis ZSET 中 VIP 用户的 score 比普通用户小 600000，自然排在前面</li>
+      <li>坐席打开转接对话时，工作台显示上下文摘要面板（对话历史 + 用户画像 + 当前意图 + 已执行操作），无需用户重述</li>
+    </ul></div>
+  </div>
+
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-05">客服效果评测</a> — 学习集成测试设计、Advisor 断言、A/B 实验框架和坏例库构建</li></ul></div>
 </section>

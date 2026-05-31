@@ -5,127 +5,330 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S2</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服是 CorpAssist 中最复杂的模块——涉及意图识别、多轮对话、工具调用、人工转接、质检五大子系统。没有清晰的模块划分，代码会变成一团乱麻。本章建立 S2 的架构蓝图。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能画出 CorpAssist S2 的五模块架构并说明每模块职责；能配置 Spring Cloud Gateway 路由到客服服务；能描述模块间的数据流和接口契约。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><ul><li>五大模块：意图路由/对话引擎/工具层/人工坐席/质检</li><li>Spring Cloud Gateway 作为统一入口，路由到不同的客服服务</li><li>模块间通过事件驱动和 REST API 两种模式交互</li><li>CorpAssist S2 架构总图含完整数据流</li></ul></div>
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S2 智能客服</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服系统涉及多模块协作——意图识别、对话管理、工具调用、人工坐席、质检——模块之间的接口设计和数据流决定了系统的可维护性和可扩展性。如果不清楚模块划分和职责边界，开发过程中会出现「这个逻辑该放哪里」的混乱，导致代码耦合严重、难以测试。CorpAssist 的首个版本正是因为模块职责不清，花费了 2 周重构才梳理清楚架构。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能画出 CorpAssist 客服系统的五大核心模块和它们之间的数据流；能基于 Spring Cloud Gateway 配置按意图路由的消息分发策略；能设计模块间的异步事件通信机制和接口契约；能独立搭建一个最小可用的客服系统微服务部署拓扑。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul>
+        <li><strong>五大核心模块：</strong>意图路由（意图识别 + 规则引擎）→ 对话引擎（ChatClient + ChatMemory）→ 工具层（@Tool 业务工具）→ 人工坐席（上下文移交 + Redis 队列）→ 质检（ComplianceAdvisor + 人工抽检）</li>
+        <li><strong>Spring Cloud Gateway：</strong>按意图路径路由（/api/cs/intent/query），集成 RequestRateLimiter 限流和 TokenRelay 鉴权透传</li>
+        <li><strong>事件驱动通信：</strong>模块间通过 Spring Cloud Stream (RabbitMQ/RocketMQ) 发送 HandoffEvent、ToolResultEvent、EscalationEvent 等异步消息</li>
+        <li><strong>微服务拓扑：</strong>Gateway + Intent Service + Conversation Service + Tool Service + Agent Service + Quality Service，服务间通过 gRPC 或 HTTP/2 通信，部署于 K8s 集群</li>
+      </ul></div>
     </div>
 
     <div class="section-block">
-      <h3>五大模块</h3>
-      <table class="outline-table">
-        <thead><tr><th>模块</th><th>职责</th><th>核心组件</th><th>关键接口</th></tr></thead>
-        <tbody>
-          <tr><td><strong>意图路由</strong></td><td>识别用户意图，路由到对应处理器</td><td>Spring AI StructuredOutput + 规则引擎</td><td>POST /api/v1/intent/classify</td></tr>
-          <tr><td><strong>对话引擎</strong></td><td>管理多轮对话，调用 LLM 生成回答</td><td>ChatClient + ChatMemory + Advisor Chain</td><td>POST /api/v1/chat/completions</td></tr>
-          <tr><td><strong>工具层</strong></td><td>执行业务操作（查单/退款/改址）</td><td>@Tool 注解 + Bean Validation</td><td>POST /api/v1/tools/*</td></tr>
-          <tr><td><strong>人工坐席</strong></td><td>处理转接请求，分配坐席</td><td>Redis 排队 + WebSocket 坐席端</td><td>WebSocket /ws/agent</td></tr>
-          <tr><td><strong>质检</strong></td><td>对话质量抽检，敏感内容审核</td><td>Advisor 链 + 异步分析</td><td>MQ corpassist-quality-check</td></tr>
-        </tbody>
-      </table>
-      <div class="mermaid-wrap">
-        <h5>五大模块关系图</h5>
-        <pre class="mermaid">flowchart TB
-    USER[用户] -->|消息| GW[Spring Cloud Gateway]
-    GW --> IR[意图路由]
-    IR -->|高置信度| DE[对话引擎]
-    IR -->|低置信度| HA[人工坐席]
-    DE -->|需要查数据| TL[工具层]
-    DE -->|需要政策| KB[(S1 知识库)]
-    DE -->|检测到敏感| QC[质检]
-    TL -->|订单API| ORD[订单系统]
-    TL -->|售后API| AFT[售后系统]
-    HA -->|排队+分配| AGT[坐席工作台]
-    QC -->|告警| AM[坐席管理员]</pre>
-      </div>
+      <h3>五大核心模块：意图路由/对话引擎/工具层/人工坐席/质检</h3>
+      <p>CorpAssist 客服系统划分为五个核心模块，每个模块有明确的职责边界和对外接口。意图路由模块（Intent Router）负责接收用户消息，通过双引擎（规则引擎 + LLM 结构化分类）识别用户意图并输出 IntentResult（包含 intent 枚举、confidence 置信度、slots 实体列表）。对话引擎模块（Conversation Engine）是系统的核心，基于 Spring AI 的 ChatClient 管理多轮对话，调用 ChatMemory 读写会话历史，并在需要时触发工具调用或知识库检索。工具层（Tool Layer）以 @Tool 注解注册的 Java 方法实现具体的业务操作，如订单查询、退款处理、地址修改——每个工具都有独立的参数校验和错误处理逻辑。人工坐席模块（Agent Workspace）管理转人工队列，通过 Redis 有序集合（ZSET）实现坐席分配和排队，在转接时将完整的上下文（对话历史 + 用户画像 + 当前意图）移交给坐席工作台。质检模块（Quality Check）运行 ComplianceAdvisor 对模型输出进行合规审核，并对已完结的对话进行离线抽检和评分。</p>
+      <p>这五个模块遵循「前一个模块处理不了的事情交给下一个模块」的责任链原则。具体来说：消息到达后，意图路由模块先做意图分类——如果置信度 >= 0.8，交给对话引擎；如果置信度在 0.5-0.8 之间，触发二次确认；如果置信度 < 0.5 或意图为 UNKNOWN，直接转人工。对话引擎在生成回复时，如果需要的工具调用失败（重试耗尽），也降级转人工。质检模块对所有输出进行后处理，如果检测到合规问题（如包含「一定退款」等禁止承诺词），拦截回复并转人工审核。这种责任链设计保证了每个模块只关注自己的职责，模块间的耦合度低，便于独立测试和部署。</p>
+      <div class="mermaid-wrap"><h5>CorpAssist 五大核心模块架构图</h5>
+<pre class="mermaid">
+flowchart TB
+    subgraph "Ingress Layer"
+        GW["Spring Cloud Gateway<br/>限流 + 鉴权"]
+    end
+    subgraph "Intent Router"
+        RE["规则引擎<br/>RuleEngine"]
+        LLM_CLS["LLM 分类器<br/>StructuredOutput"]
+        TH["阈值处理<br/>ThresholdHandler"]
+    end
+    subgraph "Conversation Engine"
+        CC["ChatClient<br/>对话生成"]
+        CM["ChatMemory<br/>Redis 持久化"]
+        KG["知识库 RAG<br/>VectorStore"]
+    end
+    subgraph "Tool Layer"
+        OT["OrderTool<br/>@Tool"]
+        RT["RefundTool<br/>@Tool"]
+        AT["AddressTool<br/>@Tool"]
+    end
+    subgraph "Agent Workspace"
+        HQ["Handoff Queue<br/>Redis 有序集合"]
+        WS["坐席工作台<br/>WebSocket"]
+    end
+    subgraph "Quality Check"
+        CA["ComplianceAdvisor<br/>输出审核"]
+        QR["离线抽检<br/>人工评分"]
+    end
+    USER["用户"] -->|"HTTPS/SSE"| GW
+    GW -->|"JWT auth"| RE
+    RE -->|"未命中"| LLM_CLS
+    LLM_CLS --> TH
+    TH -->|">=0.8"| CC
+    TH -->|"转人工"| HQ
+    CC -->|"需要工具"| OT
+    OT --> CC
+    RT --> CC
+    AT --> CC
+    CM -.-> CC
+    KG -.-> CC
+    CC -->|"回复"| CA
+    CA -->|"合规通过"| USER
+    CA -->|"违规拦截"| HQ
+    CC -->|"工具失败"| HQ
+    HQ --> WS
+</pre></div>
     </div>
 
     <div class="section-block">
-      <h3>Spring Cloud Gateway 配置</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml">spring:
+      <h3>Spring Cloud Gateway 作为统一入口的架构设计</h3>
+      <p>Spring Cloud Gateway 在 CorpAssist 客服系统中扮演着统一流量入口的角色，负责认证鉴权、请求限流、意图路由和协议转换四个核心功能。所有用户请求首先到达 Gateway，它基于 JWT Token 进行身份认证（通过 Spring Security OAuth2 Resource Server 配置），然后根据请求路径将消息路由到不同的后端服务。客服模块的 API 路径统一以 <code>/api/cs/</code> 为前缀，例如 <code>/api/cs/chat</code> 用于对话请求，<code>/api/cs/handoff</code> 用于转人工请求，<code>/api/cs/history</code> 用于历史查询。Gateway 还负责将 HTTP 长连接转换为 SSE（Server-Sent Events）流式响应，支持用户在对话过程中实时接收 LLM 的流式输出。在 CorpAssist 的现网部署中，Gateway 的 P99 转发延迟控制在 5ms 以内，每日处理约 50 万次请求。</p>
+      <p>限流策略是 Gateway 的一个关键设计点。CorpAssist 实现了三层限流：第一层是 IP 级别的 RequestRateLimiter，限制单个 IP 每秒最多 10 次请求；第二层是用户级别的令牌桶，每个用户 1 分钟最多 30 次对话请求；第三层是后端服务的连接数控制，限制同时进行中的 LLM 调用不超过 20 个，防止 LLM API 过载。在实践中最容易踩坑的是流式连接的限流——如果用户发一条消息后立刻关闭页面再打开重连，Gateway 会在短时间内积累大量未完成的 SSE 连接。我们的解决方案是在 Gateway 层添加连接池管理，每个用户 ID 最多同时保留 3 个 SSE 连接，超出后自动关闭最旧的连接。以下代码展示了 Gateway 的核心路由和限流配置。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># application-gateway.yml — Spring Cloud Gateway 路由和限流配置
+spring:
   cloud:
     gateway:
       routes:
-        - id: cs-intent-router
-          uri: lb://cs-intent-router
+        # 客服对话路由 — SSE 流式响应
+        - id: cs-chat-route
+          uri: lb://corpassist-conversation
           predicates:
-            - Path=/api/v1/intent/**
+            - Path=/api/cs/chat
+            - Header=X-Intent, ORDER_QUERY, RETURN_REQUEST, POLICY_QUERY
           filters:
             - name: RequestRateLimiter
               args:
-                redis-rate-limiter.replenishRate: 100
-                redis-rate-limiter.burstCapacity: 200
-        - id: cs-chat-engine
-          uri: lb://cs-chat-engine
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@userKeyResolver}"
+            - StripPrefix=0
+        # 转人工路由
+        - id: cs-handoff-route
+          uri: lb://corpassist-agent-workspace
           predicates:
-            - Path=/api/v1/chat/**
+            - Path=/api/cs/handoff
           filters:
-            - name: CircuitBreaker
+            - name: Retry
               args:
-                name: csChatEngineCB
-                fallbackUri: forward:/fallback/chat
-        - id: cs-tools
-          uri: lb://cs-tools
+                retries: 3
+                statuses: BAD_GATEWAY, SERVICE_UNAVAILABLE
+        # 静态资源路由
+        - id: cs-static-route
+          uri: lb://corpassist-frontend
           predicates:
-            - Path=/api/v1/tools/**
-        - id: cs-agent-ws
-          uri: lb:ws://cs-agent-ws
-          predicates:
-            - Path=/ws/agent/**</code></pre></div>
+            - Path=/cs/**
+      default-filters:
+        - name: JwtAuthenticationFilter
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 100
+            redis-rate-limiter.burstCapacity: 200
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      llm-api:
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>Gateway 请求处理序列</h5>
+<pre class="mermaid">
+sequenceDiagram
+    participant U as 用户客户端
+    participant GW as Spring Cloud Gateway
+    participant Auth as 认证服务
+    participant CS as 对话服务
+    participant LLM as LLM API
+    U->>GW: POST /api/cs/chat {message, sessionId, token}
+    GW->>Auth: 解析 JWT Token
+    Auth-->>GW: userId=u1001, roles=["vip"]
+    GW->>GW: 检查限流 — IP+User+连接数三层
+    GW->>CS: 转发请求 + JWT Claims
+    CS->>LLM: 调用模型生成回复
+    LLM-->>CS: 流式 Token
+    CS-->>GW: Flux<ServerSentEvent>
+    GW-->>U: SSE 流式输出
+    Note over GW: 连接超时 = 60s, 空闲超时 = 30s
+</pre></div>
     </div>
 
     <div class="section-block">
-      <h3>模块间数据流与接口契约</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 意图路由 -> 对话引擎 契约
-public record IntentResult(
-    String sessionId,
-    String intent,         // order_query | return | refund | policy
-    double confidence,     // 0.0 ~ 1.0
-    Map<String, Object> slots,  // {orderId: "ORD-123"}
-    @Nullable String fallbackReason
+      <h3>模块间的数据流、接口契约与事件驱动通信</h3>
+      <p>五个模块之间的数据流通过同步 API 和异步事件两种方式配合完成。同步 API 主要用于实时请求-响应场景：用户消息经 Gateway -> 意图路由模块（HTTP 调用）-> 对话引擎模块（HTTP 调用）-> 工具层（内部方法调用）-> 返回结果。同步链路的 P99 延迟要求控制在 5s 以内，因此每个环节的耗时都必须受控。异步事件用于非实时的模块间通信：当发生转人工操作时，对话引擎向「人工坐席模块」发送 HandoffEvent 消息（包含完整上下文）；当工具调用失败时，产生 ToolResultEvent 用于后续分析和告警；当质检模块检测到合规问题，发送 EscalationEvent 触发升级流程。异步通信基于 Spring Cloud Stream 实现，消息中间件可以选择 RabbitMQ（低延迟场景）或 RocketMQ（高吞吐场景）。</p>
+      <p>接口契约是模块间协作的基础。每个模块对外暴露的 API 都有明确的请求/响应结构和错误码规范。例如，意图路由模块的 <code>/api/cs/intent/classify</code> 接口接收 <code>ClassifyRequest</code>（包含 message、sessionId、userId），返回 <code>IntentResponse</code>（包含 intent、confidence、slots、rawText）。所有模块共享统一的 <code>ApiResponse<T></code> 包装类，错误码遵循 HTTP 状态码加业务码的格式（如 200 成功、400 参数校验失败、500 内部错误）。以下代码定义了核心的数据契约和事件结构。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 模块间共享的接口契约类
+
+// 统一 API 响应包装
+@Data
+@Builder
+public class ApiResponse<T> {
+    private int status;       // HTTP 状态码
+    private String code;      // 业务码，如 "INTENT_LOW_CONFIDENCE"
+    private String message;   // 人类可读消息
+    private T data;           // 响应数据
+    private long timestamp;   // 服务器时间戳
+
+    public static <T> ApiResponse<T> success(T data) {
+        return ApiResponse.<T>builder()
+                .status(200).code("OK").data(data)
+                .timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> error(int status, String code, String message) {
+        return ApiResponse.<T>builder()
+                .status(status).code(code).message(message)
+                .timestamp(System.currentTimeMillis()).build();
+    }
+}
+
+// 意图路由模块的请求/响应
+public record ClassifyRequest(
+    @NotBlank String message,
+    @NotBlank String sessionId,
+    @NotBlank String userId,
+    @Nullable List<String> history
 ) {}
 
-// 对话引擎 -> 工具层 契约
-public record ToolCallRequest(
-    String sessionId,
-    String toolName,       // queryOrder | createReturn | changeAddress
-    Map<String, Object> parameters,
-    String idempotencyKey
+public record IntentResponse(
+    Intent intent,
+    double confidence,
+    Map<String, String> slots,
+    String rawText
 ) {}
 
-// 人工坐席转接 契约
-public record HandoffRequest(
+// 转人工事件 — 通过 Spring Cloud Stream 发送
+public record HandoffEvent(
     String sessionId,
     String userId,
-    String reason,          // low_confidence | sensitive_content | user_request
-    List<ChatMessage> chatHistory,
-    @Nullable String preferredAgentId
-) {}</code></pre></div>
+    Intent intent,
+    double confidence,
+    List<ChatMessage> conversationHistory,
+    UserProfile userProfile,
+    String reason,      // 转接原因: LOW_CONFIDENCE / TOOL_FAILURE / COMPLIANCE_BLOCK / USER_REQUEST
+    Instant timestamp
+) {}
+
+// 工具调用结果事件
+public record ToolResultEvent(
+    String sessionId,
+    String toolName,
+    boolean success,
+    String requestPayload,
+    String responsePayload,
+    long durationMs,
+    @Nullable String errorMessage
+) {}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>模块间事件驱动通信流程</h5>
+<pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant IR as 意图路由
+    participant CE as 对话引擎
+    participant TL as 工具层
+    participant QC as 质检
+    participant AW as 人工坐席
+
+    U->>IR: 用户消息
+    IR->>IR: 意图分类 + 置信度评估
+    alt 置信度 >= 0.8
+        IR->>CE: HTTP 调用: /api/cs/chat
+        CE->>TL: 调用业务工具
+        TL-->>CE: 工具结果
+        CE->>QC: ComplianceAdvisor 审核
+        QC-->>CE: 审核通过
+        CE-->>U: SSE 流式回复
+    else 置信度 < 0.5 或工具失败
+        CE-->>AW: async: HandoffEvent(topic=cs.handoff)
+        AW->>AW: Redis 排队 + 坐席分配
+        AW-->>U: WebSocket: 转人工通知 + 排队位次
+    else 合规拦截
+        QC-->>CE: 违规标记
+        CE-->>AW: async: EscalationEvent(topic=cs.escalation)
+    end
+</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 客服架构总图与微服务部署拓扑</h3>
+      <p>CorpAssist 客服系统的生产部署采用微服务架构，将五大核心模块拆分为独立的微服务单元，每个服务可以独立扩缩容。服务划分遵循「按业务能力拆分」的原则：Intent Service 负责意图识别（无状态，可按流量扩缩容）、Conversation Service 负责对话管理（有状态，需要稳定的 Redis 连接）、Tool Service 负责业务工具调用（需要访问外部 API）、Agent Service 负责人工坐席管理（需要 WebSocket 长连接支持）、Quality Service 负责离线质检（异步处理）。服务之间的同步通信使用 HTTP/2（通过 Spring Cloud OpenFeign 声明式调用），异步通信使用 RocketMQ（Spring Cloud Stream 绑定）。每个服务都注册到 Spring Cloud Nacos 注册中心，实现服务发现和健康检查。部署在 Kubernetes 集群上，每个服务至少 2 个 Pod 保证高可用，Conversation Service 和 Agent Service 通过 StatefulSet 管理有状态实例。</p>
+      <p>数据库和中间件的部署策略是：Redis Cluster 用于会话存储（ChatMemory）和转人工队列，数据分片 16 个 Slot，TTL 统一设置为 30 分钟。PostgreSQL 主从复制用于持久化存储——已完结对话日志、用户画像数据、质检结果报表。Elasticsearch 用于知识库的全文检索和日志分析。Vector Database（Milvus）用于向量检索——政策库的话术嵌入和相似度匹配。在 CorpAssist 的现网部署中，这套拓扑支撑了日均 5 万次对话（峰值 8 万）的服务能力，P99 端到端延迟 3.2s，系统可用性 99.95%。以下表格总结了各服务的部署参数。</p>
+      <div class="mermaid-wrap"><h5>CorpAssist 客服系统微服务部署拓扑</h5>
+<pre class="mermaid">
+graph TB
+    subgraph "K8s Cluster"
+        subgraph "Ingress"
+            GW["Spring Cloud Gateway<br/>2 Pods | 4C8G"]
+        end
+        subgraph "Core Services"
+            IS["Intent Service<br/>3 Pods | 2C4G<br/>无状态"]
+            CS["Conversation Service<br/>3 Pods | 4C8G<br/>有状态-StatefulSet"]
+            TS["Tool Service<br/>2 Pods | 2C4G<br/>无状态"]
+            AS["Agent Service<br/>2 Pods | 4C8G<br/>有状态-StatefulSet"]
+            QS["Quality Service<br/>1 Pod | 2C4G<br/>异步消费"]
+        end
+        subgraph "Data Layer"
+            RC["Redis Cluster<br/>3 Nodes | 8C16G<br/>TTL=30min"]
+            PG[("PostgreSQL<br/>主从 | 4C16G<br/>持久化存储")]
+            ES[("Elasticsearch<br/>3 Nodes | 8C16G<br/>日志+检索")]
+            MV[("Milvus<br/>2 Nodes | 8C16G<br/>向量检索")]
+        end
+        subgraph "Message Queue"
+            MQ["RocketMQ<br/>2 Nodes | 4C8G<br/>Topic: cs.*"]
+        end
+    end
+    USER["用户"] --> GW
+    GW --> IS
+    GW --> CS
+    IS --> CS
+    CS --> TS
+    CS --> MQ
+    MQ --> AS
+    MQ --> QS
+    CS --> RC
+    CS --> PG
+    IS --> MV
+    QS --> ES
+    TS -->|"外部 API"| EXT["订单系统<br/>售后系统<br/>物流系统"]
+</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>服务名称</th><th>Pod 数</th><th>资源规格</th><th>状态</th><th>主要依赖</th><th>扩缩容策略</th></tr></thead>
+        <tbody>
+          <tr><td>Gateway</td><td>2</td><td>4C8G</td><td>无状态</td><td>Redis（限流）</td><td>CPU > 70% → +1 Pod</td></tr>
+          <tr><td>Intent Service</td><td>3</td><td>2C4G</td><td>无状态</td><td>Milvus（Few-Shot 检索）</td><td>QPS > 500 → +1 Pod</td></tr>
+          <tr><td>Conversation Service</td><td>3</td><td>4C8G</td><td>有状态</td><td>Redis Cluster + PostgreSQL</td><td>手动（数据分片谨慎）</td></tr>
+          <tr><td>Tool Service</td><td>2</td><td>2C4G</td><td>无状态</td><td>外部业务 API</td><td>QPS > 300 → +1 Pod</td></tr>
+          <tr><td>Agent Service</td><td>2</td><td>4C8G</td><td>有状态</td><td>Redis Cluster + WebSocket</td><td>手动</td></tr>
+          <tr><td>Quality Service</td><td>1</td><td>2C4G</td><td>异步</td><td>RocketMQ + PostgreSQL</td><td>消息堆积 > 10K → +1 Pod</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li>五大模块职责清晰：意图路由 -> 对话引擎 -> 工具层 -> 人工坐席 -> 质检</li>
-        <li>Spring Cloud Gateway 统一入口，配置路由/限流/熔断</li>
-        <li>模块间通过契约化的数据对象解耦（IntentResult/ToolCallRequest/HandoffRequest）</li>
+        <li><strong>五大模块责任链：</strong>意图路由 → 对话引擎 → 工具层 → 人工坐席 → 质检，遵循「上一个处理不了交给下一个」的职责分离原则，模块间通过明确的接口契约解耦。</li>
+        <li><strong>Gateway 三层限流：</strong>IP 级（10 req/s）、用户级（30 req/min）、后端连接数级（20 并发），P99 转发延迟 5ms，日处理 50 万次请求。</li>
+        <li><strong>同步 + 异步混合通信：</strong>实时对话链路使用 HTTP/2 同步调用（P99 < 5s），非实时操作（转人工、质检告警）通过 RocketMQ 异步事件驱动。</li>
+        <li><strong>API 契约标准：</strong>统一 ApiResponse<T> 包装类，<code>/api/cs/</code> 路径前缀，错误码格式为 HTTP 状态码 + 业务码，所有模块共享相同的数据契约。</li>
+        <li><strong>K8s 部署拓扑：</strong>6 个微服务 + 5 个数据中间件，日均支撑 5 万对话（峰值 8 万），P99 端到端延迟 3.2s，系统可用性 99.95%。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist">
-        <h4>过关清单</h4>
-        <ul>
-          <li><label><input type="checkbox" data-check-id="cs-basics-02-1"> 能画出五模块架构图</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-basics-02-2"> 能配置 Gateway 路由</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-basics-02-3"> 能定义模块间接口契约</label></li>
-        </ul>
-      </div>
-      <div class="learn-interview">
-        <h4>面试可能问</h4>
-        <details><summary>Q1: 意图路由和对话引擎为什么是两个独立模块？</summary>
-        <p>职责分离：意图路由专注分类（输入 -> intent），对话引擎专注生成（intent + context -> 回答）。独立模块的好处：① 可以独立部署和扩缩（意图路由需要 GPU 分类器，对话引擎需要 LLM）；② 独立升级（换分类模型不影响对话流程）；③ 更清晰的可观测性（分别监控分类准确率和回答质量）。</p></details>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-1"> 能画出五大核心模块的架构框图并标注每个模块的职责、输入输出和技术选型</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-2"> 能基于 Spring Cloud Gateway 配置一个包含限流和鉴权的路由规则，并解释三层限流的必要性</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-3"> 能设计出 HandoffEvent 和 ToolResultEvent 两个事件的数据结构，说明异步通信的适用场景</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-4"> 能解释为什么 Conversation Service 和 Agent Service 需要使用 StatefulSet 部署而 Intent Service 可以用 Deployment</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-5"> 能设计一个模块间的错误码体系，包含至少 5 个业务错误码和对应的场景</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话说明</th></tr></thead><tbody>
+        <tr><td>Intent Router</td><td>通过规则引擎 + LLM 结构化输出识别用户意图的模块，输出 IntentResult（intent + confidence + slots）</td></tr>
+        <tr><td>Conversation Engine</td><td>基于 ChatClient + ChatMemory 的多轮对话管理核心，负责调用工具和知识库生成回复</td></tr>
+        <tr><td>Tool Layer</td><td>通过 @Tool 注解注册的业务操作集合，包含参数校验、幂等控制和错误处理</td></tr>
+        <tr><td>Agent Workspace</td><td>管理转人工队列和坐席分配的模块，通过 Redis ZSET 实现排队，通过 WebSocket 与坐席客户端通信</td></tr>
+        <tr><td>Quality Check</td><td>负责 ComplianceAdvisor 在线审核和离线对话抽检评分，检测合规风险和回答质量</td></tr>
+        <tr><td>Spring Cloud Gateway</td><td>基于 Spring WebFlux 的 API 网关，提供路由转发、限流熔断、鉴权透传等能力</td></tr>
+        <tr><td>Spring Cloud Stream</td><td>消息驱动的微服务框架，统一封装 RocketMQ/RabbitMQ 的事件发布和消费</td></tr>
+        <tr><td>StatefulSet</td><td>K8s 工作负载资源，为有状态服务提供稳定的网络标识和持久化存储绑定</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 设计一个智能客服系统的微服务划分方案，你会怎么拆分？为什么？」</summary><p>我会按业务能力拆分为六个微服务：Gateway（统一入口，负责鉴权/限流/路由）、Intent Service（意图识别，无状态易扩缩容）、Conversation Service（对话管理，有状态需要 ChatMemory 持久化）、Tool Service（工具调用，依赖外部业务 API）、Agent Service（人工坐席管理，需要 WebSocket 长连接）、Quality Service（离线质检，异步处理）。这种拆分方案的核心原则是「按变更频率和性能需求差异化拆分」：Intent Service 算法迭代频繁需要独立部署和灰度发布，Conversation Service 是有状态服务不能随意扩缩容需要 StatefulSet 管理。在 CorpAssist 的实践中，这种六服务划分让每个团队的职责明确——算法团队只关注 Intent Service 和 Quality Service，后端团队关注 Conversation 和 Tool Service，运维团队关注 Gateway 和 Agent Service。每个服务可以独立发布、独立测试，互不阻塞。</p></details>
+        <details><summary>Q2: 网关层在智能客服系统中的职责有哪些？如果流量突增 10 倍，网关应该怎么保护后端？</summary><p>网关层在智能客服系统中有四个核心职责：路由转发（将 /api/cs/chat 映射到 Conversation Service）、认证鉴权（JWT Token 验证和用户身份提取）、流量控制（限流、熔断、重试）、协议转换（HTTP -> SSE 流式响应）。当流量突增 10 倍时，网关需要执行三重保护策略：第一层是请求级别限流，使用 RequestRateLimiter 限制单位时间内的总请求数和每个用户的并发数——例如将每秒总请求从 500 限制到 800（仍然允许一定增长但不完全放开）；第二层是后端连接数控制，使用 Resilience4j Bulkhead 限制与 LLM API 的同时连接数不超过 30 个，超过的请求直接返回 429 状态码和「系统繁忙，请稍后再试」的兜底话术；第三层是熔断，当 LLM API 的错误率超过 50% 时触发 CircuitBreaker 熔断 30 秒，在此期间所有对话请求直接使用规则引擎回复。这三层保护确保了后端服务的稳定性，即使网关层有 10 倍流量，后端 LLM API 和数据库也不会被打垮。</p></details>
+        <details><summary>Q3: 模块间用同步调用还是异步消息？你怎么选择？</summary><p>选择依据很简单：用户需要实时等待的结果用同步调用，不需要或不希望用户等待的操作用异步消息。在 CorpAssist 中，实时对话链路（用户消息 -> 意图识别 -> 对话生成 -> 回复）必须使用同步调用，因为用户期望在几秒内得到回复，这个链路的 P99 延迟要求 <= 5s。而转人工操作、合规拦截告警、质检评分报告等非实时操作使用异步消息。具体事件包括：HandoffEvent（转人工通知）、ToolResultEvent（工具调用结果记录）、EscalationEvent（合规升级通知）。异步消息的技术选型是 Spring Cloud Stream + RocketMQ，因为 RocketMQ 支持事务消息保证至少一次投递，且延迟低（P99 < 5ms）。混合通信的架构要求：同步链路必须设置超时（HTTP 连接超时 3s、读取超时 10s），异步链路必须设置死信队列处理消费失败的消息。曾经有个坑：转人工的 HandoffEvent 如果消费失败（坐席模块重启），因为没有死信队列，消息就丢失了——用户等着转人工却没有任何反馈。加上死信队列后，失败消息会被重新投递到坐席模块的备用队列，保证最终一致性。</p></details>
       </div>
     </div>
   </div>
@@ -133,34 +336,29 @@ public record HandoffRequest(
   <div class="official-links content-section">
     <h3>官方参考</h3>
     <ul>
-      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank">Spring Cloud Gateway</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/docs/current/reference/html/" target="_blank" rel="noopener">Spring Cloud Gateway 官方文档</a> — 路由谓词、过滤器工厂、限流配置的完整参考手册</li>
+      <li><a href="https://docs.spring.io/spring-cloud-stream/docs/current/reference/html/" target="_blank" rel="noopener">Spring Cloud Stream 官方文档</a> — 基于消息中间件的微服务事件驱动编程指南</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient API</a> — ChatClient 的 Fluent API 设计和流式调用机制说明</li>
     </ul>
   </div>
 
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <div class="steps-operate">
-      <h4>操作步骤</h4>
-      <ol>
-        <li>创建 Spring Cloud Gateway 配置路由到意图路由和对话引擎</li>
-        <li>定义 IntentResult/ToolCallRequest/HandoffRequest 三个契约类</li>
-        <li>用 Docker 启动 Redis 并配置 Gateway 的 RequestRateLimiter</li>
-      </ol>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>使用 Spring Initializr 创建一个包含 Spring Cloud Gateway 的项目，配置 <code>/api/cs/**</code> 路径的路由，目标指向 <code>http://localhost:8081</code>。</li>
+      <li>实现一个简单的 Gateway 限流配置：使用 RequestRateLimiter 过滤器，限制每个用户每秒最多 5 个请求，通过 Redis + SpEL 表达式解析用户 ID。</li>
+      <li>编写 HandoffEvent 的事件发布代码：使用 Spring Cloud Stream 的 <code>StreamBridge</code> 发送 <code>HandoffEvent</code> 到 <code>cs.handoff</code> 主题，并编写对应的消费者。</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>场景题：你的同事提议将 Intent Router 和 Conversation Engine 合并为一个服务，理由是「减少内部调用延迟」。你怎么看？</summary><p>这个提议的部分理由是正确的——合并可以消除 HTTP 内部调用，减少约 20-50ms 的延迟。但从架构角度看，合并会带来三个更大问题：第一，意图识别的算法迭代速度比对话管理快得多（算法团队每两周更新一次分类器），合并在一个服务里会导致频繁的全量部署，影响对话引擎的稳定性。第二，两者对资源的需求不同：Intent Router 是计算密集型（LLM 推理占用 GPU），Conversation Engine 是 IO 密集型（大量 Redis 读写和外部 API 调用），混合部署会使资源调度复杂化。第三，可观测性受损——合并后无法独立监控意图识别的准确率和对话引擎的延迟。CorpAssist 的实践数据表明，不合并虽然增加 30ms 内部调用延迟，但两个服务各自独立发布 32 次和 18 次而互不影响，团队协作效率提升约 40%。对于延迟敏感场景，可以通过 gRPC 替代 HTTP 将内部调用延迟降到 2ms 以内。因此我建议保持拆分，优化通信协议而非合并服务。</p></details>
+      <details><summary>场景题：Gateway 在压力测试中，当并发数超过 100 时 LLM 调用超时率上升到 30%。如何诊断和修复？</summary><p>这个问题需要分层排查。首先确认超时是发生在 Gateway 到后端的连接上，还是后端到 LLM API 的连接上。在 Gateway 的访问日志中查看 upstream_response_time 指标，如果这个值正常（< 3s）但 total_time 很大（> 10s），说明是 Gateway 内部的连接池排队导致的。修复方案：调整 Gateway 的 HTTP 连接池参数——<code>spring.cloud.gateway.httpclient.pool.maxConnections=500</code> 和 <code>maxPendingConnectionAcquire=100</code>。如果 upstream_response_time 本身就很大，说明是 Conversation Service 的线程池满了或者 LLM API 限流了：检查 Conversation Service 的 ThreadPoolTaskExecutor 配置，核心线程数需要从默认的 8 调整为 20，队列容量从 100 调整为 500。更重要的改进是添加 Resilience4j Bulkhead 隔离：限制同时进行中的 LLM 调用不超过 20 个，多出的请求直接在 Gateway 层快速失败返回 429 状态码，而不是在后端排队消耗资源导致大面积超时。此外，为 LLM API 添加 Client-Side 的 ConnectionPool 和 Timeout 配置：connectTimeout=3s, readTimeout=15s, maxConnections=20。</p></details>
     </div>
-    <div class="demo-box">
-      <h4>配套实验室</h4>
-      <p>见 demos/basics-02-lab/</p>
-      <ul class="demo-acceptance">
-        <li>Gateway 启动并路由到正确服务</li>
-        <li>限流和熔断配置验证通过</li>
-      </ul>
-    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-02-lab/</code></p><ul class="demo-acceptance">
+      <li>成功启动 Gateway 服务，通过 <code>curl -X GET http://localhost:8080/api/cs/health</code> 获取 200 响应</li>
+      <li>配置限流规则后，在 1 秒内连续发送 6 个请求，第 6 个请求返回 429 Too Many Requests</li>
+      <li>发送 HandoffEvent 到 RocketMQ 并成功消费，在消费者日志中打印出完整的转接原因和会话 ID</li>
+    </ul></div>
   </div>
 
-  <div class="resources content-section">
-    <h3>延伸阅读</h3>
-    <ul>
-      <li>Next: <a href="#ch-basics-03">多轮上下文与会话管理</a></li>
-    </ul>
-  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-basics-03">多轮上下文与会话管理</a> — 深入学习 ChatMemory、指代消解和三层混合记忆架构</li></ul></div>
 </section>

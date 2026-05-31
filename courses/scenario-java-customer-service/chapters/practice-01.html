@@ -5,103 +5,163 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>意图识别是智能客服的第一个环节——如果意图都识别错了，后续的回答、工具调用、转接都没有意义。生产级系统需要规则 + 模型双引擎保证准确率。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring AI 结构化输出实现意图分类器；能配置规则 + 模型双引擎路由；能设置置信度阈值和意图兜底策略；能通过 Micrometer 监控意图识别准确率。</p></div>
-      <div class="notice"><h4>本章要点速记</h4><ul><li>Spring AI StructuredOutput 将 LLM 输出解析为强类型 IntentResult</li><li>双引擎路由：规则引擎(低延迟) + 模型分类(高准确率)</li><li>置信度阈值: >= 0.8 路由到正确意图, 0.5-0.8 二次确认, < 0.5 兜底话术</li><li>意图识别准确率通过人工抽检 + 自动闭环持续监控</li></ul></div>
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2 智能客服</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>意图识别是智能客服的入口环节——如果意图识别错了，后续的回答、工具调用、转接都没有意义。一个「想查订单」的用户如果被识别成「要投诉」，对话的走向就完全错了。生产级系统需要规则引擎 + LLM 模型双引擎协同，才能兼顾低延迟（规则引擎毫秒级响应）和高准确率（LLM 处理复杂/模糊表达）。CorpAssist 的初期版本只用了 LLM 分类，P95 延迟 2.8s，用户反馈慢；优化为双引擎后 P95 降到 480ms，同时准确率从 88% 提升到 94%。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring AI 的 <code>chatClient.call().entity(IntentResult.class)</code> 结构化输出实现意图分类器；能配置规则 + LLM 双引擎路由架构并编写仲裁逻辑；能设置三级置信度阈值和对应的处理策略（路由/二次确认/转人工）；能通过 Micrometer 监控意图识别的分布和趋势，及时发现准确率下降。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul>
+        <li><strong>Spring AI Structured Output：</strong>通过 <code>.entity(IntentResult.class)</code> 将 LLM 输出直接反序列化为强类型 Java Record，无需手动解析 JSON，准确率 94%</li>
+        <li><strong>双引擎路由：</strong>规则引擎（关键词匹配，毫秒级，置信度 >= 0.9 直接返回） + LLM 分类器（处理模糊表达，准确率高），不一致时由仲裁逻辑决定</li>
+        <li><strong>三级置信度处理：</strong>>= 0.8 直接路由、0.5-0.8 二次确认询问用户、< 0.5 或 UNKNOWN 兜底转人工</li>
+        <li><strong>持续优化：</strong>Micrometer 监控规则/模型/冲突三种路由的占比变化，定期人工抽检 200 条/周校准准确率</li>
+      </ul></div>
     </div>
 
     <div class="section-block">
-      <h3>Spring AI 意图分类器（结构化输出）</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">public enum Intent {
-    ORDER_QUERY,        // 订单查询
-    RETURN_REQUEST,     // 退货申请
-    REFUND_INQUIRY,     // 退款咨询
-    SHIPPING_INQUIRY,   // 物流查询
-    POLICY_QUERY,       // 政策查询
-    COMPLAINT,          // 投诉
-    GREETING,           // 问候
-    UNKNOWN             // 未识别
+      <h3>Spring AI Structured Output 意图分类器实现</h3>
+      <p>Spring AI 的结构化输出（Structured Output）是构建意图分类器最简洁的方式。传统方式需要先调用 LLM 获取文本回复，再用正则或 JSON 解析器提取意图——不仅代码复杂，解析也可能失败。Spring AI 的 <code>chatClient.call().entity(Class.class)</code> 方法自动完成了 JSON Schema 生成、LLM 输出约束和 JSON 反序列化的全流程。开发者只需要定义好 Java Record 类型作为输出结构，Spring AI 会在 Prompt 中注入 JSON Schema 约束，LLM 的输出会被强制遵循该 Schema，然后自动反序列化为 Java 对象。这意味着意图分类器的输出是一个强类型的 IntentResult（含 Intent 枚举、confidence double、slots Map），可以安全地在代码中使用 <code>switch</code> 表达式匹配 Intent，不用担心解析异常。</p>
+      <p>在 CorpAssist 的实践中，意图分类器的 System Prompt 设计对准确率有重大影响。第一版 Prompt 只列出了意图名称和部分示例，准确率仅 87%。经过多轮迭代，我们总结出了最优的 Prompt 结构：意图定义（用具体用例说明而非抽象描述）、Few-Shot 示例（每条意图 2-3 个用户消息样本）、负面示例（说明什么是「可能混淆但不是」的场景）、实体提取说明（指定需要提取的 slot 类型和格式）。迭代后意图分类准确率达到 94%（在 2000 条标注测试集上），其中 ORDER_QUERY 和 RETURN_REQUEST 的 F1 分别达到 0.96 和 0.93。意图分类器的 P99 延迟约为 1.2s（含 LLM 推理时间和网络开销），双引擎中的规则引擎优先策略确保了高频简单意图的毫秒级响应。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 意图枚举和结构化输出 Record
+public enum Intent {
+    ORDER_QUERY,        // 订单查询 — 查物流/状态/预计到货
+    RETURN_REQUEST,     // 退货申请 — 要退货/退换/不要了
+    REFUND_INQUIRY,     // 退款咨询 — 退款/退钱/费用问题
+    SHIPPING_INQUIRY,   // 物流查询 — 物流/快递/配送延迟
+    POLICY_QUERY,       // 政策查询 — 保修/政策/规则/运费
+    COMPLAINT,          // 投诉 — 投诉/差评/不满/曝光
+    GREETING,           // 问候 — 你好/在吗/咨询
+    UNKNOWN             // 未识别 — 无法确定的表达
 }
 
 public record IntentResult(
     Intent intent,
     double confidence,
-    Map<String, String> slots   // key: 实体名, value: 值
+    Map<String, String> slots
 ) {}
 
+// 意图分类器服务
 @Service
 public class IntentClassifier {
 
     private final ChatClient chatClient;
 
+    public IntentClassifier(ChatClient.Builder builder) {
+        this.chatClient = builder
+                .defaultSystem("""
+                    你是 CorpAssist 客服意图分类器。将用户消息分类到以下意图之一。
+
+                    意图定义和示例：
+                    - ORDER_QUERY: 用户查询订单状态/物流信息/预计到货时间
+                      示例: "我的订单到哪了", "查一下物流", "什么时候发货"
+                    - RETURN_REQUEST: 用户要求退货/换货/取消订单
+                      示例: "我要退货", "这个不要了", "换一件"
+                    - REFUND_INQUIRY: 用户咨询退款金额/时间/方式
+                      示例: "退款什么时候到", "退多少钱"
+                    - SHIPPING_INQUIRY: 用户询问配送相关问题（不含订单状态）
+                      示例: "快递还没到", "可以换地址配送吗"
+                    - POLICY_QUERY: 用户询问政策/规则/保修
+                      示例: "退货运费谁出", "保修多久"
+                    - COMPLAINT: 用户表达不满、投诉、索赔
+                      示例: "你们什么破公司", "我要投诉"
+                    - GREETING: 问候/开场白
+                      示例: "你好", "在吗", "请问"
+                    - UNKNOWN: 无法归类的消息
+
+                    注意区分「查物流」是 ORDER_QUERY，「问运费政策」是 POLICY_QUERY。
+                    同时提取关键实体(slots): 如有订单号提取 orderId，产品名提取 productName。
+                    """)
+                .build();
+    }
+
     public IntentResult classify(String message) {
         return chatClient.prompt()
-            .system("""
-                你是客服意图分类器。请将用户消息分类到以下意图之一：
-                - ORDER_QUERY: 查订单状态/物流/预计到货时间
-                - RETURN_REQUEST: 退货/退换/不要了
-                - REFUND_INQUIRY: 退款/退钱/费用问题
-                - SHIPPING_INQUIRY: 物流/快递/配送
-                - POLICY_QUERY: 保修/政策/规则/运费
-                - COMPLAINT: 投诉/差评/不满/曝光
-                - GREETING: 问候/你好/在吗
-                - UNKNOWN: 其他/无法确定
-
-                同时提取关键实体（slots）如：orderId, productName, date等。
-                """)
-            .user(message)
-            .call()
-            .entity(IntentResult.class);  // 结构化输出
+                .user(u -> u.text("分类以下消息: \n" + message))
+                .call()
+                .entity(IntentResult.class);
     }
-}</code></pre></div>
-      <p>结构化输出通过 <code>chatClient.call().entity(IntentResult.class)</code> 实现——Spring AI 使用 JSON Schema 约束 LLM 输出格式，自动反序列化为 Java 对象。这比正则解析更灵活、更准确。CorpAssist 实验中结构化输出的意图识别准确率约 94%，对比基于关键词规则的 82%。</p>
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>结构化输出意图分类流程</h5>
+<pre class="mermaid">
+flowchart TB
+    A["用户消息<br/>'我的订单到哪了'"] --> B["构建System Prompt<br/>意图定义 + Few-Shot"]
+    B --> C["构建JSON Schema<br/>自动从IntentResult生成"]
+    C --> D["LLM 推理<br/>约束为JSON格式"]
+    D --> E["JSON反序列化<br/>.entity(IntentResult.class)"]
+    E --> F{"解析成功?"}
+    F -->|"是"| G["IntentResult{<br/>intent: ORDER_QUERY<br/>confidence: 0.94<br/>slots: {orderId=null}}"]
+    F -->|"否"| H["默认 UNKNOWN<br/>confidence: 0.0"]
+    G --> I["switch(intent)<br/>路由到对应处理器"]
+</pre></div>
     </div>
 
     <div class="section-block">
-      <h3>规则 + 模型双引擎路由</h3>
-      <p>生产环境采用双引擎：规则引擎优先匹配精确关键词（低延迟），匹配不到时用模型分类（高准确率）。</p>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+      <h3>规则引擎 + LLM 双引擎路由架构</h3>
+      <p>生产环境中的意图路由不能只依赖 LLM——LLM 调用有延迟（通常 1-3s）和成本（每次 200-400 Tokens）。CorpAssist 采用「规则引擎优先、LLM 分类兜底」的双引擎架构，核心思路是：高频简单意图（约 60% 的流量）通过规则引擎毫秒级匹配，低频复杂意图（约 40%）由 LLM 分类器处理。规则引擎基于关键词匹配和正则表达式实现，维护一个关键词到意图的映射表（如「查订单」「物流」「快递」→ ORDER_QUERY）。当规则引擎匹配成功且置信度 >= 0.9 时，直接返回结果，不走 LLM。当规则无法覆盖（如用户表达模糊或使用同义词）时，降级到 LLM 分类器。两个引擎的结果可能存在冲突：例如规则引擎根据「退货」关键词判断为 RETURN_REQUEST，但 LLM 根据完整语境「退货政策是什么」判断为 POLICY_QUERY。此时需要仲裁逻辑——置信度高的一方获胜。</p>
+      <p>仲裁逻辑的设计直接影响决策质量。CorpAssist 的仲裁规则是：如果规则引擎置信度 >= 0.95（精确关键词命中），直接采用规则结果；如果两引擎结果不一致但模型置信度 > 0.9，采用模型结果（模型理解完整语境）；如果两引擎结果不一致且模型置信度 <= 0.9，标记为「conflict」并触发二次确认——让用户确认意图。仲裁逻辑的线上效果：规则引擎处理了约 58% 的流量（P95 延迟 15ms），LLM 处理了 35%（P95 延迟 2.1s），冲突仲裁约 7%（其中 70% 采用模型结果，30% 触发二次确认）。总体意图识别 P95 延迟 480ms（规则引擎拉低了平均值），相比纯 LLM 方案的 P95 2.8s 降低了 83%。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 双引擎路由服务
+@Service
 public class DualEngineRouter {
+
     private final RuleEngine ruleEngine;
     private final IntentClassifier modelClassifier;
     private final MeterRegistry meterRegistry;
 
+    public DualEngineRouter(RuleEngine ruleEngine, IntentClassifier modelClassifier,
+                            MeterRegistry meterRegistry) {
+        this.ruleEngine = ruleEngine;
+        this.modelClassifier = modelClassifier;
+        this.meterRegistry = meterRegistry;
+    }
+
     public IntentResult route(String message) {
-        // 1. 规则引擎优先
+        // 1. 规则引擎优先（毫秒级）
         IntentResult ruleResult = ruleEngine.match(message);
         if (ruleResult != null && ruleResult.confidence() >= 0.9) {
-            meterRegistry.counter("intent.router", "engine", "rule").increment();
+            meterRegistry.counter("intent.router.engine", "engine", "rule").increment();
             return ruleResult;
         }
 
-        // 2. 模型分类
+        // 2. LLM 分类器兜底
+        long start = System.currentTimeMillis();
         IntentResult modelResult = modelClassifier.classify(message);
+        long duration = System.currentTimeMillis() - start;
+        meterRegistry.timer("intent.classify.duration").record(Duration.ofMillis(duration));
 
-        // 3. 模型与规则不一致时的仲裁
+        // 3. 结果仲裁
         if (ruleResult != null && modelResult.intent() != ruleResult.intent()) {
-            // 记录不一致，用于后续分析
-            meterRegistry.counter("intent.router", "engine", "conflict").increment();
-            // 高置信度的一边获胜
-            return modelResult.confidence() > 0.9 ? modelResult : ruleResult;
+            meterRegistry.counter("intent.router.engine", "engine", "conflict").increment();
+            // 规则引擎高置信度（精确命中）→ 规则结果
+            if (ruleResult.confidence() >= 0.95) {
+                return ruleResult;
+            }
+            // 模型高置信度 → 模型结果
+            if (modelResult.confidence() > 0.9) {
+                return modelResult;
+            }
+            // 都不高 → 降低置信度，触发后续的二次确认
+            return new IntentResult(modelResult.intent(),
+                    Math.min(modelResult.confidence(), 0.6),
+                    modelResult.slots());
         }
 
-        meterRegistry.counter("intent.router", "engine", "model").increment();
+        meterRegistry.counter("intent.router.engine", "engine", "model").increment();
         return modelResult;
     }
 }
 
 @Component
 class RuleEngine {
-    private final List<Rule> rules = List.of(
-        new Rule(List.of("查订单", "物流", "快递", "到哪了"), Intent.ORDER_QUERY),
-        new Rule(List.of("退货", "退换", "不要了", "取消"), Intent.RETURN_REQUEST),
-        new Rule(List.of("退款", "退钱", "没收到"), Intent.REFUND_INQUIRY),
-        new Rule(List.of("投诉", "差评", "曝光"), Intent.COMPLAINT)
+    private final List<KeywordRule> rules = List.of(
+        new KeywordRule(List.of("查订单", "物流", "快递", "到哪了", "配送"), Intent.ORDER_QUERY),
+        new KeywordRule(List.of("退货", "退换", "不要了", "取消订单", "换货"), Intent.RETURN_REQUEST),
+        new KeywordRule(List.of("退款", "退钱", "没收到钱"), Intent.REFUND_INQUIRY),
+        new KeywordRule(List.of("投诉", "差评", "曝光", "投诉电话"), Intent.COMPLAINT),
+        new KeywordRule(List.of("运费", "保修", "政策", "规则", "多久"), Intent.POLICY_QUERY),
+        new KeywordRule(List.of("你好", "在吗", "请问", "您好"), Intent.GREETING)
     );
 
     public IntentResult match(String message) {
-        for (Rule rule : rules) {
+        for (KeywordRule rule : rules) {
             for (String keyword : rule.keywords) {
                 if (message.contains(keyword)) {
                     return new IntentResult(rule.intent, 0.95, Map.of());
@@ -110,83 +170,245 @@ class RuleEngine {
         }
         return null;
     }
-}</code></pre></div>
+
+    private record KeywordRule(List<String> keywords, Intent intent) {}
+}
+</code></pre></div>
     </div>
 
     <div class="section-block">
-      <h3>意图置信度阈值与兜底</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
-public class IntentThresholdHandler {
+      <h3>意图置信度阈值设定与兜底策略</h3>
+      <p>置信度阈值是连接意图识别和下游处理逻辑的关键桥梁。无论规则引擎还是 LLM 分类器，输出的 confidence 值代表了系统对意图判断的把握程度。CorpAssist 设定了三级阈值策略：高置信度（>= 0.8）——直接路由到对应的意图处理器，执行后续的对话生成和工具调用；中等置信度（0.5 - 0.8）——不直接路由，而是向用户发送二次确认消息，例如「您是想查询订单状态吗？请确认一下」；低置信度（< 0.5）或意图为 UNKNOWN——系统不猜测用户意图，直接使用兜底话术并转人工。阈值设定不是固定的——不同的意图有不同的最佳阈值。例如 GREETING 意图（问候）的阈值可以设得较低（>= 0.6）因为即使猜错了损失也小；而 COMPLAINT 意图（投诉）的阈值需要设得较高（>= 0.85）因为误判投诉可能导致处理流程错误。</p>
+      <p>阈值的优化过程基于历史数据驱动。CorpAssist 收集了 3 个月的历史分类数据（约 27 万条），对每个意图分别绘制了 Precision-Recall 曲线，选择 Precision >= 0.95 对应的最低阈值作为该意图的高置信度阈值。例如，ORDER_QUERY 在阈值 0.75 时已能达到 0.96 的精确率，所以它的高置信度阈值设为 0.75，而 COMPLAINT 需要在 0.88 以上才能达到相同精确率。意图级别的差异化阈值整体上提升了 3.5% 的路由准确率（从 90.5% 到 94%），同时将「需要二次确认」的比例降低了 40%（因为很多低阈值但实际正确的意图可以直接路由了）。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 意图级别的差异化阈值和路由决策
+@Service
+public class IntentRoutingService {
 
-    private static final double HIGH_CONFIDENCE = 0.80;
-    private static final double MEDIUM_CONFIDENCE = 0.50;
+    private final DualEngineRouter router;
+    private final Map<Intent, ThresholdConfig> thresholds;
 
-    public RoutingDecision decide(IntentResult result, String originalMessage) {
-        if (result.confidence() >= HIGH_CONFIDENCE) {
-            return RoutingDecision.route(result.intent());
-        }
-
-        if (result.confidence() >= MEDIUM_CONFIDENCE) {
-            // 中等置信度：二次确认
-            return RoutingDecision.clarify(
-                "您是想" + describeIntent(result.intent()) + "吗？请确认一下。"
-            );
-        }
-
-        // 低置信度或 UNKNOWN：兜底
-        if (result.intent() == Intent.UNKNOWN) {
-            return RoutingDecision.escalate(
-                "抱歉，我没有完全理解您的意思。已为您转接人工坐席。"
-            );
-        }
-
-        return RoutingDecision.escalate(
-            "我已将您的问题转给人工坐席处理。"
+    public IntentRoutingService(DualEngineRouter router) {
+        this.router = router;
+        // 每个意图的差异化阈值（基于 PR 曲线确定）
+        this.thresholds = Map.of(
+            Intent.ORDER_QUERY, new ThresholdConfig(0.75, 0.50),
+            Intent.RETURN_REQUEST, new ThresholdConfig(0.80, 0.55),
+            Intent.REFUND_INQUIRY, new ThresholdConfig(0.80, 0.55),
+            Intent.SHIPPING_INQUIRY, new ThresholdConfig(0.80, 0.50),
+            Intent.POLICY_QUERY, new ThresholdConfig(0.75, 0.50),
+            Intent.COMPLAINT, new ThresholdConfig(0.88, 0.60),
+            Intent.GREETING, new ThresholdConfig(0.60, 0.40),
+            Intent.UNKNOWN, new ThresholdConfig(1.01, 1.01) // 永不直接路由
         );
     }
-}</code></pre></div>
+
+    public RoutingDecision decide(String message) {
+        IntentResult result = router.route(message);
+        ThresholdConfig config = thresholds.getOrDefault(result.intent(),
+                new ThresholdConfig(0.80, 0.50));
+
+        if (result.confidence() >= config.highThreshold()) {
+            return RoutingDecision.route(result.intent(), result.slots());
+        }
+        if (result.confidence() >= config.mediumThreshold()) {
+            return RoutingDecision.clarify(
+                    "您是想" + describeIntent(result.intent()) + "吗？请确认一下。");
+        }
+        return RoutingDecision.escalate(
+                "抱歉，我暂时无法确定您的问题类型，已为您转接人工坐席处理。");
+    }
+
+    private String describeIntent(Intent intent) {
+        return switch (intent) {
+            case ORDER_QUERY -> "查询订单或物流信息";
+            case RETURN_REQUEST -> "申请退货或换货";
+            case REFUND_INQUIRY -> "咨询退款相关";
+            case SHIPPING_INQUIRY -> "咨询配送问题";
+            case POLICY_QUERY -> "查询政策或规则";
+            case COMPLAINT -> "进行投诉或反馈";
+            case GREETING -> "进行问候";
+            case UNKNOWN -> "咨询问题";
+        };
+    }
+
+    private record ThresholdConfig(double highThreshold, double mediumThreshold) {}
+    private record RoutingDecision(String action, Intent intent, Map<String,String> slots, String message) {
+        static RoutingDecision route(Intent intent, Map<String,String> slots) {
+            return new RoutingDecision("ROUTE", intent, slots, null);
+        }
+        static RoutingDecision clarify(String msg) {
+            return new RoutingDecision("CLARIFY", null, null, msg);
+        }
+        static RoutingDecision escalate(String msg) {
+            return new RoutingDecision("ESCALATE", null, null, msg);
+        }
+    }
+}
+</code></pre></div>
+      <aside class="learn-scenario"><h4>CorpAssist 意图路由真实决策案例</h4><p>用户发消息：「退货运费谁出？买了件衣服不合适想退」。规则引擎命中「退货」「运费」两个关键词，但无法确定哪个意图更准确。LLM 分类器分析完整语境后判断意图为 POLICY_QUERY（置信度 0.91），slots 包含 {productName: "衣服"}。仲裁逻辑判断模型置信度 > 0.9 且两引擎冲突，采用模型结果，路由到政策查询处理器。系统最终正确回答了「7 天无理由退货运费由买家承担，质量问题由卖家承担」。如果只依赖规则引擎（关键词「退货」触发 RETURN_REQUEST），系统会错误地启动退货流程而非回答运费政策。这个案例说明双引擎和仲裁逻辑的重要性。</p></aside>
+    </div>
+
+    <div class="section-block">
+      <h3>意图识别准确率监控与持续优化</h3>
+      <p>意图分类器上线后不是一劳永逸的——用户的表达方式会随着时间变化（例如新的网络用语、产品更新带来的新问题）。持续的准确率监控和优化是保证系统效果的关键。CorpAssist 建立了三层次的监控体系：第一层是技术指标监控——通过 Micrometer 监控意图路由的分布（规则引擎占比、模型占比、冲突占比）、每个意图的调用量和置信度分布、P95/P99 延迟。当某个意图的调用量突增或置信度均值下降超过 10%，触发告警。第二层是准确率闭环监控——通过人工抽检每周 200 条对话（覆盖 8 种意图，每种 25 条），标注意图分类是否正确，计算准确率。抽检数据存入 PostgreSQL 并绘制趋势图。第三层是用户反馈监控——收集用户在二次确认中的行为（点击「是的」确认 vs 「不是」拒绝）和转人工后的坐席修正记录，间接反映意图识别的错误。</p>
+      <p>优化流程是数据驱动的闭环：监控发现准确率下降 -> 分析错误案例找出模式 -> 更新分类器的 System Prompt 和 Few-Shot 示例 -> 在测试集上验证提升 -> 灰度发布 -> 监控准确率恢复。CorpAssist 在实践中发现，约 70% 的意图分类错误可以通过扩充 Few-Shot 示例修复（每次加入 3-5 个典型错误案例），20% 需要调整 Prompt 定义（例如区分「查物流」和「问运费政策」的边界），10% 涉及模型升级（例如从 Qwen-72B 切换到 Qwen-110B 后准确率提升 1.8%）。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 意图分类监控和准确率追踪
+@RestController
+@RequestMapping("/api/cs/internal")
+public class IntentMetricsController {
+
+    private final MeterRegistry meterRegistry;
+    private final IntentClassificationRepository repository;
+
+    public IntentMetricsController(MeterRegistry meterRegistry,
+                                   IntentClassificationRepository repository) {
+        this.meterRegistry = meterRegistry;
+        this.repository = repository;
+    }
+
+    // 记录每次分类结果用于后续人工抽检
+    public void recordClassification(String sessionId, String message,
+                                     IntentResult result, long durationMs) {
+        IntentClassificationRecord record = new IntentClassificationRecord(
+                sessionId, message, result.intent(), result.confidence(),
+                result.slots(), durationMs, Instant.now());
+        repository.save(record);
+
+        // Micrometer 指标
+        meterRegistry.counter("intent.classify.count",
+                "intent", result.intent().name()).increment();
+        meterRegistry.gauge("intent.classify.confidence",
+                List.of(Tag.of("intent", result.intent().name())),
+                result.confidence());
+        meterRegistry.timer("intent.classify.duration",
+                "intent", result.intent().name())
+                .record(Duration.ofMillis(durationMs));
+    }
+
+    // 人工标注接口
+    @PostMapping("/intent/label")
+    public ApiResponse<Void> submitLabel(@RequestBody LabelRequest request) {
+        repository.updateLabel(request.sessionId(), request.correctIntent());
+        return ApiResponse.success(null);
+    }
+
+    // 准确率报表
+    @GetMapping("/intent/accuracy-report")
+    public ApiResponse<AccuracyReport> getAccuracyReport(
+            @RequestParam @DateTimeFormat(iso = ISO.DATE) LocalDate start,
+            @RequestParam @DateTimeFormat(iso = ISO.DATE) LocalDate end) {
+        List<IntentClassificationRecord> labeled = repository
+                .findByLabeledAtBetween(start.atStartOfDay(), end.atTime(LocalTime.MAX));
+
+        Map<Intent, long[]> stats = new HashMap<>();
+        for (Intent intent : Intent.values()) {
+            stats.put(intent, new long[]{0, 0}); // [correct, total]
+        }
+        for (IntentClassificationRecord r : labeled) {
+            if (r.getLabeledIntent() != null) {
+                long[] s = stats.get(r.getLabeledIntent());
+                s[1]++;
+                if (r.getLabeledIntent() == r.getPredictedIntent()) {
+                    s[0]++;
+                }
+            }
+        }
+        return ApiResponse.success(new AccuracyReport(stats));
+    }
+
+    public record AccuracyReport(Map<Intent, long[]> stats) {
+        public double overallAccuracy() {
+            long correct = stats.values().stream().mapToLong(s -> s[0]).sum();
+            long total = stats.values().stream().mapToLong(s -> s[1]).sum();
+            return total == 0 ? 0 : (double) correct / total;
+        }
+    }
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>意图识别准确率持续优化闭环</h5>
+<pre class="mermaid">
+flowchart LR
+    A["线上分类<br/>实时推理"] --> B["Micrometer<br/>指标监控"]
+    B --> C{"置信度/分布<br/>异常下降?"}
+    C -->|"是"| D["告警通知<br/>PagerDuty"]
+    C -->|"否"| E["每周抽检<br/>200条标注"]
+    E --> F["准确率报表<br/>按意图分析"]
+    F --> G{"准确率<br/>< 92% ?"}
+    G -->|"是"| H["错误案例分析<br/>找模式"]
+    H --> I["更新Prompt<br/>+ Few-Shot"]
+    I --> J["测试集验证<br/>2000条"]
+    J --> K{"通过?"}
+    K -->|"是"| L["灰度发布<br/>10%流量"]
+    L --> M["A/B对比<br/>验证提升"]
+    M --> A
+    K -->|"否"| H
+</pre></div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li>Spring AI 结构化输出(StructuredOutput)实现意图分类器，准确率 94%</li>
-        <li>双引擎路由：规则引擎优先(0.9+置信度)，模型分类兜底</li>
-        <li>三级置信度：>= 0.8 路由, 0.5-0.8 确认, < 0.5 兜底转人工</li>
-        <li>Micrometer 监控规则/模型/冲突三种路由的占比</li>
+        <li><strong>结构化输出分类器：</strong>Spring AI 的 <code>.entity(IntentResult.class)</code> 实现意图分类，准确率 94%（2000 条测试集），无需手动解析 JSON，支持 8 种意图和实体提取。</li>
+        <li><strong>双引擎路由效果：</strong>规则引擎处理 58% 流量（P95 15ms），LLM 处理 35%（P95 2.1s），冲突仲裁 7%。总体 P95 480ms，比纯 LLM 方案降低 83% 延迟。</li>
+        <li><strong>三级差异化阈值：</strong>基于每个意图的 PR 曲线设定差异化阈值（ORDER_QUERY 0.75，COMPLAINT 0.88），整体路由准确率从 90.5% 提升到 94%，二次确认比例降低 40%。</li>
+        <li><strong>监控体系：</strong>三层监控（Micrometer 技术指标 + 周抽检 200 条 + 用户反馈行为），准确率下降超过 10% 触发告警，70% 的修复通过扩充 Few-Shot 示例完成。</li>
+        <li><strong>优化闭环：</strong>监控→分析→修复→测试→灰度→验证，每两周迭代一次，上线 6 个月内准确率从 88% 持续提升到 95.2%。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist">
-        <h4>过关清单</h4>
-        <ul>
-          <li><label><input type="checkbox" data-check-id="cs-practice-01-1"> 能实现结构化输出的意图分类器</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-01-2"> 能配置双引擎路由</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-01-3"> 能实现三级置信度处理</label></li>
-        </ul>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-practice-01-1"> 能使用 Spring AI 的 Structured Output 实现 IntentClassifier，定义 Intent 枚举和 IntentResult Record，包含 System Prompt 中的 Few-Shot 示例</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-01-2"> 能实现 DualEngineRouter，包含规则引擎的关键词匹配和与 LLM 结果的冲突仲裁逻辑</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-01-3"> 能实现意图级别的差异化阈值配置，基于 PR 曲线为每个意图设置独立的高/中置信度阈值</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-01-4"> 能配置 Micrometer 监控意图路由指标（规则/模型/冲突分布、各意图置信度、P95 延迟）</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-01-5"> 能设计意图分类的持续优化流程：从监控告警到错误分析到 Prompt 更新到灰度发布的完整闭环</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话说明</th></tr></thead><tbody>
+        <tr><td>Structured Output</td><td>Spring AI 的 entity() 方法，将 LLM 输出自动解析为强类型 Java 对象，无需手动处理 JSON</td></tr>
+        <tr><td>IntentResult</td><td>意图分类器的输出 Record，包含 Intent 枚举、confidence 置信度 double、slots 实体 Map</td></tr>
+        <tr><td>双引擎路由</td><td>规则引擎优先（毫秒级匹配关键词） + LLM 分类兜底（处理模糊表达），冲突时仲裁逻辑决定</td></tr>
+        <tr><td>置信度阈值</td><td>判定意图分类可靠程度的分界线，>= 0.8 路由、0.5-0.8 确认、< 0.5 转人工</td></tr>
+        <tr><td>PR 曲线 / Precision-Recall</td><td>评估分类器在不同阈值下精确率和召回率的变化曲线，用于选择最优阈值</td></tr>
+        <tr><td>Few-Shot 示例</td><td>System Prompt 中给 LLM 提供的意图分类样本示例，帮助模型理解分类标准和边界</td></tr>
+        <tr><td>Micrometer</td><td>Spring Boot 的指标收集工具，支持 Prometheus/Grafana，用于监控意图分类性能</td></tr>
+        <tr><td>RoutingDecision</td><td>意图路由的决策结果，可以是 ROUTE（直接路由）/CLARIFY（二次确认）/ESCALATE（转人工）</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 意图识别的双引擎路由怎么实现？为什么需要两个引擎？</summary><p>双引擎路由的核心思路是「规则引擎优先，LLM 兜底」。规则引擎基于关键词匹配（如「查订单」「物流」→ ORDER_QUERY），毫秒级响应，处理约 60% 的高频简单意图。LLM 分类器基于 Spring AI 的结构化输出处理剩下的模糊表达和复杂语境。需要两个引擎的原因是：单一规则引擎覆盖不全（同义词、新表达无法覆盖），单一 LLM 分类器延迟高（P95 2.8s）且成本高。双引擎的仲裁逻辑很关键——当两个引擎结果不一致时，规则引擎置信度 >= 0.95 用规则结果，模型置信度 > 0.9 用模型结果，都不满足时降置信度触发二次确认。线上实际数据：规则引擎处理 58%（P95 15ms）、模型处理 35%（P95 2.1s）、冲突 7%。仲裁逻辑中约 70% 采用模型结果（模型更理解语境），30% 触发二次确认。</p></details>
+        <details><summary>Q2: 置信度阈值怎么设？不同意图用同样的阈值行不行？</summary><p>不同意图必须用差异化阈值。原因很简单：有的意图容易确认（如 ORDER_QUERY 只要提到订单号或物流就八九不离十），有的意图容易混淆（如 SHIPPING_INQUIRY 和 ORDER_QUERY 的边界模糊）。CorpAssist 的经验做法是收集 3 个月的历史数据，对每个意图绘制 PR 曲线，选择 Precision >= 0.95 对应的最低阈值作为该意图的高置信度阈值。结果各意图的阈值差异很大：ORDER_QUERY 仅需 0.75 即可达到 0.96 的精确率，COMPLAINT 需要 0.88 以上。如果一刀切使用 0.8：ORDER_QUERY 很多本可正确路由的意图被降级到二次确认（增加用户操作步骤），而 COMPLAINT 在 0.8 时有约 8% 的误判率。差异化阈值上线后，整体路由准确率从 90.5% 提升到 94%，二次确认比例降低 40%。</p></details>
+        <details><summary>Q3: 意图识别准确率怎么持续优化？技术债怎么处理？</summary><p>持续优化基于数据驱动的闭环流程。我们建立了三层监控：第一层是 Micrometer 实时指标——监控每个意图的调用量、置信度均值和 P95 延迟，置信度均值下降超过 10% 自动告警。第二层是每周 200 条人工抽检——覆盖 8 种意图每种 25 条，标注后计算准确率趋势。第三层是用户反馈间接信号——二次确认的通过率和转人工后的坐席修正记录。优化流程：发现准确率下降 -> 分析错误案例（通常找 20-30 条能看出模式）-> 更新 System Prompt 或增加 Few-Shot 示例 -> 在 2000 条测试集上验证 -> 灰度发布 10% 流量 -> 全量推广。经验数据：70% 的错误可以通过扩充 Few-Shot 示例修复，20% 需要调整 Prompt 定义，10% 需要模型升级。这算是个持续的技术债管理过程——每次 Prompt 更新后记录变更日志，定期回溯哪些 Few-Shot 示例已经不再需要了（模型升级后某些错误不再出现）。</p></details>
       </div>
     </div>
   </div>
 
-  <div class="chapter-practice">
-    <h3>动手练习</h3>
-    <div class="steps-operate">
-      <h4>操作步骤</h4>
-      <ol>
-        <li>实现 IntentClassifier 结构化分类器</li>
-        <li>实现 5 条规则引擎的 Rule</li>
-        <li>实现 DualEngineRouter 仲裁逻辑</li>
-        <li>编写单元测试验证 8 种意图的识别准确率</li>
-      </ol>
-    </div>
-  </div>
-
-  <div class="resources content-section">
-    <h3>延伸阅读</h3>
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
     <ul>
-      <li>Next: <a href="#ch-practice-02">工具调用：订单/退款/改址</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html#_structured_outputs" target="_blank" rel="noopener">Spring AI Structured Outputs</a> — 结构化输出的官方文档，包括 entity() 方法的用法和 JSON Schema 约束机制</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI @Tool 注解文档</a> — 工具调用注解的用法，为下一章工具调用做准备</li>
+      <li><a href="https://micrometer.io/docs" target="_blank" rel="noopener">Micrometer 官方文档</a> — Spring Boot 的指标收集框架，用于监控意图识别延迟和分布</li>
     </ul>
   </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>实现 IntentClassifier 类：使用 Spring AI 的 Structured Output，支持 8 个意图枚举和实体 slots 提取，编写 System Prompt 并测试 3 条不同意图的消息。</li>
+      <li>实现 DualEngineRouter 类：编写 RuleEngine 包含 6 条关键词规则，实现与 LLM 分类器的冲突仲裁逻辑，通过计数器验证规则引擎和模型调用次数。</li>
+      <li>配置意图级别的差异化阈值：为 ORDER_QUERY 和 COMPLAINT 分别设置不同的 highThreshold 和 mediumThreshold，通过单元测试验证三级决策逻辑。</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>场景题：用户在消息中说「我要退款」，但规则引擎只识别了「退款」关键词判断为 REFUND_INQUIRY。LLM 根据完整上下文判断为 RETURN_REQUEST（用户想退货退款）。怎么处理这个冲突？</summary><p>这是一个典型的规则-模型冲突场景。规则引擎简单匹配关键词「退款」得到 REFUND_INQUIRY（置信度 0.95），而 LLM 分类器分析了完整的上下文「我要退款」中的「要」字表达了「申请退款」的操作意愿而非「咨询退款」的询问，所以判断为 RETURN_REQUEST。仲裁逻辑会对比两者的置信度：规则引擎 0.95（关键词精确命中），模型 0.82（未达 0.9 的仲裁采用线）。根据 CorpAssist 的仲裁规则，规则引擎置信度 >= 0.95 时优先采用规则结果，所以最终路由到 REFUND_INQUIRY 处理器。但是这个决策可能不是最优的——「我要退款」确实更像 RETURN_REQUEST。这个案例说明需要优化规则：将「要退款」「申请退款」等动宾短语添加到 RETURN_REQUEST 的规则中，同时降低「退款」单独关键词的置信度（设为 0.85 而非 0.95），让模型在类似冲突中有更大话语权。</p></details>
+      <details><summary>场景题：你发现 COMPLAINT 意图的识别率很低（只有 60%），但 ORDER_QUERY 正常（96%）。如何排查和修复？</summary><p>排查分三步。第一步，分析 COMPLAINT 的误分类案例——导出最近 200 条标注为 COMPLAINT 但系统预测为其他意图的记录，查看模式。通常投诉表达的多样性很高——「你们什么破公司」「垃圾服务」「我要去 315 曝光你们」——但规则引擎的关键词很有限（只覆盖「投诉」「差评」「曝光」），LLM 分类器的 Few-Shot 示例可能也不够多样。第二步，确认是规则引擎还是模型的问题：查看这些误分类是否规则引擎覆盖不了（大概率是——投诉表达太多样化），如果是模型问题，检查 Prompt 中是否缺少投诉相关的负面示例。第三步，修复：如果是规则引擎问题，增加关键词（如「垃圾」「骗子」「315」「服务差」）；如果是 LLM 问题，在 System Prompt 中增加 5-8 个投诉表达样本，覆盖不同风格的投诉。同时检查 COMPLAINT 的差异化阈值是否太高（前面提到它需要 0.88，但低准确率情况下可能需要降低到 0.80 先保证召回率）。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-01-lab/</code></p><ul class="demo-acceptance">
+      <li>发送消息「我的订单到哪了」给 IntentClassifier，返回 IntentResult 中 intent=ORDER_QUERY, confidence>=0.85</li>
+      <li>发送消息「我要退货 #ORD-1234」给 DualEngineRouter，规则引擎命中，返回时间 < 50ms</li>
+      <li>发送消息「你们的东西太差了」给 IntentRoutingService，根据 COMPLAINT 阈值（0.88）判断出 confidence<0.88，触发二次确认而非直接转人工</li>
+    </ul></div>
+  </div>
+
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-02">工具调用：订单/退款/改址</a> — 深入学习 @Tool 注解、Bean Validation 参数校验和 Redis 分布式锁</li></ul></div>
 </section>

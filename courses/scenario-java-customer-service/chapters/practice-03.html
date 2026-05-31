@@ -5,168 +5,490 @@
   </header>
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>45</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2</strong></p>
-      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服的核心是 Agent —— 它能理解用户意图、决策是否需要调用工具、根据工具返回信息生成回答。Spring AI 的 ReactAgent 提供了完整的思考-行动-观察循环。</p></div>
-      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring AI ReactAgent 构建完整的客服对话流程；能配置工具节点与 LLM 节点的协作逻辑；能实现 SSE 流式响应的端到端链路；能实现会话状态跨请求传递。</p></div>
+      <p class="chapter-meta">约 <strong>45</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2 智能客服</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>简单的「接收消息 -> 回复消息」模式无法满足复杂客服场景。用户可能在同一轮对话中先说「查一下订单」又说「顺便退了这个」——涉及意图切换和工具链组合。Spring AI 的 ReAct Agent（ReactAgent）实现了 Think-Act-Observe 循环，让 LLM 可以自我推理、调用工具、观察结果，最终自主决定何时回复用户。CorpAssist 从简单的 ChatClient 升级到 ReAct Agent 后，一次性解决多步问题（如查物流 + 退其中一个商品）的成功率从 41% 提升到 78%。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring AI 的 ReactAgent 实现 Think-Act-Observe 循环，让 Agent 自主决定工具调用顺序和回复时机；能配置 ToolCallback 注册多个业务工具并设置 maxSteps 限制循环次数；能实现 SSE 流式响应的端到端 Controller，用户边收边看 Agent 的推理过程；能实现会话状态跨请求的保存和恢复，支持长时间多轮对话的连续性。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul>
+        <li><strong>ReAct 循环：</strong>Think（思考当前需要什么）-> Act（调用工具或检索知识）-> Observe（观察工具结果）-> 循环直到满足停止条件或达到 maxSteps=5</li>
+        <li><strong>ToolCallback 注册：</strong>通过 ToolCallback.from(@Tool Bean) 批量注册工具到 ReactAgent，Agent 根据思考结果自主决定调用顺序</li>
+        <li><strong>SSE 流式 Controller：</strong>Flux<ServerSentEvent<String>> 实现，用户实时看到 Agent 的思考过程和工具调用结果，连接超时 60s</li>
+        <li><strong>跨请求状态恢复：</strong>ChatMemory + Redis 保存会话上下文和 Agent 执行状态，即使服务重启用户也能在下次请求中继续对话</li>
+      </ul></div>
     </div>
 
     <div class="section-block">
-      <h3>Spring AI ReactAgent 对话流程</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
-public class CustomerServiceAgent {
+      <h3>ReAct Agent 的 Think-Act-Observe 循环实现</h3>
+      <p>ReAct（Reasoning + Acting）是让 LLM 具备自主决策能力的核心模式。与简单的「用户问 -> LLM 答」不同，ReAct Agent 在生成回复之前，会反复执行「思考（Think）-> 行动（Act）-> 观察（Observe）」的循环。在 Think 阶段，Agent 判断当前需要什么信息或操作来回答用户问题；在 Act 阶段，Agent 调用对应的工具函数（如查订单、查政策）或检索知识库；在 Observe 阶段，Agent 获取工具的执行结果并将结果纳入推理过程。然后 Agent 决定：是继续下一轮循环（还需要更多信息）还是停止循环给出最终回复。Spring AI 的 ReactAgent 实现了这个循环，开发者只需要提供工具定义和停止条件（maxSteps 最大循环次数、工具调用是否需要等决策规则）。</p>
+      <p>在 CorpAssist 的客服场景中，ReAct Agent 的典型运行流程：用户说「帮我查一下 #ORD-001 的物流，再退一下这个单」。Agent 第一次 Think 判断需要「查物流」和「退款」两个操作。它在 Act 阶段先调用 OrderTool.queryOrder("ORD-001")，Observe 到结果后第二次 Think 判断「物流已查到，还需要执行退款」。第二次 Act 调用 RefundTool.applyRefund("ORD-001", "用户要求退款")，Observe 到退款成功后第三次 Think 判断「所有操作已完成」，停止循环，将两次操作结果组织成自然语言回复。整个过程中 Agent 自主决定了工具调用顺序（先查后退）、调用次数（2 次）、和停止时机（全部完成）。对比非 Agent 模式需要在代码中硬编码这个流程，ReAct Agent 的灵活性和自适应能力明显更强。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// ReAct Agent 配置和实现
+@Configuration
+public class CustomerServiceAgentConfig {
 
-    private final ChatClient chatClient;
-    private final ChatMemory chatMemory;
-    private final IntentClassifier intentClassifier;
+    @Bean
+    public ReactAgent customerServiceAgent(
+            ChatClient.Builder chatBuilder,
+            List<Object> toolBeans) {
 
-    private static final int MAX_STEPS = 8;
+        // 自动注册所有 @Tool 注解的 Bean
+        ToolCallback[] tools = toolBeans.stream()
+                .filter(bean -> bean.getClass().getName().contains("Tool"))
+                .flatMap(bean -> Stream.of(ToolCallbacks.from(bean)))
+                .toArray(ToolCallback[]::new);
 
-    public CustomerServiceAgent(ChatClient.Builder builder,
-                                 ChatMemory chatMemory,
-                                 IntentClassifier intentClassifier,
-                                 OrderTools orderTools,
-                                 ReturnTools returnTools) {
+        // 构建 ChatClient 作为 Agent 的 LLM 后端
+        ChatClient chatClient = chatBuilder
+                .defaultSystem("""
+                    你是 CorpAssist 智能客服 Agent。你拥有以下工具可用：
+                    queryOrder - 查询订单状态和物流信息
+                    applyRefund - 申请退货退款
+                    modifyAddress - 修改配送地址
 
-        this.chatMemory = chatMemory;
-        this.intentClassifier = intentClassifier;
+                    你的工作流程：
+                    1. 分析用户需求，思考需要哪些操作
+                    2. 按顺序调用必要工具（可以调用多次）
+                    3. 观察工具结果，判断是否还需要其他操作
+                    4. 所有操作完成后，用自然语言回复用户
 
-        this.chatClient = builder
-            .defaultSystem("""
-                你是一个智能客服助手。你的工作流程：
-                1. 理解用户问题，确定意图
-                2. 如果需要查数据，使用 available functions
-                3. 基于工具返回结果，生成友好、准确的回答
-                4. 如果用户要求退货/退款，先查订单再创建退货
-                5. 如果无法处理，主动提出转人工
+                    注意：
+                    - 如果工具调用失败，尝试修正参数后重试
+                    - 如果无法解决，告知用户并转人工
+                    - 最多调用工具 5 次
+                    - 回复时要引用工具结果中的具体信息
+                    """)
+                .build();
 
-                可用工具：
-                - query_order: 查订单状态和物流
-                - create_return: 创建退货申请
-                - change_address: 修改收货地址
-
-                注意：
-                - 每次调用前先确认用户意图
-                - 工具返回错误时，用通俗语言解释给用户
-                - 涉及金额的决策须用户明确确认
-                """)
-            .defaultTools(orderTools, returnTools)
-            .defaultAdvisors(
-                new ConversationAdvisor(chatMemory),
-                new SafeOutputAdvisor()
-            )
-            .build();
-    }
-
-    public Flux<String> chat(String sessionId, String userMessage) {
-        return chatClient.prompt()
-            .user(userMessage)
-            .advisors(a -> a.param("chat_memory_conversation_id", sessionId))
-            .stream()
-            .content();
-    }
-}</code></pre></div>
-    </div>
-
-    <div class="section-block">
-      <h3>工具节点与 LLM 节点的协作</h3>
-      <p>ReactAgent 在每次迭代中执行「思考 -> 行动 -> 观察」循环。Spring AI 通过 ChatClient 的 <code>defaultTools()</code> 注册可用工具，LLM 自主决策何时调用哪个工具。</p>
-      <div class="mermaid-wrap">
-        <h5>ReactAgent 思考-行动-观察循环</h5>
-        <pre class="mermaid">sequenceDiagram
-    participant USER as 用户
-    participant LLM as LLM
-    participant TOOL as 工具层
-    participant API as 业务系统
-
-    USER->>LLM: 我的订单还没到
-    LLM->>LLM: 思考：用户意图是查订单
-    LLM->>TOOL: 行动：query_order(orderId="")
-    TOOL->>API: 查订单 API
-    API-->>TOOL: 返回物流信息
-    TOOL-->>LLM: 观察：订单已发货，在途
-    LLM->>LLM: 思考：基于结果生成回答
-    LLM-->>USER: 您的订单已于昨日发出，预计2-3天到达
-    USER->>LLM: 那我要退货
-    LLM->>LLM: 思考：意图转为退货
-    LLM->>TOOL: 行动：query_order(确认订单)
-    TOOL-->>LLM: 订单可退货
-    LLM->>LLM: 思考：需要用户确认退货原因
-    LLM-->>USER: 好的，请问您退货的原因是什么？</pre>
-      </div>
-    </div>
-
-    <div class="section-block">
-      <h3>SSE 流式响应的端到端链路</h3>
-      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@RestController
-@RequestMapping("/api/v1/cs")
-public class CustomerServiceController {
-
-    private final CustomerServiceAgent agent;
-
-    @PostMapping(value = "/chat/stream",
-                 produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<ServerSentEvent<String>> chatStream(
-            @RequestBody ChatRequest request,
-            @AuthenticationPrincipal UserPrincipal user) {
-
-        return agent.chat(request.sessionId(), request.message())
-            .map(token -> ServerSentEvent.<String>builder()
-                .event("token")
-                .data(token)
-                .build())
-            .concatWithValues(
-                ServerSentEvent.<String>builder()
-                    .event("done")
-                    .data("[DONE]")
-                    .build());
+        return ReactAgent.builder(chatClient)
+                .tools(tools)
+                .maxSteps(5)  // 最多循环 5 次
+                .build();
     }
 }
 
-record ChatRequest(String sessionId, String message) {}
+// 使用 Agent 处理用户消息
+@Service
+public class AgentConversationService {
 
-// 前端 EventSource 示例:
-// const es = new EventSource('/api/v1/cs/chat/stream');
-// es.onmessage = (e) => console.log(e.data);</code></pre></div>
+    private final ReactAgent agent;
+    private final ChatMemory chatMemory;
+    private final MeterRegistry meterRegistry;
+
+    public AgentConversationService(ReactAgent agent, ChatMemory chatMemory,
+                                    MeterRegistry meterRegistry) {
+        this.agent = agent;
+        this.chatMemory = chatMemory;
+        this.meterRegistry = meterRegistry;
+    }
+
+    public Flux<ServerSentEvent<String>> processMessage(
+            String sessionId, String userId, String message) {
+
+        // 加载会话历史
+        List<Message> history = chatMemory.get(sessionId, 50);
+
+        // 记录 Agent 执行指标
+        Timer.Sample sample = Timer.start(meterRegistry);
+
+        // 执行 Agent，获取流式响应
+        return agent.stream(userId, message)
+                .doOnNext(response -> {
+                    // Agent 正在思考或调用工具
+                    String type = response.getResult() != null ? "tool_call" : "thought";
+                    meterRegistry.counter("agent.step", "type", type).increment();
+                })
+                .map(response -> {
+                    String content = response.getResult() != null
+                            ? "[工具调用] " + response.getResult().getOutput().getContent()
+                            : response.getOutput().getContent();
+                    return ServerSentEvent.<String>builder(content)
+                            .event("agent-message")
+                            .build();
+                })
+                .doFinally(signalType -> {
+                    sample.stop(meterRegistry.timer("agent.execution.duration"));
+                    // 保存会话到 ChatMemory
+                    chatMemory.add(sessionId, new UserMessage(message));
+                    chatMemory.add(sessionId, new AssistantMessage("Agent completed"));
+                });
+    }
+}
+</code></pre></div>
+      <div class="mermaid-wrap"><h5>ReAct Agent Think-Act-Observe 循环</h5>
+<pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant AG as ReAct Agent
+    participant LLM as LLM 推理
+    participant T1 as OrderTool
+    participant T2 as RefundTool
+
+    U->>AG: "查 ORD-001 物流再退款"
+    AG->>LLM: Think: 需要查物流和退款两个操作
+    LLM-->>AG: 先查物流，再退款
+    AG->>T1: Act: queryOrder("ORD-001")
+    T1-->>AG: Observe: 物流=已签收
+    AG->>LLM: Think: 物流已查到，需要执行退款
+    LLM-->>AG: 继续执行退款
+    AG->>T2: Act: applyRefund("ORD-001", "用户要求")
+    T2-->>AG: Observe: 退款已提交，单号RF-001
+    AG->>LLM: Think: 两个操作都完成了
+    LLM-->>AG: 停止循环，组织回复
+    AG-->>U: "订单 ORD-001 已签收（顺丰 SF123456），退款已提交（单号 RF-001），预计3-5天到账。"
+    Note over AG: maxSteps=5，实际使用2步
+</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具节点与 LLM 节点的协作编排</h3>
+      <p>ReAct Agent 的核心在于工具节点（Tool Nodes）和 LLM 节点（LLM Nodes）之间的协作编排。每次循环中，LLM 首先生成推理文本（Reasoning），然后判断是否需要调用工具——如果需要，输出函数调用请求；如果不需要，生成最终回复并结束循环。Spring AI 的 ReactAgent 内部维护了一个执行计划状态机：初始状态为「思考」-> 如果 LLM 决定调用工具，转入「工具调用」状态 -> 工具执行完成后回到「思考」状态 -> 如果 LLM 不再需要工具，转入「完成」状态。在 CorpAssist 中，工具节点的设计遵循单一职责原则——每个工具只做一件事（查询、退款或改地址），复杂的业务逻辑由 Agent 的组合能力完成。工具节点的执行结果会以 ToolExecutionResult 的形式注入到 LLM 的下轮上下文中，LLM 据此做出后续决策。</p>
+      <p>工具节点的错误处理也需要融入 Agent 的编排逻辑。当某个工具调用失败时（如退款 API 超时），Agent 不会立即终止整个流程，而是将错误信息作为 Observe 结果反馈给 LLM。LLM 可以决定：重试（修正参数后重新调用）、跳过（该操作无法完成）、或者调整策略（例如无法退款时改为发放优惠券补偿）。在 CorpAssist 的线上数据中，Agent 能够自主处理约 65% 的工具调用失败（通过重试或调整策略），剩余 35% 的失败才需要降级转人工。以下代码展示了如何将多个 @Tool Bean 注册到 Agent 并配置执行策略。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 工具节点与 LLM 节点编排的完整实现
+@Service
+public class OrchestratedCustomerAgent {
+
+    private final ReactAgent agent;
+    private final ChatClient chatClient;
+    private final StreamBridge eventBridge;
+
+    public OrchestratedCustomerAgent(
+            OrderTool orderTool,
+            RefundTool refundTool,
+            AddressTool addressTool,
+            ChatClient.Builder chatBuilder,
+            StreamBridge eventBridge) {
+
+        this.eventBridge = eventBridge;
+        this.chatClient = chatBuilder
+                .defaultSystem("""
+                    你是 CorpAssist 客服协调 Agent。你负责：
+                    1. 分析用户需求，分解为工具调用步骤
+                    2. 按最佳顺序执行工具（先查后改、先查后退）
+                    3. 每次工具调用后检查结果
+                    4. 工具失败时评估是否重试或转人工
+
+                    工具调用策略：
+                    - 涉及订单的操作先调用 queryOrder 确认订单状态
+                    - 已发货的订单不能 modifyAddress，提示用户转人工
+                    - 退款需要先确认用户身份和购买记录
+                    - 如果某个工具连续失败 2 次，放弃并转人工
+
+                    每次工具调用后，请在回复中包含工具结果的具体信息。
+                    """)
+                .build();
+
+        ToolCallback[] tools = ToolCallbacks.from(orderTool, refundTool, addressTool);
+
+        this.agent = ReactAgent.builder(chatClient)
+                .tools(tools)
+                .maxSteps(5)
+                .observationFunction(result -> {
+                    // 工具执行后的观察回调 — 记录执行情况
+                    String toolName = result.getToolName();
+                    boolean success = result.getStatus() == ToolExecutionResult.Status.SUCCESS;
+                    eventBridge.send("cs.agent-tool-result",
+                            new ToolResultEvent("agent", toolName, success,
+                                    result.getOutput().getContent(), Instant.now()));
+                    return result;
+                })
+                .build();
+    }
+
+    public AgentResponse execute(UserMessage userMessage) {
+        // 执行 Agent 并等待最终结果
+        AgentResponse response = agent.execute(userMessage);
+        log.info("Agent completed in {} steps, tools used: {}",
+                response.getSteps().size(),
+                response.getToolNames());
+        return response;
+    }
+
+    // 记录每个步骤的信息
+    public record AgentStep(int stepNumber, String thought, String action,
+                           String observation, long durationMs) {}
+}
+</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>SSE 流式响应的端到端 Controller 实现</h3>
+      <p>智能客服的响应不能等 Agent 完全执行完再一次性返回——ReAct Agent 的一个完整循环可能需要数秒（多个工具调用串行执行），用户等待过程的焦虑感会严重影响 CSAT。CorpAssist 使用 SSE（Server-Sent Events）实现流式响应：Agent 的每个中间步骤（思考、调用工具、观察结果）都实时推送给用户，用户可以看到 Agent 正在「思考」、正在「查订单」、查到了什么结果。这种透明度显著提升了用户体验——用户知道系统正在处理而不是「转圈中」。Spring AI 的 ReactAgent 原生支持流式响应，通过 <code>agent.stream()</code> 返回 Flux<AgentResponse>，每次 Agent 状态的变更（输出文本、调用工具、得到结果）都会触发一个事件。我们在 Controller 层将这个 Flux 映射为 SSE 的事件流返回给前端。</p>
+      <p>SSE 连接的可靠性和性能需要精细配置。CorpAssist 的 SSE 配置包括：连接超时 60s（超过无数据交互自动断开）、空闲超时 30s（Agent 的每步之间可能有间隔）、重连间隔 3s（客户端断开后自动重连）。在 Controller 层，使用 Spring WebFlux 的 <code>Flux<ServerSentEvent<String>></code> 作为返回类型，Spring 自动处理 SSE 协议的头信息（Content-Type: text/event-stream、Cache-Control: no-cache、Connection: keep-alive）。前端使用 EventSource API 或 fetch + ReadableStream 接收事件流。事件流包含三种事件类型：thought（Agent 的思考过程）、tool-call（工具调用的输入输出）、final（最终回复）。前端根据事件类型在 UI 上展示不同的交互元素（思考气泡、工具调用卡片、最终回复区域）。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// SSE 流式响应的端到端 Controller
+@RestController
+@RequestMapping("/api/cs")
+public class AgentSseController {
+
+    private final AgentConversationService agentService;
+    private final SseEmitterManager emitterManager;
+
+    public AgentSseController(AgentConversationService agentService,
+                              SseEmitterManager emitterManager) {
+        this.agentService = agentService;
+        this.emitterManager = emitterManager;
+    }
+
+    @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<String>> streamChat(
+            @RequestBody @Valid ChatRequest request) {
+
+        // 解析请求
+        String sessionId = request.sessionId();
+        String userId = extractUserIdFromToken(); // 从 SecurityContext 获取
+        String message = request.message();
+
+        // 返回 Agent 的流式响应
+        return agentService.processMessage(sessionId, userId, message)
+                .onErrorResume(e -> {
+                    log.error("Agent stream error for session {}: {}", sessionId, e.getMessage());
+                    return Flux.just(
+                            ServerSentEvent.<String>builder("[系统错误] 对不起，处理您的请求时出现异常，已记录并转人工处理。")
+                                    .event("error")
+                                    .build()
+                    );
+                })
+                .doFinally(signal -> {
+                    emitterManager.removeEmitter(sessionId);
+                    log.info("SSE stream closed for session {}: {}", sessionId, signal);
+                });
+    }
+
+    // SSE 连接心跳 — 保持长连接
+    @GetMapping(value = "/chat/stream/{sessionId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<String>> heartbeat(
+            @PathVariable String sessionId) {
+        return Flux.interval(Duration.ofSeconds(15))
+                .map(i -> ServerSentEvent.<String>builder("ping")
+                        .event("heartbeat")
+                        .build())
+                .timeout(Duration.ofSeconds(60))
+                .onErrorReturn(ServerSentEvent.<String>builder("timeout")
+                        .event("error")
+                        .build());
+    }
+}
+
+// ChatRequest 请求体
+public record ChatRequest(
+    @NotBlank String sessionId,
+    @NotBlank String message,
+    @Nullable String idempotencyKey
+) {}
+
+// Agent SSE 事件映射
+@Service
+class AgentEventMapper {
+
+    public ServerSentEvent<String> mapAgentResponse(AgentResponse response) {
+        String eventType;
+        String data;
+
+        if (response.getResult() != null) {
+            // 工具调用事件
+            eventType = "tool-call";
+            data = String.format("{\"tool\":\"%s\",\"result\":\"%s\"}",
+                    response.getResult().getToolName(),
+                    escapeJson(response.getResult().getOutput().getContent()));
+        } else {
+            String content = response.getOutput().getContent();
+            if (content.startsWith("Thought:")) {
+                eventType = "thought";
+                data = content.substring(8).trim();
+            } else {
+                eventType = "message";
+                data = content;
+            }
+        }
+
+        return ServerSentEvent.<String>builder(data)
+                .event(eventType)
+                .id(String.valueOf(System.currentTimeMillis()))
+                .build();
+    }
+
+    private String escapeJson(String s) {
+        return s.replace("\"", "\\\"").replace("\n", "\\n");
+    }
+}
+</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>会话状态跨请求传递与恢复</h3>
+      <p>Agent 的执行状态需要在多个 HTTP 请求之间持续存在——用户发送一条消息，Agent 可能需要几秒钟完成循环，但 HTTP 连接可能因为各种原因中断（用户刷新页面、网络抖动、浏览器关闭）。当用户重新连接时，Agent 需要从之前的状态继续执行，而不是从头开始。CorpAssist 通过两级状态管理来实现跨请求恢复：第一级是 ChatMemory 保存的对话历史（消息级别的持久化），第二级是 Agent 执行快照（Agent 级别的执行状态持久化）。Agent 执行快照存储在 Redis 中，Key 为 <code>agent:state:{sessionId}</code>，包含当前的思考上下文、已完成和待完成的工具调用列表、已消耗的 step 数。当用户重新连接时，Agent 从快照恢复执行状态，而不是重新开始思考。</p>
+      <p>快照机制的一个重要设计点是在什么时机保存状态。CorpAssist 在 Agent 每个步骤（Think 或 Act）完成后都保存一次快照。这样即使 Agent 在第 3 步执行工具调用时崩溃，重启后可以从第 2 步结束的状态恢复——避免了已完成的步骤重复执行和 Token 浪费。但同时快照保存也有性能开销（每次序列化 + Redis 写入约 5-10ms），需要在粒度和性能之间权衡。我们最终采用的策略是：步骤级别保存 + 异步写入（使用 Reactor 的 Schedulers.boundedElastic()），不阻塞 Agent 的主执行流。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 跨请求会话状态保存和恢复
+@Service
+public class AgentStateManager {
+
+    private final StringRedisTemplate redisTemplate;
+    private final ObjectMapper objectMapper;
+    private static final Duration STATE_TTL = Duration.ofMinutes(30);
+
+    public AgentStateManager(StringRedisTemplate redisTemplate, ObjectMapper objectMapper) {
+        this.redisTemplate = redisTemplate;
+        this.objectMapper = objectMapper;
+    }
+
+    // 保存 Agent 执行快照
+    public void saveState(String sessionId, AgentState state) {
+        try {
+            String json = objectMapper.writeValueAsString(state);
+            redisTemplate.opsForValue()
+                    .set("agent:state:" + sessionId, json, STATE_TTL);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialize agent state for session: {}", sessionId, e);
+        }
+    }
+
+    // 恢复 Agent 执行快照
+    public Optional<AgentState> restoreState(String sessionId) {
+        String json = redisTemplate.opsForValue().get("agent:state:" + sessionId);
+        if (json == null) {
+            return Optional.empty();
+        }
+        try {
+            AgentState state = objectMapper.readValue(json, AgentState.class);
+            return Optional.of(state);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to deserialize agent state for session: {}", sessionId, e);
+            return Optional.empty();
+        }
+    }
+
+    // 清理会话状态
+    public void clearState(String sessionId) {
+        redisTemplate.delete("agent:state:" + sessionId);
+    }
+
+    // Agent 状态快照
+    @Data
+    @Builder
+    public static class AgentState {
+        private String sessionId;
+        private String userId;
+        private int stepCount;              // 已完成步数
+        private List<String> completedActions; // 已完成的操作
+        private List<String> pendingActions;   // 待完成的操作
+        private String currentContext;      // 当前推理上下文
+        private List<StepRecord> steps;     // 步骤详细记录
+        private Instant lastUpdated;
+    }
+
+    @Data
+    @Builder
+    public static class StepRecord {
+        private int stepNumber;
+        private String type;       // THINK / ACT
+        private String content;    // 思考内容或工具调用
+        private String result;     // 观察结果
+        private long durationMs;
+    }
+}
+
+// 支持状态恢复的 Agent 执行器
+@Service
+public class StatefulAgentExecutor {
+
+    private final ReactAgent agent;
+    private final AgentStateManager stateManager;
+
+    public Flux<AgentResponse> executeWithState(String sessionId, String userId, String message) {
+        // 尝试恢复之前的状态
+        Optional<AgentStateManager.AgentState> restored = stateManager.restoreState(sessionId);
+        if (restored.isPresent()) {
+            log.info("Restored agent state for session {}: step {}", sessionId,
+                    restored.get().getStepCount());
+        }
+
+        return agent.stream(userId, message)
+                .doOnNext(response -> {
+                    // 每个步骤完成后保存快照
+                    AgentStateManager.AgentState state = buildState(sessionId, userId, response);
+                    stateManager.saveState(sessionId, state);
+                })
+                .doFinally(signal -> {
+                    if (signal == SignalType.ON_COMPLETE) {
+                        stateManager.clearState(sessionId); // 正常完成，清理状态
+                    }
+                });
+    }
+
+    private AgentStateManager.AgentState buildState(String sessionId, String userId,
+                                                     AgentResponse response) {
+        return AgentStateManager.AgentState.builder()
+                .sessionId(sessionId)
+                .userId(userId)
+                .stepCount(response.getSteps() != null ? response.getSteps().size() : 0)
+                .lastUpdated(Instant.now())
+                .build();
+    }
+}
+</code></pre></div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
-        <li>Spring AI ReactAgent 通过 ChatClient + defaultTools + Advisor 实现完整客服 Agent</li>
-        <li>思考-行动-观察循环：LLM 自主决策工具调用，最大步数 8 次</li>
-        <li>SSE 流式接口通过 Flux<ServerSentEvent> 实现端到端流式输出</li>
+        <li><strong>ReAct Agent 循环：</strong>Think-Act-Observe 循环让 Agent 自主决定工具调用顺序和回复时机，多步问题的解决成功率从 41%（ChatClient）提升到 78%（ReAct Agent）。</li>
+        <li><strong>工具节点编排：</strong>ToolCallbacks.from() 批量注册 @Tool Bean，Agent 根据推理结果自主编排调用顺序，65% 的工具调用失败可通过 Agent 自主重试或策略调整解决。</li>
+        <li><strong>SSE 流式响应：</strong>Flux<ServerSentEvent> 实现 Agent 中间步骤实时推送，事件类型分为 thought/tool-call/message/error，连接超时 60s 空闲超时 30s。</li>
+        <li><strong>跨请求状态恢复：</strong>Redis 存储 Agent 执行快照（agent:state:{sessionId}），步骤级别保存，异步写入效率 5-10ms，支持断线重连后从上次步骤继续执行。</li>
+        <li><strong>maxSteps 限制：</strong>设置 maxSteps=5 防止 Agent 无限循环，线上数据 87% 的对话在 3 步内完成，超过 5 步的自动转人工并附带循环历史。</li>
       </ul>
     </div>
 
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
-      <div class="learn-checklist">
-        <h4>过关清单</h4>
-        <ul>
-          <li><label><input type="checkbox" data-check-id="cs-practice-03-1"> 能构建 CustomerServiceAgent</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-03-2"> 能配置工具节点与 LLM 协作</label></li>
-          <li><label><input type="checkbox" data-check-id="cs-practice-03-3"> 能实现 SSE 流式 Controller</label></li>
-        </ul>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-practice-03-1"> 能使用 ReactAgent.builder() 创建客服 Agent，配置 ChatClient 和 @Tool 工具注册，设置 maxSteps=5</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-03-2"> 能实现 ToolCallback 的观察函数（observationFunction），在工具执行后记录结果到事件总线</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-03-3"> 能实现 SSE 流式 Controller，将 Agent 的思考、工具调用和最终回复分别映射为不同事件类型的 ServerSentEvent</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-03-4"> 能实现 Agent 状态的 Redis 快照保存和恢复，包括步骤级别保存和正常完成后的清理逻辑</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-practice-03-5"> 能设计 Agent 执行失败的兜底策略：超 maxSteps 或连续工具失败时自动降级转人工</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话说明</th></tr></thead><tbody>
+        <tr><td>ReAct Agent</td><td>Spring AI 的推理-行动 Agent 实现，通过 Think-Act-Observe 循环自主决策和执行工具</td></tr>
+        <tr><td>ToolCallback</td><td>Spring AI 的工具注册和管理接口，通过 ToolCallbacks.from() 将 @Tool Bean 注册到 Agent</td></tr>
+        <tr><td>maxSteps</td><td>Agent 循环的最大步数限制，CorpAssist 设为 5，防止无限循环消耗 Token</td></tr>
+        <tr><td>SSE / Server-Sent Events</td><td>服务端单向推送技术，CorpAssist 用于流式推送 Agent 的实时执行过程</td></tr>
+        <tr><td>Agent 快照</td><td>Agent 执行状态的序列化快照（步骤数、已完成操作、推理上下文），存储在 Redis 用于恢复</td></tr>
+        <tr><td>observationFunction</td><td>ReAct Agent 的观察回调函数，在工具执行后触发，用于记录结果或触发额外逻辑</td></tr>
+        <tr><td>Think-Act-Observe 循环</td><td>Agent 的核心工作模式：思考需要什么 -> 执行工具 -> 观察结果 -> 判断是否继续</td></tr>
+        <tr><td>Flux&lt;ServerSentEvent&gt;</td><td>Spring WebFlux 的响应式 SSE 推送类型，支持背压控制和异步非阻塞 I/O</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: ReAct Agent 和普通 ChatClient 的区别是什么？什么时候应该用 Agent？</summary><p>核心区别在于决策能力。普通 ChatClient 是「一次对话 -> 一次响应」的模式——用户说一句，LLM 回答一句，无法主动执行额外的操作。而 ReAct Agent 实现了 Think-Act-Observe 循环：Agent 可以自己决定是否需要调用工具、调用哪个工具、调用的顺序、以及什么时候结束循环给出回复。在 CorpAssist 的实践中，以下场景应该用 Agent：第一，用户在同一句话中提出多个需求，如「查订单物流然后退货」——Agent 可以自主先查物流确认订单状态，再执行退货。第二，Agent 的执行结果影响后续决策——如查订单后发现有部分商品已发货只退未发货部分，Agent 能根据查询结果调整退款参数。第三，需要条件判断的流程——如用户说「退了这个」但不知道订单号，Agent 可以查用户最近的订单列表再让用户选择。Agent 不适合的场景：只需要单一工具调用的简单查询（「查一下 ORD-001 的物流」），这种情况下用普通 ChatClient + @Tool 效率更高，Agent 的循环开销（额外推理 Token 和执行步骤）不划算。</p></details>
+        <details><summary>Q2: 怎么防止 Agent 无限循环消耗 Token？有没有遇到过死循环问题？</summary><p>防止 Agent 无限循环有三个控制手段。第一是 maxSteps 参数（CorpAssist 设为 5）——Agent 最多执行 5 次 Think-Act-Observe 循环，超过后强制停止并转人工。第二是超时控制——整个 Agent 执行有 30 秒的总超时，超过时抛出 TimeoutException 终止循环。第三是工具调用频率限制——同一种工具在 1 分钟内最多调用 3 次，超过则暂时禁用该工具。我们确实在早期版本遇到过死循环问题：Agent 在查询订单物流时发现订单已签收，用户要求退款，退款时发现订单已超过退款期限，Agent 又回到查物流状态……形成了「查 -> 退不了 -> 再查」的循环。解决方案是在 System Prompt 中增加了明确的循环检测指令——「如果发现当前操作与之前步骤相似或重复，且结果没有变化，应该停止尝试并告知用户替代方案。」同时增加了步骤去重检查：如果第 N 步和第 N-2 步的工具调用完全相同且结果相同，判断为循环提前终止。</p></details>
+        <details><summary>Q3: SSE 流式响应的连接管理怎么做的？大量并发连接下服务端会有什么压力？</summary><p>SSE 连接管理的核心目标是：在用户能看到 Agent 实时进展的前提下，保障服务端的连接数不过载。我们做了三层管理：第一层是连接池限制——每个用户最多同时保留 3 个 SSE 连接（用户可能打开多个浏览器标签页），超出时自动关闭最旧的连接。第二层是超时断连——60 秒无数据交互自动关闭连接，客户端通过心跳（每 15 秒）维持活跃。第三层是服务端整体连接数上限——Nginx 层面设置最大 5000 并发连接，超过时返回 503 状态码。大量并发连接下服务端的压力主要来自三方面：第一是线程模型——Spring WebFlux 的响应式模型天然适合大量长连接（Netty 的事件循环机制），每个连接只占用少量内存（约 10KB），相比传统 Servlet 容器每个连接一个线程的模型能支撑多 10 倍的并发连接。第二是 Agent 执行资源的竞争——大量 Agent 同时执行会争夺 LLM API 的并发配额和 Redis 的连接数。我们在 LLM API 客户端设置了连接池（maxConnections=30），超过的请求在队列中等待。第三是内存中的 Agent 状态——每个活跃的 Agent 执行会话在内存中维护中间状态，我们通过限制 maxSteps=5 和总超时 30s 来确保 Agent 不会长时间占用内存。压测数据显示 8C16G 单机能支撑 200 个并发 SSE 连接。</p></details>
       </div>
     </div>
   </div>
 
-  <div class="chapter-practice">
-    <h3>动手练习</h3>
-    <div class="steps-operate">
-      <h4>操作步骤</h4>
-      <ol>
-        <li>构建 CustomerServiceAgent 并注册 orderTools</li>
-        <li>实现 SSE 流式 Controller</li>
-        <li>编写模拟对话测试验证工具调用</li>
-      </ol>
-    </div>
-  </div>
-
-  <div class="resources content-section">
-    <h3>延伸阅读</h3>
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
     <ul>
-      <li>Next: <a href="#ch-practice-04">降级与人工转接</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/agents.html" target="_blank" rel="noopener">Spring AI Agent API</a> — 包括 ReactAgent 的 builder、maxSteps 配置、stream() 和 execute() 方法的官方文档</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI ToolCallback API</a> — ToolCallbacks.from() 批量注册工具的方法和 ToolCallback 接口定义</li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webflux/reactive-html.html" target="_blank" rel="noopener">Spring WebFlux SSE 文档</a> — Spring WebFlux 中 SSE 的 ServerSentEvent 支持和响应式编程模型</li>
     </ul>
   </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>使用 ReactAgent.builder() 创建客服 Agent，注册 OrderTool 和 RefundTool 两个工具，编写 JUnit 测试验证 Agent 能在一个对话中先后调用两个工具。</li>
+      <li>实现 SSE 流式 Controller：创建 POST /api/cs/chat/stream 端点，使用 Flux<ServerSentEvent<String>> 返回 Agent 的 thought、tool-call、message 事件。</li>
+      <li>实现 AgentStateManager：使用 Redis 存储 Agent 执行快照，在 Agent 的每个步骤完成后保存状态，模拟服务重启后验证状态恢复。</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>场景题：Agent 在处理「查订单物流和退货」时，查物流成功但退货失败（订单已超过退货期限），Agent 卡在这一步反复重试（连续 4 次调用退货工具失败），最终超 5 步转人工。如何优化？</summary><p>这个问题的根因是 Agent 缺乏对不可逆失败的判断能力。连续 4 次重试说明 Agent 在第 2 步得到失败结果后，第 3 步仍然尝试用相同的参数重试——因为 LLM 认为「再试一次可能就成功了」。优化方向有三个。第一，在 System Prompt 中增加明确的失败分类指令——「当工具调用返回明确提示订单状态异常（如已签收、已超期）时，放弃重试并告知用户原因」。第二，在 Tool 方法的返回值中，除了 success/failed 外增加一个 retryable 字段——false 表示该错误不可重试，Agent 看到 retryable=false 后不应重试。第三，在 observationFunction 中增加重试检测逻辑——检测到连续 2 次相同工具相同参数调用且结果相同，自动注入一条系统提示「该操作已重试仍失败，不应继续重试，请为用户提供替代方案或转人工」。实测第三种方案最有效，因为不需要修改 LLM 的行为模式，而是通过外部逻辑注入约束。</p></details>
+      <details><summary>场景题：用户发送「帮我查一下订单」但没有提供订单号，Agent 该如何处理？</summary><p>Agent 应该通过思考后决定：需要订单号才能查订单，但用户没有提供。正确的处理流程是：Agent 在第 1 次 Think 判断「用户没有提供订单号，无法调用 queryOrder 工具」，然后通过 LLM 生成回复向用户追问「请提供您的订单号，我帮您查询。订单号在您购买后发送的短信或邮件中可以找到。」如果用户回复了订单号，Agent 将订单号传递给工具并继续执行。如果用户仍然没有提供订单号（例如说「我不记得了」），Agent 应该启动备用方案——通过用户的 userId 查询最近的订单列表（如果有 listUserOrders 工具的话），或者引导用户去订单列表页面查看。CorpAssist 的实现中提供了一个 listRecentOrders 工具，当用户不记得订单号时，Agent 可以调用这个工具获取用户最近 5 个订单让用户选择。这种方法在线上将「无订单号」场景的解决率从 32% 提升到 79%。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-03-lab/</code></p><ul class="demo-acceptance">
+      <li>发送「查 #ORD-001 物流并退款」给 Agent SSE 端点，SSE 事件流中依次出现 thought、tool-call（queryOrder）、tool-call（applyRefund）和 message 事件</li>
+      <li>Agent 在 5 步内完成处理，不超过 maxSteps 限制，终端日志显示正常完成</li>
+      <li>模拟 Agent 在第 3 步时服务重启，重启后从 Redis 恢复状态继续执行，不丢失已完成的 2 步结果</li>
+    </ul></div>
+  </div>
+
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-04">降级与人工转接</a> — 学习四级降级策略、完整上下文移交和 Redis 坐席分配队列</li></ul></div>
 </section>
