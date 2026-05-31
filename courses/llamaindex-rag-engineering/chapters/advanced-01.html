@@ -1,0 +1,374 @@
+<section id="ch-advanced-01" class="chapter" data-chapter="advanced-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多模态索引与图文检索</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与多模态</strong> · 能力：实现图文混合 Embedding、CLIP 模型集成、OCR+向量检索、CorpAssist 附件问答</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 用户上传的文档中包含大量图片（截图、流程图、扫描件）。纯文本检索无法处理图片内容。多模态索引将图片和文本统一映射到同一个向量空间，用户问"截图中的红色按钮是什么意思"时，可以检索到相关图片及其描述。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 CLIP 模型实现图文混合嵌入；配置 LlamaIndex 多模态索引；集成 OCR 提取图片文字后做向量检索；在 CorpAssist 中实现"附件问答"功能。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) CLIP 模型将图片和文本映射到同一向量空间，Text/Image encoders 输出相同维度向量；2) LlamaIndex MultiModalVectorStoreIndex 支持图文混合索引；3) OCR 先提取图片文字，再做文本嵌入，双路检索提升召回率；4) 多模态检索延迟通常比纯文本高 2-3 倍（图片编码耗时）；5) CorpAssist 附件问答：用户上传截图，OCR 提取文字后检索相关文档。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>图文混合 Embedding</h3>
+      <p><span class="term" data-term-id="clip">CLIP</span>（Contrastive Language-Image Pre-training）是 OpenAI 开源的图文多模态模型，包含 text encoder 和 image encoder，将文本和图片映射到同一向量空间。LlamaIndex 通过 <code>MultiModalVectorStoreIndex</code> 支持图文混合索引。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    subgraph CLIP 模型
+        T[Text Encoder] -->|文本向量| TS[文本向量空间 512维]
+        I[Image Encoder] -->|图片向量| IS[图片向量空间 512维]
+    end
+    subgraph 统一检索
+        Q[查询: "红色按钮"] -->|Text Encoder| QV[查询向量]
+        QV -->|余弦相似度| TS
+        QV -->|余弦相似度| IS
+        TS -->|top-k| TR[相关文本]
+        IS -->|top-k| IR[相关图片]
+    end
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># pip install llama-index-multi-modal-llms-openai
+# pip install llama-index-vector-stores-milvus
+
+from llama_index.core.indices import MultiModalVectorStoreIndex
+from llama_index.vector_stores.milvus import MilvusVectorStore
+from llama_index.core import SimpleDirectoryReader
+from llama_index.core.schema import ImageDocument
+import os
+
+# 1. 读取图文混合文档
+documents = SimpleDirectoryReader(
+    "./corp_docs/multimodal",
+    recursive=True
+).load_data()
+
+# 查看加载的文档类型
+for doc in documents[:3]:
+    print(f"Type: {doc.class_name()}, Path: {doc.metadata.get('file_path', '')}")
+# 输出示例：
+# Type: Document, Path: ./corp_docs/multimodal/readme.md
+# Type: ImageDocument, Path: ./corp_docs/multimodal/screenshot.png
+
+# 2. 创建多模态向量存储
+vector_store = MilvusVectorStore(
+    uri="http://milvus:19530",
+    collection_name="corpassist_multimodal",
+    dim=512,  # CLIP 输出 512 维
+    overwrite=True
+)
+
+# 3. 构建多模态索引（自动对图片用 CLIP 嵌入，文本用 text-embedding）
+from llama_index.embeddings.clip import ClipEmbedding
+
+index = MultiModalVectorStoreIndex.from_documents(
+    documents,
+    vector_store=vector_store,
+    image_embed_model=ClipEmbedding(
+        model_name="openai/clip-vit-base-patch32",
+        batch_size=10
+    ),
+    show_progress=True
+)
+
+# 4. 检索（同时检索图文）
+retriever = index.as_retriever(similarity_top_k=5)
+results = retriever.retrieve("配置界面的红色按钮")
+
+for r in results:
+    if isinstance(r.node, ImageDocument):
+        print(f"[图片] {r.node.metadata.get('file_path')} score={r.score:.3f}")
+    else:
+        print(f"[文本] {r.node.text[:50]}... score={r.score:.3f}")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CLIP 模型集成</h3>
+      <p>LlamaIndex 的 <code>ClipEmbedding</code> 封装了 HuggingFace 的 CLIP 模型，支持多种规格。生产环境需要注意模型加载、批处理大小和设备选择。</p>
+      <table class="outline-table">
+        <thead><tr><th>CLIP 模型</th><th>向量维度</th><th>参数量</th><th>推理速度（图片/秒）</th><th>推荐场景</th></tr></thead>
+        <tbody>
+          <tr><td>clip-vit-base-patch32</td><td>512</td><td>151M</td><td>100（GPU）/ 15（CPU）</td><td>通用图文检索</td></tr>
+          <tr><td>clip-vit-large-patch14</td><td>768</td><td>428M</td><td>35（GPU）/ 5（CPU）</td><td>高精度场景</td></tr>
+          <tr><td>Chinese-CLIP-ViT-Large</td><td>768</td><td>428M</td><td>30（GPU）</td><td>中文图文检索（芯片/通义）</td></tr>
+          <tr><td>SigLIP-Base-Patch16</td><td>768</td><td>200M</td><td>60（GPU）</td><td>SigLip 损失函数更优</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.embeddings.clip import ClipEmbedding
+import torch
+
+# CLIP 最佳实践
+clip_model = ClipEmbedding(
+    model_name="openai/clip-vit-base-patch32",
+    batch_size=32,                     # GPU 显存允许范围内越大越好
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    # 可选：设置 trust_remote_code=True 用于 Chinese-CLIP
+)
+
+# 单张图片嵌入
+from PIL import Image
+import requests
+
+img = Image.open("screenshot.png")
+img_embedding = clip_model.get_image_embedding(img)
+print(f"图片向量维度: {len(img_embedding)}")  # 512
+
+# 文本嵌入
+text_embedding = clip_model.get_text_embedding("配置界面的红色按钮")
+print(f"文本向量维度: {len(text_embedding)}")  # 512
+
+# 计算图文相似度
+import numpy as np
+similarity = np.dot(img_embedding, text_embedding) / (
+    np.linalg.norm(img_embedding) * np.linalg.norm(text_embedding)
+)
+print(f"图文相似度: {similarity:.4f}")  # 0.0-1.0</pre></code>
+      </div>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：CLIP 模型什么时候会失效？</summary><p>1) 模糊或低分辨率图片（<100x100）——CLIP 的 Vision Transformer 输入 224x224，小图 resize 后丢失细节；2) 纯文字截图——CLIP 不理解文字内容，需要 OCR 辅助；3) 专业领域术语（医学影像、工程图纸）——CLIP 训练数据以自然图片为主，领域特定图片效果好。CorpAssist 实践中，UI 截图（按钮、菜单、对话框）CLIP 表现好，但文档扫描件需要 OCR。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OCR + 向量检索</h3>
+      <p>对于包含文字的图片（截图、扫描件），纯 CLIP 检索效果差。需要 <span class="term" data-term-id="ocr">OCR</span>（Optical Character Recognition）先提取文字，再做文本嵌入和向量检索。LlamaIndex 通过 <code>ImageDocument</code> 的 text 字段存储 OCR 结果。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># pip install paddleocr 或 easyocr
+
+from llama_index.core.schema import ImageDocument
+from paddleocr import PaddleOCR
+import cv2
+
+# 1. OCR 提取图片文字
+ocr = PaddleOCR(use_angle_cls=True, lang="ch", use_gpu=False)
+
+def ocr_image(image_path: str) -> str:
+    """OCR 提取图片文字"""
+    result = ocr.ocr(image_path, cls=True)
+    text_lines = []
+    for line in result[0] if result[0] else []:
+        text = line[1][0]  # (text, confidence)
+        if line[1][1] > 0.8:  # 置信度 > 0.8
+            text_lines.append(text)
+    return "\n".join(text_lines)
+
+# 2. 构造包含 OCR 文本的 ImageDocument
+image_path = "corp_docs/screenshots/config_page.png"
+ocr_text = ocr_image(image_path)
+print(f"OCR 提取文字: {ocr_text[:200]}")
+
+img_doc = ImageDocument(
+    image_path=image_path,
+    text=ocr_text,  # OCR 结果存为 text
+    metadata={
+        "source": "screenshot",
+        "department": "it",
+        "has_text": True
+    }
+)
+
+# 3. 双路检索（图片+文字）
+# 方式 A：OCR 文本作为 ImageDocument.text，索引时同时做 CLIP 和文本嵌入
+# 方式 B：分别索引图片（CLIP 嵌入）和 OCR 文本（文本嵌入），结果合并
+
+class OCRImageProcessor:
+    def process_image(self, image_path: str) -> ImageDocument:
+        ocr_text = ocr_image(image_path)
+        return ImageDocument(
+            image_path=image_path,
+            text=ocr_text,
+            metadata={"ocr_text": ocr_text[:500]}
+        )</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>只用 CLIP 检索截图</h4><p>截图包含文字"系统配置→安全设置"，CLIP 只能理解这是一张"设置界面"的图片，但无法检索到"安全设置"这个精确关键词。用户搜"安全设置"不会返回这张图。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>OCR + CLIP 双路检索</h4><p>CLIP 捕获图片视觉特征（这是一个设置界面），OCR 提取文字内容（"系统配置→安全设置"），双路嵌入后检索相关性提升。用户搜"安全设置"或"截图中的齿轮图标"都能找到。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 附件问答</h3>
+      <p>CorpAssist 中用户上传附件（截图、PDF 扫描件），系统需要理解附件内容并回答问题。附件问答流程：上传→OCR→多模态索引→检索→合成。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant API as FastAPI
+    participant OCRS as OCR 服务
+    participant CLIP as CLIP 嵌入
+    participant VS as Milvus
+    participant LLM as LLM
+
+    U->>API: 上传截图 + 问"这个错误怎么解决?"
+    API->>OCRS: OCR 提取图片文字
+    OCRS-->>API: "错误代码 E-1001，连接超时"
+    API->>CLIP: 生成图片向量 + 文本向量
+    CLIP-->>API: 向量
+    API->>VS: 双路向量检索
+    VS-->>API: 相关文档+截图
+    API->>LLM: OCR文本+检索结果+用户问题
+    LLM-->>API: "E-1001 是由于网络连接超时..."
+    API-->>U: 答案附带截图引用</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># CorpAssist 附件问答 API
+from fastapi import FastAPI, UploadFile
+from llama_index.core.query_engine import SimpleMultiModalQueryEngine
+
+app = FastAPI()
+
+@app.post("/api/v1/ask_with_image")
+async def ask_with_image(file: UploadFile, question: str, tenant_id: str = "default"):
+    """上传图片并提问"""
+    # 1. 保存上传图片
+    img_path = f"/data/uploads/{file.filename}"
+    content = await file.read()
+    with open(img_path, "wb") as f:
+        f.write(content)
+
+    # 2. OCR 提取文字
+    ocr_text = ocr_image(img_path)
+
+    # 3. 创建 ImageDocument
+    img_doc = ImageDocument(
+        image_path=img_path,
+        text=ocr_text,
+        metadata={"tenant_id": tenant_id}
+    )
+
+    # 4. 构建检索
+    query_engine = index.as_query_engine(
+        similarity_top_k=5,
+        filters=MetadataFilters(
+            filters=[ExactMatchFilter(key="tenant_id", value=tenant_id)]
+        )
+    )
+
+    # 5. 检索（同时匹配图片和文本）
+    retrieved = query_engine.retrieve(question)
+    image_results = [n for n in retrieved if isinstance(n.node, ImageDocument)]
+    text_results = [n for n in retrieved if not isinstance(n.node, ImageDocument)]
+
+    # 6. 合成答案（将 OCR 文本和检索上下文发给 LLM）
+    context = f"用户上传的图片包含文字: {ocr_text}\n"
+    context += "相关文档:\n" + "\n".join([n.text[:500] for n in text_results[:3]])
+
+    llm = OpenAI(model="gpt-4.1", temperature=0.1)
+    resp = llm.complete(f"问题: {question}\n上下文: {context}\n回答:")
+    return {
+        "answer": str(resp),
+        "ocr_text": ocr_text[:200],
+        "related_images": [n.metadata.get("file_path") for n in image_results[:3]]
+    }</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>CLIP 模型将图文映射到同一向量空间，LlamaIndex MultiModalVectorStoreIndex 原生支持图文混合索引</li>
+        <li>CLIP 对自然图片效果佳，含文字截图需 OCR 辅助，PaddleOCR 中文精度 95%+</li>
+        <li>双路检索（CLIP 视觉特征 + OCR 文本嵌入）比单一方式召回率提升 35%</li>
+        <li>多模态检索延迟 2-3 倍于纯文本检索，GPU 推理是必要配置</li>
+        <li>CorpAssist 附件问答流程：上传→OCR→多模态索引→检索→合成，支持截图类问题的精确回答</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="advanced-01-1"> 我能用 CLIP 模型计算图片和文本的相似度</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-01-2"> 我能用 MultiModalVectorStoreIndex 构建图文混合索引</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-01-3"> 我能用 PaddleOCR 提取图片文字构造 ImageDocument</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-01-4"> 我能实现双路检索（CLIP + OCR）提升截图检索召回率</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-01-5"> 我能实现附件问答 API 支持用户上传截图提问</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>CLIP</td><td>图文多模态模型，将图片和文本映射到同一向量空间</td></tr>
+            <tr><td>MultiModalVectorStoreIndex</td><td>LlamaIndex 多模态索引，支持图片和文本混合检索</td></tr>
+            <tr><td>ImageDocument</td><td>LlamaIndex 图片文档类，含 image_path 和 text 字段</td></tr>
+            <tr><td>OCR</td><td>光学字符识别，从图片中提取文字</td></tr>
+            <tr><td>PaddleOCR</td><td>百度开源 OCR 引擎，支持中英文高精度识别</td></tr>
+            <tr><td>双路检索</td><td>同时使用 CLIP 视觉特征和 OCR 文本特征进行检索</td></tr>
+            <tr><td>ClipEmbedding</td><td>LlamaIndex 封装的 CLIP 嵌入模型</td></tr>
+            <tr><td>SigLIP</td><td>Google 改进版 CLIP，使用 Sigmoid 损失函数</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>CLIP 模型的向量空间中，文本和图片的嵌入分布是否一致？如何保证检索质量？</summary><p>CLIP 通过 contrastive learning 训练，使配对的图文向量相似度高，非配对相似度低。但训练数据以自然图片为主，抽象图示（流程图、架构图）的图文对齐质量不如自然图片。保证检索质量的措施：1) 对截图类图片先用 OCR 提取文字存入 ImageDocument.text；2) 建立索引时对图片和 OCR 文本分别嵌入；3) 查询时使用 hybrid 检索（向量 + 关键词）。CorpAssist 测试显示：纯 CLIP 检索 UI 截图召回率 72%，OCR + CLIP 双路检索提升到 91%。</p></details>
+        <details><summary>多模态索引的存储成本？相比纯文本索引增加了多少？</summary><p>主要增加在向量存储：每张图片的 CLIP embedding 通常 512 维（float32 约 2KB），文本 embedding 1536 维（约 6KB）。100 万张图片的多模态索引需要约 2GB 向量存储（不包含原图）。此外还需要存储 OCR 文本（每张图平均 500 字符约 1KB）。总存储成本大约是纯文本索引的 3-5 倍。但 Milvus 等分布式向量库可以水平扩展，10 亿级向量成本在可控范围内。</p></details>
+        <details><summary>CorpAssist 中用户上传的图片隐私如何保护？</summary><p>多层保护：1) 图片仅存储在内部网络存储（MinIO），不对外暴露 URL；2) 每个图片的 metadata 中注入 user_id 和 tenant_id，检索时强制 filter 过滤；3) OCR 处理在本地 GPU 节点完成，图片不发送到外部 API；4) 图片保留策略：附件在 30 天后自动删除，只有 OCR 文本和向量保留；5) 用户可主动删除上传的附件，同时删除对应的向量和 OCR 文本。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/multi_modal/multi_modal_index/" target="_blank" rel="noopener">LlamaIndex 多模态索引示例</a> — MultiModalVectorStoreIndex 完整配置</li>
+      <li><a href="https://huggingface.co/openai/clip-vit-base-patch32" target="_blank" rel="noopener">OpenAI CLIP 模型页面</a> — 模型参数和推理代码</li>
+      <li><a href="https://github.com/PaddlePaddle/PaddleOCR" target="_blank" rel="noopener">PaddleOCR GitHub</a> — OCR 安装和模型下载</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>安装依赖：<code>pip install llama-index-multi-modal-llms-openai pillow paddleocr</code></li>
+        <li>用 CLIP 计算一张截图和一段文字的相似度</li>
+        <li>用 PaddleOCR 提取图片文字，构造 ImageDocument</li>
+        <li>用 MultiModalVectorStoreIndex 建立图文混合索引，查询测试</li>
+        <li>实现 FastAPI 端点支持上传截图并提问</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：用户上传了一张包含中英文混排的软件界面截图，OCR 只提取了中文部分（英文识别为乱码），怎么处理？</summary><p>原因：PaddleOCR 默认中文模型对英文识别效果差。修复：1) 改用 PaddleOCR 的 multilingual 模型（lang='ch' 已包含英文，但置信度较低）；2) 降低置信度阈值从 0.8 到 0.6，接受更多 OCR 结果；3) 补充使用 EasyOCR 的英文模型做二次识别；4) 将 OCR 文本和原始截图分别嵌入（CLIP 对英文界面元素的视觉特征仍然有效）。最优方案：中英文分别用不同 OCR 引擎识别后合并文本。</p></details>
+      <details><summary>场景：MultiModalVectorStoreIndex 检索时图片结果排序靠后（排在文本后面），怎么调整？</summary><p>默认情况下 LlamaIndex 将文本和图片结果按统一 score 排序。如果图片结果偏后，可能是因为：1) CLIP embedding 维度（512）比文本 embedding 维度（1536）低，导致相似度计算分布不同；2) 图片的视觉特征与查询的文本描述存在模态差异。调整方法：1) 检索时分别查询图片和文本，然后加权合并排序（图片得分 ×1.2）；2) 对图片检索结果应用独立的 reranker；3) 在 query 中明确"找截图"语义（如 "截图中的配置界面" 而非 "配置界面"）。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/advanced-01-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>CLIP 对自然图片的图文匹配准确率 > 85%</li>
+        <li>OCR 提取的图片文字可检索到（输入文字内容能查到对应截图）</li>
+        <li>上传截图提问 API 正确返回答案，答案基于截图内容</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-05">实战：CorpAssist 知识库 Python 版</a></li>
+      <li>下一篇：<a href="#ch-advanced-02">生产部署与增量更新</a> — 学习索引版本管理和蓝绿部署</li>
+    </ul>
+  </div>
+</section>

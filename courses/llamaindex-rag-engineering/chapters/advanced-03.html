@@ -1,0 +1,427 @@
+<section id="ch-advanced-03" class="chapter" data-chapter="advanced-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>性能与成本优化</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与多模态</strong> · 能力：实现缓存策略、小模型路由、预计算热点、Token 成本归因</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 上线后每天处理 10 万次查询，每次查询可能消耗 2000 tokens（检索+合成）。一个月 Token 费用可能超过 3 万元。而且大部分查询是重复的——80% 的查询集中在 20% 的热点问题上。缓存命中时零成本、零延迟，小模型路由可以将 60% 的简单查询用便宜模型处理。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>实现精确缓存和语义缓存两种策略；配置小模型路由将简单查询分流；预计算热点问答并缓存答案；设计 Token 成本归因体系。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 精确缓存命中率 20%，语义缓存命中率 35%，组合可覆盖 55% 查询；2) 小模型路由：简单查询用 DeepSeek-V3（$0.5/百万 Token），复杂用 GPT-4.1（$15/百万 Token）；3) 预计算热点问答可将 P99 延迟从 3s 降到 50ms；4) Token 成本归因到租户和部门维度，月成本透明度提升；5) 缓存策略组合同比降低 CorpAssist 月 Token 费用约 60%。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>缓存策略</h3>
+      <p><span class="term" data-term-id="cache-strategy">缓存策略</span>分两种：精确缓存（相同查询直接返回缓存答案）和语义缓存（语义相似的查询命中缓存）。LlamaIndex 不内置缓存，但可以通过装饰器或中间件实现。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    Q[查询] -->|精确缓存| EX{在缓存中?}
+    EX -->|是| CACHE[直接返回缓存答案<br/>延迟: 1ms 成本: 0]
+    EX -->|否| SEM{语义缓存<br/>相似度 > 0.95?}
+    SEM -->|是| SCACHE[返回缓存答案<br/>延迟: 50ms 成本: 嵌入]
+    SEM -->|否| LLM[调用 LLM 合成]
+    LLM -->|写入缓存| STORE[Redis]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">import hashlib, json, time
+import redis as redis_lib
+from llama_index.embeddings.openai import OpenAIEmbedding
+
+# Redis 连接
+redis_client = redis_lib.Redis(host="redis", port=6379, decode_responses=True)
+embed_model = OpenAIEmbedding(model="text-embedding-3-small", dimensions=512)
+
+# ---- 1. 精确缓存 ----
+def exact_cache_key(query: str, tenant_id: str) -> str:
+    """精确缓存 Key: md5(query + tenant_id)"""
+    raw = f"{query}:{tenant_id}"
+    return f"cache:exact:{hashlib.md5(raw.encode()).hexdigest()}"
+
+def get_exact_cache(query: str, tenant_id: str) -> str | None:
+    key = exact_cache_key(query, tenant_id)
+    return redis_client.get(key)
+
+def set_exact_cache(query: str, tenant_id: str, answer: str, ttl=3600):
+    key = exact_cache_key(query, tenant_id)
+    redis_client.setex(key, ttl, answer)
+
+# ---- 2. 语义缓存 ----
+class SemanticCache:
+    def __init__(self, similarity_threshold=0.95):
+        self.threshold = similarity_threshold
+        self.embed_model = OpenAIEmbedding(model="text-embedding-3-small", dimensions=512)
+
+    def find_similar(self, query: str, tenant_id: str) -> str | None:
+        """查找语义相似的缓存条目"""
+        query_vec = self.embed_model.get_text_embedding(query)
+        # 从 Redis 获取该租户的所有缓存向量
+        cache_entries = redis_client.hgetall(f"cache:semantic:{tenant_id}")
+        best_score, best_answer = 0, None
+        for cached_query, cached_data in cache_entries.items():
+            data = json.loads(cached_data)
+            cached_vec = data["vector"]
+            # 余弦相似度
+            score = sum(a*b for a,b in zip(query_vec, cached_vec)) / (
+                sum(a*a for a in query_vec)**0.5 * sum(b*b for b in cached_vec)**0.5
+            )
+            if score > self.threshold and score > best_score:
+                best_score, best_answer = score, data["answer"]
+        return best_answer
+
+    def store(self, query: str, tenant_id: str, answer: str, ttl=7200):
+        query_vec = self.embed_model.get_text_embedding(query)
+        data = json.dumps({"vector": query_vec, "answer": answer, "timestamp": time.time()})
+        redis_client.hset(f"cache:semantic:{tenant_id}", query, data)
+        redis_client.expire(f"cache:semantic:{tenant_id}", ttl)
+
+# ---- 3. 组合缓存中间件 ----
+class CacheMiddleware:
+    def __init__(self):
+        self.exact_ttl = 3600       # 精确缓存 1 小时
+        self.semantic_ttl = 7200    # 语义缓存 2 小时
+        self.semantic_cache = SemanticCache(threshold=0.95)
+
+    async def get_or_compute(self, query: str, tenant_id: str, compute_fn):
+        # 1. 精确缓存
+        cached = get_exact_cache(query, tenant_id)
+        if cached:
+            return json.loads(cached)
+
+        # 2. 语义缓存
+        semantic = self.semantic_cache.find_similar(query, tenant_id)
+        if semantic:
+            return json.loads(semantic)
+
+        # 3. 计算新答案
+        result = await compute_fn()
+
+        # 4. 写入缓存
+        result_json = json.dumps(result)
+        set_exact_cache(query, tenant_id, result_json, self.exact_ttl)
+        self.semantic_cache.store(query, tenant_id, result_json, self.semantic_ttl)
+        return result</pre></div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>无缓存</h4><p>每次查询都走完整检索+LLM 合成。10 万次/天 × 2000 tokens = 2 亿 tokens/月。按 GPT-4.1 $15/百万 tokens = ￥21000/月。P99 延迟 3s。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>组合缓存</h4><p>精确缓存命中 20%（2 万次零成本），语义缓存命中 35%（3.5 万次仅嵌入成本），仅 4.5 万次需要 LLM。月 Token 消耗降至 9000 万（节省 55%）。P99 延迟降至 1.5s。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>小模型路由</h3>
+      <p><span class="term" data-term-id="small-model-routing">小模型路由</span>根据查询复杂度选择 LLM：简单查询（事实性、分类）用低成本模型，复杂查询（推理、比较）用高性能模型。可通过分类器或 LLM 自身判断。</p>
+      <table class="learn-decision-table">
+        <thead><tr><th>模型</th><th>价格（/百万 Token）</th><th>适用查询类型</th><th>占比预估</th><th>月费用（10 万次）</th></tr></thead>
+        <tbody>
+          <tr><td>DeepSeek-V3</td><td>$0.5</td><td>事实性问答、简单翻译、分类</td><td>60%</td><td>¥600</td></tr>
+          <tr><td>GPT-4.1 Mini</td><td>$1.5</td><td>中等推理、摘要提取</td><td>25%</td><td>¥750</td></tr>
+          <tr><td>GPT-4.1</td><td>$15</td><td>复杂推理、多文档比较、代码生成</td><td>15%</td><td>¥4500</td></tr>
+          <tr><td colspan="3">总费用（路由后）</td><td></td><td>¥5850</td></tr>
+          <tr><td colspan="3">对比：全量 GPT-4.1</td><td></td><td>¥21000</td></tr>
+          <tr><td colspan="3">节省</td><td></td><td>72%</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.llms.openai import OpenAI
+from llama_index.llms.deepseek import DeepSeek
+
+class ModelRouter:
+    """根据查询复杂度路由到不同 LLM"""
+    def __init__(self):
+        self.cheap_llm = DeepSeek(model="deepseek-chat", temperature=0.1)
+        self.medium_llm = OpenAI(model="gpt-4.1-mini", temperature=0.1)
+        self.expensive_llm = OpenAI(model="gpt-4.1", temperature=0.1)
+
+    def classify_query(self, query: str) -> str:
+        """用简单规则 + 小模型分类查询复杂度"""
+        # 简单规则快速过滤
+        simple_keywords = ["什么", "多少", "谁", "哪里", "何时", "是不是", "有没有"]
+        complex_keywords = ["对比", "比较", "分析", "总结", "为什么", "如何解决", "区别"]
+
+        if any(kw in query for kw in complex_keywords):
+            return "complex"
+        if any(kw in query for kw in simple_keywords):
+            return "simple"
+        # 不确定的用小模型分类
+        response = self.cheap_llm.complete(
+            f"判断以下查询的复杂度，只返回 simple/medium/complex: {query}"
+        )
+        return str(response).strip().lower()
+
+    def get_llm(self, query: str):
+        complexity = self.classify_query(query)
+        if complexity == "simple":
+            return self.cheap_llm
+        elif complexity == "medium":
+            return self.medium_llm
+        else:
+            return self.expensive_llm
+
+# 使用
+router = ModelRouter()
+llm = router.get_llm("年假是多少天")  # → DeepSeek（简单）
+llm2 = router.get_llm("对比HR的年假和IT的VPN配置")  # → GPT-4.1（复杂）</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>预计算热点问答</h3>
+      <p><span class="term" data-term-id="hotspot-qna">预计算热点问答</span>是通过分析历史查询日志，识别高频重复问题，提前计算答案并存入缓存。这样热点问题直接用预计算答案响应，零检索零生成。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 1. 分析历史日志，找出热点查询
+from collections import Counter
+import json
+
+def analyze_query_logs(log_path: str, top_n: int = 100):
+    """分析查询日志，找出高频问题"""
+    queries = []
+    with open(log_path) as f:
+        for line in f:
+            record = json.loads(line)
+            queries.append(record["query"])
+
+    counter = Counter(queries)
+    hotspots = counter.most_common(top_n)
+    print(f"Top 5 热点查询:")
+    for q, count in hotspots[:5]:
+        print(f"  {count}次: {q}")
+    return [q for q, _ in hotspots]
+
+# 2. 预计算热点答案
+async def precompute_hotspots(hotspot_queries: list[str], tenant_id: str):
+    """预计算热点问题的答案并缓存"""
+    engine = get_tenant_engine(tenant_id)
+    results = {}
+    for query in hotspot_queries:
+        resp = engine.query(query)
+        answer = str(resp)
+        # 写入精确缓存（TTL 设为 24 小时）
+        set_exact_cache(query, tenant_id, json.dumps({
+            "answer": answer,
+            "sources": [n.node_id for n in resp.source_nodes],
+            "precomputed": True
+        }), ttl=86400)
+        results[query] = answer
+        print(f"预计算: {query[:30]}... → {len(answer)} 字符")
+    return results
+
+# 3. 定时任务（每天凌晨 3 点执行）
+async def daily_hotspot_update():
+    for tenant_id in ["hr", "it", "finance", "product"]:
+        log_path = f"/var/log/corpassist/queries_{tenant_id}.log"
+        hotspots = analyze_query_logs(log_path, top_n=50)
+        await precompute_hotspots(hotspots, tenant_id)
+        print(f"{tenant_id}: 预计算 {len(hotspots)} 个热点完成")
+
+# 4. 热点问答直接返回（延迟 < 50ms）
+@app.post("/api/v1/query")
+async def query(req: QueryRequest):
+    cached = get_exact_cache(req.question, req.tenant_id)
+    if cached:
+        data = json.loads(cached)
+        return QueryResponse(
+            answer=data["answer"],
+            sources=data.get("sources", []),
+            token_usage=0,
+            from_cache=True
+        )
+    # 正常检索...</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>分析月度查询日志发现："年假几天"月查询 8342 次，"VPN 怎么配置"月查询 5210 次，"密码重置"月查询 4230 次。Top-50 热点覆盖了 57% 的查询量。预计算后，这 57% 的查询延迟从 2s 降到 20ms，Token 成本降为零。月节省约 ¥12000。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Token 成本归因</h3>
+      <p><span class="term" data-term-id="token-cost-attribution">Token 成本归因</span>将每次查询的 Token 消耗分解到检索、合成、路由各个环节，并归属到租户和部门。这是优化 ROI 的基础数据。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from dataclasses import dataclass
+from datetime import datetime
+import json
+
+@dataclass
+class CostRecord:
+    query_id: str
+    tenant_id: str
+    query: str
+    retrieval_tokens: int
+    llm_model: str
+    prompt_tokens: int
+    completion_tokens: int
+    latency_ms: int
+    from_cache: bool
+    created_at: str
+
+class CostTracker:
+    def __init__(self):
+        self.records = []
+
+    def record_query(self, **kwargs):
+        record = CostRecord(
+            query_id=kwargs['query_id'],
+            tenant_id=kwargs['tenant_id'],
+            query=kwargs['query'][:100],
+            retrieval_tokens=kwargs.get('retrieval_tokens', 0),
+            llm_model=kwargs.get('llm_model', 'none'),
+            prompt_tokens=kwargs.get('prompt_tokens', 0),
+            completion_tokens=kwargs.get('completion_tokens', 0),
+            latency_ms=kwargs.get('latency_ms', 0),
+            from_cache=kwargs.get('from_cache', False),
+            created_at=datetime.utcnow().isoformat()
+        )
+        self.records.append(record)
+
+    def calculate_cost(self, record: CostRecord) -> float:
+        """计算单次查询的 Token 费用"""
+        if record.from_cache:
+            return 0.0
+        rates = {
+            "gpt-4.1": {"prompt": 15, "completion": 60},
+            "gpt-4.1-mini": {"prompt": 1.5, "completion": 6},
+            "deepseek-chat": {"prompt": 0.5, "completion": 2},
+            "text-embedding-3-small": {"prompt": 0.002, "completion": 0},
+        }
+        model_rates = rates.get(record.llm_model, rates["gpt-4.1"])
+        # 输出是百万 Token 价格，计算到分的费用
+        cost = (record.prompt_tokens * model_rates["prompt"] +
+                record.completion_tokens * model_rates["completion"]) / 1_000_000
+        return round(cost, 6)
+
+    def report_by_tenant(self) -> str:
+        """按租户生成费用报告"""
+        tenant_costs = {}
+        for record in self.records:
+            tenant = record.tenant_id
+            if tenant not in tenant_costs:
+                tenant_costs[tenant] = {"count": 0, "cost": 0, "cache_hit": 0}
+            tenant_costs[tenant]["count"] += 1
+            tenant_costs[tenant]["cost"] += self.calculate_cost(record)
+            if record.from_cache:
+                tenant_costs[tenant]["cache_hit"] += 1
+
+        report = "租户费用报告:\n"
+        for tenant, data in tenant_costs.items():
+            cache_rate = data["cache_hit"] / data["count"] * 100
+            report += f"  {tenant}: {data['count']}次, ${data['cost']:.2f}, 缓存率{cache_rate:.0f}%\n"
+        return report
+
+# 使用
+tracker = CostTracker()
+# 每次查询后记录
+tracker.record_query(
+    query_id="q_001", tenant_id="hr", query="年假几天",
+    retrieval_tokens=128, llm_model="deepseek-chat",
+    prompt_tokens=350, completion_tokens=120, latency_ms=450, from_cache=False
+)
+print(tracker.report_by_tenant())</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>组合缓存（精确 20% + 语义 35%）覆盖 55% 的查询，减少 55% 的 LLM 调用和费用</li>
+        <li>小模型路由根据查询复杂度选择 LLM，60% 简单查询用 DeepSeek-V3，月费从 ¥21000 降至 ¥5850</li>
+        <li>预计算 Top-50 热点问答覆盖 57% 的查询量，延迟从 2s 降到 20ms，Token 费用为零</li>
+        <li>Token 成本归因到租户维度，为优化决策提供数据支撑</li>
+        <li>CorpAssist 综合优化后月 Token 费用从 ¥21000 降至约 ¥7000，节省 67%</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="advanced-03-1"> 我能用 Redis 实现精确缓存和语义缓存（含向量相似度计算）</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-2"> 我能用小模型分类器为查询分配不同的 LLM</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-3"> 我能通过历史日志分析热点查询并预计算答案</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-4"> 我能实现按租户的成本归因和报告生成</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-5"> 我能估算各种优化方案对 Token 费用的影响</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>精确缓存</td><td>完全相同查询直接返回缓存答案</td></tr>
+            <tr><td>语义缓存</td><td>语义相近（cosine > 0.95）的查询命中缓存</td></tr>
+            <tr><td>小模型路由</td><td>简单查询分流到低成本模型</td></tr>
+            <tr><td>预计算热点</td><td>离线计算高频问题的答案并存入缓存</td></tr>
+            <tr><td>Token 成本归因</td><td>将 Token 消耗分解到租户/模型/环节</td></tr>
+            <tr><td>HTTPS://COSINE 相似度</td><td>向量夹角的余弦值，衡量语义相似度</td></tr>
+            <tr><td>TTL</td><td>Redis 缓存的过期时间</td></tr>
+            <tr><td>深度Seek</td><td>低成本中文大模型，适合 CorpAssist 简单查询</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>精确缓存和语义缓存的适用场景分别是什么？语义缓存的阈值怎么确定？</summary><p>精确缓存：用户完全相同的查询（"年假几天"和"年假几天"）。适合系统自动生成的问题、常见 FAQ。语义缓存：表述不同但意图相同的查询（"年假几天"和"我有多少天年假"）。阈值通过实验确定：在验证集上测试不同阈值（0.90/0.95/0.99）的精度和召回率。阈值太高（0.99）命中少，太低（0.90）可能误命中不同意图的问题。CorpAssist 经验值 0.95 是平衡点。</p></details>
+        <details><summary>小模型路由分类错误（把复杂查询路由到简单模型）导致回答质量差，怎么兜底？</summary><p>双层兜底：1) 快速验证：简单模型生成答案后，用另一个模型快速评估答案质量（如检查答案长度、是否包含"不确定"等信号），质量低则重新路由到高级模型；2) 用户反馈：设置用户对答案的"有用/没用"评分，评分低的查询自动记录并重新路由。用户也可以手动触发"深入回答"按钮，强制使用高级模型重新生成。CorpAssist 策略：先 DeepSeek 快速回答，用户可一键切换到 GPT-4.1 深究。</p></details>
+        <details><summary>预计算热点的答案会过期（HR 政策调整后旧答案错误），怎么处理？</summary><p>答案过期是预计算的核心挑战。处理方案：1) TTL 管理：热点答案缓存 TTL 设为 24 小时，每天凌晨重新预计算；2) 文档变更触发：HR 文档更新时，清除关联的热点缓存（基于 metadata 中记录的 source 文档 ID）；3) 版本标记：预计算答案打上文档版本号，查询时如果发现文档版本高于缓存版本，重新生成；4) 渐进式更新：不一次全部重新计算，而是每小时扫描 10% 的热点题目，7 小时内完成全量刷新。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://redis.io/docs/data-types/" target="_blank" rel="noopener">Redis 数据类型文档</a> — Hash/Set/Expire 在缓存中的应用</li>
+      <li><a href="https://platform.openai.com/docs/models" target="_blank" rel="noopener">OpenAI 模型定价</a> — 各模型 Token 价格和速率限制</li>
+      <li><a href="https://api-docs.deepseek.com/" target="_blank" rel="noopener">DeepSeek API 文档</a> — 模型列表和定价</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>启动 Redis：<code>docker run -d -p 6379:6379 redis:7-alpine</code></li>
+        <li>实现精确缓存 + 语义缓存，对比命中率和响应时间</li>
+        <li>用小模型（DeepSeek）分类 10 个查询，验证分类准确率</li>
+        <li>模拟 100 条查询日志，分析 Top-10 热点并预计算答案</li>
+        <li>实现 CostTracker，输出按租户的费用报告</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：语义缓存命中了一个相似但不完全相同的问题，答案有些偏差，怎么在延迟和准确性之间平衡？</summary><p>方案 1：提高阈值（从 0.95 到 0.98），减少误命中但降低命中率。方案 2：缓存答案时同时缓存该答案的 source_nodes，返回缓存答案时附带来源引用让用户自判。方案 3：两阶段策略——先用缓存快速返回答案（200ms），同时后台触发完整 LLM 调用，如果新答案与缓存答案不一致（通过 LLM 判断），推送更新页面。CorpAssist 采用方案 3，体验最佳。</p></details>
+      <details><summary>场景：小模型路由中，查询"帮我写一篇关于公司年假政策的 500 字报告"被误判为"simple"，怎么优化？</summary><p>误判原因是规则中没有识别"写报告"类复杂请求。优化：1) 在分类规则中加入"写|创建|生成...报告|文章|邮件"等动词+名词组合的复杂查询模式；2) 查询长度也是一个信号——超过 30 个字符的查询更可能是复杂查询；3) 使用更快速的轻量分类器（如朴素贝叶斯或 small LM 分类器）代替规则。修改后"写...报告"类查询被正确路由到 GPT-4.1，分类准确率从 82% 提升到 94%。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/advanced-03-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>精确缓存 TTL=3600 秒，过期后自动失效触发重新计算</li>
+        <li>语义缓存相似度阈值 0.95，Top-5 测试查询中命中至少 2 个语义相似查询</li>
+        <li>CostTracker 按租户输出月费用报告，区分缓存/非缓存的费用</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-advanced-02">生产部署与增量更新</a></li>
+      <li>下一篇：<a href="#ch-advanced-04">面试：LlamaIndex vs LangChain 架构题</a> — STAR 答题模板和架构对比</li>
+    </ul>
+  </div>
+</section>

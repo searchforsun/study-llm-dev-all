@@ -1,0 +1,420 @@
+<section id="ch-advanced-01" class="chapter" data-chapter="advanced-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>容灾、限流与降级</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与治理</strong> · 能力：实现熔断策略、模型 fallback 链路、限流削峰、多活部署</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>Agent 生产环境最大的风险是外部依赖（LLM API、MCP Server、数据库）不可用。CorpAssist 每天 10 万次查询，如果 GPT-4.1 API 超时 5 分钟，影响 350 次查询。熔断、降级、多活部署是保证 SLA 的核心手段。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 Resilience4j 实现 LLM 调用熔断；配置模型 fallback 链路（GPT-4.1→DeepSeek→本地模型）；用 Sentinel 实现限流削峰；设计多活部署架构。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 熔断器：5 次失败开启 30 秒熔断；2) Fallback 链路：GPT-4.1 → DeepSeek-V3 → 本地 BGE 模型；3) 限流：Sentinel QPS=50/租户，超过排队或拒绝；4) 多活部署：两个机房同时提供服务。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>熔断策略</h3>
+      <p><span class="term" data-term-id="circuit-breaker">熔断器</span>防止级联故障。当 LLM API 或 MCP Server 连续失败达到阈值时，熔断开启，请求快速失败（不调用后端），给后端恢复时间。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import java.time.Duration;
+
+@Configuration
+public class CircuitBreakerConfig {
+
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry() {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            // 滑动窗口统计最近 10 次调用
+            .slidingWindowSize(10)
+            // 失败率超过 50% 开启熔断
+            .failureRateThreshold(50)
+            // 熔断开启后等待 30 秒尝试半开
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            // 半开状态下允许 3 次尝试
+            .permittedNumberOfCallsInHalfOpenState(3)
+            // 记录哪些异常为失败
+            .recordExceptions(TimeoutException.class,
+                HttpServerErrorException.class)
+            // 忽略哪些异常不算失败
+            .ignoreExceptions(IllegalArgumentException.class)
+            .build();
+
+        return CircuitBreakerRegistry.of(config);
+    }
+
+    @Bean
+    public CircuitBreaker llmCircuitBreaker(CircuitBreakerRegistry registry) {
+        return registry.circuitBreaker("llm-api");
+    }
+
+    // 使用熔断器包裹 LLM 调用
+    @Component
+    public class ResilientLlmClient {
+
+        private final CircuitBreaker circuitBreaker;
+        private final ChatClient primaryClient;
+        private final ChatClient fallbackClient;
+
+        public String callLlm(String prompt) {
+            // 熔断器会自动统计失败率，熔断时走 fallback
+            Supplier<String> decorated = Decorators.ofSupplier(
+                () -> primaryClient.prompt().user(prompt).call().content()
+            ).withCircuitBreaker(circuitBreaker)
+             .withFallback(throwable ->
+                 fallbackClient.prompt().user(prompt).call().content()
+             ).decorate();
+            return decorated.get();
+        }
+    }
+}
+
+// 熔断事件监听
+@Component
+public class CircuitBreakerEventListener {
+
+    @EventListener
+    public void onStateTransition(CircuitBreakerOnStateTransitionEvent event) {
+        String newState = event.getStateTransition().getToState().name();
+        if ("OPEN".equals(newState)) {
+            alertService.sendAlert(
+                "LLM 熔断已开启，降级到备用模型");
+        } else if ("HALF_OPEN".equals(newState)) {
+            log.info("LLM 熔断尝试恢复");
+        } else if ("CLOSED".equals(newState)) {
+            notificationService.notify("LLM 熔断已恢复");
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>模型 Fallback 链路</h3>
+      <p><span class="term" data-term-id="model-fallback">模型 Fallback</span> 链路是容灾的核心——当首选模型不可用时，自动降级到备用模型。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    Q[用户查询] --> L1{GPT-4.1 可用?}
+    L1 -->|是| GPT[GPT-4.1 回答]
+    L1 -->|否: 超时/错误| L2{DeepSeek-V3 可用?}
+    L2 -->|是| DS[DeepSeek-V3 回答<br/>带降级标记]
+    L2 -->|否| L3{本地 BGE 模型  可用?}
+    L3 -->|是| BGE[BGE 基础模型回答<br/>仅支持简单查询]
+    L3 -->|否| FALLBACK[返回"AI服务暂时不可用"]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Component
+public class ModelFallbackChain {
+
+    private final List<LlmProvider> providers;
+    private final CircuitBreaker circuitBreaker;
+
+    public ModelFallbackChain(CircuitBreaker circuitBreaker) {
+        this.circuitBreaker = circuitBreaker;
+        this.providers = List.of(
+            new OpenAiProvider("gpt-4.1", 15.0),         // 首选
+            new DeepSeekProvider("deepseek-chat", 0.5),   // 备用 1
+            new LocalOllamaProvider("qwen2.5:7b", 0.0)    // 备用 2
+        );
+    }
+
+    public FallbackResponse callWithFallback(String prompt) {
+        List<String> attemptedProviders = new ArrayList<>();
+
+        for (LlmProvider provider : providers) {
+            attemptedProviders.add(provider.getName());
+            try {
+                // 熔断器内调用
+                String result = Decorators.ofSupplier(
+                    () -> provider.call(prompt)
+                ).withCircuitBreaker(circuitBreaker)
+                 .withFallback(t -> null)
+                 .get();
+
+                if (result != null) {
+                    boolean isDegraded = attemptedProviders.size() > 1;
+                    return new FallbackResponse(
+                        result,
+                        provider.getName(),
+                        isDegraded,
+                        attemptedProviders
+                    );
+                }
+            } catch (Exception e) {
+                log.warn("Provider {} failed: {}",
+                    provider.getName(), e.getMessage());
+            }
+        }
+
+        // 所有模型都不可用
+        return new FallbackResponse(
+            "AI 服务暂时不可用，请稍后重试",
+            "none", true, attemptedProviders
+        );
+    }
+}
+
+// 降级标记：告知用户当前使用的是降级模型
+public record FallbackResponse(
+    String content,
+    String provider,
+    boolean degraded,
+    List<String> attemptedProviders
+) {
+    public String toUserMessage() {
+        if (degraded) {
+            return content + "\n\n（当前使用" + provider +
+                   "提供服务，响应质量可能有所降低）";
+        }
+        return content;
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>限流与削峰</h3>
+      <p><span class="term" data-term-id="rate-limiting">限流</span>防止突发流量压垮后端服务。<span class="term" data-term-id="sentinel">Sentinel</span> 是阿里开源的限流组件，支持 QPS 限流、并发线程数限流、热点参数限流。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Sentinel 限流配置
+@Configuration
+public class SentinelConfig {
+
+    // 按租户限流：每个租户 QPS 不超过 50
+    @PostConstruct
+    public void initFlowRules() {
+        List<FlowRule> rules = new ArrayList<>();
+
+        FlowRule agentRule = new FlowRule();
+        agentRule.setResource("corp_agent_query");
+        agentRule.setGrade(RuleConstant.FLOW_GRADE_QPS);
+        agentRule.setCount(200);      // 全局 QPS 200
+        agentRule.setLimitApp("default");
+        rules.add(agentRule);
+
+        // 热点参数限流（按 tenantId）
+        ParamFlowRule tenantRule = new ParamFlowRule("corp_agent_query");
+        tenantRule.setParamIdx(0);    // 第一个参数是 tenantId
+        tenantRule.setCount(50);      // 每个租户 QPS 50
+        tenantRule.setDurationInSec(1);
+        rules.add(tenantRule);
+
+        FlowRuleManager.loadRules(rules);
+    }
+}
+
+// 限流后的处理
+@Service
+public class AgentQueryService {
+
+    @SentinelResource(value = "corp_agent_query",
+                      blockHandler = "handleBlocked",
+                      fallback = "handleFallback")
+    public AgentResponse query(String tenantId, String question) {
+        return agentService.process(tenantId, question);
+    }
+
+    // 被限流时调用（blockHandler）
+    public AgentResponse handleBlocked(
+            String tenantId, String question, BlockException ex) {
+        // 返回排队提示
+        return AgentResponse.builder()
+            .content("系统繁忙，请稍后重试（当前排队人数: " +
+                     getQueueSize() + "）")
+            .build();
+    }
+
+    // 服务异常时调用（fallback）
+    public AgentResponse handleFallback(
+            String tenantId, String question, Throwable ex) {
+        return AgentResponse.builder()
+            .content("AI 服务暂时异常，请稍后重试")
+            .build();
+    }
+
+    // 削峰：请求队列，异步处理
+    private final Queue<AgentRequest> requestQueue =
+        new ConcurrentLinkedQueue<>();
+
+    @Scheduled(fixedDelay = 100) // 每 100ms 处理一批
+    public void processQueue() {
+        int batchSize = Math.min(10, requestQueue.size());
+        for (int i = 0; i < batchSize; i++) {
+            AgentRequest req = requestQueue.poll();
+            if (req != null) {
+                CompletableFuture.runAsync(() ->
+                    agentService.process(req.tenantId(), req.question())
+                );
+            }
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>多活部署</h3>
+      <p><span class="term" data-term-id="multi-active">多活部署</span>指多个机房同时提供服务，任一机房故障时流量自动切换到其他机房。</p>
+      <table class="outline-table">
+        <thead><tr><th>部署模式</th><th>可用性</th><th>成本</th><th>复杂段</th><th>适用</th></tr></thead>
+        <tbody>
+          <tr><td>单机房</td><td>99.9%</td><td>低</td><td>低</td><td>开发测试</td></tr>
+          <tr><td>两地三中心</td><td>99.99%</td><td>中</td><td>中</td><td>CorpAssist 生产</td></tr>
+          <tr><td>多活（三机房）</td><td>99.999%</td><td>高</td><td>高</td><td>金融级</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># 多活部署 k8s 配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: corp-agent
+spec:
+  replicas: 4  # 每个机房 4 个副本
+  strategy:
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+---
+# 跨机房流量调度的配置
+# spring:
+#   cloud:
+#     nacos:
+#       discovery:
+#         server-addr: nacos-zone1:8848,nacos-zone2:8848
+#     loadbalancer:
+#       zone: zone1  # 优先本机房
+#       failover:
+#         enabled: true  # 本机房不可用时 failover 到其他
+
+// 机房级别熔断
+@Component
+public class ZoneAwareRouter {
+    private final Map<String, HealthAggregator> zones;
+
+    public ServiceInstance chooseInstance(String serviceId) {
+        List<ServiceInstance> allInstances = discoveryClient
+            .getInstances(serviceId);
+
+        // 按机房分组
+        Map<String, List<ServiceInstance>> byZone = allInstances.stream()
+            .collect(Collectors.groupingBy(
+                inst -> inst.getMetadata()
+                    .getOrDefault("zone", "default")));
+
+        // 优先本机房
+        String myZone = System.getProperty("zone");
+        List<ServiceInstance> local = byZone.get(myZone);
+        if (local != null && !local.isEmpty()
+            && isZoneHealthy(myZone)) {
+            return loadBalancer.choose(local);
+        }
+        // 本机房不健康 → 切换到健康的其他机房
+        for (var entry : byZone.entrySet()) {
+            if (isZoneHealthy(entry.getKey())) {
+                return loadBalancer.choose(entry.getValue());
+            }
+        }
+        throw new NoAvailableInstanceException("所有机房都不可用");
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>熔断器配置滑动窗口 10 次，失败率 50% 开启，30 秒后尝试半开</li>
+        <li>Fallback 链路：GPT-4.1 → DeepSeek-V3 → 本地模型 → 友好提示，每级降级耗时 +2 秒</li>
+        <li>Sentinel 限流：全局 QPS 200，单租户 QPS 50，超限排队或拒绝</li>
+        <li>多活部署：两个机房各自部署 Agent，Nacos 跨机房注册，本机房不可用时自动 failover</li>
+        <li>CorpAssist 采用"两地三中心"模式，可用性目标 99.99%，年停机 < 1 小时</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="advanced-01-1"> 我能配置 Resilience4j 熔断器参数</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-2"> 我能实现多级模型 Fallback 链路</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-3"> 我能用 Sentinel 配置 QPS 限流</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-4"> 我能设计多活部署的跨机房切换</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-5"> 我能解释熔断半开状态的工作原理</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>熔断器</td><td>失败率达到阈值后快速拒绝请求的防护机制</td></tr>
+            <tr><td>半开状态</td><td>熔断开启后允许少量请求试探是否恢复</td></tr>
+            <tr><td>Fallback 链路</td><td>多级模型降级路径</td></tr>
+            <tr><td>Sentinel</td><td>阿里开源的限流降级组件</td></tr>
+            <tr><td>QPS 限流</td><td>每秒请求数限制</td></tr>
+            <tr><td>热点参数限流</td><td>按参数值（如租户 ID）限流</td></tr>
+            <tr><td>多活部署</td><td>多机房同时提供服务</td></tr>
+            <tr><td>Zone Failover</td><td>机房级别故障切换</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>熔断器的三种状态（CLOSED/OPEN/HALF_OPEN）转换逻辑是什么？</summary><p>CLOSED（关闭）：正常状态，所有请求通过。每次失败计数器 +1，当滑动窗口内的失败率超过阈值（如 50%），状态转换到 OPEN。OPEN（开启）：所有请求快速失败，不调用后端。等待配置的时间（30 秒）后，转换到 HALF_OPEN。HALF_OPEN（半开）：允许少量请求（3 次）试探后端是否恢复。如果试探成功（所有请求都成功），转换到 CLOSED；如果有任何一个失败，回到 OPEN 重新等待 30 秒。</p></details>
+        <details><summary>Fallback 链路中，从 GPT-4.1 降级到 DeepSeek 时，质量和延迟的变化？</summary><p>质量：DeepSeek-V3 在中文和企业场景下质量接近 GPT-4.1（准确率约 92% vs 96%），但复杂推理和代码生成差距明显。延迟：GPT-4.1 平均 3s，DeepSeek-V3 平均 1.5s。降级策略：1) 简单查询（分类/提取/事实问答）降级到 DeepSeek，用户几乎无感；2) 复杂查询（推理/比较/分析）不自动降级，提示用户等待或返回部分结果。CorpAssist 的 RouterQueryEngine 自动识别查询复杂度，只有简单查询才启用 DeepSeek fallback。</p></details>
+        <details><summary>多活部署下，两个机房的 Agent 同时处理同一用户的请求，怎么保证一致性？</summary><p>通过会话亲和性负载均衡：同一用户的请求始终路由到同一机房的同一实例（基于 sessionId hash）。但如果机房故障，用户会被路由到另一个机房，此时 ChatMemory 在 Redis 中是共享的（跨机房 Redis 集群），所以新的机房可以看到完整的对话历史。关键依赖：Redis 必须是跨机房部署的集群（CRDT 或主从），确保数据一致性。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://resilience4j.readme.io/" target="_blank" rel="noopener">Resilience4j 文档</a> — 熔断器/重试/限流配置</li>
+      <li><a href="https://sentinelguard.io/" target="_blank" rel="noopener">Sentinel 官方文档</a> — QPS 限流和热点参数限流</li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/" target="_blank" rel="noopener">K8s 多活部署</a> — Pod 反亲和性和多可用区部署</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>配置 Resilience4j 熔断器，模拟 5 次 LLM 超时验证熔断开启</li>
+      <li>实现 DeepSeek → 本地模型的两级 Fallback 链路</li>
+      <li>用 Sentinel 配置 QPS=10/sec，启动 20 个并发请求验证限流</li>
+      <li>模拟一个机房不可用，验证跨机房 failover</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：熔断器频繁开启和关闭（抖动），影响用户体验，怎么优化参数？</summary><p>原因是滑动窗口太小（10 次），偶尔的失败就触发熔断。优化：1) 增大滑动窗口到 50 次（更平滑）；2) 提高失败率阈值从 50% 到 70%（容忍更多失败）；3) 增加半开状态的等待时间从 30s 到 60s；4) 确保只熔断"不可恢复"的异常（如 HTTP 503），忽略"可恢复"的异常（如 429 限流，应该重试而不是熔断）。CorpAssist 参数：窗口 30 次，阈值 60%，半开等待 45 秒。</p></details>
+      <details><summary>场景：限流后用户排队等待，但队列积压到 1000 个请求时内存不足，怎么设计削峰？</summary><p>三层削峰：1) 请求进入队列前先进行 Token Bucket 限流（桶大小=200，每秒补充=50），超出的拒绝；2) 通过的请求放入有界队列（ArrayBlockingQueue 容量=200），队列满时拒绝；3) 用户收到限流响应后，客户端自动退避重试（Retry-After header 指定等待时间）。这样不会无限积压，即使流量峰值 10 倍于正常，也只拒绝超出容量的部分。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/advanced-01-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>LLM API 连续 5 次超时后熔断器开启，fallback 模型返回结果</li>
+        <li>Sentinel 限流配置生效，超限请求返回排队提示</li>
+        <li>模拟机房故障，Agent 请求在 5 秒内切换到其他机房</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-05">实战：CorpAssist 办公 Agent</a></li>
+      <li>下一篇：<a href="#ch-advanced-02">观测与调试</a></li>
+    </ul>
+  </div>
+</section>

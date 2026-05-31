@@ -1,0 +1,369 @@
+<section id="ch-advanced-02" class="chapter" data-chapter="advanced-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>生产部署与增量更新</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与多模态</strong> · 能力：实现增量索引、索引版本管理、蓝绿部署、监控告警</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 上线后，文档每天都在更新：HR 政策每个季度调整、IT 指南每周更新、产品文档每次发版都变。全量重建索引需要 2 小时且服务不可用。增量策略可以在不中断服务的情况下秒级更新，蓝绿部署保证切换零停机，监控和告警确保问题 5 分钟内发现。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 index.insert() 和 index.delete_ref_doc() 实现增量更新；设计索引版本号管理和回滚策略；配置 Milvus 蓝绿部署实现零停机切换；搭建 Prometheus + Grafana 监控面板。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 增量更新用 index.insert() 不触发全量重建，效率比全量高 100 倍；2) 版本管理用 Milvus 集合别名切换实现；3) 蓝绿部署通过交换 Collection 别名实现秒级切换；4) 监控核心指标：检索延迟 P99、召回率、索引同步延迟；5) 全量重建和增量更新并行不悖——各自覆盖不同的变更场景。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>增量索引策略</h3>
+      <p><span class="term" data-term-id="incremental-index">增量索引</span>指只对新增、修改、删除的文档重新索引，不触及其他文档。LlamaIndex 和 Milvus 都原生支持增量操作。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    D[文档变更事件] -->|新增| INS[index.insert(new_doc)]
+    D -->|修改| DEL[index.delete_ref_doc(doc_id)]
+    DEL --> INS
+    D -->|删除| DEL2[index.delete_ref_doc(doc_id)]
+    INS -->|写入| VS[Milvus]
+    DEL2 -->|删除向量| VS
+    VS -->|检索| Q[查询引擎]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core import VectorStoreIndex, Document
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.vector_stores.milvus import MilvusVectorStore
+
+vector_store = MilvusVectorStore(uri="http://milvus:19530", dim=1536)
+index = VectorStoreIndex.from_vector_store(vector_store)
+
+# 1. 增量添加文档
+def add_document(text: str, metadata: dict) -> str:
+    """增量添加单篇文档"""
+    doc = Document(text=text, metadata=metadata)
+    # 方法 A：直接插到已有索引
+    index.insert(doc)
+    # 方法 B：通过 IngestionPipeline（推荐，支持转换）
+    # pipeline = IngestionPipeline(transformations=[...], vector_store=vector_store)
+    # nodes = pipeline.run(documents=[doc])
+    return doc.doc_id
+
+# 2. 增量修改文档（先删除后插入）
+def update_document(doc_id: str, new_text: str, new_metadata: dict):
+    """增量修改：删除旧版本，插入新版本"""
+    index.delete_ref_doc(doc_id, delete_from_docstore=True)
+    new_doc = Document(text=new_text, metadata=new_metadata)
+    index.insert(new_doc)
+    print(f"文档 {doc_id} 已更新")
+
+# 3. 批量增量更新
+def batch_upsert(documents: list[Document]):
+    """批量新增或更新"""
+    for doc in documents:
+        if doc.doc_id and doc.metadata.get("_is_update"):
+            try:
+                index.delete_ref_doc(doc.doc_id)
+            except Exception:
+                pass  # 新文档无旧记录
+    index.insert_nodes([doc for doc in documents])  # 批量插入</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>操作</th><th>API</th><th>耗时（100 万文档）</th><th>服务影响</th></tr></thead>
+        <tbody>
+          <tr><td>全量重建</td><td>from_documents()</td><td>~2 小时</td><td>需要切换 Collection</td></tr>
+          <tr><td>增量添加</td><td>insert()</td><td>~50ms/文档</td><td>无影响</td></tr>
+          <tr><td>增量删除</td><td>delete_ref_doc()</td><td>~30ms/文档</td><td>无影响</td></tr>
+          <tr><td>批量 Upsert</td><td>insert_nodes()</td><td>~1s/100 文档</td><td>无影响</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>HR 部门每周更新一次员工手册。增量更新流程：1) RocketMQ 收到文档变更消息；2) Worker 消费消息，下载新版本 PDF；3) 解析文档后与旧版本 diff，确定增删改的章节；4) 用 insert/delete_ref_doc 增量更新索引；5) 验证查询一致性后提交。全程 < 5 秒，检索服务零影响。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>索引版本管理</h3>
+      <p>索引版本管理解决"更新后需要回滚"的问题。LlamaIndex 不直接管理版本，但可以通过 Milvus 的集合别名机制实现。核心思路：每个版本是一个独立的 Milvus Collection，通过别名（alias）指向当前活跃版本。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></span></div>
+        <pre><code class="language-python">from pymilvus import Collection, utility, connections
+
+# Milvus 版本管理工具
+class IndexVersionManager:
+    ALIAS = "corpassist_active"
+
+    def __init__(self, host="milvus", port=19530):
+        connections.connect(host=host, port=port)
+
+    def create_version(self, version_id: str, dim: int = 1536):
+        """创建新版本的 Collection"""
+        from pymilvus import CollectionSchema, FieldSchema, DataType
+
+        schema = CollectionSchema([
+            FieldSchema("id", DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema("vector", DataType.FLOAT_VECTOR, dim=dim),
+            FieldSchema("text", DataType.VARCHAR, max_length=65535),
+            FieldSchema("metadata", DataType.JSON),
+        ])
+        collection = Collection(f"corpassist_v{version_id}", schema)
+        collection.create_index("vector", {"index_type": "IVF_FLAT", "params": {"nlist": 1024}, "metric_type": "IP"})
+        return collection
+
+    def switch_active(self, version_id: str):
+        """切换活跃版本（蓝绿切换）"""
+        new_collection = f"corpassist_v{version_id}"
+        # 移除当前别名
+        if utility.has_collection(self.ALIAS):
+            utility.drop_alias(self.ALIAS)
+        # 别名指向新版本
+        utility.create_alias(new_collection, self.ALIAS)
+        print(f"活跃索引切换到: {new_collection}")
+
+    def list_versions(self):
+        """列出所有版本"""
+        collections = utility.list_collections()
+        return [c for c in collections if c.startswith("corpassist_v")]
+
+    def rollback(self, version_id: str):
+        """回滚到指定版本"""
+        self.switch_active(version_id)
+        print(f"已回滚到 v{version_id}")
+
+# 使用示例
+vman = IndexVersionManager()
+vman.create_version("20260530")
+vman.switch_active("20260530")
+# 写入数据...
+vman.create_version("20260601")
+vman.switch_active("20260601")
+# 发现有问题！
+vman.rollback("20260530")</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>无版本管理</h4><p>直接覆盖旧索引。新索引发问题后无法回滚，只能从备份恢复（耗时 2 小时+）。期间服务不可用。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>Collection 别名切换</h4><p>保留最近 7 个版本的索引。新版本出问题时，秒级切换别名回旧版本。查询服务无感，零停机。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>蓝绿部署</h3>
+      <p><span class="term" data-term-id="blue-green">蓝绿部署</span>保持两套索引（蓝/绿）同时存在，任何时候只有一套提供服务。蓝色为新版，绿色为旧版，通过流量控制切换。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    subgraph 阶段 1: 绿色活跃
+        TRAFFIC[查询流量] -->|别名指向绿| GREEN[绿色索引 v20260530]
+    end
+    subgraph 阶段 2: 蓝色部署
+        BUILD[全量构建] --> BLUE[蓝色索引 v20260601]
+    end
+    subgraph 阶段 3: 切换蓝色
+        TRAFFIC2[查询流量] -->|别名切换到蓝| BLUE2[蓝色索引 v20260601]
+        GREEN2[绿色索引 v20260530] -->|保留作为回滚| BACKUP
+    end
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></span></div>
+        <pre><code class="language-python"># 蓝绿部署脚本（bash + Python）
+# 步骤 1：构建蓝色版本
+python -c "
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.vector_stores.milvus import MilvusVectorStore
+
+# 构建到 v20260601 集合（不切换别名）
+vector_store = MilvusVectorStore(
+    uri='http://milvus:19530',
+    collection_name='corpassist_v20260601',
+    dim=1536,
+    overwrite=True  # 全新构建
+)
+documents = SimpleDirectoryReader('./corp_docs').load_data()
+index = VectorStoreIndex.from_documents(documents, vector_store=vector_store)
+print('蓝色版本索引构建完成')
+"
+
+# 步骤 2：验证蓝色版本
+python -c "
+from llama_index.core import VectorStoreIndex
+from llama_index.vector_stores.milvus import MilvusVectorStore
+
+vector_store = MilvusVectorStore(uri='http://milvus:19530', collection_name='corpassist_v20260601')
+index = VectorStoreIndex.from_vector_store(vector_store)
+query_engine = index.as_query_engine()
+resp = query_engine.query('年假政策')
+print(f'验证通过: {len(resp.source_nodes)} 个来源')
+"
+
+# 步骤 3：切换别名
+python -c "
+from pymilvus import utility
+utility.drop_alias('corpassist_active')
+utility.create_alias('corpassist_v20260601', 'corpassist_active')
+print('已切换到蓝色版本 v20260601')
+"
+
+# 步骤 4：验证切换后正常
+# 步骤 5：保留绿色版本 7 天后清理</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>监控与告警</h3>
+      <p>生产环境需要实时监控 RAG 服务的健康状况。核心指标通过 Prometheus 采集，Grafana 可视化，告警规则在 AlertManager 中配置。</p>
+      <table class="outline-table">
+        <thead><tr><th>指标</th><th>采集方式</th><th>告警阈值</th><th>影响</th></tr></thead>
+        <tbody>
+          <tr><td>检索延迟 P99</td><td>Prometheus Histogram</td><td>> 3000ms</td><td>用户体验差，触发降级</td></tr>
+          <tr><td>嵌入 API 错误率</td><td>Prometheus Counter</td><td>> 1%</td><td>索引写入失败，报警排查</td></tr>
+          <tr><td>Milvus 连接数</td><td>Milvus Exporter</td><td>> 200</td><td>连接池不足，扩容</td></tr>
+          <tr><td>召回率离线指标</td><td>RAGAS 定时评测</td><td>下降 > 5%</td><td>数据或模型退化</td></tr>
+          <tr><td>索引同步延迟</td><td>自定义 Metric</td><td>> 10 分钟</td><td>增量更新堆积</td></tr>
+          <tr><td>401/403 错误率</td><td>Nginx 日志</td><td>> 0.1%</td><td>权限问题</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></span></div>
+        <pre><code class="language-python"># FastAPI 集成 Prometheus 指标
+from prometheus_client import Histogram, Counter, Gauge, generate_latest
+from fastapi import Response
+import time
+
+# 定义指标
+RETRIEVAL_LATENCY = Histogram(
+    'rag_retrieval_latency_seconds',
+    '检索延迟',
+    buckets=[0.1, 0.3, 0.5, 1.0, 2.0, 5.0],
+    labelnames=['tenant_id']
+)
+QUERY_COUNTER = Counter(
+    'rag_queries_total',
+    '查询总数',
+    labelnames=['tenant_id', 'status']
+)
+RETRIEVAL_RECALL = Gauge(
+    'rag_retrieval_recall',
+    '检索召回率（离线评测）',
+    labelnames=['tenant_id']
+)
+
+@app.post("/api/v1/query", response_model=QueryResponse)
+async def query(req: QueryRequest):
+    start = time.time()
+    try:
+        engine = get_tenant_engine(req.tenant_id)
+        resp = engine.query(req.question)
+        status = "success"
+        return QueryResponse(...)
+    except Exception as e:
+        status = "error"
+        raise
+    finally:
+        elapsed = time.time() - start
+        RETRIEVAL_LATENCY.labels(tenant_id=req.tenant_id).observe(elapsed)
+        QUERY_COUNTER.labels(tenant_id=req.tenant_id, status=status).inc()
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type="text/plain")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>增量更新用 index.insert() 和 index.delete_ref_doc() 实现，每文档约 50ms，比全量重建快 10000 倍</li>
+        <li>索引版本通过 Milvus Collection 别名管理，支持秒级切换和回滚</li>
+        <li>蓝绿部署保持两套索引共存，别名切换实现零停机，保留旧版本 7 天用于回滚</li>
+        <li>监控核心指标：检索延迟 P99、嵌入 API 错误率、Milvus 连接数、召回率离线指标</li>
+        <li>CorpAssist 每天凌晨 2 点全量重建，日常文档变更通过 RocketMQ 触发增量更新</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="advanced-02-1"> 我能用 index.insert() 实现单文档增量索引</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-02-2"> 我能用 Pymilvus 创建 Collection 并管理别名切换</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-02-3"> 我能设计蓝绿部署流程，实现零停机索引更新</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-02-4"> 我能用 Prometheus + FastAPI 暴露 RAG 监控指标</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-02-5"> 我能设计索引版本回滚策略并验证回滚正确性</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>增量索引</td><td>只对变更的文档重新索引，不重建全量</td></tr>
+            <tr><td>delete_ref_doc</td><td>从索引中删除指定文档的所有 Node</td></tr>
+            <tr><td>Collection Alias</td><td>Milvus 集合别名，切换别名实现零停机</td></tr>
+            <tr><td>蓝绿部署</td><td>两套独立索引环境，交替切换</td></tr>
+            <tr><td>Prometheus Histogram</td><td>延迟分布指标，支持 P50/P95/P99 计算</td></tr>
+            <tr><td>召回率离线指标</td><td>定期运行 RAGAS 评测，观察召回率趋势</td></tr>
+            <tr><td>AlertManager</td><td>Prometheus 告警管理，支持 PagerDuty 通知</td></tr>
+            <tr><td>Upsert</td><td>Update+Insert，存在则更新不存在则新增</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>全量重建和增量更新分别应对什么场景？为什么两者需要共存？</summary><p>全量重建：1) 嵌入模型升级（如 text-embedding-3-xxx → gte-Qwen2），新模型生成的向量与旧的不兼容，必须全部重新嵌入；2) 索引结构变更（如 chunk_size 从 512 改为 1024）；3) 数据迁移（开发→测试→生产）。增量更新：1) 日常文档新增和修改；2) 少量文档内容修正。两者共存原因：全量重建保证架构一致性，增量更新保证日常效率。CorpAssist 实践：每天全量重建一次，日常变更增量更新。</p></details>
+        <details><summary>Milvus 集合别名切换时，正在进行的查询会受影响吗？</summary><p>不会受影响。Milvus 通过引用计数管理 Collection 的生命周期：切换别名只是元数据操作（修改 Alias → Collection 映射），正在执行的查询持有底层 Collection 的引用，会继续完成。新查询通过别名访问新的 Collection。所以别名切换是"零停机"的。但如果切换时旧 Collection 有大量写入请求（如增量索引），需要等写入完成后才能释放旧 Collection 的引用。</p></details>
+        <details><summary>如何设计 RAG 服务的自愈机制？当监控告警触发时自动做什么？</summary><p>多层自愈：1) 检索延迟 P99 > 3s → 自动切换为快速检索模式（降级：关闭 Reranker、减小 top_k）；2) Milvus 连接失败 → 自动切换到 Qdrant 副本（双写双读）；3) 嵌入 API 错误 > 5% → 自动切换到本地嵌入模型（BGE-M3）；4) 新版本索引出问题 → 自动回滚到上一版本（保留最近 3 个版本异或，保留 7 个版本）。每层自愈都在 30 秒内完成，超过则告警人工介入。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/indexing/metadata_extraction/" target="_blank" rel="noopener">LlamaIndex 增量更新文档</a> — insert/delete_ref_doc/update_ref_doc API</li>
+      <li><a href="https://milvus.io/docs/manage-collections.md" target="_blank" rel="noopener">Milvus 集合管理文档</a> — Collection 别名创建和切换</li>
+      <li><a href="https://prometheus.io/docs/practices/histograms/" target="_blank" rel="noopener">Prometheus Histogram 最佳实践</a> — 延迟指标采集和告警配置</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>用 index.insert() 增量添加 5 个文档，验证检索结果中包含新文档</li>
+        <li>用 index.delete_ref_doc() 删除一个文档，验证其不再出现在检索结果中</li>
+        <li>用 Pymilvus 创建两个 Collection，用别名切换实现蓝绿部署</li>
+        <li>用 prometheus_client 在 FastAPI 中添加检索延迟 histogram</li>
+        <li>模拟一版错误索引，测试 rollback 回滚流程</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：全量重建时仍有查询流量，怎么保证两个操作不互相影响？</summary><p>使用蓝绿部署模式。全量重建写入新的 Collection（蓝色），当前查询路由到旧的 Collection（绿色）。重建完成后通过切换别名将查询路由切换到新 Collection。关键点：1) 蓝色 Collection 要使用不同的名称（如 corpassist_v20260601）；2) 别名 corpassist_active 始终指向当前活跃的 Collection；3) 重建期间不要切换别名。这个过程对查询服务完全透明。</p></details>
+      <details><summary>场景：增量删除后用户仍然能检索到已删除的文档，可能的原因？</summary><p>可能原因：1) delete_ref_doc 的 delete_from_docstore=False（默认），只删除了索引结构中的引用，但向量库中的向量未被删除；2) Milvus 的删除操作默认是软删除，需要 cleanup 后才能真正生效；3) 请求的索引实例是旧的（连接到了旧 Collection）。排查：确认 delete_from_docstore=True；调用 collection.compact() 清理 Milvus 的已删除数据；检查当前查询连接的 Collection 是否已切换。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/advanced-02-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>增量添加文档后，检索结果包含新文档且 score 正常</li>
+        <li>蓝绿切换后，查询流量无中断，旧版本作为回滚选项可用</li>
+        <li>Prometheus 指标 /metrics 返回 rag_retrieval_latency_seconds 的 histogram 数据</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-advanced-01">多模态索引与图文检索</a></li>
+      <li>下一篇：<a href="#ch-advanced-03">性能与成本优化</a> — 学习缓存策略、小模型路由和 Token 成本归因</li>
+    </ul>
+  </div>
+</section>

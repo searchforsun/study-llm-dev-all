@@ -1,0 +1,343 @@
+<section id="ch-practice-03" class="chapter" data-chapter="practice-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>评测与迭代</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>高级 RAG 管线</strong> · 能力：使用 LlamaIndex eval 模块评测 RAG、结合 RAGAS 做自动化评估、设计 Ablation 实验</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 上线后发现部分回答不准确，但没有量化指标无法知道是检索问题还是生成问题。LlamaIndex 内置评测模块可以分别测量检索召回率和答案正确率，RAGAS 提供了端到端指标（Faithfulness、Answer Relevancy），Ablation 实验可以量化每次改动的影响（如 SentenceWindow 召回率提升 12%）。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 LlamaIndex 的 RetrieverEvaluator 评测检索精度；结合 RAGAS 计算 Faithfulness/Relevancy 指标；设计 Ablation 实验验证每次策略改进的效果；生成评测报告并定位 RAG 管线瓶颈。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) LlamaIndex 的 RetrieverEvaluator 评测检索（MRR、Recall）；2) RAGAS 的 Faithfulness 衡量答案是否基于检索内容（幻觉检测）；3) Ablation 实验每次只改一个变量（如 window_size），对比基线指标变化；4) 评测集应人工标注 100-200 条 QA 对作为黄金标准；5) 迭代顺序：先优化检索召回率，再优化答案质量。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>LlamaIndex eval 模块</h3>
+      <p><span class="term" data-term-id="retriever-evaluator">RetrieverEvaluator</span> 评测检索器的召回能力。<span class="term" data-term-id="response-evaluator">ResponseEvaluator</span> 评测最终答案质量。两者都需要黄金标准数据集（人工标注的 <code>query → relevant_docs</code> 映射）。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.evaluation import (
+    RetrieverEvaluator,
+    CorrectnessEvaluator,
+    RelevancyEvaluator,
+    FaithfulnessEvaluator
+)
+from llama_index.core.evaluation import (
+    generate_question_context_pairs,
+    EmbeddingQAFinetuneDataset
+)
+from llama_index.llms.openai import OpenAI
+import pandas as pd
+
+# ---- 1. 生成评测集 ----
+# 方法 A：自动生成（LLM 根据文档生成 Q-A 对）
+qa_dataset = generate_question_context_pairs(
+    nodes,                        # 文档 Node
+    llm=OpenAI(model="gpt-4.1"),
+    num_questions_per_chunk=2    # 每个 Node 生成 2 个问题
+)
+
+# 方法 B：人工标注（推荐，准确性更高）
+# qa_dataset = EmbeddingQAFinetuneDataset.from_json("eval_dataset.json")
+# 格式: {"queries": {"q1": "年假几天?", "q2": "..."},
+#        "relevant_docs": {"q1": ["node_123"], "q2": ["node_456"]}}
+
+# ---- 2. 评测检索器 ----
+retriever_eval = RetrieverEvaluator.from_metric_names(
+    ["mrr", "recall", "precision"],
+    retriever=retriever
+)
+
+eval_results = await retriever_eval.aevaluate_dataset(qa_dataset)
+df = pd.DataFrame([{
+    "query": r.query,
+    "mrr": r.metric_vals_dict["mrr"],
+    "recall": r.metric_vals_dict["recall_at_5"],
+    "precision": r.metric_vals_dict["precision_at_5"]
+} for r in eval_results])
+print(df.describe())
+# MRR: 0.85 ± 0.12  |  Recall@5: 0.78 ± 0.15
+
+# ---- 3. 评测答案质量 ----
+correctness_eval = CorrectnessEvaluator(llm=OpenAI(model="gpt-4.1"))
+relevancy_eval = RelevancyEvaluator(llm=OpenAI(model="gpt-4.1"))
+faithfulness_eval = FaithfulnessEvaluator(llm=OpenAI(model="gpt-4.1"))
+
+for query, expected in test_set.items():
+    response = query_engine.query(query)
+    result = faithfulness_eval.evaluate(
+        query=query,
+        response=str(response),
+        contexts=[n.text for n in response.source_nodes]
+    )
+    print(f"Faithfulness: {result.passing} — {result.feedback}")</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>评测器</th><th>测量什么</th><th>分数范围</th><th>目标值</th></tr></thead>
+        <tbody>
+          <tr><td>RetrieverEvaluator (MRR)</td><td>第一个正确答案的排序位置</td><td>0-1</td><td>>0.85</td></tr>
+          <tr><td>RetrieverEvaluator (Recall@5)</td><td>top-5 中包含正确答案的比例</td><td>0-1</td><td>>0.80</td></tr>
+          <tr><td>CorrectnessEvaluator</td><td>答案与标准答案的语义一致度</td><td>1-5</td><td>>4.0</td></tr>
+          <tr><td>RelevancyEvaluator</td><td>答案是否回答了问题</td><td>pass/fail</td><td>>90% pass</td></tr>
+          <tr><td>FaithfulnessEvaluator</td><td>答案是否基于检索内容（无幻觉）</td><td>pass/fail</td><td>>95% pass</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>上线前评测：用 200 条黄金标准 QA 对（HR 手册 100 条 + IT 指南 60 条 + 产品文档 40 条）。首次 MRR 只有 0.65（检索召回不足），优化 SentenceWindow 后达到 0.83，再优化嵌入模型维度（1536→512）后 MRR 略微下降至 0.81 但速度提升 40%，性价比可接受。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>与 RAGAS 结合</h3>
+      <p><span class="term" data-term-id="ragas">RAGAS</span> 是一个专注于 RAG 评估的开源框架，提供更细粒度的指标。LlamaIndex 可以通过 <code>llama_index.core.evaluation.RagasEvaluatorPack</code> 或直接使用 RAGAS 库集成。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># pip install ragas llama-index-llms-openai
+
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    context_precision,
+    context_recall,
+    answer_correctness
+)
+from datasets import Dataset
+import pandas as pd
+
+# 准备评测数据
+eval_data = {
+    "question": ["年假几天?", "VPN 怎么配置?", ...],
+    "answer": [response1, response2, ...],         # 系统输出
+    "contexts": [[ctx1], [ctx2], ...],              # 检索到的文本
+    "ground_truth": ["工作满一年可享5天年假", ...],  # 标准答案
+}
+
+dataset = Dataset.from_dict(eval_data)
+
+# RAGAS 评测
+result = evaluate(
+    dataset,
+    metrics=[
+        faithfulness,          # 答案是否基于 context
+        answer_relevancy,      # 答案与问题相关性
+        context_precision,     # context 中相关信息比例
+        context_recall,        # 标准答案信息是否被 context 覆盖
+        answer_correctness     # 答案与标准答案的一致性
+    ]
+)
+
+df = result.to_pandas()
+print(df[["faithfulness", "context_recall", "answer_correctness"]].mean())
+# faithfulness: 0.92 | context_recall: 0.78 | answer_correctness: 0.85</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>只用人工评测</h4><p>每次改动需要 2 人天评测 200 条 QA，反馈周期长。迭代频率：每周 1-2 次。容易遗漏边缘 case。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>RAGAS 自动评测</h4><p>每次改动 3 分钟完成 200 条自动化评测，反馈即时。迭代频率：每天 5-10 次。自动发现 faithfulness 下降等退化问题。</p></div>
+      </div>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：RAGAS 的 faithfulness 和 context_recall 有什么区别？</summary><p>Faithfulness 衡量"答案中的每句话是否都能在检索到的 context 中找到支持"——如果有回答"5 天年假"但 context 中只有"年假"没有"5 天"，则 faithfulness 低。Context_recall 衡量"标准答案的信息是否被检索到的 context 覆盖"——标准答案有"5 天"和"年假"两个信息点，如果 context 只包含"年假"没有"5 天"，则 context_recall 低。简单区别：faithfulness = 答案没说 context 没有的；context_recall = context 包含了答案需要的。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Ablation 实验设计</h3>
+      <p><span class="term" data-term-id="ablation">Ablation</span> 实验（消融实验）每次只改动一个变量，测量其对指标的影响。这是 RAG 管线优化的核心方法。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    BL[基线: VectorStoreIndex] -->|A1: +SentenceWindow| A1R[MRR: 0.72→0.83]
+    BL -->|A2: +Reranker| A2R[MRR: 0.72→0.80]
+    BL -->|A3: +Hybrid 检索| A3R[Recall: 0.70→0.78]
+    A1R -->|A4: 组合全部| ALL[MRR: 0.88<br/>Recall: 0.85]
+    A2R --> ALL
+    A3R --> ALL
+    BL -->|A5: 维度 1536→512| A5R[MRR: 0.72→0.70<br/>Speed: +40%]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">import json
+from dataclasses import dataclass, asdict
+
+@dataclass
+class AblationConfig:
+    name: str
+    window_size: int = 0
+    reranker: bool = False
+    hybrid: bool = False
+    embedding_dim: int = 1536
+
+def run_ablation(cfg: AblationConfig) -> dict:
+    """运行一次 Ablation 实验，返回评测指标"""
+    # 1. 构建配置对应的管线
+    config = build_pipeline_config(cfg)
+
+    # 2. 构建索引
+    index = build_index(config)
+
+    # 3. 评测
+    retriever = index.as_retriever(similarity_top_k=5)
+    eval_results = await retriever_eval.aevaluate_dataset(qa_dataset)
+
+    return {
+        "mrr": eval_results["mrr"].mean(),
+        "recall@5": eval_results["recall_at_5"].mean(),
+        "latency_ms": measure_latency(index)  # 平均查询延迟
+    }
+
+# 运行 Ablation 实验序列
+experiments = [
+    AblationConfig(name="baseline"),
+    AblationConfig(name="+sentence_window", window_size=3),
+    AblationConfig(name="+reranker", window_size=3, reranker=True),
+    AblationConfig(name="+hybrid", window_size=3, reranker=True, hybrid=True),
+    AblationConfig(name="dim512", window_size=3, embedding_dim=512),
+]
+
+results = [asdict(cfg) | run_ablation(cfg) for cfg in experiments]
+with open("ablation_results.json", "w") as f:
+    json.dump(results, f, indent=2, ensure_ascii=False)
+
+print(pd.DataFrame(results)[["name", "mrr", "recall@5", "latency_ms"]])</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>评测报告模板</h3>
+      <p>评测报告需要包含实验配置、指标数据和分析结论，便于团队决策和后续对比。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def generate_eval_report(results: list[dict], output_path: str):
+    """生成 Markdown 格式的评测报告"""
+    df = pd.DataFrame(results)
+
+    report = f"""# RAG 管线评测报告
+## 配置说明
+- 数据集: {len(qa_dataset.queries)} 条黄金标准 QA
+- 评测日期: 2026-05-30
+- 基线版本: v2.1.0
+- 嵌入模型: text-embedding-3-small (dim={df.iloc[0]['embedding_dim']})
+
+## Ablation 结果
+
+| 实验 | MRR | Recall@5 | 延迟(ms) | vs 基线 |
+"""
+    baseline_mrr = df.iloc[0]['mrr']
+    for _, row in df.iterrows():
+        change = f"+{row['mrr']-baseline_mrr:.3f}" if row['mrr'] >= baseline_mrr else f"{row['mrr']-baseline_mrr:.3f}"
+        report += f"| {row['name']} | {row['mrr']:.3f} | {row['recall@5']:.3f} | {row['latency_ms']:.0f} | {change} |\n"
+
+    report += f"""
+## 结论
+- 最优配置: SentenceWindow + Reranker + Hybrid
+- 相比基线 MRR 提升: {(df.iloc[3]['mrr']-baseline_mrr)/baseline_mrr*100:.1f}%
+- 推荐生产配置: SentenceWindow + Hybrid（延迟增量 <100ms，MRR 提升 >15%）
+"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f"报告已生成: {output_path}")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>LlamaIndex RetrieverEvaluator 测量 MRR 和 Recall，ResponseEvaluator 测量正确性和忠实度</li>
+        <li>RAGAS 的 Faithfulness 和 Context Recall 分别从"答案不超纲"和"上下文覆盖全"两个角度评测 RAG</li>
+        <li>Ablation 实验每次只改一个变量，定量分析每个策略的独立贡献</li>
+        <li>评测集是评测的基石，推荐 200 条人工标注的黄金标准 QA 对</li>
+        <li>迭代顺序：先优化检索指标（MRR >0.85），再优化答案质量（Faithfulness >0.95）</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-03-1"> 我能用 RetrieverEvaluator 评测检索器的 MRR 和 Recall</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-2"> 我能用 RAGAS 计算 Faithfulness/Context Recall/Answer Correctness</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-3"> 我能设计 Ablation 实验验证每个策略改进的效果</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-4"> 我能根据评测结果定位 RAG 管线瓶颈（检索还是生成）</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-5"> 我能生成结构化的评测报告并给出优化建议</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>MRR</td><td>Mean Reciprocal Rank，第一个正确答案的排序倒数均值</td></tr>
+            <tr><td>Recall@K</td><td>Top-K 中包含正确答案的比例</td></tr>
+            <tr><td>Faithfulness</td><td>答案是否全部基于检索上下文（无幻觉）</td></tr>
+            <tr><td>Context Recall</td><td>检索上下文是否覆盖标准答案所需信息</td></tr>
+            <tr><td>Answer Correctness</td><td>答案与标准答案的语义一致度</td></tr>
+            <tr><td>Ablation</td><td>每次移除或改变一个变量，测量其对指标的影响</td></tr>
+            <tr><td>RAGAS</td><td>RAG Assessment，端到端 RAG 评测框架</td></tr>
+            <tr><td>黄金标准</td><td>人工标注的 query→relevant_docs 映射，评测的标准参照</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>如果 RAG 评测显示 MRR 高（0.85）但 Faithfulness 低（0.60），问题出在哪？怎么修？</summary><p>MRR 高表示检索器找到了正确答案，但 Faithfulness 低表示最终答案存在幻觉（回答了检索内容之外的信息）。问题在合成阶段（ResponseSynthesizer）不在检索阶段。修复方法：1) 缩小 response_mode（从 tree_summarize 切换到 compact，减少 LLM 自由发挥空间）；2) 在 prompt 中强调"只基于检索内容回答，不知道就说不知道"；3) 增加 SimilarityPostprocessor 过滤低分 Node（>0.75），减少噪音输入导致的幻觉。</p></details>
+        <details><summary>Ablation 实验中发现 +Reranker 使 MRR 提升了但 Recall 下降了，怎么理解？</summary><p>Reranker 对检索结果重新排序，把最相关的提到前面（提升 MRR），但同时也过滤了部分可能相关的结果（降低 Recall）。这是排序质量 vs 召回覆盖率的固有权衡。对于 CorpAssist 客服场景，MRR 更重要（用户更关注前几个结果），所以接受 Recall 的小幅下降。但如果场景需要穷举所有相关信息（如合规审查），则需要降低 Reranker 的 top_n 值或不用 Reranker。</p></details>
+        <details><summary>RAGAS 的 context_precision 和 MRR 有什么区别？</summary><p>MRR 关注第一个正确答案的位置，不考虑其他结果的准确性。Context Precision 关注所有检索结果中相关信息（有用）占全部结果的比例，考虑精度。举例：检索到 5 条，只有第 1 条相关 → MRR=1.0（完美），context_precision=0.2（低）。两者互补：MRR 衡量是否能把正确答案排到前面，context_precision 衡量是否带了噪音。CorpAssist 要求 MRR>0.85 且 context_precision>0.6。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/evaluating/" target="_blank" rel="noopener">LlamaIndex 评测文档</a> — 所有评测器的使用方法和参数说明</li>
+      <li><a href="https://docs.ragas.io/" target="_blank" rel="noopener">RAGAS 官方文档</a> — 指标公式、评测集格式、最佳实践</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/evaluation/ablation/" target="_blank" rel="noopener">Ablation 实验示例</a> — 使用 LlamaIndex 进行结构化消融实验</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>用 20 个文档生成 40 条 QA 对的评测集（用 generate_question_context_pairs）</li>
+        <li>运行 RetrieverEvaluator 评测检索器，记录 MRR 和 Recall@5</li>
+        <li>安装 RAGAS，计算 Faithfulness 和 Context Recall，分析结果</li>
+        <li>设计 3 个 Ablation 实验（基线 / +SentenceWindow / +Reranker），对比指标变化</li>
+        <li>生成评测报告，给出 CorpAssist 检索管线的优化建议</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Ablation 结果显示 +Reranker 使延迟增加了 500ms 但 MRR 只提升了 0.02，怎么决策？</summary><p>对于 CorpAssist 的在线场景，推荐不加 Reranker。500ms 延迟会显著影响用户体验（SLA 是 3 秒），而 MRR 收益 0.02 的实际体验差异很小。如果离线分析场景（如批量处理历史数据），可以加 Reranker 追求极致精度。替代方案：用使用更快的 Reranker 模型（如 BGE-reranker-v2-m3 比 cross-encoder 快 2 倍），或者只在复杂查询上启用 Reranker（通过 RouterQueryEngine 分流）。</p></details>
+      <details><summary>场景：Automatic 评测（RAGAS）分数高，但人工评测发现很多答案不正确，哪里出了问题？</summary><p>典型问题：RAGAS 的 LLM-as-judge 有偏差。1) 评测 LLM 偏好较长、格式漂亮的答案（长度偏差）；2) 评测 LLM 与回答 LLM 使用相同模型家族（模型偏差）；3) 黄金标准 QA 对覆盖不全（评测集偏差）。修复：1) 用不同模型做 judge（如 DeepSeek 评测 GPT 输出）；2) 人工抽检 10% 的评测结果校准 RAGAS 分数；3) 定期更新评测集，覆盖更多边缘 case。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-03-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>生成 20 条 QA 对的评测集，格式符合 EmbeddingQAFinetuneDataset 标准</li>
+        <li>RetrieverEvaluator 输出 MRR 和 Recall@5 的均值和标准差</li>
+        <li>Ablation 实验报告包含至少 3 组对比的科学数据和结论</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-02">Agent + Tools 集成</a></li>
+      <li>下一篇：<a href="#ch-practice-04">多知识库与路由</a> — 学习多租户索引隔离和意图路由</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,373 @@
+<section id="ch-basics-04" class="chapter" data-chapter="basics-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>查询引擎与路由</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>LlamaIndex 核心抽象</strong> · 能力：掌握多种查询引擎、路由策略、响应合成模式</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 的查询场景很复杂：有的问题需要单一知识库回答，有的需要跨多份文档综合答案，有的需要先理解再拆解为子问题逐个回答。LlamaIndex 提供了 RouterQueryEngine、SubQuestionQueryEngine、RetrieverQueryEngine 等多种查询引擎，选对了查询引擎能让答案准确率提升 30% 以上。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>配置 RouterQueryEngine 根据意图路由到不同索引；用 SubQuestionQueryEngine 拆解复杂问题；选择正确的响应合成模式（compact/tree_summarize/accumulate）；将 LlamaIndex 查询引擎与 Spring AI 查询模式对照。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) RetrieverQueryEngine = Retriever + ResponseSynthesizer 的组合；2) RouterQueryEngine 用选择器（LLM/Embedding）决定路由目标；3) SubQuestionQueryEngine 将复杂问题拆解为子问题并行检索；4) 响应合成模式影响答案质量和 Token 消耗；5) Spring AI 的 QueryExecutor 类似 LlamaIndex 的 query engine，但缺少路由和子查询能力。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>查询引擎架构</h3>
+      <p><span class="term" data-term-id="query-engine">QueryEngine</span> 是 LlamaIndex 的查询入口，核心流程是：接收查询 → 检索相关 Node → 合成答案。每个 Index 都有 <code>as_query_engine()</code> 方法，但 LlamaIndex 也提供了独立的高级查询引擎。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    Q[用户查询] --> QE[QueryEngine]
+    subgraph QueryEngine 内部
+        QE --> R[Retriever]
+        R -->|检索 Node| RS[ResponseSynthesizer]
+        RS -->|合成| A[Answer]
+    end
+    subgraph 高级引擎
+        REQ[RouterQueryEngine] -->|选择子引擎| QE1[QueryEngine A]
+        REQ -->|或| QE2[QueryEngine B]
+        SEQ[SubQuestionQueryEngine] -->|拆解为子问题| SQ1[子问题1]
+        SEQ -->|拆解| SQ2[子问题2]
+        SQ1 --> QE
+        SQ2 --> QE
+    end
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.response_synthesizers import CompactAndRefine
+from llama_index.core import VectorStoreIndex
+
+index = VectorStoreIndex.from_documents(documents)
+
+# 方式 1：Index 快捷方式
+engine1 = index.as_query_engine(
+    similarity_top_k=3,
+    response_mode="compact",
+    streaming=False
+)
+
+# 方式 2：显式构造（可精细控制检索和合成）
+retriever = index.as_retriever(similarity_top_k=5)
+synthesizer = CompactAndRefine(verbose=True)
+engine2 = RetrieverQueryEngine.from_args(
+    retriever=retriever,
+    response_synthesizer=synthesizer
+)
+
+# 方式 3：自定义 Node 后处理
+from llama_index.core.postprocessor import SimilarityPostprocessor
+engine3 = RetrieverQueryEngine.from_args(
+    retriever=retriever,
+    node_postprocessors=[
+        SimilarityPostprocessor(similarity_cutoff=0.7)  # 过滤低分 Node
+    ]
+)
+
+# 三种方式相同接口
+resp = engine2.query("CorpAssist 支持哪些功能?")
+print(f"回答: {resp}")
+print(f"来源: {[n.node_id for n in resp.source_nodes]}")</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>引擎类型</th><th>适用场景</th><th>关键配置</th><th>延迟预期</th></tr></thead>
+        <tbody>
+          <tr><td>RetrieverQueryEngine</td><td>单索引检索问答</td><td>retriever + synthesizer</td><td>0.5-2s</td></tr>
+          <tr><td>RouterQueryEngine</td><td>多索引按意图路由</td><td>selector + tools 列表</td><td>1-4s（含选择延迟）</td></tr>
+          <tr><td>SubQuestionQueryEngine</td><td>多步复杂问题拆解</td><td>子引擎 + LLM 拆解</td><td>3-8s（并行子问题）</td></tr>
+          <tr><td>RetrieverToolQueryEngine</td><td>Agent 内部工具调用</td><td>作为 Tool 注册给 Agent</td><td>取决于 Agent 调度</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>RouterQueryEngine 实现路由</h3>
+      <p><span class="term" data-term-id="router-query-engine">RouterQueryEngine</span> 的核心是选择器（<span class="term" data-term-id="selector">Selector</span>）。选择器读取每个子引擎的描述（ToolMetadata.description），判断当前查询最适合哪个引擎。选择器有 LLMSingleSelector（高准确率）、PydanticSingleSelector（结构约束）、EmbeddingSingleSelector（低延迟）三种。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.query_engine import RouterQueryEngine
+from llama_index.core.selectors import (
+    LLMSingleSelector,
+    PydanticSingleSelector,
+    EmbeddingSingleSelector
+)
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+
+# 工具描述（关键：选择器根据 description 决策）
+tools = [
+    QueryEngineTool(
+        query_engine=hr_engine,
+        metadata=ToolMetadata(
+            name="hr_policy",
+            description="HR 政策相关查询：请假、年假、考勤、薪酬、入职离职等人力资源政策"
+        )
+    ),
+    QueryEngineTool(
+        query_engine=it_guide_engine,
+        metadata=ToolMetadata(
+            name="it_guide",
+            description="IT 技术指南：系统权限、VPN、邮箱配置、软件安装等 IT 运维问题"
+        )
+    ),
+    QueryEngineTool(
+        query_engine=summary_engine,
+        metadata=ToolMetadata(
+            name="summarize",
+            description="文档内容总结、汇总、概括类查询，如'总结XX文档'"
+        )
+    )
+]
+
+# LLM 选择器（推荐，准确率高）
+router = RouterQueryEngine(
+    selector=LLMSingleSelector.from_defaults(),
+    query_engine_tools=tools,
+    verbose=True
+)
+
+# 查询测试
+resp = router.query("怎么申请年假")
+# [Router] 选择: hr_policy (score=0.92)
+print(resp)</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>描述不够具体</h4><p>"HR policies about employees" — 选择器可能把"请假"这类查询路由到默认引擎。<br>分数：无法区分 HR 和 IT 类问题。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>描述具体精确</h4><p>"HR 政策相关查询：请假、年假、考勤、薪酬、入职离职等人力资源政策" — 选择器根据关键词"请假""年假"准确匹配。<br>分数选择准确率 96%。</p></div>
+      </div>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：什么情况下 EmbeddingSingleSelector 比 LLMSingleSelector 更合适？</summary><p>当延迟要求高且路由类别差异明显时。EmbeddingSingleSelector 将描述文本和查询都嵌入为向量，计算余弦相似度选择最匹配的，延迟仅 50-100ms（vs LLM 的 1-2s）。但准确率约 85-90%（vs 96%+）。适合场景：CorpAssist 中"IT 问题"和"HR 问题"描述差异大，Embedding 就能区分，不需要 LLM 推理。混合策略：先用 Embedding 快速筛选 2-3 个候选，再用 LLM 从中选择最优。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>SubQuestionQueryEngine 与子问题拆解</h3>
+      <p><span class="term" data-term-id="sub-question-query-engine">SubQuestionQueryEngine</span> 专门处理需要多步推理的问题。它将复杂问题拆解为多个子问题，每个子问题独立检索，最后汇总答案。其实现依赖 LLM 做三步操作：拆解（分解问题）→ 执行（并行检索）→ 合成（合并答案）。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant SQE as SubQuestionEngine
+    participant LLM as LLM
+    participant DR as 文档检索
+    U->>SQE: "HR 的年假政策和 IT 的 VPN 指南?"
+    SQE->>LLM: 拆解问题为子问题
+    LLM-->>SQE: Q1: 年假政策是什么<br/>Q2: VPN 指南内容
+    par 并行检索
+        SQE->>DR: 检索"年假政策"
+        SQE->>DR: 检索"VPN 指南"
+    end
+    DR-->>SQE: HR 手册第3章
+    DR-->>SQE: IT 指南第5节
+    SQE->>LLM: 合成两个答案
+    LLM-->>SQE: 综合回答
+    SQE-->>U: 最终答案
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.query_engine import SubQuestionQueryEngine
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+
+# 为每个子知识库创建工具
+tools = [
+    QueryEngineTool(
+        query_engine=hr_engine,
+        metadata=ToolMetadata(name="hr", description="HR 政策文档")
+    ),
+    QueryEngineTool(
+        query_engine=it_engine,
+        metadata=ToolMetadata(name="it", description="IT 技术文档")
+    ),
+]
+
+# 子问题引擎
+sub_question_engine = SubQuestionQueryEngine.from_defaults(
+    query_engine_tools=tools,
+    llm=llm,  # 用于拆解和合成的 LLM
+    verbose=True,
+    use_async=True  # 子问题并行执行
+)
+
+# 复杂问题自动拆解
+resp = sub_question_engine.query(
+    "比较 HR 手册中的年假政策和 IT 指南中的 VPN 配置要求"
+)
+
+# 输出示例：
+# >> 生成 2 个子问题
+# >> [Q1] HR 手册中的年假政策是什么？
+# >> [Q2] IT 指南中的 VPN 配置要求是什么？
+# >> 合并结果中...</pre></code>
+      </div>
+      <table class="learn-decision-table">
+        <thead><tr><th>问题类型</th><th>引擎选择</th><th>原因</th></tr></thead>
+        <tbody>
+          <tr><td>"年假几天"</td><td>RetrieverQueryEngine</td><td>简单问题，一次检索即可</td></tr>
+          <tr><td>"年假政策和产假政策分别是什么"</td><td>SubQuestionQueryEngine</td><td>两个独立子问题，并行检索更高效</td></tr>
+          <tr><td>"HR 手册说了什么"</td><td>RouterQueryEngine → SummaryEngine</td><td>"说了什么"是总结意图，路由到 SummaryIndex</td></tr>
+          <tr><td>"对比 HR 的年假和 IT 的 VPN"</td><td>SubQuestionQueryEngine</td><td>跨文档对比，需要拆分为子问题再比较</td></tr>
+          <tr><td>"年假政策和 VPN 配置"</td><td>SubQuestionQueryEngine</td><td>涉及不同知识库、不同文档类型</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>响应合成模式与 Spring AI 对照</h3>
+      <p>LlamaIndex 的 <span class="term" data-term-id="response-synthesizer">ResponseSynthesizer</span> 负责将检索到的 Node 合成为最终答案。有 5 种模式，影响答案质量和 Token 消耗。同时与 Spring AI 的查询模式做对照。</p>
+      <table class="outline-table">
+        <thead><tr><th>模式</th><th>工作机制</th><th>Token 消耗</th><th>适用场景</th></tr></thead>
+        <tbody>
+          <tr><td>compact</td><td>Node 文本拼接后一次调用</td><td>低（1 次 LLM 调用）</td><td>Node 数量少（<8），单次能放得下</td></tr>
+          <tr><td>refine</td><td>逐 Node 提炼，先结合第一个，叠加第二个修正</td><td>中（N 次调用）</td><td>Node 量大但需要逐步细化答案</td></tr>
+          <tr><td>tree_summarize</td><td>递归两两合并</td><td>中（logN 次调用）</td><td>大量 Node（20+），需要全面摘要</td></tr>
+          <tr><td>accumulate</td><td>逐 Node 独立回答后合并</td><td>高（N+1 次调用）</td><td>需要每个 Node 单独处理后再聚合</td></tr>
+          <tr><td>compact_accumulate</td><td>分组拼接后逐组回答</td><td>中（分组数+1 次调用）</td><td>Node 可分组，各组的答案独立</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>Spring AI QueryExecutor</h4><p>Spring AI 的 <code>SearchRequest</code> 只能指定 vectorStore 和 topK，不支持路由、子查询或响应合成策略。复杂查询需要在 Java 侧手动编排多个 <code>SearchRequest</code> 调用。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>LlamaIndex QueryEngine</h4><p>提供 5 种合成模式 + 路由 + 子查询，通过 <code>response_mode</code> 参数一键切换。与 Spring AI 的桥接：LlamaIndex 的 QueryEngine 作为 Python 侧检索服务，通过 FastAPI 暴露 <code>/api/v1/query</code> 接口供 Spring AI 调用。</p></div>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># FastAPI 桥接：为 Spring AI 提供查询接口
+from fastapi import FastAPI
+from pydantic import BaseModel
+from llama_index.core.query_engine import RetrieverQueryEngine
+
+app = FastAPI()
+
+class QueryRequest(BaseModel):
+    question: str
+    mode: str = "compact"  # compact/refine/tree_summarize
+    top_k: int = 5
+    tenant_id: str
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: list[dict]
+    token_usage: int
+
+@app.post("/api/v1/query", response_model=QueryResponse)
+async def query_rag(req: QueryRequest):
+    # 根据租户选择索引
+    engine = get_tenant_engine(req.tenant_id)
+    engine.response_synthesizer.mode = req.mode
+
+    resp = await engine.aquery(req.question)
+    return QueryResponse(
+        answer=str(resp),
+        sources=[{"node_id": n.node_id, "score": n.score} for n in resp.source_nodes],
+        token_usage=resp.metadata.get("token_usage", 0)
+    )
+
+# Spring AI 侧调用（Java）
+# RestTemplate.postForObject(
+#     "http://python-rag:8000/api/v1/query",
+#     new QueryRequest("年假政策", "compact", 5, "tenant_hr"),
+#     QueryResponse.class
+# )</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>QueryEngine 由 Retriever + ResponseSynthesizer 组成，可通过 as_query_engine() 或显式构造</li>
+        <li>RouterQueryEngine 选择器的 description 质量直接影响路由准确率，建议用 LLMSingleSelector（96%+）</li>
+        <li>SubQuestionQueryEngine 将复杂问题自动拆解为子问题并行检索，适合跨域对比类问题</li>
+        <li>响应合成模式 compact 最省 Token，tree_summarize 最适合大量 Node 的摘要场景</li>
+        <li>LlamaIndex 查询引擎通过 FastAPI 与 Spring AI 桥接，Python 侧负责检索+合成，Java 侧负责对话编排</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-04-1"> 我能说出 QueryEngine 的三层结构（Retriever → Synthesizer → Answer）</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-2"> 我能用 RouterQueryEngine 配置多索引路由，验证路由结果准确</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-3"> 我能用 SubQuestionQueryEngine 处理跨文档对比查询</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-4"> 我能选择正确的 response_mode 并说明理由</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-5"> 我能用 FastAPI 封装 QueryEngine 供 Spring AI 调用</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>QueryEngine</td><td>LlamaIndex 查询入口，组合检索和合成</td></tr>
+            <tr><td>RouterQueryEngine</td><td>根据意图路由到不同子引擎</td></tr>
+            <tr><td>SubQuestionQueryEngine</td><td>拆解复杂问题为子问题并行检索</td></tr>
+            <tr><td>ResponseSynthesizer</td><td>Node 到最终答案的合成器，5 种模式</td></tr>
+            <tr><td>LLMSingleSelector</td><td>用 LLM 选择路由目标，准确率高</td></tr>
+            <tr><td>compact</td><td>拼接 Node 后单次调用 LLM 合成</td></tr>
+            <tr><td>tree_summarize</td><td>递归合并摘要，适合大量 Node</td></tr>
+            <tr><td>SimilarityPostprocessor</td><td>按分数阈值过滤检索结果</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>RouterQueryEngine 和 SubQuestionQueryEngine 的区别是什么？各自适用什么场景？</summary><p>RouterQueryEngine 是"按意图分发"：查询进入后，选择器判定它适合哪个引擎，然后该引擎独立处理。适合查询内容明确指向某个知识领域。SubQuestionQueryEngine 是"分解后组合"：查询被拆为多个子问题，每个子问题分配到不同引擎，结果再合并。适合跨域查询。举例：Router 用于"年假政策"（单一意图路由到 HR），SubQuestion 用于"对比 HR 年假和 IT VPN"（两个实体需要分别检索再比较）。</p></details>
+        <details><summary>compact 和 refine 两种响应合成模式在 Token 消耗和答案质量上的差异？</summary><p>compact 将所有检索到的 Node 文本拼接后一次性送入 LLM，单次调用 context window 内处理。Token 消耗低（1 次 LLM 调用 + 拼接文本）。但若 Node 总量超过 context window（如 128K），会截断尾部。refine 逐个 Node 处理：先用第一个 Node 生成初始答案，然后用第二个 Node 修正，依此类推。Token 消耗高（N 次 LLM 调用），但不会截断。CorpAssist 场景：top_k=5 时用 compact（单次能放下）；top_k=20 且每个 Node 很长时用 refine。</p></details>
+        <details><summary>Spring AI 的 QueryExecutor 与 LlamaIndex 相比缺少什么能力？如何双栈补齐？</summary><p>Spring AI 的 QueryExecutor 只提供了简单的 vectorStore.similaritySearch + 直接拼接发送给 LLM。缺少：1) 多种响应合成模式（只能简单拼接）；2) 路由能力（只能对单一 VectorStore 操作）；3) 子查询拆解；4) Node 后处理器（无法过滤低分结果）。补齐方案：Python 侧用 LlamaIndex QueryEngine 封装所有能力，暴露 HTTP API，Java 侧用 RestTemplate 或 WebClient 调用。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/querying/engine/" target="_blank" rel="noopener">LlamaIndex 查询引擎文档</a> — 所有引擎类型的详细说明和参数</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/query_engine/RouterQueryEngine/" target="_blank" rel="noopener">RouterQueryEngine 示例</a> — 选择器调优和工具描述编写指南</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/response_synthesizers/" target="_blank" rel="noopener">响应合成模式对比</a> — 5 种模式在同一查询上的效果和 Token 消耗对比</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>用 VectorStoreIndex 创建两个子索引（HR 和 IT），分别 as_query_engine()</li>
+        <li>用 RouterQueryEngine 配置 LLMSingleSelector，测试路由准确率</li>
+        <li>用 SubQuestionQueryEngine 执行跨文档对比查询</li>
+        <li>切换 response_mode（compact/refine/tree_summarize），对比答案质量和 Token 消耗</li>
+        <li>用 FastAPI 暴露 /api/v1/query 接口，用 curl 测试</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：RouterQueryEngine 总是把"VPN 配置"查询路由到 HR 引擎而不是 IT 引擎，可能的原因和修复方法？</summary><p>原因：IT 引擎的 ToolMetadata.description 不够具体，没有包含"VPN""配置""网络"等关键词。LLM 选择了描述中"包含类似名词较多的" HR 引擎。修复方法：将 IT 引擎描述改为"IT 网络与系统配置：VPN 配置、邮箱设置、系统权限申请、软件安装等企业 IT 技术支持"。确保描述中包含目标查询的关键词。如果仍然路由错误，检查 LLMSingleSelector 使用的 LLM 是否够强（推荐 GPT-4 或 DeepSeek-V3）。</p></details>
+      <details><summary>场景：查询返回答案截断了，原因是 10 个 Node 拼接后超出 128K context window，怎么解决？</summary><p>方案一：切换 response_mode=refine，逐 Node 处理不拼接，不会超长但多轮调用。方案二：用 tree_summarize，递归合并摘要，每次只处理两个 Node 的摘要。方案三：减少 top_k 到 5，降低拼接长度。方案四：增大 chunk_size（从 512 到 1024），减少 Node 数量但保留更多单个 Node 内容。CorpAssist 推荐 tree_summarize + top_k=5，平衡质量和 Token 消耗。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-04-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>RouterQueryEngine 在 10 个测试查询上路由准确率 >= 90%</li>
+        <li>SubQuestionQueryEngine 正确拆解"对比 HR 的年假和 IT 的 VPN"为 2 个子问题</li>
+        <li>compact 和 tree_summarize 模式在相同查询上输出不同长度和格式的答案</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-03">索引类型选型</a></li>
+      <li>下一篇：<a href="#ch-basics-05">Embedding 与向量存储</a> — 学习嵌入模型选择和向量数据库集成</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,425 @@
+<section id="ch-practice-03" class="chapter" data-chapter="practice-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>MCP 协议集成</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>多 Agent 编排与集成</strong> · 能力：实现 MCP Server/Client、工具注册发现、鉴权安全、超时降级</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 需要接入多个外部系统：邮件系统、日历系统、工单系统、审批系统。每个系统都有自己的 API。MCP（Model Context Protocol）提供了统一的标准接口——系统提供方实现 MCP Server，Agent 通过 MCP Client 调用。无需为每个系统写适配器。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 Java 实现 MCP Server 暴露工具；用 MCP Client 发现和调用远程工具；配置 JWT 鉴权和 mTLS；实现超时控制和降级策略。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) MCP = Model Context Protocol，Anthropic 推出的标准工具协议；2) MCP Server 暴露工具列表，Client 发现并调用；3) 鉴权支持 JWT Token 和 mTLS；4) 超时控制分连接超时（5s）和读取超时（30s）；5) 降级策略：MCP 失败时切换到本地缓存或提示用户。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>MCP Server/Client 架构</h3>
+      <p><span class="term" data-term-id="mcp-server">MCP Server</span> 暴露工具和服务描述，<span class="term" data-term-id="mcp-client">MCP Client</span> 发现并调用工具。Agent 作为 MCP Client 连接到各个 MCP Server，实现标准化的工具调用。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    subgraph CorpAssist Agent
+        AG[Agent] --> MCP_CLIENT[MCP Client]
+    end
+    subgraph MCP 服务
+        MCP_CLIENT -->|list_tools| MAIL_SVR[邮件 MCP Server]
+        MCP_CLIENT -->|call_tool| CAL_SVR[日历 MCP Server]
+        MCP_CLIENT -->|list_tools| TICKET_SVR[工单 MCP Server]
+        MCP_CLIENT -->|call_tool| APPR_SVR[审批 MCP Server]
+    end
+    subgraph 鉴权层
+        MAIL_SVR --> JWT[JWT 验证]
+        CAL_SVR --> mTLS[mTLS]
+        TICKET_SVR --> JWT
+        APPR_SVR --> JWT + mTLS
+    end
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 1. MCP Client 配置（Agent 端）
+@Configuration
+public class McpClientConfig {
+
+    @Bean
+    public McpClient mailMcpClient() {
+        return McpClient.builder()
+            .serverUrl("http://mail-mcp:8080")
+            .transport(HttpClientTransport.builder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .readTimeout(Duration.ofSeconds(30))
+                .build())
+            .authProvider(new JwtAuthProvider(
+                "corp-agent", "secret-key"
+            ))
+            .build();
+    }
+
+    @Bean
+    public McpClient calendarMcpClient() {
+        return McpClient.builder()
+            .serverUrl("https://calendar-mcp:8443")
+            .transport(HttpClientTransport.builder()
+                .sslContext(createMtlsContext())  // mTLS
+                .build())
+            .authProvider(new MtlsAuthProvider())
+            .build();
+    }
+}
+
+// 2. Agent 集成 MCP 工具
+@Component
+public class McpToolRegistry {
+
+    private final List<McpClient> mcpClients;
+    private final List<ToolCallback> toolCallbacks = new ArrayList<>();
+
+    @PostConstruct
+    public void discoverTools() {
+        for (McpClient client : mcpClients) {
+            // 发现所有可用工具
+            List<McpTool> tools = client.listTools();
+            for (McpTool tool : tools) {
+                // 注册为 ToolCallback
+                toolCallbacks.add(
+                    new McpToolCallback(client, tool)
+                );
+            }
+        }
+        System.out.println("已发现 " + toolCallbacks.size() + " 个 MCP 工具");
+    }
+
+    @Bean
+    public List<ToolCallback> mcpToolCallbacks() {
+        return toolCallbacks;
+    }
+}
+
+// 3. MCP Server 端（邮件系统方）
+@SpringBootApplication
+@EnableMcpServer
+public class MailMcpServerApplication {
+
+    @Bean
+    public McpServer mailServer() {
+        return McpServer.builder()
+            .name("corp-mail-server")
+            .version("1.0.0")
+            .tools(List.of(
+                new SendEmailTool(),
+                new ReadInboxTool(),
+                new SearchEmailTool()
+            ))
+            .build();
+    }
+
+    @Component
+    public class SendEmailTool implements McpTool {
+        @Override
+        public String getName() { return "send_email"; }
+
+        @Override
+        public String getDescription() {
+            return "发送邮件，支持 HTML 正文和附件";
+        }
+
+        @Override
+        public JsonSchema getInputSchema() {
+            return JsonSchema.builder()
+                .addProperty("to", JsonSchema.string("收件人邮箱"))
+                .addProperty("subject", JsonSchema.string("邮件主题"))
+                .addProperty("body", JsonSchema.string("邮件正文"))
+                .addRequired("to")
+                .addRequired("subject")
+                .build();
+        }
+
+        @Override
+        public McpToolResult execute(Map<String, Object> args) {
+            // 调用真实的邮件服务
+            try {
+                emailService.send(
+                    (String) args.get("to"),
+                    (String) args.get("subject"),
+                    (String) args.get("body")
+                );
+                return McpToolResult.success("邮件已发送");
+            } catch (Exception e) {
+                return McpToolResult.error("发送失败: " + e.getMessage());
+            }
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具注册与发现</h3>
+      <p>MCP 规范定义了标准化的工具注册和发现流程。Server 端通过 <code>McpServer.builder()</code> 注册工具，Client 端通过 <code>listTools()</code> 发现可用工具。</p>
+      <table class="outline-table">
+        <thead><tr><th>MCP 方法</th><th>方向</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>list_tools</td><td>Client → Server</td><td>获取 Server 的所有工具列表</td></tr>
+          <tr><td>call_tool</td><td>Client → Server</td><td>调用指定工具并传入参数</td></tr>
+          <tr><td>list_resources</td><td>Client → Server</td><td>获取 Server 的资源列表（可选）</td></tr>
+          <tr><td>read_resource</td><td>Client → Server</td><td>读取指定资源内容（可选）</td></tr>
+          <tr><td>ping</td><td>双向</td><td>健康检查</td></tr>
+          <tr><td>tool_result</td><td>Server → Client</td><td>工具执行结果返回</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>鉴权与安全</h3>
+      <p>MCP Server 需要鉴权防止未授权调用。支持 JWT Token 和 mTLS 双向认证。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Server 端 JWT 鉴权过滤
+@Component
+public class McpAuthFilter implements WebFilter {
+
+    private final JwtDecoder jwtDecoder;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+        String authHeader = exchange.getRequest()
+            .getHeaders().getFirst("Authorization");
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+
+        try {
+            String token = authHeader.substring(7);
+            Jwt jwt = jwtDecoder.decode(token);
+
+            // 验证 Agent 身份
+            String agentId = jwt.getClaimAsString("agent_id");
+            String tenantId = jwt.getClaimAsString("tenant_id");
+
+            // 注入到请求上下文
+            McpContext.setCurrent(
+                new McpContext(agentId, tenantId)
+            );
+
+            return chain.filter(exchange);
+        } catch (JwtException e) {
+            exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
+            return exchange.getResponse().setComplete();
+        }
+    }
+
+    // Client 端 JWT Provider
+    @Component
+    public class JwtAuthProvider implements AuthProvider {
+
+        @Override
+        public Map<String, String> getAuthHeaders() {
+            String token = Jwts.builder()
+                .claim("agent_id", "corp-main-agent")
+                .claim("tenant_id", TenantContext.getCurrent())
+                .expiration(Date.from(
+                    Instant.now().plus(5, ChronoUnit.MINUTES)))
+                .signWith(SignatureAlgorithm.HS256, secretKey)
+                .compact();
+            return Map.of("Authorization", "Bearer " + token);
+        }
+    }
+}
+
+// mTLS 配置
+@Bean
+public SslContext createMtlsContext() throws Exception {
+    return SslContextBuilder.forClient()
+        .keyManager(
+            new File("client-cert.pem"),
+            new File("client-key.pem")
+        )
+        .trustManager(new File("ca-cert.pem"))
+        .build();
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>超时与降级</h3>
+      <p>MCP 调用可能超时或失败。需要超时控制和降级策略保证 Agent 的可用性。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 带超时和降级的 MCP Client 包装
+@Component
+public class ResilientMcpClient {
+
+    private final McpClient delegate;
+    private final Map<String, Object> localCache = new ConcurrentHashMap<>();
+
+    public ResilientMcpClient(McpClient delegate) {
+        this.delegate = delegate;
+    }
+
+    public McpToolResult callTool(String toolName, Map<String, Object> args) {
+        try {
+            // 超时控制
+            McpToolResult result = delegate.callTool(toolName, args)
+                .timeout(Duration.ofSeconds(10))
+                .block();
+            return result;
+        } catch (TimeoutException e) {
+            // 降级：使用缓存数据
+            Object cached = localCache.get(toolName + ":" + args);
+            if (cached != null) {
+                return McpToolResult.success(cached,
+                    "(缓存数据，可能不是最新)");
+            }
+            return McpToolResult.error("服务超时，请稍后重试");
+        } catch (Exception e) {
+            return McpToolResult.error("服务不可用: " + e.getMessage());
+        }
+    }
+
+    // 健康检查
+    public boolean isHealthy() {
+        try {
+            return delegate.ping().timeout(Duration.ofSeconds(2))
+                .block() != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+
+// 熔断器
+@Component
+public class McpCircuitBreaker {
+
+    private final Map<String, AtomicInteger> failureCounts = new ConcurrentHashMap<>();
+    private final Map<String, Boolean> circuitStates = new ConcurrentHashMap<>();
+    private static final int THRESHOLD = 5;
+    private static final long RESET_TIMEOUT_MS = 30000;
+
+    public boolean isAllowed(String serverName) {
+        if (circuitStates.getOrDefault(serverName, false)) {
+            // 熔断已开启，检查是否到恢复时间
+            return false;
+        }
+        return true;
+    }
+
+    public void recordFailure(String serverName) {
+        int count = failureCounts.computeIfAbsent(
+            serverName, k -> new AtomicInteger()).incrementAndGet();
+        if (count >= THRESHOLD) {
+            circuitStates.put(serverName, true);
+            // 定时恢复
+            scheduler.schedule(() -> {
+                circuitStates.put(serverName, false);
+                failureCounts.get(serverName).set(0);
+            }, RESET_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    public void recordSuccess(String serverName) {
+        failureCounts.getOrDefault(serverName,
+            new AtomicInteger()).set(0);
+    }
+}</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>邮件 MCP Server 部署在邮件系统侧，工单 MCP Server 部署在工单系统侧。Agent 启动时通过 list_tools 发现所有可用的工具。发送邮件时调用 mail-mcp 的 send_email 工具，查工单时调用 ticket-mcp 的 query_ticket 工具。如果某个 MCP Server 不可达（如工单系统维护中），Agent 的熔断器打开该 Server，调用降级逻辑返回"工单系统维护中"。</p>
+      </aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>MCP 协议通过 list_tools/call_tool 标准化工具调用，Server 和 Client 通过 HTTP/SSE 通信</li>
+        <li>工具注册在 Server 端用 @EnableMcpServer 自动扫描，Client 端用 listTools() 发现</li>
+        <li>鉴权支持 JWT Token（客户端身份验证）和 mTLS（双向证书认证）</li>
+        <li>超时控制连接 5s + 读 30s，熔断器 5 次失败开启 30s，降级返回提示或缓存</li>
+        <li>CorpAssist 4 个 MCP Server（邮件/日历/工单/审批），Agent 通过 MCP Client 统一接入</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="practice-03-1"> 我能用 Java 实现 MCP Server 暴露工具</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-2"> 我能用 MCP Client 发现和调用远程工具</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-3"> 我能配置 JWT 鉴权和 mTLS</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-4"> 我能实现超时控制和熔断降级</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-5"> 我能解释 MCP 的 6 个核心方法</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>MCP Server</td><td>暴露工具列表和调用端点的服务器</td></tr>
+            <tr><td>MCP Client</td><td>发现和调用 MCP 工具的客户端</td></tr>
+            <tr><td>list_tools</td><td>获取 Server 所有可用工具的 API</td></tr>
+            <tr><td>call_tool</td><td>调用指定工具的 API</td></tr>
+            <tr><td>JWT Auth</td><td>JSON Web Token 鉴权</td></tr>
+            <tr><td>mTLS</td><td>双向 TLS 证书认证</td></tr>
+            <tr><td>@EnableMcpServer</td><td>启用 MCP Server 自动配置</td></tr>
+            <tr><td>McpToolCallback</td><td>将 MCP 工具包装为 Spring AI ToolCallback</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>MCP 协议和 OpenAPI（Swagger）有什么区别？为什么要用 MCP 而不是直接调 REST API？</summary><p>MCP 和 OpenAPI 目标不同。OpenAPI 描述"静态的 HTTP API 接口"，适合手工或代码调用。MCP 描述"LLM 可调用的工具"，包含工具的描述、参数 Schema、调用逻辑，专门为 LLM 优化。区别：1) MCP 的 tool description 和参数 description 让 LLM 理解何时调用；2) MCP 的 list_tools 动态发现，OpenAPI 需要编译期生成；3) MCP 支持标准化鉴权握手。CorpAssist 中，底层系统接口用 OpenAPI 文档化，面向 Agent 的接口用 MCP。</p></details>
+        <details><summary>MCP Server 如何保证工具执行结果的实时性？缓存怎么处理？</summary><p>MCP 没有内置缓存机制。实时性由工具实现者保证。策略：1) 读操作（查询类）——MCP Server 内部可以做短时缓存（如 30 秒），减少重复查询；2) 写操作（创建/修改）——直接操作真实数据源，不缓存；3) 在工具返回结果中标记"cached_at"时间戳，让 Client 端知道数据的时效性。Agent 端根据查询类型判断：查询"我的工单"可以直接用缓存（30秒内），"发邮件"必须实时。</p></details>
+        <details><summary>多个 Agent 共用一个 MCP Server 时，怎么防止相互影响？</summary><p>隔离策略：1) Agent ID 标帜——每个 MCP 请求携带 X-Agent-Id header，Server 端按 Agent ID 做资源隔离（如 Redis key 前缀）；2) 租户隔离——Server 端从 JWT Token 提取 tenant_id，限制请求只能访问该租户的数据；3) 写锁——关键操作（创建工单）用分布式锁，防止两个 Agent 同时操作同一资源。MCP Server 可以拒绝未知 Agent ID 的请求。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">MCP 协议官方文档</a> — 规范和核心概念</li>
+      <li><a href="https://github.com/modelcontextprotocol/java-sdk" target="_blank" rel="noopener">MCP Java SDK</a> — Java 版 Server/Client 实现</li>
+      <li><a href="https://docs.spring.io/spring-security/reference/servlet/authentication/passwords/jwt.html" target="_blank" rel="noopener">Spring Security JWT</a> — JWT 鉴权配置</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>实现一个简单的 MCP Server（暴露 queryTicket 工具）</li>
+      <li>实现 MCP Client，连接 Server 并调用工具</li>
+      <li>为 MCP Server 添加 JWT 鉴权</li>
+      <li>模拟 MCP Server 超时，验证熔断器打开和降级逻辑</li>
+      <li>将 MCP 工具注册到 Spring AI Agent 的 toolCallbacks</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：MCP Server 返回了一个非常大的数据集（10000 条工单），Agent 的 Context Window 装不下，怎么解决？</summary><p>三种方法组合：1) MCP Server 内部支持分页——工具参数加 page/size，Agent 先取第一页，再根据需要请求后续页；2) Server 端预聚合——返回统计摘要"共 10000 条，待处理 2000 条，已完成 8000 条"而不是返回所有明细；3) Agent 端的工具结果后处理——收到大结果后，先问用户"查到了 10000 条，需要看明细吗？"再决定是否全部加载。CorpAssist 优先用方案 2，必要是方案 1。</p></details>
+      <details><summary>场景：MCP Client 发现两个 Server 都提供了 send_email 工具（重名），Agent 怎么选择？</summary><p>Agent 端应该根据工具描述自动选择。两个 send_email 的描述应该不同，一个可能是"发送内部邮件，仅限公司内部通讯"，另一个是"发送客户邮件，包含合规检查和审批"。Agent 根据场景选择。如果描述不足以区分，在工具注册时加前缀（mail_internal_send、mail_customer_send）。MCP 规范不强制工具名全局唯一，但生产使用需要统一命名空间避免冲突。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-03-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>MCP Server 暴露 2 个工具，Client 的 listTools() 返回正确</li>
+        <li>Client 调用 call_tool(send_email, {to,subject,body}) 邮件成功发送</li>
+        <li>MCP Server 不可达时，Client 返回降级提示而非异常</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-02">人在回路与审批</a></li>
+      <li>下一篇：<a href="#ch-practice-04">A2A 与 Nacos 分布式 Agent</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,300 @@
+<section id="ch-basics-01" class="chapter" data-chapter="basics-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>ReactAgent 基础与 ReAct 循环</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Agent 基础</strong> · 能力：理解 ReAct 循环、定义工具规范、配置停止条件</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 需要 Agent 来执行多步操作（查工单→查日程→发邮件），而不是简单问答。ReAct（Reasoning+Acting）循环是 Agent 最基础的设计模式——模型思考需要做什么、调用工具、观察结果、继续思考直到任务完成。Spring AI Alibaba 的 ReactAgent 实现了这个模式。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>解释 ReAct 循环的四个阶段（思考/行动/观察/推理）；用 Spring AI Alibaba 定义 Agent 工具和 System Prompt；配置 maxIterations 和 Token 预算控制 Agent 行为；对比 ReAct 与 LangGraph 的工作流差异。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) ReAct 循环 = 思考(Thought)→行动(Action)→观察(Observation) 循环直到最终回答；2) 工具定义需包含 name/description/parameters 三要素；3) maxIterations 防止 Agent 无限循环（默认 10）；4) System Prompt 中固定 Agent 角色和行为边界；5) Spring AI Alibaba 的 ReactAgent 基于 Spring AI 的 AbstractToolCallSupport。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>ReAct 思考-行动-观察</h3>
+      <p><span class="term" data-term-id="react-loop">ReAct 循环</span>是 Agent 的核心模式。每次循环：LLM 生成思考（Thought），决定调用哪个工具（Action），执行工具并获取结果（Observation），然后继续思考。循环持续到 LLM 认为任务完成并生成最终答案（Final Answer）。Spring AI Alibaba 的 <code>ReactAgent</code> 在 Spring AI 的 <code>ChatClient</code> 基础上增加了循环控制。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant AG as ReactAgent
+    participant LLM as 大模型
+    participant T as 工具
+    U->>AG: "帮我查张三的工单状态"
+    AG->>LLM: SystemPrompt + 用户请求
+    LLM-->>AG: Thought: 需要查用户信息和工单<br/>Action: getUserInfo("张三")
+    AG->>T: getUserInfo("张三")
+    T-->>AG: Observation: {userId: "u123", role: "IT"}
+    AG->>LLM: 历史 + Observation
+    LLM-->>AG: Thought: 知道了 userId<br/>Action: queryTicket("u123")
+    AG->>T: queryTicket("u123")
+    T-->>AG: Observation: 有3个待处理工单
+    AG->>LLM: 历史 + Observation
+    LLM-->>AG: Final Answer: 张三有3个待处理工单...
+    AG-->>U: 最终回答
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// ReactAgent 基础配置
+@Configuration
+public class AgentConfig {
+
+    @Bean
+    public ChatClient chatClient(ChatClient.Builder builder) {
+        return builder
+            .defaultSystem("""
+                你是一个企业办公助手。你有以下工具可用：
+                1. getUserInfo(name) - 查询员工信息
+                2. queryTicket(userId) - 查询工单状态
+
+                请按照 ReAct 格式执行：先思考需要做什么，再调用工具。
+                如果不需要工具，直接回答问题。
+                """)
+            .build();
+    }
+
+    @Bean
+    public ReactAgent corpAgent(ChatClient chatClient,
+                                 List<ToolCallback> tools) {
+        return ReactAgent.builder()
+            .chatClient(chatClient)
+            .tools(tools)
+            .maxIterations(10)        // 最大循环次数
+            .maxTokenUsage(4096)      // 最大 Token 消耗
+            .systemPrompt("你是一个企业办公助手。")
+            .build();
+    }
+}</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工在门户输入"帮我查一下张三的工单状态，然后给张三发邮件提醒"，Agent 三步完成：1) getUserInfo 查张三的 userId；2) queryTicket 查工单；3) sendEmail 发提醒。每一步的 Observation 作为下一步的上下文，最终返回完整结果。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>工具定义规范</h3>
+      <p>Spring AI Alibaba 通过 <code>@Tool</code> 注解将 Java 方法暴露为 Agent 工具。框架自动提取方法签名和参数信息，生成 OpenAI 兼容的 Function Calling Schema。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">import com.alibaba.spring.ai.tool.annotation.Tool;
+import com.alibaba.spring.ai.tool.annotation.ToolParam;
+import java.util.Map;
+
+@Component
+public class TicketTools {
+
+    @Tool(name = "queryTicket", description = "根据工单编号或用户ID查询工单状态")
+    public Map<String, Object> queryTicket(
+            @ToolParam(description = "工单编号，格式 TKT-2026-XXX，可选") String ticketId,
+            @ToolParam(description = "用户ID，可选") String userId) {
+
+        // 模拟工单系统查询
+        if (ticketId != null) {
+            return Map.of(
+                "ticketId", ticketId,
+                "status", "处理中",
+                "assignee", "张三",
+                "createdAt", "2026-05-20"
+            );
+        }
+        return Map.of("error", "请提供工单编号或用户ID");
+    }
+
+    @Tool(name = "getUserInfo", description = "根据姓名查询员工信息")
+    public Map<String, Object> getUserInfo(
+            @ToolParam(description = "员工姓名") String name) {
+        return Map.of(
+            "name", name,
+            "userId", "u_001",
+            "department", "IT",
+            "email", name + "@corp.com"
+        );
+    }
+}</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>@Tool 参数</th><th>说明</th><th>推荐值</th></tr></thead>
+        <tbody>
+          <tr><td>name</td><td>工具名，LLM 调用时使用的标识</td><td>动词+名词，如 queryTicket</td></tr>
+          <tr><td>description</td><td>工具描述，LLM 判断何时调用的依据</td><td>包含场景和示例，20-50 字</td></tr>
+          <tr><td>returnDirect</td><td>是否直接返回（跳过 Agent 二次处理）</td><td>简单数据返回 true，否则 false</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>工具描述模糊</h4><p><code>@Tool(description = "查询信息")</code> — LLM 不确定该工具查什么，可能误调用。如查询日程时调用了工单查询工具。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>工具描述清晰</h4><p><code>@Tool(description = "根据工单编号或用户ID查询工单状态和详情，用于在客服场景跟进用户问题")</code> — LLM 明确知道用途和场景。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>停止条件与预算</h3>
+      <p>Agent 需要预算控制防止无限循环和 Token 溢出。Spring AI Alibaba 提供了 <code>maxIterations</code> 和 <code>maxTokenUsage</code> 两个核心参数。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Bean
+public ReactAgent budgetAgent(ChatClient chatClient, List<ToolCallback> tools) {
+    return ReactAgent.builder()
+        .chatClient(chatClient)
+        .tools(tools)
+        // 停止条件配置
+        .maxIterations(15)               // 最大 ReAct 循环次数
+        .maxTokenUsage(8192)             // 单次对话最大 Token 数
+        .maxToolCallAttempts(3)          // 单工具最大调用次数
+        .toolRetryAttempts(2)            // 工具失败重试次数
+        // 超时控制
+        .toolTimeout(Duration.ofSeconds(30))
+        // Token 预算耗尽时的行为
+        .onTokenBudgetExhausted(session -> {
+            // 生成摘要并返回当前进度
+            return "Token 预算已用完，已处理的部分：" + session.getSummary();
+        })
+        .build();
+}
+
+// 监控 Agent 状态
+@Component
+public class AgentMonitor {
+    private final MeterRegistry meterRegistry;
+
+    public void recordIteration(String sessionId, int iterationCount) {
+        meterRegistry.counter("agent.iterations", "session", sessionId)
+            .increment(iterationCount);
+    }
+
+    public void recordTokenUsage(String sessionId, int tokens) {
+        meterRegistry.gauge("agent.token_usage", tokens);
+    }
+}</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>参数</th><th>默认值</th><th>说明</th><th>CorpAssist 推荐</th></tr></thead>
+        <tbody>
+          <tr><td>maxIterations</td><td>10</td><td>ReAct 循环最大次数</td><td>15（复杂任务 5-10 步）</td></tr>
+          <tr><td>maxTokenUsage</td><td>4096</td><td>单次对话最大 Token 消耗</td><td>8192（含工具返回文本）</td></tr>
+          <tr><td>toolTimeout</td><td>10s</td><td>单个工具调用超时</td><td>30s（外部 API 可能慢）</td></tr>
+          <tr><td>toolRetryAttempts</td><td>0</td><td>工具失败重试次数</td><td>2（覆盖网络抖动）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>与 LangGraph 概念对照</h3>
+      <p><span class="term" data-term-id="langgraph">LangGraph</span> 是 LangChain 的图形化 Agent 框架，用节点和边定义工作流。理解 ReAct 和 LangGraph 的对照关系，有助于在简单 Agent 和复杂工作流之间做选择。</p>
+      <table class="outline-table">
+        <thead><tr><th>概念</th><th>Spring AI Alibaba ReactAgent</th><th>LangGraph</th></tr></thead>
+        <tbody>
+          <tr><td>执行模式</td><td>循环（loop）直到条件满足</td><td>有向图（DAG），节点可循环</td></tr>
+          <tr><td>状态管理</td><td>隐式（对话历史）</td><td>显式 State 对象，可持久化</td></tr>
+          <tr><td>条件分支</td><td>LLM 通过 Thought 决定下一步</td><td>条件边（conditional_edge）</td></tr>
+          <tr><td>记忆</td><td>ChatHistory 自动管理</td><td>State 中自定义记忆</td></tr>
+          <tr><td>并行执行</td><td>不支持（顺序执行）</td><td>支持（fan-out / fan-in）</td></tr>
+          <tr><td>调试可视化</td><td>日志文本</td><td>LangSmith / Mermaid 图</td></tr>
+          <tr><td>学习成本</td><td>低（几小时）</td><td>中（几天）</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：什么场景应该选 ReAct Agent 而不是 LangGraph？</summary><p>ReAct Agent 适合：1) 单 Agent 顺序执行工具调用（CorpAssist 的办公助手场景）；2) 不需要复杂并行/条件分支；3) 团队对 Spring AI 熟悉。LangGraph 适合：1) 需要多个 Agent 协作（主管-工人模式）；2) 需要人在回路中断和恢复；3) 状态需要持久化和回放。简单原则：5 步以内的顺序工具调用用 ReAct，需要人工介入或多 Agent 用 LangGraph。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>ReAct 循环的四个阶段（思考/行动/观察/推理）驱动 Agent 多步推理，Spring AI Alibaba 通过 ReactAgent 实现</li>
+        <li>@Tool 注解定义工具，清晰的 description 是 LLM 正确调用工具的关键</li>
+        <li>停止条件配置 maxIterations=15 + maxTokenUsage=8192 覆盖 CorpAssist 95% 的业务场景</li>
+        <li>ReAct Agent 适合单 Agent 顺序工具调用，LangGraph 适合多 Agent 协作和工作流编排</li>
+        <li>CorpAssist 办公助手（查工单/日程/邮件）是 ReAct Agent 的典型应用场景</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-01-1"> 我能画出 ReAct 循环的流程图并解释每个环节</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-2"> 我能用 @Tool 注解定义至少 3 个工具</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-3"> 我能配置 ReactAgent 的停止条件和预算参数</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-4"> 我能对比 ReAct 和 LangGraph 的适用场景</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-5"> 我能用 Spring AI Alibaba 写一个完整的 Agent 示例</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>ReAct</td><td>Reasoning+Acting 循环，Agent 的核心设计模式</td></tr>
+            <tr><td>Thought</td><td>LLM 在 ReAct 循环中的推理步骤</td></tr>
+            <tr><td>Action</td><td>LLM 决定调用的工具及其参数</td></tr>
+            <tr><td>Observation</td><td>工具执行后的结果返回给 LLM</td></tr>
+            <tr><td>@Tool</td><td>Spring AI Alibaba 的工具注解</td></tr>
+            <tr><td>maxIterations</td><td>ReAct 循环的最大次数限制</td></tr>
+            <tr><td>LangGraph</td><td>LangChain 的图形化 Agent 编排框架</td></tr>
+            <tr><td>ToolCallback</td><td>Spring AI 工具回调接口</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>ReAct Agent 陷入死循环时如何检测和恢复？</summary><p>检测：1) 设置 maxIterations=10，到达后强制中断；2) 检测相同工具+参数的调用模式——连续 3 次调用同一个工具且参数相同，判定为死循环，中断并触发降级。恢复：1) 中断时返回当前已收集的信息（部分结果）；2) 在 System Prompt 中加入"如果在 5 步内没有进展，请直接总结已有的信息并提交"；3) 添加工具调用 dedup 逻辑——对相同输入返回缓存结果。</p></details>
+        <details><summary>Spring AI Alibaba 的 ReactAgent 与 Spring AI 的 ChatClient 是什么关系？</summary><p>ReactAgent 构建在 ChatClient 之上。ChatClient 提供与 LLM 的通信（组装 Prompt、处理 Response、管理 ChatHistory）。ReactAgent 在 ChatClient 的基础上增加了 ReAct 循环控制：每次 LLM 返回结果后，检查是否有 tool_calls，如果有则执行工具并将结果作为新的 Message 发送给 LLM，重复此过程直到 LLM 返回 Final Answer 或达到 maxIterations。相当于 ChatClient 是"一回合对话"，ReactAgent 是"多回合自动对话"。</p></details>
+        <details><summary>工具返回的 Observation 太长导致 Token 超限怎么办？</summary><p>三种策略：1) 截断——工具返回结果前截断到 1000 字符，超出部分用"{{截断}}..."标记；2) 摘要——工具返回结构数据时提取关键字段丢弃细节（如工单列表只返回数量和摘要不返回全文）；3) 压缩——Agent 在发送给 LLM 前自动压缩历史消息（Spring AI 的 ChatMemory 支持 summarize 模式）。CorpAssist 三种都用：工具层截断 + Agent 层摘要 + ChatMemory 压缩。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://github.com/alibaba/spring-ai-alibaba" target="_blank" rel="noopener">Spring AI Alibaba GitHub</a> — ReactAgent 源码和示例</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient 文档</a> — ChatClient API 参考</li>
+      <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph 官方文档</a> — 对比学习 LangGraph 的工作流设计</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>创建 Spring Boot 项目，引入 spring-ai-alibaba 依赖</li>
+        <li>用 @Tool 定义 2 个工具（getUserInfo、queryTicket）</li>
+        <li>配置 ReactAgent，测试"查张三的工单"完整流程</li>
+        <li>故意让工具返回错误，观察 Agent 的降级行为</li>
+        <li>设置 maxIterations=3，验证到达上限后 Agent 中断并返回部分结果</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Agent 在第三步循环中调用了 getUserInfo，但 Observation 显示用户不存在。接下来 Agent 应该怎么做？</summary><p>Observation 返回 {"error": "用户不存在"} 后，LLM 的下一轮推理应该判断：用户不存在 → 可能是工单创建者已离职 → 跳过错信息 → 直接返回"该用户不存在，建议联系管理员"。或者：用户不存在但工单号码有效 → 跳过用户查询仅返回工单状态。Agent 不应该继续重试 getUserInfo 或死在这里，而应该调整计划继续执行或友好提示。</p></details>
+      <details><summary>场景：需求从"查工单"变为"查工单→如果状态是待处理则给处理人发邮件→发完邮件创建一个跟进日程"，Agent 需要增加几步？</summary><p>原始任务 1 步（queryTicket），扩展后需要：1) queryTicket 查状态；2) 如果是待处理则 getUserInfo 查处理人邮箱；3) sendEmail 发通知；4) createSchedule 创建跟进日程。共 4 步，其中步骤 2-4 有条件依赖。maxIterations 从 5 调到 10。System Prompt 需要补充"根据工单状态决定是否需要发邮件，发邮件后自动创建跟进日程"的规则。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-01-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>ReactAgent 在 5 步以内完成"查用户→查工单→汇总"流程</li>
+        <li>工具描述不清晰时 Agent 调用了错误工具，优化描述后调用正确</li>
+        <li>maxIterations 设置为 3 时，Agent 到达后中断并返回进度摘要</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>下一篇：<a href="#ch-basics-02">Graph 工作流与状态管理</a> — 学习 SAA Graph 的节点/边/条件路由</li>
+    </ul>
+  </div>
+</section>

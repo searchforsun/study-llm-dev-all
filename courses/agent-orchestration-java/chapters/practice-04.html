@@ -1,0 +1,411 @@
+<section id="ch-practice-04" class="chapter" data-chapter="practice-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>A2A 与 Nacos 分布式 Agent</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>多 Agent 编排与集成</strong> · 能力：分布式 Agent 架构、Nacos 服务发现、负载均衡、网关集成</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 的 Agent 不是单机运行——HR Agent、IT Agent、审批 Agent 分别部署在不同的微服务节点上，需要互相发现和通信。Nacos 作为注册中心管理 Agent 实例，A2A（Agent-to-Agent）协议定义 Agent 间的通信规范，网关统一入口。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>设计分布式 Agent 架构；用 Nacos 注册和发现 Agent 实例；实现 Agent 间负载均衡；将 Agent 集成到微服务网关（Spring Cloud Gateway）。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 每个 Agent 是一个微服务实例，注册到 Nacos；2) A2A 协议定义 Agent 间的通信格式（请求/响应）；3) 负载均衡策略：会话亲和性（同一用户固定到同一实例）；4) Spring Cloud Gateway 路由 /agent/* 请求到对应 Agent 服务。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>分布式 Agent 架构</h3>
+      <p><span class="term" data-term-id="distributed-agent">分布式 Agent</span> 将不同类型的 Agent 部署为独立的微服务，通过注册中心互相发现。每个 Agent 服务可以独立扩缩容。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    subgraph 注册中心 Nacos
+        NACOS[Nacos Server]
+    end
+    subgraph 网关
+        GW[Spring Cloud Gateway]
+    end
+    subgraph Agent 集群
+        HR1[HR Agent v1]
+        HR2[HR Agent v2]
+        IT1[IT Agent v1]
+        IT2[IT Agent v2]
+        APR1[审批 Agent v1]
+    end
+    Client[用户] --> GW
+    GW --> HR1 & HR2
+    GW --> IT1 & IT2
+    GW --> APR1
+    HR1 & HR2 -->|A2A| IT1
+    HR1 & HR2 -->|A2A| APR1
+    HR1 -.->|注册| NACOS
+    HR2 -.->|注册| NACOS
+    IT1 -.->|注册| NACOS
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Agent 服务注册到 Nacos
+@SpringBootApplication
+@EnableDiscoveryClient
+public class HrAgentApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(HrAgentApplication.class, args);
+    }
+
+    @Bean
+    public AgentMetadata agentMetadata() {
+        return AgentMetadata.builder()
+            .agentId("hr-agent")
+            .agentName("HR 政策 Agent")
+            .version("1.0.0")
+            .capabilities(List.of(
+                "query_hr_policy",
+                "query_employee_info",
+                "query_attendance"
+            ))
+            .maxConcurrentSessions(100)
+            .build();
+    }
+}
+
+// application.yml
+// spring:
+//   application:
+//     name: hr-agent
+//   cloud:
+//     nacos:
+//       discovery:
+//         server-addr: nacos:8848
+//         metadata:
+//           agent-id: hr-agent
+//           agent-version: 1.0.0
+//           capabilities: query_hr_policy,query_employee_info</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>服务发现与注册</h3>
+      <p>Agent 通过 Nacos 注册自身信息，其他 Agent 或网关通过 Nacos 发现可用的 Agent 实例。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Agent 服务发现客户端
+@Component
+public class AgentDiscoveryClient {
+
+    private final DiscoveryClient discoveryClient;
+    private final LoadBalancerClient loadBalancer;
+
+    public AgentDiscoveryClient(DiscoveryClient discoveryClient,
+                                 LoadBalancerClient loadBalancer) {
+        this.discoveryClient = discoveryClient;
+        this.loadBalancer = loadBalancer;
+    }
+
+    // 发现指定能力的 Agent
+    public List<AgentInstance> findAgentsByCapability(String capability) {
+        List<AgentInstance> agents = new ArrayList<>();
+
+        // 从 Nacos 发现所有 agent 服务
+        for (String serviceId : discoveryClient.getServices()) {
+            if (!serviceId.endsWith("-agent")) continue;
+
+            List<ServiceInstance> instances =
+                discoveryClient.getInstances(serviceId);
+
+            for (ServiceInstance instance : instances) {
+                String caps = instance.getMetadata()
+                    .get("capabilities");
+                if (caps != null && caps.contains(capability)) {
+                    agents.add(new AgentInstance(
+                        instance.getServiceId(),
+                        instance.getHost(),
+                        instance.getPort(),
+                        instance.getMetadata()
+                    ));
+                }
+            }
+        }
+        return agents;
+    }
+
+    // 选择最合适的 Agent 实例（负载均衡）
+    public AgentInstance selectAgent(String capability) {
+        List<ServiceInstance> instances = new ArrayList<>();
+        for (AgentInstance agent : findAgentsByCapability(capability)) {
+            instances.add(agent.toServiceInstance());
+        }
+        if (instances.isEmpty()) {
+            throw new AgentNotFoundException(
+                "没有找到支持 " + capability + " 的 Agent");
+        }
+        ServiceInstance selected = loadBalancer.choose(
+            instances.get(0).getServiceId());
+        return AgentInstance.fromServiceInstance(selected);
+    }
+}
+
+// Agent 健康检查（Nacos 自动心跳 + 自定义）
+@Component
+public class AgentHealthIndicator implements HealthIndicator {
+
+    private final AgentMetrics metrics;
+
+    @Override
+    public Health health() {
+        // 检查 LLM 连接
+        boolean llmHealthy = checkLlmConnection();
+        // 检查工具 API
+        boolean toolsHealthy = checkToolsConnection();
+        // 检查内存使用
+        long memoryUsage = Runtime.getRuntime()
+            .totalMemory() - Runtime.getRuntime().freeMemory();
+        boolean memoryHealthy = memoryUsage < 1024 * 1024 * 1024; // <1GB
+
+        if (llmHealthy && toolsHealthy && memoryHealthy) {
+            return Health.up()
+                .withDetail("llm", "connected")
+                .withDetail("tools", "available")
+                .withDetail("memory", memoryUsage)
+                .build();
+        }
+        return Health.down()
+            .withDetail("reason", llmHealthy ? "" : "LLM 连接失败")
+            .withDetail("memory", memoryUsage)
+            .build();
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>负载均衡</h3>
+      <p>Agent 实例间的负载均衡需要考虑会话亲和性——同一用户的多次请求尽量路由到同一实例（利用缓存的 ChatMemory）。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 会话亲和性负载均衡
+@Component
+public class SessionAffinityLoadBalancer implements ReactorServiceInstanceLoadBalancer {
+
+    private final Random random = new Random();
+    private final Cache<String, ServiceInstance> affinityCache =
+        Caffeine.newBuilder()
+            .expireAfterWrite(30, TimeUnit.MINUTES)
+            .maximumSize(10000)
+            .build();
+
+    @Override
+    public Mono<Response<ServiceInstance>> choose(Request request) {
+        // 从请求中提取会话 ID
+        String sessionId = extractSessionId(request);
+        if (sessionId != null) {
+            ServiceInstance cached = affinityCache.getIfPresent(sessionId);
+            if (cached != null && isInstanceAlive(cached)) {
+                return Mono.just(Response.of(cached));
+            }
+        }
+
+        // 随机选择一个活跃实例
+        List<ServiceInstance> instances = getAliveInstances();
+        if (instances.isEmpty()) {
+            return Mono.just(Response.error(new EmptyInstanceException()));
+        }
+        ServiceInstance selected = instances.get(
+            random.nextInt(instances.size()));
+
+        // 缓存亲和性
+        if (sessionId != null) {
+            affinityCache.put(sessionId, selected);
+        }
+        return Mono.just(Response.of(selected));
+    }
+
+    private String extractSessionId(Request request) {
+        // 从请求 header 或 cookie 提取 sessionId
+        if (request.getHeaders() != null) {
+            return request.getHeaders().getFirst("X-Session-Id");
+        }
+        return null;
+    }
+}</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>负载均衡策略</th><th>适用场景</th><th>效果</th></tr></thead>
+        <tbody>
+          <tr><td>轮询（Round Robin）</td><td>无状态 Agent</td><td>请求均匀分布</td></tr>
+          <tr><td>最少连接（Least Connections）</td><td>处理时间不均匀</td><td>避免某个 Agent 负载过重</td></tr>
+          <tr><td>会话亲和性</td><td>有状态 Agent（推荐）</td><td>利用率略有倾斜但 ChatMemory 命中率高</td></tr>
+          <tr><td>加权响应时间</td><td>异构实例</td><td>快的实例收到更多请求</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>与微服务网关集成</h3>
+      <p>Spring Cloud Gateway 作为统一入口，按照 Agent 类型路由到不同的 Agent 微服务。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Spring Cloud Gateway 路由配置
+@Configuration
+public class AgentGatewayConfig {
+
+    @Bean
+    public RouteLocator agentRoutes(RouteLocatorBuilder builder) {
+        return builder.routes()
+            // HR Agent 路由
+            .route("hr-agent", r -> r
+                .path("/agent/hr/**")
+                .filters(f -> f
+                    .stripPrefix(2)
+                    .addRequestHeader("X-Agent-Type", "hr")
+                    .circuitBreaker(config -> config
+                        .setName("hrAgentCB")
+                        .setFallbackUri("forward:/fallback/agent-unavailable")))
+                .uri("lb://hr-agent"))
+            // IT Agent 路由
+            .route("it-agent", r -> r
+                .path("/agent/it/**")
+                .filters(f -> f
+                    .stripPrefix(2)
+                    .addRequestHeader("X-Agent-Type", "it"))
+                .uri("lb://it-agent"))
+            // 审批 Agent 路由
+            .route("approval-agent", r -> r
+                .path("/agent/approval/**")
+                .filters(f -> f.stripPrefix(2))
+                .uri("lb://approval-agent"))
+            .build();
+    }
+
+    // A2A 通信路由（Agent 之间）
+    @Bean
+    public RouteLocator a2aRoutes(RouteLocatorBuilder builder) {
+        return builder.routes()
+            .route("a2a-communication", r -> r
+                .path("/a2a/**")
+                .filters(f -> f
+                    .stripPrefix(1)
+                    .addRequestHeader("X-A2A-Protocol", "v1")
+                    // A2A 鉴权
+                    .filter(new A2AAuthGatewayFilter()))
+                .uri("lb://a2a-router"))
+            .build();
+    }
+}
+
+// A2A 鉴权过虑器
+@Component
+public class A2AAuthGatewayFilter implements GatewayFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String sourceAgent = exchange.getRequest()
+            .getHeaders().getFirst("X-Source-Agent");
+        String targetAgent = exchange.getRequest()
+            .getHeaders().getFirst("X-Target-Agent");
+
+        // 校验 source 和 target 都是注册的 Agent
+        if (!isRegisteredAgent(sourceAgent) ||
+            !isRegisteredAgent(targetAgent)) {
+            exchange.getResponse().setStatusCode(
+                HttpStatus.FORBIDDEN);
+            return exchange.getResponse().setComplete();
+        }
+        return chain.filter(exchange);
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>分布式 Agent 架构：每种 Agent 独立微服务，注册到 Nacos，通过网关统一入口</li>
+        <li>服务发现用 DiscoveryClient 查询 Nacos 实例列表，按 capability metadata 过滤匹配</li>
+        <li>负载均衡推荐会话亲和性策略（30 分钟缓存），保证同一用户的请求路由到同一实例</li>
+        <li>Spring Cloud Gateway 按 /agent/{type}/** 路径路由到对应 Agent 服务，支持熔断降级</li>
+        <li>CorpAssist HR/IT/审批三个 Agent 独立部署，通过 Nacos 互相发现</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="practice-04-1"> 我能设计分布式 Agent 的微服务架构</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-2"> 我能用 Nacos 注册和发现 Agent 实例</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-3"> 我能配置会话亲和性负载均衡</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-4"> 我能用 Spring Cloud Gateway 路由 Agent 请求</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-5"> 我能实现 A2A 鉴权过滤器</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>Nacos</td><td>阿里云开源的注册中心和配置中心</td></tr>
+            <tr><td>A2A</td><td>Agent-to-Agent，Agent 间通信协议</td></tr>
+            <tr><td>@EnableDiscoveryClient</td><td>启用服务注册发现</td></tr>
+            <tr><td>DiscoveryClient</td><td>Spring Cloud 服务发现客户端</td></tr>
+            <tr><td>Session Affinity</td><td>会话亲和性，同一用户固定到同一实例</td></tr>
+            <tr><td>Spring Cloud Gateway</td><td>API 网关，按路径路由</td></tr>
+            <tr><td>CircuitBreaker</td><td>熔断器，防止级联故障</td></tr>
+            <tr><td>AgentMetadata</td><td>Agent 元信息（能力/版本/限额）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>分布式 Agent 和单体 Agent 的优缺点是什么？什么场景需要分布式部署？</summary><p>单体 Agent：所有能力在一个进程中。优点是开发简单、调试方便、没有网络延迟。缺点是扩容粒度粗（单一能力流量大时需要整体扩容）。分布式 Agent：每种能力独立部署。优点是隔离性好（HR Agent 故障不影响 IT Agent）、弹性伸缩精细（只扩容瓶颈 Agent）、技术栈可异构（HR Agent 用 Spring Boot，IT Agent 用 Python FastAPI）。但复杂度指数级增加（服务发现/网络/一致性）。CorpAssist 选择：初始阶段单体部署，3 个 Agent 服务后切到分布式。</p></details>
+        <details><summary>Nacos 和 Eureka 作为 Agent 注册中心的区别？</summary><p>Nacos 比 Eureka 更强大：1) 支持配置管理（可以动态更新 Agent 的参数而不用重启）；2) 支持权重路由（可以控制流量分配到不同版本的 Agent）；3) 支持临时/持久实例（持久实例即使心跳停止也保留记录，适合 Agent 维护场景）；4) 支持健康检查策略更多样（HTTP/TCP/MySQL）。CorpAssist 选择 Nacos 因为它也管理了其他微服务，统一注册中心。如果只用服务发现，Eureka 也够用。</p></details>
+        <details><summary>A2A 通信协议怎么保证可靠性？掉消息了怎么办？</summary><p>A2A 通信走 HTTP（同步）或消息队列（异步）。同步：超时重试（3次）+ 幂等性（请求 ID 去重）。异步：死信队列 + 补偿机制。对于 Agent 间的高价值通信（如工单状态变更），建议用消息队列：A Agent 发送消息到 RocketMQ → 主题过滤 → B Agent 消费。确保 at-least-once 语义。写操作（如"创建工单"）需要幂等——同一请求重复调用不产生两笔工单。消费者端用请求 ID 去重。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://nacos.io/" target="_blank" rel="noopener">Nacos 官方文档</a> — 安装、配置、服务发现</li>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank" rel="noopener">Spring Cloud Gateway 文档</a> — 路由和过滤器配置</li>
+      <li><a href="https://spring.io/projects/spring-cloud-commons" target="_blank" rel="noopener">Spring Cloud DiscoveryClient</a> — 服务发现抽象接口</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>启动 Nacos：<code>docker run -d -p 8848:8848 nacos/nacos-server:v2.3.0</code></li>
+      <li>创建两个 Spring Boot Agent 服务，注册到 Nacos</li>
+      <li>实现 Agent 服务发现客户端，查询可用 Agent</li>
+      <li>配置 Spring Cloud Gateway 路由到 Agent</li>
+      <li>实现 A2A 通信（HR Agent 调用 IT Agent 的工具）</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：HR Agent 需要调用 IT Agent 的 queryTicket 工具，A2A 调用路径是什么？</summary><p>完整路径：HR Agent → 内部 HTTP 请求 → Spring Cloud Gateway → 路由到 IT Agent → IT Agent 执行 queryTicket → 返回结果给 Gateway → Gateway 返回给 HR Agent。或者直接走 Nacos 服务发现：HR Agent 用 DiscoveryClient 找到 IT Agent 实例，直连（绕过网关但需要独立鉴权）。CorpAssist 走网关路径，便于统一鉴权和监控。</p></details>
+      <details><summary>场景：Agent 实例滚动更新时，正在处理的请求会怎样？怎么保证不中断？</summary><p>Nacos 在实例下线前有 graceful shutdown 机制：1) Agent 收到 SIGTERM 后，从 Nacos 反注册（不再接收新请求）；2) 处理完当前正在进行的请求（设置一个超时，如 30 秒）；3) 30 秒后如果还有请求未完成，中断并返回"Service updating, please retry"给客户端。网关端的 Spring Cloud Gateway 通过 discoveryClient 感知实例下线（约 5-10 秒）。加上重试机制：客户端收到 503 后等待 1 秒重试到新实例。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-04-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>两个 Agent 服务成功注册到 Nacos，Nacos 控制台可查</li>
+        <li>Gateway 根据路径路由到对应的 Agent 服务</li>
+        <li>A2A 通信（HR→IT）成功返回结果</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-03">MCP 协议集成</a></li>
+      <li>下一篇：<a href="#ch-practice-05">实战：CorpAssist 办公 Agent</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,449 @@
+<section id="ch-practice-02" class="chapter" data-chapter="practice-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>人在回路与审批</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>多 Agent 编排与集成</strong> · 能力：实现中断与恢复、审批节点设计、上下文压缩、审计日志</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>Agent 不能全自动——发重要邮件、审批工单、修改敏感数据时需要人工确认。人在回路（Human-in-the-Loop）让 Agent 在关键节点暂停，等待人工审批后继续。CorpAssist 的"发邮件给客户"和"创建大金额报销"都需要审批节点。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>在 StateGraph 中实现中断节点保存状态；设计审批流程（审批人/超时/驳回）；实现上下文压缩传递审批上下文；配置审计日志追踪所有 Agent 操作。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 中断点 = StateGraph 中设置等待人工输入的节点；2) 审批节点保存当前 State 并挂起，恢复时从挂起点继续；3) 上下文压缩用结构化 JSON 替代完整对话；4) 审计日志记录每次 Agent 操作（调用者/工具/参数/结果）。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>中断与恢复</h3>
+      <p><span class="term" data-term-id="interrupt">中断</span>是 Agent 在关键节点暂停执行，等待人工输入后恢复。<span class="term" data-term-id="resume">恢复</span>从挂起点继续，不重置 State。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant AG as Agent
+    participant ES as 外部系统
+    participant HM as 人工审批
+    U->>AG: 给客户发报价邮件
+    AG->>ES: 生成报价单
+    AG->>HM: 中断: 等待审批
+    Note over HM: 审批人收到通知
+    HM->>AG: 审批通过 + 补充说明
+    AG->>ES: 发送邮件（含补充说明）
+    ES-->>AG: 发送成功
+    AG-->>U: 报价邮件已发送
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 1. 中断节点：等待人工审批
+@Component
+public class ApprovalInterruptNode implements Node<CorpState> {
+
+    @Override
+    public CorpState apply(CorpState state) {
+        // 设置中断原因和等待审批的详细信息
+        state.setInterrupt(true);
+        state.setInterruptReason("发送报价邮件需要审批");
+        state.setPendingAction("send_quote_email");
+        state.setPendingParams(Map.of(
+            "to", "client@example.com",
+            "subject", "报价单",
+            "amount", 50000
+        ));
+
+        // State 保存到数据库（挂起）
+        savePendingApproval(state);
+        return state;
+    }
+
+    private void savePendingApproval(CorpState state) {
+        // 保存到 pending_approvals 表
+        jdbcTemplate.update("""
+            INSERT INTO pending_approvals
+            (session_id, agent_state, reason, created_at)
+            VALUES (?, ?, ?, NOW())
+            """, state.getSessionId(), toJson(state),
+                state.getInterruptReason());
+    }
+}
+
+// 2. 审批 API
+@RestController
+@RequestMapping("/api/approvals")
+public class ApprovalController {
+
+    @PostMapping("/approve")
+    public void approve(@RequestBody ApprovalRequest req) {
+        // 1. 更新审批记录
+        jdbcTemplate.update("""
+            UPDATE pending_approvals
+            SET status='approved', approved_by=?, comment=?
+            WHERE session_id=?
+            """, req.approvedBy, req.comment, req.sessionId);
+
+        // 2. 恢复 Agent 执行
+        CorpState savedState = loadState(req.sessionId);
+        savedState.setInterrupt(false);
+        savedState.set("approval_comment", req.comment);
+
+        // 从挂起的节点继续执行
+        graph.resume(savedState);
+    }
+
+    @PostMapping("/reject")
+    public void reject(@RequestBody ApprovalRequest req) {
+        jdbcTemplate.update("""
+            UPDATE pending_approvals SET status='rejected',
+            approved_by=?, comment=? WHERE session_id=?
+            """, req.approvedBy, req.comment, req.sessionId);
+
+        // 通知用户：审批被驳回
+        notifyUser(req.sessionId, "审批被驳回: " + req.comment);
+    }
+}
+
+// 3. 审批状态查询
+@GetMapping("/pending")
+public List<PendingApproval> getPendingApprovals(
+        @RequestParam String userId) {
+    return jdbcTemplate.query("""
+        SELECT * FROM pending_approvals
+        WHERE status='pending' AND approved_by=?
+        ORDER BY created_at DESC
+        """, userId, new PendingApprovalRowMapper());
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>审批节点设计</h3>
+      <p>审批节点需要考虑：谁会审批、超时怎么办、驳回后做什么。以下是 CorpAssist 的审批流程设计。</p>
+      <table class="outline-table">
+        <thead><tr><th>审批维度</th><th>配置</th><th>CorpAssist 值</th></tr></thead>
+        <tbody>
+          <tr><td>审批触发条件</td><td>金额/操作类型/收件人</td><td>金额 > ¥10000 或 发给外部邮箱</td></tr>
+          <tr><td>审批人</td><td>指定人/上级/部门经理</td><td>按部门负责人自动匹配</td></tr>
+          <tr><td>超时时间</td><td>超过后自动处理</td><td>30 分钟未审批→自动驳回</td></tr>
+          <tr><td>驳回行为</td><td>停止/修改后重试</td><td>驳回后 Agent 询问用户修改方案</td></tr>
+          <tr><td>审批通知</td><td>通知方式</td><td>企业微信消息 + 邮件</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Component
+public class ApprovalNode implements Node<CorpState> {
+
+    private final UserService userService;
+    private final NotificationService notificationService;
+
+    @Override
+    public CorpState apply(CorpState state) {
+        String action = state.getPendingAction();
+        Map<String, Object> params = state.getPendingParams();
+
+        // 1. 自动匹配审批人
+        String applicantDept = userService.getDepartment(
+            state.getUserId());
+        String approver = userService.getDepartmentHead(applicantDept);
+
+        // 2. 创建审批记录
+        String approvalId = UUID.randomUUID().toString();
+        state.set("approval_id", approvalId);
+        state.set("approver", approver);
+        state.set("approval_status", "pending");
+        state.set("approval_deadline",
+            Instant.now().plus(30, ChronoUnit.MINUTES).toString());
+
+        // 3. 发送审批通知
+        notificationService.sendApprovalRequest(
+            approver,
+            state.getUserId(),
+            action,
+            params
+        );
+
+        // 4. 设置中断
+        state.setInterrupt(true);
+        state.setInterruptReason(
+            "等待 " + approver + " 审批");
+        return state;
+    }
+}
+
+// 超时处理：定时任务扫描超时审批
+@Scheduled(fixedRate = 60000) // 每分钟检查
+public void handleExpiredApprovals() {
+    List<CorpState> expired = jdbcTemplate.query("""
+        SELECT * FROM pending_approvals
+        WHERE status='pending' AND deadline < NOW()
+        """, new CorpStateRowMapper());
+
+    for (CorpState state : expired) {
+        // 自动驳回
+        state.set("approval_status", "auto_rejected");
+        state.setInterrupt(false);
+        graph.resume(state, "timeout");
+        // 通知用户：审批超时已自动驳回
+        notificationService.notify(state.getUserId(),
+            "审批超时，操作已取消");
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文压缩</h3>
+      <p>审批时不需要将完整对话历史发给审批人。上下文压缩提取关键信息，减少审批人阅读负担。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 上下文压缩：提取审批所需的关键信息
+@Component
+public class ContextCompressor {
+
+    public ApprovalContext compress(CorpState state, int maxTokens) {
+        String history = state.getChatHistory();
+        List<Message> messages = parseMessages(history);
+
+        // 1. 提取系统消息（工具调用结果等）
+        List<Message> systemMessages = messages.stream()
+            .filter(m -> m.getRole() == Message.Role.SYSTEM)
+            .collect(Collectors.toList());
+
+        // 2. 提取最近的用户-助手交互
+        List<Message> recentMessages = messages.stream()
+            .filter(m -> m.getRole() == Message.Role.USER ||
+                         m.getRole() == Message.Role.ASSISTANT)
+            .skip(Math.max(0, messages.size() - 5)) // 最近 5 轮
+            .collect(Collectors.toList());
+
+        // 3. 提取结构化数据
+        Map<String, Object> structuredData = Map.of(
+            "requested_action", state.getPendingAction(),
+            "params", state.getPendingParams(),
+            "triggered_by", state.getUserId(),
+            "reason", state.getReason(),
+            "risk_level", calculateRiskLevel(state)
+        );
+
+        return new ApprovalContext(
+            structuredData,
+            recentMessages,
+            estimateTokens(recentMessages)
+        );
+    }
+
+    private String calculateRiskLevel(CorpState state) {
+        int amount = (int) state.getPendingParams()
+            .getOrDefault("amount", 0);
+        if (amount > 100000) return "high";
+        if (amount > 10000) return "medium";
+        return "low";
+    }
+}
+
+// 审批通知模板
+public class ApprovalNotificationBuilder {
+
+    public String buildApprovalMessage(ApprovalContext ctx) {
+        return """
+            ===== 审批请求 =====
+            操作: %s
+            申请人: %s
+            风险等级: %s
+            参数: %s
+            原因: %s
+
+            最近对话摘要:
+            %s
+            ==================
+            请审批: /approve 或 /reject
+            """.formatted(
+                ctx.structuredData().get("requested_action"),
+                ctx.structuredData().get("triggered_by"),
+                ctx.structuredData().get("risk_level"),
+                ctx.structuredData().get("params"),
+                ctx.structuredData().get("reason"),
+                formatRecentMessages(ctx.recentMessages())
+            );
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>审计日志</h3>
+      <p>每一笔 Agent 操作都需要记录审计日志。日志包含：谁调用、哪个 Agent、调用了什么工具、传了什么参数、结果如何。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 审计日志记录器
+@Component
+public class AuditLogger {
+
+    private final JdbcTemplate jdbc;
+
+    // 方法级别的审计拦截器
+    @Around("@annotation(AuditLog)")
+    public Object logAudit(ProceedingJoinPoint pjp) throws Throwable {
+        String methodName = pjp.getSignature().getName();
+        Object[] args = pjp.getArgs();
+        String userId = SecurityContextHolder.get()
+            .getAuthentication().getName();
+
+        Object result = null;
+        String status = "success";
+        long start = System.currentTimeMillis();
+
+        try {
+            result = pjp.proceed();
+        } catch (Exception e) {
+            status = "error: " + e.getMessage();
+            throw e;
+        } finally {
+            long duration = System.currentTimeMillis() - start;
+            // 记录审计日志
+            jdbc.update("""
+                INSERT INTO agent_audit_log
+                (user_id, agent_name, action, params, result,
+                 status, duration_ms, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+                """, userId,
+                pjp.getTarget().getClass().getSimpleName(),
+                methodName, toJson(args), toJson(result),
+                status, duration
+            );
+        }
+        return result;
+    }
+
+    // 查询审计日志
+    public List<AuditEntry> queryLogs(
+            String userId, String action,
+            LocalDateTime from, LocalDateTime to) {
+        return jdbc.query("""
+            SELECT * FROM agent_audit_log
+            WHERE user_id = ? AND action = ?
+            AND created_at BETWEEN ? AND ?
+            ORDER BY created_at DESC
+            LIMIT 100
+            """, userId, action, from, to,
+            new AuditEntryRowMapper());
+    }
+}
+
+// 工具调用审计（在 @Tool 上启用）
+@Component
+public class AuditedTools {
+
+    @AuditLog
+    @Tool(name = "sendEmail",
+          description = "发送邮件（操作已记录审计日志）")
+    public EmailResult sendEmail(
+            @ToolParam(description = "收件人") String to,
+            @ToolParam(description = "内容") String body) {
+        // 此操作会被审计日志记录
+        return emailService.send(to, body);
+    }
+
+    @AuditLog
+    @Tool(name = "approveExpense",
+          description = "审批报销（操作已记录审计日志）")
+    public ApprovalResult approveExpense(
+            @ToolParam(description = "报销单 ID") String expenseId,
+            @ToolParam(description = "审批意见") String comment) {
+        return approvalService.approve(expenseId, comment);
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>中断节点通过 setInterrupt(true) 暂停 Graph，State 持久化到数据库等待恢复</li>
+        <li>审批流程四要素：触发条件（金额/类型）、审批人（自动匹配）、超时（30 分钟）、驳回行为</li>
+        <li>上下文压缩提取关键信息（操作/参数/风险等级）传递给审批人，减少阅读负担</li>
+        <li>审计日志记录每个 Agent 操作：谁/何时/何工具/何参数/结果</li>
+        <li>CorpAssist 中发外部邮件/高额报销等需要审批，审计日志满足合规要求</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="practice-02-1"> 我能实现 StateGraph 的中断节点并保存状态</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-2"> 我能设计包含审批人/超时/驳回的审批流程</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-3"> 我能实现上下文压缩传递给审批人</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-4"> 我能用 @AuditLog 注解记录工具调用</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-5"> 我能设计超时审批的自动处理逻辑</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>Interrupt</td><td>Graph 的挂起机制，等待外部输入后恢复</td></tr>
+            <tr><td>审批节点</td><td>需要人工审批的中断点</td></tr>
+            <tr><td>PendingApproval</td><td>挂起的审批请求记录</td></tr>
+            <tr><td>上下文压缩</td><td>提取关键信息减少审批人阅读量</td></tr>
+            <tr><td>@AuditLog</td><td>审计日志注解</td></tr>
+            <tr><td>Risk Level</td><td>审批风险等级（low/medium/high）</td></tr>
+            <tr><td>超时驳回</td><td>审批超时后自动执行的操作</td></tr>
+            <tr><td>Graph.resume()</td><td>从挂起点恢复 Graph 执行</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>中断恢复时，中断期间的对话（审批人补充的 comment）怎么和原始对话合并？</summary><p>中断期间审批人的 commen 作为新的 system message 注入到中断点的 State 中。恢复后 Agent 看到一条"审批人补充：{comment}"，据此调整后续行为（如修改邮件内容再发送）。合并方式：1) 审批通过时 comment 作为新消息追加到 ChatHistory；2) 审批驳回时 commen 作为错误消息触发 Agent 重新规划。关键：中断点前后的 State 保持版本连贯，不丢失任何信息。</p></details>
+        <details><summary>审计日志的存储量多大？保留策略是什么？</summary><p>每次工具调用产生一条日志。CorpAssist 每天约 10 万次工具调用，每条日志约 2KB（含 JSON 参数），每天约 200MB。保留策略：1) 最近 30 天在线可查（Elasticsearch）；2) 30-365 天归档压缩（Parquet 格式，压缩比 10:1）；3) 超过 1 年的按摘要存储（只保留操作类型和数量统计，不保留参数详情）。Elasticsearch 按天建索引，查询审计日志时按 user_id 和日期范围加速。</p></details>
+        <details><summary>审批人长时间不操作，Agent 是等待还是超时后自动执行？</summary><p>策略可配置，CorpAssist 采用"超时自动驳回"：30 分钟后未审批，系统自动驳回并通知用户。设计理由：1) Agent 等待太久会影响用户体验；2) 如果超时自动通过（auto_approve），有安全风险；3) 驳回后用户可以调整参数重新提交，或手动联系审批人。对于紧急请求，用户可以在提交审批时标记"紧急"（审批人收到红色通知），且超时从 30 分钟缩短到 10 分钟。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/" target="_blank" rel="noopener">LangGraph Human-in-the-Loop 文档</a> — 中断/恢复/审批设计</li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/core/aop.html" target="_blank" rel="noopener">Spring AOP 文档</a> — @Around 注解实现审计切面</li>
+      <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html" target="_blank" rel="noopener">Elasticsearch 审计日志存储</a> — 日志索引和查询优化</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>在 StateGraph 中实现一个中断节点，保存 State 到数据库</li>
+      <li>实现审批 API（/api/approvals/approve 和 /reject）</li>
+      <li>实现上下文压缩，只传递关键信息给审批人</li>
+      <li>用 Spring AOP 实现 @AuditLog 注解</li>
+      <li>配置审批超时定时任务（30 分钟自动驳回）</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Agent 需要发送 100 封通知邮件，但每封邮件都需要审批，怎么设计？</summary><p>不要每封邮件独立审批。改为：Agent 先汇总"100 封通知邮件清单"，生成一份审批请求（含总量、收件人列表摘要、邮件模板）。审批人一次性审批通过（或驳回）。Agent 收到审批后批量发送，并在审计日志中记录为"批量发送 100 封（审批人：xxx）"。如果其中某些邮件发送失败，只单独记录失败的日志，不重新触发审批。</p></details>
+      <details><summary>场景：审批通过后，Agent 即将执行操作前判断条件已变更（如报价单金额已过期），怎么处理？</summary><p>在执行操作前增加一个"revalidate"步骤：在执行操作前重新校验条件。如果校验通过（报价单仍在有效期内），执行操作。如果校验失败（报价单已过期），Agent 先通知用户"报价单已过期，审批已撤销"，然后等待用户提供新报价单后重新触发审批。不直接执行已过期的操作。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-02-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>中断后 State 保存到数据库，恢复时从挂起点继续</li>
+        <li>审批通过后 Agent 继续执行，驳回后 Agent 通知用户</li>
+        <li>审计日志包含用户/工具/参数/结果/耗时完整信息</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-01">多 Agent 编排模式</a></li>
+      <li>下一篇：<a href="#ch-practice-03">MCP 协议集成</a></li>
+    </ul>
+  </div>
+</section>

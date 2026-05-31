@@ -1,0 +1,412 @@
+<section id="ch-practice-01" class="chapter" data-chapter="practice-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多 Agent 编排模式</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>多 Agent 编排与集成</strong> · 能力：实现 Sequential/Parallel/Routing 模式、主管-工人模式、Handoff 交接</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 办公助手不止一个 Agent——需要客服 Agent 处理用户问题、IT Agent 处理技术工单、审批 Agent 处理流程。多 Agent 编排决定这些 Agent 是依次执行、并行执行还是按需路由。选错模式会导致效率低（串行执行可并行的任务）或冲突（多个 Agent 同时处理工单）。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>实现三种编排模式（Sequential/Parallel/Routing）；设计主管-工人架构分配任务；实现 Agent 间 Handoff 交接传递上下文；解决状态共享和冲突问题。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) Sequential 串行适合有依赖关系的任务（先查用户再查工单）；2) Parallel 并行适合独立任务（同时查多个系统）；3) Routing 按条件分发任务；4) 主管-工人模式中主管 Agent 分配任务，工人 Agent 执行；5) Handoff 是在 Agent 间传递 State 和上下文。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Sequential/Parallel/Routing 模式</h3>
+      <p>三种基础编排模式覆盖多 Agent 协作的大部分场景。<span class="term" data-term-id="sequential">Sequential</span> 按顺序执行，<span class="term" data-term-id="parallel">Parallel</span> 同时执行，<span class="term" data-term-id="routing">Routing</span> 根据条件分配到不同 Agent。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    subgraph Sequential
+        A[Agent A: 查用户] --> B[Agent B: 查工单]
+        B --> C[Agent C: 汇总]
+    end
+    subgraph Parallel
+        D[分发器] --> E[Agent A: 查HR]
+        D --> F[Agent B: 查IT]
+        D --> G[Agent C: 查财务]
+        E & F & G --> H[合并结果]
+    end
+    subgraph Routing
+        I[路由器] -->|HR 问题| J[Agent HR]
+        I -->|IT 问题| K[Agent IT]
+        I -->|财务问题| L[Agent Finance]
+    end
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Sequential 模式
+@Component
+public class SequentialOrchestrator {
+
+    public String execute(String userId) {
+        // 先查用户
+        AgentResult userResult = userAgent.execute("查用户信息: " + userId);
+        String dept = userResult.getData("department");
+
+        // 再查工单
+        AgentResult ticketResult = ticketAgent.execute(
+            "查 " + userId + " 的待处理工单");
+
+        // 最后汇总
+        return summaryAgent.execute(
+            "汇总: 用户部门=" + dept + ", 工单=" + ticketResult.getOutput());
+    }
+}
+
+// Parallel 模式
+@Component
+public class ParallelOrchestrator {
+
+    public Map<String, AgentResult> executeParallel(String userId) {
+        CompletableFuture<AgentResult> hrFuture =
+            CompletableFuture.supplyAsync(() ->
+                hrAgent.execute("查询 HR 信息: " + userId));
+
+        CompletableFuture<AgentResult> itFuture =
+            CompletableFuture.supplyAsync(() ->
+                itAgent.execute("查询 IT 信息: " + userId));
+
+        CompletableFuture<AgentResult> ticketFuture =
+            CompletableFuture.supplyAsync(() ->
+                ticketAgent.execute("查询工单: " + userId));
+
+        // 等待所有并行任务完成
+        Map<String, AgentResult> results = Map.of(
+            "hr", hrFuture.join(),
+            "it", itFuture.join(),
+            "ticket", ticketFuture.join()
+        );
+        return results;
+    }
+}
+
+// Routing 模式（基于 StateGraph）
+public class RoutingWorkflow {
+    public static StateGraph<String> build() {
+        StateGraph<String> graph = new StateGraph<>(String.class);
+
+        graph.addNode("router", state -> {
+            if (state.contains("HR") || state.contains("请假")) {
+                return "hr_agent";
+            } else if (state.contains("IT") || state.contains("VPN")) {
+                return "it_agent";
+            }
+            return "general_agent";
+        });
+
+        graph.addConditionalEdge("router",
+            Function.identity(),
+            Map.of("hr_agent", "hr_agent",
+                   "it_agent", "it_agent",
+                   "general_agent", "general_agent")
+        );
+        return graph;
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>主管-工人模式</h3>
+      <p><span class="term" data-term-id="supervisor-worker">主管-工人模式</span>中，Supervisor Agent 负责任务规划、分配和结果整合，Worker Agent 专注于执行特定子任务。这是最常用的多 Agent 模式。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 主管 Agent：拆解任务并分配给工人
+@Component
+public class SupervisorAgent {
+
+    private final ChatClient chatClient;
+    private final List<WorkerAgent> workers;
+
+    public AgentResult execute(String task) {
+        // 1. 规划：用 LLM 拆解任务
+        String plan = chatClient.prompt()
+            .user("""
+                将以下任务拆解为子任务列表（JSON 数组格式）：
+                任务：%s
+                可用的工人：查用户、查日程、发邮件、查工单
+
+                返回格式：[{"worker":"查用户","task":"查询张三的信息"}, ...]
+                """.formatted(task))
+            .call()
+            .content();
+
+        // 2. 分配：解析 JSON 并分发给对应工人
+        List<SubTask> subTasks = parsePlan(plan);
+        List<CompletableFuture<WorkerResult>> futures = new ArrayList<>();
+
+        for (SubTask subTask : subTasks) {
+            WorkerAgent worker = findWorker(subTask.worker());
+            futures.add(CompletableFuture.supplyAsync(() ->
+                worker.execute(subTask.task())
+            ));
+        }
+
+        // 3. 收集结果
+        List<WorkerResult> results = futures.stream()
+            .map(CompletableFuture::join)
+            .toList();
+
+        // 4. 汇总：LLM 整合所有结果
+        String summary = chatClient.prompt()
+            .user("请整合以下结果：\n" + formatResults(results))
+            .call()
+            .content();
+
+        return new AgentResult(summary, results);
+    }
+}
+
+// 工人 Agent：专注执行特定任务
+@Component("worker_query_user")
+public class QueryUserWorker implements WorkerAgent {
+
+    @Override
+    public WorkerResult execute(String task) {
+        // 专注查询用户信息
+        return new WorkerResult("query_user",
+            Map.of("name", "张三", "department", "IT", "email", "zhangsan@corp.com"));
+    }
+}
+
+@Component("worker_send_email")
+public class SendEmailWorker implements WorkerAgent {
+
+    @Override
+    public WorkerResult execute(String task) {
+        // 专注发送邮件
+        return new WorkerResult("send_email", Map.of("status", "sent"));
+    }
+}</pre></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工说"帮我查一下张三的工单状态，然后通知他处理"。Supervisor 拆解为：1) QueryUserWorker(查张三的信息) → 2) QueryTicketWorker(查张三工单) → 3) SendEmailWorker(给张某发邮件)。三个 Worker 中 1 和 2 可以并行（没有数据依赖），3 需要 1 和 2 的结果。Supervisor 自动优化执行顺序。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Handoff 交接</h3>
+      <p><span class="term" data-term-id="handoff">Handoff</span> 是一个 Agent 将任务和上下文交给另一个 Agent 的机制。交接时传递 State（当前进度）、Context（已收集的信息）和 Artifacts（中间产物）。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Handoff 上下文
+public class HandoffContext {
+    private final String fromAgent;
+    private final String toAgent;
+    private final Map<String, Object> state;     // 当前状态
+    private final List<Message> history;         // 对话历史
+    private final String handoffReason;          // 交接原因
+
+    // 构建交接上下文
+    public static HandoffContext create(
+            String from, String to, String reason,
+            Map<String, Object> state, List<Message> history) {
+        return new HandoffContext(from, to, reason, state, history);
+    }
+}
+
+// Agent 间的 Handoff 工具
+@Component
+public class HandoffTools {
+
+    @Tool(name = "handoffToHR",
+          description = "将对话转交给 HR 专员 Agent，处理请假、薪酬等人力资源问题")
+    public HandoffResult handoffToHR(
+            @ToolParam(description = "交接原因，说明为什么需要 HR 处理") String reason,
+            @ToolParam(description = "当前已收集的信息，JSON 格式") String context) {
+
+        return new HandoffResult("hr_agent", reason, context);
+    }
+
+    @Tool(name = "handoffToIT",
+          description = "将对话转交给 IT 支持 Agent，处理技术问题")
+    public HandoffResult handoffToIT(
+            @ToolParam(description = "交接原因") String reason,
+            @ToolParam(description = "当前已收集的信息") String context) {
+
+        return new HandoffResult("it_agent", reason, context);
+    }
+}
+
+// Handoff 执行器
+@Component
+public class HandoffExecutor {
+
+    private final Map<String, Agent> agentRegistry;
+
+    public AgentResult executeHandoff(HandoffContext context) {
+        Agent targetAgent = agentRegistry.get(context.getToAgent());
+        if (targetAgent == null) {
+            return AgentResult.error("未知 Agent: " + context.getToAgent());
+        }
+
+        // 将上下文注入目标 Agent 的记忆
+        targetAgent.getMemory().add(context.getHistory());
+
+        // 执行
+        return targetAgent.execute(
+            "【经由 " + context.getFromAgent() + " 转交】" +
+            context.getHandoffReason() +
+            "\n已收集信息: " + context.getState()
+        );
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>状态共享与冲突解决</h3>
+      <p>多 Agent 并行执行时可能同时修改同一资源（如同时查和修改同一工单）。需要状态隔离和冲突检测机制。</p>
+      <table class="outline-table">
+        <thead><tr><th>问题</th><th>表现</th><th>解决方案</th></tr></thead>
+        <tbody>
+          <tr><td>写冲突</td><td>两个 Agent 同时修改同一工单的状态</td><td>悲观锁：分布式锁（Redis RedLock）</td></tr>
+          <tr><td>读过期</td><td>Agent A 读到的状态被 Agent B 改了</td><td>乐观锁：版本号校验（CAS）</td></tr>
+          <tr><td>状态覆盖</td><td>并行结果合并时后到的覆盖了先到的</td><td>MergedState：按字段合并而非整体覆盖</td></tr>
+          <tr><td>循环依赖</td><td>Agent A 等 B，B 等 A 的死锁</td><td>依赖图分析 + 超时中断</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 分布式状态存储
+@Component
+public class DistributedStateStore {
+
+    private final RedisTemplate<String, String> redis;
+
+    // 乐观锁：版本号 CAS
+    public boolean updateWithVersion(String key,
+                                      Function<String, String> updater) {
+        for (int retry = 0; retry < 3; retry++) {
+            String current = redis.opsForValue().get(key);
+            String version = extractVersion(current);
+            String newValue = updater.apply(current);
+            // CAS: 仅当版本号一致时更新
+            boolean success = redis.opsForValue()
+                .setIfEquals(key, current, newValue);
+            if (success) return true;
+        }
+        return false;
+    }
+
+    // 合并状态：字段级别合并而非覆盖
+    public Map<String, Object> mergeState(
+            Map<String, Object> base,
+            Map<String, Object> update) {
+        Map<String, Object> merged = new HashMap<>(base);
+        for (var entry : update.entrySet()) {
+            // 如果是集合类型，追加而非覆盖
+            if (entry.getValue() instanceof List) {
+                List<Object> existing = (List<Object>)
+                    merged.getOrDefault(entry.getKey(), new ArrayList<>());
+                existing.addAll((List) entry.getValue());
+                merged.put(entry.getKey(), existing);
+            } else {
+                // 标量值：更新（但保留原始值的时间戳）
+                merged.put(entry.getKey() + "_updated_at",
+                    Instant.now().toString());
+                merged.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return merged;
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>三种基础模式：Sequential 适合有依赖的任务，Parallel 适合独立任务，Routing 按条件分发</li>
+        <li>主管-工人模式是 CorpAssist 最常用的多 Agent 模式，主管拆解任务，工人专注执行</li>
+        <li>Handoff 传递 State+Context+Artifacts，通过 @Tool 工具实现 Agent 间交接</li>
+        <li>状态冲突用版本号 CAS 和字段级合并解决，分布式锁防止写冲突</li>
+        <li>CorpAssist 的 5 个 Agent（HR/IT/财务/工单/日程）通过 Supervisor + Handoff 协作</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="practice-01-1"> 我能根据任务依赖关系选择 Sequential/Parallel/Routing 模式</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-2"> 我能实现主管-工人模式分配和汇总任务</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-3"> 我能用 @Tool 实现 Agent 间 Handoff 交接</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-4"> 我能用版本号 CAS 解决状态写冲突</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-5"> 我能画出三种模式的 Mermaid 流程图</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>Sequential</td><td>Agent 按顺序依次执行</td></tr>
+            <tr><td>Parallel</td><td>多个 Agent 同时执行独立任务</td></tr>
+            <tr><td>Routing</td><td>按条件分发任务到不同 Agent</td></tr>
+            <tr><td>主管-工人</td><td>Supervisor 分配任务，Worker 专注执行</td></tr>
+            <tr><td>Handoff</td><td>Agent 间传递任务和上下文的机制</td></tr>
+            <tr><td>CAS</td><td>Compare-And-Swap，乐观锁实现</td></tr>
+            <tr><td>RedLock</td><td>Redis 分布式锁，防止写冲突</td></tr>
+            <tr><td>MergedState</td><td>字段级别的状态合并</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Sequential 和 Parallel 模式各自适合什么场景？怎么判断任务有无依赖？</summary><p>判断依赖：画一个有向无环图（DAG）。节点是任务，边是数据依赖。如果没有边相连的任务可以并行。Sequential 适合：A→B→C 这种线性依赖（先登录→后查询→再操作）。Parallel 适合：同时查 HR 和 IT 两个独立知识库。CorpAssist 中 80% 的任务是 Sequential（有依赖），20% 可并行。关键优化点：在依赖图中找出可并行的层级，用 CompletableFuture 并行执行。</p></details>
+        <details><summary>主管-工人模式中，主管的 LLM 调用量是多少？会不会成为瓶颈？</summary><p>主管每次任务做一次"规划"+一次"汇总"= 2 次 LLM 调用。对于 N 个子任务，总调用 = 2（主管）+ N（工人）。主管的调用量与子任务数量无关，不会成为瓶颈。但如果主管的规划经常出错（拆解错误分配），会导致工人执行无意义的任务，浪费 Token。优化：1) 给主管的 System Prompt 中提供任务拆解示例；2) 工人执行前验证子任务是否合理。</p></details>
+        <details><summary>Handoff 和工具调用有什么区别？什么时候该用 Handoff？</summary><p>工具调用是 Agent 调用外部功能（查数据库、发邮件），返回结构化的数据。Handoff 是 Agent 将控制权交给另一个 Agent，传递的是上下文和推理历史。区别：工具调用返回数据后控制权回到原 Agent；Handoff 后原 Agent 不再参与。使用 Handoff 的场景：1) 跨领域（客服→技术支持），交接后技术专家独立处理；2) 权限提升（普通用户→管理员审批），原 Agent 不能继续处理；3) 需要不同角色视角（撰写→审核），两个阶段关注点不同。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://github.com/alibaba/spring-ai-alibaba" target="_blank" rel="noopener">Spring AI Alibaba 多 Agent 示例</a> — StateGraph 多 Agent 编排</li>
+      <li><a href="https://langchain-ai.github.io/langgraph/concepts/multi_agent/" target="_blank" rel="noopener">LangGraph 多 Agent 模式</a> — Supervisor、Handoff 等模式参考</li>
+      <li><a href="https://redis.io/docs/manual/patterns/distributed-locks/" target="_blank" rel="noopener">RedLock 分布式锁</a> — 分布式锁实现并发控制</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>实现 Sequential 三步流程：查用户→查工单→汇总</li>
+      <li>实现 Parallel 并行查询：同时查 HR 和 IT 知识库</li>
+      <li>实现 Supervisor Agent + 3 个 Worker Agent 的主管-工人模式</li>
+      <li>用 @Tool 实现 handoffToHR 和 handoffToIT 工具，验证 Agent 间交接</li>
+      <li>模拟两个 Agent 同时更新同一状态，用版本号 CAS 解决冲突</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Parallel 模式下查 HR 用了 5 秒，查 IT 用了 3 秒，合并结果时会等 5 秒。怎么优化？</summary><p>如果 HR 的结果和 IT 的结果独立（不需要一起输出），可以用流式返回——先返回快的 IT 结果，再返回慢的 HR 结果。用户先看到 IT 信息，2 秒后 HR 结果追加显示。如果必须合并输出（如对比信息），则无法优化等待时间，但可以：1) 给慢的查询设置超时（4 秒超时后用缓存或降级数据）；2) 把慢的查询改为异步（缓存上次结果，本次查询超时时用缓存）。</p></details>
+      <details><summary>场景：Handoff 交接后，接收方 Agent 不知道上下文，怎么保证连续体验？</summary><p>HandoffContext 携带了 fromAgent、toAgent、state（结构化数据）、history（对话列表）。接收方 Agent 的 ChatMemory 在 execute 前注入 history，Agent 的 System Prompt 中加上"你从上一位同事（{fromAgent}）接手的任务，当前进度：{handoffReason}"。关键是 state 中包含了关键数据（工单编号、用户信息等），不是让接收方从头推理。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-01-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>Sequential 模式按顺序执行 3 步，每一步的输出是下一步的输入</li>
+        <li>Parallel 模式同时执行 2 个独立查询，总耗时接近最慢的查询</li>
+        <li>Handoff 交接后接收方 Agent 知道交接原因和上下文</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-04">会话与记忆管理</a></li>
+      <li>下一篇：<a href="#ch-practice-02">人在回路与审批</a></li>
+    </ul>
+  </div>
+</section>

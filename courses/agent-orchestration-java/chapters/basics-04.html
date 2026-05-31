@@ -1,0 +1,380 @@
+<section id="ch-basics-04" class="chapter" data-chapter="basics-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>会话与记忆管理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Agent 基础</strong> · 能力：选型 ChatMemory 类型、Redis 持久化、多租户隔离、记忆压缩</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>Agent 不是一次性问答——用户说"帮我查工单"，Agent 查完后用户又说"给处理人发个提醒"。Agent 需要记住上一轮的工单编号和处理人信息。Spring AI 的 ChatMemory 管理对话历史，支持多种存储后端和记忆策略。选错类型会导致 Token 浪费或记忆丢失。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>选择正确的 ChatMemory 类型（InMemory/Redis/MongoDB）；配置 Redis 持久化实现跨实例对话恢复；实现多租户 Session 隔离；配置记忆压缩策略控制 Token 消耗。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) ChatMemory 类型：InMemory（单实例）/ Redis（分布式）/ JDBC（持久化）；2) Redis 存储 message 过期时间默认 24h；3) 多租户用 sessionId 前缀区分 tenant；4) 记忆压缩降低 Token 消耗 30-50%；5) summarization 模式用 LLM 生成对话摘要替代完整历史。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>ChatMemory 类型选型</h3>
+      <p><span class="term" data-term-id="chat-memory">ChatMemory</span> 管理 Agent 的对话历史，让 Agent 记住前面的交互。Spring AI 提供 4 种实现，按需选择。</p>
+      <table class="outline-table">
+        <thead><tr><th>类型</th><th>存储后端</th><th>持久化</th><th>跨实例共享</th><th>适用场景</th></tr></thead>
+        <tbody>
+          <tr><td>InMemoryChatMemory</td><td>HashMap（堆内存）</td><td>否</td><td>否</td><td>开发测试、单实例</td></tr>
+          <tr><td>RedisChatMemory</td><td>Redis</td><td>是（RDB/AOF）</td><td>是</td><td>CorpAssist 生产推荐</td></tr>
+          <tr><td>JdbcChatMemory</td><td>数据库</td><td>是（SQL）</td><td>是</td><td>需要 SQL 查询分析</td></tr>
+          <tr><td>MongoDbChatMemory</td><td>MongoDB</td><td>是</td><td>是</td><td>文档已用 MongoDB</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Configuration
+public class ChatMemoryConfig {
+
+    // 开发环境：内存存储
+    @Bean
+    @Profile("dev")
+    public ChatMemory inMemoryChatMemory() {
+        return new InMemoryChatMemory();
+    }
+
+    // 生产环境：Redis 存储（推荐 CorpAssist）
+    @Bean
+    @Profile("prod")
+    public ChatMemory redisChatMemory(RedisConnectionFactory redis) {
+        return RedisChatMemory.builder()
+            .redisConnectionFactory(redis)
+            .defaultTimeToLive(Duration.ofHours(24))  // 消息 TTL
+            .scanBatchSize(500)                        // 批量扫描
+            .build();
+    }
+
+    // 使用 ChatMemory 的 Agent
+    @Bean
+    public ChatClient chatClient(ChatClient.Builder builder,
+                                  ChatMemory chatMemory) {
+        return builder
+            .defaultSystem("你是一个企业办公助手。")
+            .defaultAdvisors(new MessageChatMemoryAdvisor(
+                chatMemory,
+                "default_session",       // 默认 session ID
+                10                       // 保留最近 10 轮对话
+            ))
+            .build();
+    }
+}</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>用户第一步说"帮我查 TKT-001"，Agent 回复工单状态为"待处理，处理人张三"。用户第二句话说"给他发邮件提醒"，Agent 从 ChatMemory 读取上一轮对话，获得处理人张三的信息，不需要重新查询。如果 Agent 部署多实例（K8s 2 副本），RedisChatMemory 保证用户请求到任何实例都能恢复对话。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Redis 持久化</h3>
+      <p><span class="term" data-term-id="redis-chat-memory">RedisChatMemory</span> 将对话消息存储在 Redis Hash 中，每个 session 对应一个 key，每条消息是 Hash 的一个 field。通过 TTL 实现自动过期。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// RedisChatMemory 详细配置
+@Configuration
+public class RedisChatMemoryConfig {
+
+    @Bean
+    public ChatMemory chatMemory(RedisConnectionFactory factory) {
+        return RedisChatMemory.builder()
+            .redisConnectionFactory(factory)
+            // Key 前缀（用于区分不同应用）
+            .keyPrefix("corpassist:memory:")
+            // 每条消息的 TTL（从创建时开始）
+            .defaultTimeToLive(Duration.ofHours(24))
+            // 批量扫描大小（生产场景大值）
+            .scanBatchSize(1000)
+            // 序列化方式
+            .serializer(new Jackson2JsonRedisSerializer<>(Message.class))
+            .build();
+    }
+
+    // 分布式场景：自定义 session ID 生成
+    @Bean
+    public SessionIdProvider sessionIdProvider() {
+        return request -> {
+            String tenantId = request.getHeader("X-Tenant-Id");
+            String userId = request.getHeader("X-User-Id");
+            // 格式: tenant:user:uuid → 支持多租户隔离
+            return String.format("%s:%s:%s",
+                tenantId, userId, UUID.randomUUID());
+        };
+    }
+}
+
+// Redis 中的数据结构（redis-cli 查看）：
+// > KEYS corpassist:memory:*
+// 1) "corpassist:memory:tenant_hr:u001:sess_abc"
+// > HGETALL corpassist:memory:tenant_hr:u001:sess_abc
+// 1) "0"    → 最早的 message
+// 2) "{\"messageType\":\"user\",\"content\":\"查工单 TKT-001\"}"
+// 3) "1"
+// 4) "{\"messageType\":\"assistant\",\"content\":\"工单状态: 待处理...\"}"
+// 5) "2"
+// 6) "{\"messageType\":\"user\",\"content\":\"发邮件给张三\"}"</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>InMemoryChatMemory</h4><p>Agent 重启后所有对话丢失。K8s 滚动更新导致用户对话中断。多实例部署下同一用户可能路由到不同实例，看不到历史。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>RedisChatMemory</h4><p>Agent 重启或有状态更新，对话从 Redis 恢复。多实例共享同一个 Redis，用户请求任意实例都能获取完整历史。P99 读取延迟 <5ms。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户 Session 隔离</h3>
+      <p><span class="term" data-term-id="session-isolation">Session 隔离</span>确保不同用户、不同租户的对话历史互不可见。通过 session ID 的命名规范实现。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 多租户 Adapter：自动从请求中提取 tenant+user 信息
+@Component
+public class TenantAwareAdvisor implements RequestResponseAdvisor {
+
+    @Override
+    public AdvisedRequest before(AdvisedRequest request) {
+        // 从请求上下文获取租户和用户信息
+        String tenantId = TenantContext.getCurrentTenant();
+        String userId = SecurityContextHolder.get()
+            .getAuthentication().getName();
+
+        // 构造隔离的 session ID
+        String sessionId = String.format("%s:%s:%s",
+            tenantId, userId, request.sessionId());
+
+        // 注入 System Prompt 提醒 Agent 租户信息
+        return AdvisedRequest.from(request)
+            .withSystemText(String.format(
+                "当前租户: %s, 用户: %s\n%s",
+                tenantId, userId, request.systemText()
+            ))
+            .withSessionId(sessionId)
+            .build();
+    }
+
+    @Override
+    public void after(AdvisedRequest request, AdvisedResponse response) {
+        // 记录审计日志
+        auditLogger.log(request.sessionId(),
+            request.userText(), response.getResponse());
+    }
+}
+
+// 查询当前对话历史
+@RestController
+@RequestMapping("/api/chat")
+public class ChatHistoryController {
+
+    private final ChatMemory chatMemory;
+
+    @GetMapping("/history")
+    public List<Message> getHistory(
+            @RequestHeader("X-Session-Id") String sessionId) {
+        return chatMemory.get(sessionId, 50)
+            .stream()
+            .map(msg -> new Message(
+                msg.getMessageType().name(),
+                msg.getContent()
+            ))
+            .toList();
+    }
+
+    @DeleteMapping("/history")
+    public void clearHistory(
+            @RequestHeader("X-Session-Id") String sessionId) {
+        chatMemory.clear(sessionId);
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>记忆压缩策略</h3>
+      <p>对话历史越长，Token 消耗越大。LLM 的 Context Window 有限（128K），且长历史中早期信息可能被遗忘。<span class="term" data-term-id="memory-compression">记忆压缩</span>通过摘要或裁剪降低 Token 消耗。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 策略 1：窗口记忆（只保留最近 N 轮）
+@Bean
+public ChatClient windowedChatClient(ChatClient.Builder builder,
+                                       ChatMemory chatMemory) {
+    return builder
+        .defaultAdvisors(new MessageChatMemoryAdvisor(
+            chatMemory, "sess_001",
+            20  // 保留最近 20 轮对话
+        ))
+        .build();
+}
+
+// 策略 2：摘要记忆（用 LLM 生成对话摘要）
+@Component
+public class SummarizingChatMemory implements ChatMemory {
+
+    private final ChatMemory delegate;
+    private final ChatClient summarizingClient;
+
+    public SummarizingChatMemory(ChatMemory delegate,
+                                  ChatClient.Builder builder) {
+        this.delegate = delegate;
+        this.summarizingClient = builder
+            .defaultSystem("将对话历史压缩为100字以内的摘要，保留关键信息：工单号、处理人、决策")
+            .build();
+    }
+
+    @Override
+    public void add(String sessionId, Message message) {
+        delegate.add(sessionId, message);
+        // 每 10 条消息触发一次压缩
+        if (delegate.get(sessionId, Integer.MAX_VALUE).size() >= 10) {
+            compress(sessionId);
+        }
+    }
+
+    private void compress(String sessionId) {
+        List<Message> history = delegate.get(sessionId, 10);
+        String fullHistory = history.stream()
+            .map(Message::getContent)
+            .collect(Collectors.joining("\n"));
+
+        // LLM 生成摘要
+        String summary = summarizingClient.prompt()
+            .user(fullHistory)
+            .call()
+            .content();
+
+        // 替换前 8 条为摘要，保留最后 2 条完整消息
+        delegate.clear(sessionId);
+        delegate.add(sessionId, new Message("system",
+            "【历史摘要】" + summary));
+        for (Message recent : history.subList(8, 10)) {
+            delegate.add(sessionId, recent);
+        }
+    }
+
+    @Override
+    public List<Message> get(String sessionId, int lastN) {
+        return delegate.get(sessionId, lastN);
+    }
+
+    @Override
+    public void clear(String sessionId) {
+        delegate.clear(sessionId);
+    }
+}
+
+// 策略 3：Token 预算限制
+@Bean
+public ReactAgent budgetAwareAgent(ChatClient chatClient,
+                                    ChatMemory chatMemory) {
+    return ReactAgent.builder()
+        .chatClient(chatClient)
+        .chatMemory(chatMemory)
+        .maxTokenUsage(8192)  // 总 Token 预算
+        .systemPrompt("""
+            当对话历史较长时：
+            1. 优先使用最近的信息
+            2. 早期的决策如果有记录，用"如之前所述"引用
+            3. 不需要重复用户说过的完整内容
+            """)
+        .build();
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>ChatMemory 选型：生产用 RedisChatMemory（TTL=24h），开发用 InMemoryChatMemory</li>
+        <li>Redis 持久化使 Agent 跨实例恢复对话，P99 读取延迟 <5ms，重启无影响</li>
+        <li>多租户隔离通过 sessionId 前缀实现（格式 tenant:user:uuid），Advisor 自动注入租户信息</li>
+        <li>记忆压缩推荐窗口策略（保留 20 轮）+ 摘要策略（每 10 轮压缩），Token 消耗降低 40%</li>
+        <li>CorpAssist 使用 RedisChatMemory + 窗口 20 + 摘要压缩 + TTL 24h 的完整记忆管理</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-04-1"> 我能选择 ChatMemory 类型并说明理由</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-2"> 我能配置 RedisChatMemory 的 TTL 和 key 前缀</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-3"> 我能实现多租户 session 隔离</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-4"> 我能配置窗口记忆和摘要压缩</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-04-5"> 我能用 Rest API 查询和清除对话历史</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>ChatMemory</td><td>管理对话历史的接口</td></tr>
+            <tr><td>RedisChatMemory</td><td>基于 Redis 的分布式对话存储</td></tr>
+            <tr><td>MessageChatMemoryAdvisor</td><td>自动管理 ChatMemory 的 Advisor</td></tr>
+            <tr><td>sessionId</td><td>对话唯一标识，格式 tenant:user:uuid</td></tr>
+            <tr><td>TTL</td><td>消息过期时间，RedisChatMemory 默认 24h</td></tr>
+            <tr><td>窗口记忆</td><td>只保留最近 N 轮对话</td></tr>
+            <tr><td>摘要记忆</td><td>LLM 生成对话摘要替代完整历史</td></tr>
+            <tr><td>Token 预算</td><td>单次对话最大 Token 消耗限制</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>ChatMemory 的 add() 和 get() 实现有哪些注意事项？</summary><p>add()：需要线程安全（ConcurrentHashMap 或 Redis 原子操作），消息需要有序（带递增索引），设置合理的 TTL 避免内存泄漏。get()：注意返回顺序（按时间升序），lastN 参数控制返回条数避免超长。Spring AI 的 MessageChatMemoryAdvisor 在每次 LLM 调用前自动执行 get()，调用后自动执行 add()，开发者不需要手动操作。在 Redis 实现中，add() 用 HSET，get() 用 HVALS 排序，O(N) 复杂度在 1000 条以内表现良好。</p></details>
+        <details><summary>多租户场景下，sessionId 怎么设计才能防止数据泄露？</summary><p>sessionId 设计为 <code>{tenantId}:{userId}:{sessionUuid}</code>。关键安全点：1) 从 JWT Token 中提取 tenantId 和 userId，不信任客户端传入的 sessionId；2) 在 TenantAwareAdvisor 的 before 方法中强制重写 sessionId，确保租户前缀正确；3) Redis key 按租户前缀分区，数据泄露不影响其他租户；4) 管理 API 需要校验当前用户是否有权限访问该 sessionId 所属的租户。</p></details>
+        <details><summary>窗口记忆和摘要记忆能同时使用吗？怎么配合？</summary><p>能。分层策略：1) 短期窗口——保留最近 20 轮完整对话（用于当前上下文）；2) 中期摘要——每隔 10 轮将前 8 轮压缩为摘要，保留最后 2 轮完整；3) 长期摘要——每天结束时将所有历史压缩为一份"日摘要"，用于第二天的上下文。CorpAssist 实现：RedisChatMemory 保留 48 小时完整历史（滑动窗口 20 轮），超过 48 小时的消息用定时任务压缩为日摘要存入单独字段。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatmemory.html" target="_blank" rel="noopener">Spring AI ChatMemory 文档</a> — 所有类型和配置选项</li>
+      <li><a href="https://redis.io/docs/manual/ttl/" target="_blank" rel="noopener">Redis TTL 文档</a> — key 过期策略和内存淘汰</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisor 文档</a> — MessageChatMemoryAdvisor 使用指南</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>启动 Redis：<code>docker run -d -p 6379:6379 redis:7-alpine</code></li>
+        <li>配置 RedisChatMemory，测试跨请求记忆保持</li>
+        <li>实现多租户 session 隔离，用不同 tenantId 测试隔离性</li>
+        <li>配置 MessageChatMemoryAdvisor 的窗口大小为 5，验证只保留最近 5 轮</li>
+        <li>实现摘要压缩，每 10 轮触发一次摘要，对比压缩后的 Token 消耗</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Redis 宕机后 Agent 服务还能工作吗？对话历史会怎样？</summary><p>Redis 宕机后，ChatMemory 的 get() 会抛出异常（Connection refused）。MessageChatMemoryAdvisor 默认不会阻止请求继续——它会忽略异常，Agent 以"无历史"的状态处理当前请求（不报错但失去上下文）。用户不会收到错误，但 Agent 不记得之前的对话内容。恢复策略：1) 给 Advisor 添加 Redis 连接失败的回退，切换到 InMemoryChatMemory（临时）；2) 添加重试逻辑（如果 Redis 只是暂时不可用）；3) 监控告警 Redis 连接状态。</p></details>
+      <details><summary>场景：用户对话了 50 轮后 Token 消耗太大，但窗口记忆设为 20 轮会丢失早期的重要上下文（如工单编号），怎么解决？</summary><p>方案：对早期信息做结构化提取而不是简单丢弃。在 System Prompt 中要求 Agent 每轮结束后自动汇总关键信息（工单编号、审批人、决策），以 JSON 格式存入记忆的 system message 中。这样即使滑动窗口丢弃了早期对话，关键的结构化信息仍然保留。CorpAssist 的 memory 包含两个部分：1) 结构化摘要（持久化 key-value 存储，保留所有关键信息）；2) 最近 20 轮对话（短时上下文，滑动窗口）。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-04-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>Redis 中能查到 corpassist:memory:* 的 key，对话消息正确存储</li>
+        <li>用户说"发邮件给张三"，Agent 自动从上一轮获得张三邮箱</li>
+        <li>不同 tenant 的 session 互不可见</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-03">工具调用与 Function Calling</a></li>
+      <li>下一篇：<a href="#ch-practice-01">多 Agent 编排模式</a></li>
+    </ul>
+  </div>
+</section>

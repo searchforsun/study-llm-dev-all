@@ -1,0 +1,311 @@
+<section id="ch-basics-03" class="chapter" data-chapter="basics-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>AI 生成代码的质量管控</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>AI 编码工具全景</strong> · 能力：识别生成代码的常见缺陷、应用静态检查+AI Review 双保险、监控测试覆盖率、控制 AI 代码比例</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>AI 生成代码不是完美的——可能包含 API 版本错误、安全漏洞（SQL 注入、CSV 注入）、错误处理缺失、并发问题。CorpAssist 团队曾因 AI 生成的代码未处理空指针（NPE）导致线上故障。建立质量管控体系后，AI 相关 Bug 减少 70%。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>识别 AI 生成代码的 6 类常见缺陷；配置静态检查工具（SonarQube/Checkstyle）+ AI Review 双保险；监控单元测试覆盖率确保 AI 代码被测试覆盖；设定和追踪团队的可接受 AI 代码比例。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 6 类常见缺陷：API 版本/安全漏洞/错误处理/并发/NPE/幻觉 API；2) 静态检查（SonarQube）拦截 60% 缺陷，AI Review（Claude Code）拦截额外 25%；3) 新生成代码的单元测试覆盖率目标 > 80%；4) AI 代码比例建议 30-50%（新功能），核心模块 < 20%。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>生成代码的常见缺陷</h3>
+      <p><span class="term" data-term-id="ai-code-defects">AI 生成代码</span>的缺陷有固定模式。识别这些模式可以快速定位问题。</p>
+      <table class="outline-table">
+        <thead><tr><th>缺陷类别</th><th>表现</th><th>检测方法</th><th>CorpAssist 实例</th></tr></thead>
+        <tbody>
+          <tr><td>API 版本错误</td><td>使用了过时的 API 或不在依赖中的类</td><td>编译检查</td><td>用 RestTemplate 而不是 WebClient（Spring Boot 3.x 推荐 WebClient）</td></tr>
+          <tr><td>安全漏洞</td><td>SQL 注入、CSV 注入、XSS</td><td>SonarQube 安全规则</td><td>CSV 导出时未对 = + - 做转义</td></tr>
+          <tr><td>空指针</td><td>没有处理 Optional/可能为 null 的值</td><td>SpotBugs</td><td>getUserInfo() 返回 null 时没有判空</td></tr>
+          <tr><td>并发问题</td><td>没有加锁/使用了非线程安全的集合</td><td>代码审查</td><td>HashMap 用在 @Service 字段中</td></tr>
+          <tr><td>幻觉 API</td><td>调用了不存在的类或方法</td><td>编译检查</td><td>import org.spring.ai 不存在的类名</td></tr>
+          <tr><td>错误处理缺失</td><td>catch 了异常但没有处理</td><td>SonarQube 规则</td><td>catch (Exception e) 只打印了日志没有恢复</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 典型缺陷示例：AI 生成的 CSV 导出代码（有漏洞）
+
+// ❌ AI 生成的缺陷代码
+public void exportCsv(List<Ticket> tickets, Writer writer) {
+    for (Ticket t : tickets) {
+        // 漏洞：没有对内容做 CSV 转义
+        writer.write(t.getId() + "," + t.getTitle() + "\n");
+        // 如果 title = "=SUM(A1:A10)"，Excel 会执行公式！
+    }
+}
+
+// ✅ 修复后的代码
+public void exportCsv(List<Ticket> tickets, Writer writer) {
+    for (Ticket t : tickets) {
+        writer.write(escapeCsv(t.getId()) + "," + escapeCsv(t.getTitle()) + "\n");
+    }
+}
+
+private String escapeCsv(String value) {
+    if (value == null) return "";
+    // CSV 注入防护：= + - @ 开头的字段加单引号前缀
+    if (value.matches("^[=+\\-@].*")) {
+        return "'" + value;
+    }
+    // 包含逗号或引号的字段用双引号包裹
+    if (value.contains(",") || value.contains("\"")) {
+        return "\"" + value.replace("\"", "\"\"") + "\"";
+    }
+    return value;
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>静态检查 + AI Review 双保险</h3>
+      <p>单靠静态检查（SonarQube）或人工审查都不够。双保险策略：静态检查拦截可自动发现的缺陷，AI Review 发现逻辑和语义问题，人工确认最终质量。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    AI_GEN[AI 生成代码] --> COMPILE[编译检查]
+    COMPILE -->|通过| STATIC[静态检查<br/>SonarQube/Checkstyle]
+    COMPILE -->|失败| AI_GEN
+    STATIC -->|通过| AI_REV[AI Review<br/>Claude Code]
+    STATIC -->|有缺陷| AI_GEN
+    AI_REV -->|通过| HUMAN[人工审查<br/>PR Review]
+    AI_REV -->|发现问题| AI_GEN
+    HUMAN -->|通过| MERGE[合并]
+    HUMAN -->|有问题| AI_GEN
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># CI 配置：双保险检查
+# .github/workflows/ai-code-quality.yml
+name: AI Code Quality Check
+on: [pull_request]
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 第 1 道防线：编译检查
+      - name: Compile Check
+        run: mvn compile -q
+
+      # 第 2 道防线：静态分析
+      - name: Static Analysis
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST }} \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+      # 第 3 道防线：AI Review
+      - name: AI Code Review
+        run: |
+          claude "审查以下 PR 的代码变更，检查：
+          1. 是否有安全漏洞（CSV注入/SQL注入/XSS）
+          2. 是否有空指针风险
+          3. 是否正确处理了异常
+          4. 是否遵循项目的架构规范
+          输出 JSON 格式的审查结果。" \
+            --input-diff ${{ github.event.pull_request.diff_url }}
+
+      # 第 4 道防线：人工审查（PR 必须 review 后才能合并）
+      - name: Require Review
+        run: |
+          gh pr merge --merge --auto</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>只有 SonarQube</h4><p>SonarQube 能发现 60% 的缺陷（CSV 注入、NPE），但逻辑错误（AI 用了错误的算法、API 语义不匹配）检测不到。缺陷漏检率 40%。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>SonarQube + AI Review</h4><p>SonarQube 拦截语法和安全问题，AI Review 发现逻辑和语义问题。组合覆盖 85% 的缺陷。剩余 15% 需要人工审查（业务逻辑正确性）。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>测试覆盖率监控</h3>
+      <p>AI 生成的代码必须有对应的单元测试。SonarQube 和 JaCoCo 追踪覆盖率变化，PR 中新增的 AI 代码覆盖率不达标时自动阻止合并。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">xml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-xml"><!-- pom.xml JaCoCo 配置 -->
+<plugin>
+    <groupId>org.jacoco</groupId>
+    <artifactId>jacoco-maven-plugin</artifactId>
+    <version>0.8.12</version>
+    <configuration>
+        <excludes>
+            <exclude>**/dto/**</exclude>
+            <exclude>**/config/**</exclude>
+        </excludes>
+        <rules>
+            <rule>
+                <element>CLASS</element>
+                <limits>
+                    <limit>
+                        <counter>LINE</counter>
+                        <value>COVEREDRATIO</value>
+                        <minimum>0.80</minimum>  <!-- 新代码覆盖率 > 80% -->
+                    </limit>
+                </limits>
+            </rule>
+        </rules>
+    </configuration>
+</plugin>
+
+# CI 中检查新增代码覆盖率
+# jacoco:check 会检查变更的类和方法覆盖率是否达标
+mvn verify -DskipTests=false
+# 如果新增的 AI 代码覆盖率 < 80%，构建失败</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>可接受的 AI 代码比例</h3>
+      <p>团队需要设定"AI 代码比例"指标，并持续追踪。不是越高越好——关键模块和复杂逻辑需要人工编写。</p>
+      <table class="learn-decision-table">
+        <thead><tr><th>模块类型</th><th>AI 代码比例建议</th><th>原因</th></tr></thead>
+        <tbody>
+          <tr><td>CRUD Controller/Service</td><td>60-80%</td><td>模式固定，AI 生成准确率高</td></tr>
+          <tr><td>DTO/VO 定义</td><td>80-90%</td><td>数据结构，AI 生成免手写</td></tr>
+          <tr><td>单元测试</td><td>50-70%</td><td>AI 生成用例骨架，人工补充边界</td></tr>
+          <tr><td>业务逻辑（核心）</td><td>10-20%</td><td>领域规则复杂，AI 可能理解偏差</td></tr>
+          <tr><td>安全/加密模块</td><td>0-10%</td><td>错误代价高，建议人工编写</td></tr>
+          <tr><td>配置文件</td><td>30-50%</td><td>AI 生成骨架，人工调整参数</td></tr>
+          <tr><td>数据库迁移脚本</td><td>20-40%</td><td>AI 生成基础 SQL，人工确认索引</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># AI 代码比例统计脚本
+# 使用 git blame + AI 标记 统计 AI 生成的代码行数
+
+# 思路：AI 生成的代码在 git blame 中有特殊标记
+# Cursor 生成的代码 commit message 含 "🤖 Cursor"
+# Claude Code 生成的 commit message 含 "🤖 Claude Code"
+
+echo "AI 代码比例统计（本月）"
+echo "="
+
+# 统计总代码行
+TOTAL=$(git log --since="2026-05-01" --until="2026-05-31" \
+  --format='' --numstat | awk '{sum+=$1} END {print sum}')
+echo "本月新增代码: $TOTAL 行"
+
+# 统计 AI 生成行（按 commit 标记）
+AI=$(git log --since="2026-05-01" --until="2026-05-31" \
+  --grep="🤖" --format='' --numstat | awk '{sum+=$1} END {print sum}')
+
+RATIO=$(echo "scale=1; $AI * 100 / $TOTAL" | bc)
+echo "AI 生成代码: $AI 行"
+echo "AI 比例: $RATIO%"
+
+# 按模块统计
+echo "按模块统计:"
+for MODULE in controller service repository config; do
+  M_TOTAL=$(find src/main/java -path "*$MODULE*" -name "*.java" \
+    -exec git log --since="2026-05-01" --format='' --numstat {} + \
+    | awk '{sum+=$1} END {print sum}')
+  M_AI=$(find src/main/java -path "*$MODULE*" -name "*.java" \
+    -exec git log --since="2026-05-01" --grep="🤖" --format='' --numstat {} + \
+    | awk '{sum+=$1} END {print sum}')
+  if [ "$M_TOTAL" -gt 0 ]; then
+    echo "  $MODULE: $(echo "scale=1; $M_AI*100/$M_TOTAL" | bc)%"
+  fi
+done</pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>AI 生成代码的 6 类常见缺陷中 API 版本错误（28%）和空指针（22%）占比最高</li>
+        <li>双保险检查：SonarQube（60% 缺陷）+ AI Review（25% 缺陷）= 85% 覆盖，人工覆盖剩余 15%</li>
+        <li>新增 AI 代码的单元测试覆盖率目标 > 80%，JaCoCo 规则确保 PR 合并不达标</li>
+        <li>AI 代码比例建议 30-50%，核心业务逻辑 < 20%，安全模块 < 10%</li>
+        <li>CorpAssist 通过 git blame 标记自动统计 AI 代码比例，每月 Review 一次</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="basics-03-1"> 我能识别 AI 生成代码的 6 类常见缺陷</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-2"> 我能配置 SonarQube + AI Review 双保险 CI</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-3"> 我能用 JaCoCo 监控新增代码的单元测试覆盖率</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-4"> 我能统计和追踪团队的 AI 代码比例</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-5"> 我能根据模块类型设定 AI 代码比例目标</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>SonarQube</td><td>代码静态分析平台，检测 Bug/安全/代码异味</td></tr>
+            <tr><td>AI Review</td><td>用 LLM 审查代码变更，发现逻辑和语义问题</td></tr>
+            <tr><td>JaCoCo</td><td>Java 代码覆盖率工具</td></tr>
+            <tr><td>CSV 注入</td><td>CSV 文件中以 = + - @ 开头的公式注入攻击</td></tr>
+            <tr><td>光环 API</td><td>AI 生成的代码中调用了不存在的类或方法</td></tr>
+            <tr><td>Checkstyle</td><td>Java 代码风格检查工具</td></tr>
+            <tr><td>git blame</td><td>Git 逐行追溯，用于统计 AI 代码比例</td></tr>
+            <tr><td>AI 代码比例</td><td>AI 生成的代码占团队总新增代码的百分比</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>AI 生成代码的"幻觉 API"（幻影 API）问题怎么系统性地检测和防止？</summary><p>系统性方案：1) 编译检查（最直接——不存在的类编译不过）；2) 依赖检查工具（如 `mvn dependency:analyze` 检查未使用的依赖和未声明的依赖）；3) IDE 插件（Cursor 有内置的编译错误检测，`Cmd+K` 时自动检查）；4) AI Review Prompt 中明确要求"检查所有 import 的类是否在当前项目的依赖中"。防止：在 .cursorrules 中列出项目依赖的核心库和版本，减少 AI 使用未知类库的概率。</p></details>
+        <details><summary>团队 AI 代码比例从 20% 提升到 60% 后，Bug 率反而下降了，为什么？</summary><p>可能原因：1) 原来人工编写的 CRUD 代码容易出错（拼写错误、Copy-Paste 遗漏），AI 生成避免了这类低级错误；2) SonarQube + AI Review 双保险拦截了大部分缺陷；3) AI 生成的代码更一致（遵循相同的模式和规范）。但需要注意：如果 AI 代码比例继续提升到 80% 以上，核心业务逻辑也开始由 AI 生成，Bug 率可能反弹（复杂逻辑 AI 理解偏差）。建议监控 Bug 率随 AI 比例的变化曲线，找到最佳平衡点。</p></details>
+        <details><summary>AI 审查代码时，怎么确保审查本身的 Prompt 足够全面？</summary><p>AI Review 的 Prompt 需要结构化设计。CorpAssist 的 Review Prompt 包含 6 个固定检查项：1) 安全——检查 OWASP Top 10（尤其是注入和认证）；2) 空指针——所有 Optional、可能为 null 的返回值是否判空；3) 资源——文件/数据库连接/HTTP 响应是否关闭；4) 并发——实例变量是否线程安全；5) API 契约——是否与 OpenAPI 定义一致；6) 性能——是否有 N+1 查询、大对象循环等。每个检查项有具体的检查标准和示例。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.sonarsource.com/sonarqube/" target="_blank" rel="noopener">SonarQube 文档</a> — Java 规则和安全热点的配置</li>
+      <li><a href="https://www.eclemma.org/jacoco/" target="_blank" rel="noopener">JaCoCo 官方文档</a> — Maven 集成和覆盖率规则</li>
+      <li><a href="https://owasp.org/www-project-top-ten/" target="_blank" rel="noopener">OWASP Top 10</a> — AI 代码安全审查参考标准</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>用 Cursor 生成一个 CSV 导出功能，检查是否包含 CSV 注入漏洞</li>
+      <li>配置 JaCoCo 覆盖率规则（新代码 >= 80%），验证 AI 生成的测试是否达标</li>
+      <li>用 Claude Code 审查一段 AI 生成的代码，输出审查报告</li>
+      <li>运行 AI 代码比例统计脚本，分析团队的 AI 使用趋势</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：AI 生成的代码在 SonarQube 中全是绿灯，但上线后出现 NPE，怎么改进检查流程？</summary><p>SonarQube 的规则不是万能的——有些 NPE 模式（如 Stream API 中的 null 元素、JSON 解析中的缺失字段）SonarQube 检测不到。改进：1) 在 AI Review 的 Prompt 中增加"检查所有可能返回 null 的方法调用"这个专项检查；2) 在单元测试中增加基于 Property-Based Testing 的随机数据测试（jqwik 库），覆盖更多边界值；3) 在代码中启用 Spring 的 Null-safety 注解（@NonNull/@Nullable），让编译器帮助检查。</p></details>
+      <details><summary>场景：团队新成员用 AI 工具生成了大量代码，但 AI 代码比例突然从 30% 飙升到 75%，怎么管理？</summary><p>AI 代码比例飙升不一定是坏事，但需要关注质量。措施：1) 检查飙升主要来自哪些模块——如果是 CRUD 层是正常的，如果是核心业务逻辑则需要关注；2) 设置阶段性目标——新成员第一个月 AI 比例可以高（快速产出），第二个月逐步降低（学习业务）；3) 增加 AI 生成代码的审查力度——双保险 + 人工 review 时间加倍；4) 建立 AI 代码质量 Dashboard，月 Review 一次。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-03-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>AI 生成的 CSV 导出包含 CSV 注入漏洞，修复后通过 SonarQube 检查</li>
+        <li>CI 中双保险检查通过后才能合并 PR</li>
+        <li>AI 代码比例统计脚本输出按模块的比例报表</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-02">Prompt 驱动开发工作流</a></li>
+      <li>下一篇：<a href="#ch-basics-04">规则与约定驱动开发</a></li>
+    </ul>
+  </div>
+</section>

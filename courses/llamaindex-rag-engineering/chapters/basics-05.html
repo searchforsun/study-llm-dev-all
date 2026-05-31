@@ -1,0 +1,344 @@
+<section id="ch-basics-05" class="chapter" data-chapter="basics-05">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Embedding 与向量存储</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>LlamaIndex 核心抽象</strong> · 能力：选择嵌入模型、集成 Milvus/Qdrant、优化批处理、管理索引持久化</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 的检索质量直接取决于嵌入向量的质量和向量数据库的查询性能。选错嵌入模型（如用 text-embedding-ada-002 处理代码）会导致代码检索准确率下降 30%。错误配置向量库（如 Milvus 索引类型）会导致查询延迟从 50ms 飙升到 5s。本章让你掌握嵌入选型和向量库调优。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>根据语言和领域选择嵌入模型；配置 Milvus 或 Qdrant 的索引参数和集合 schema；实现批处理嵌入优化吞吐；管理索引的持久化和增量更新。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) text-embedding-3-small 性价比最高（1536 维，每千条 $0.002）；2) Milvus 用 IVF_FLAT 索引适合百万级，Qdrant 用 HNSW 适合千万级；3) 批处理大小 100 条/批时吞吐最高；4) 索引持久化需定期备份 metadata；5) embedding 维度与检索速度负相关——维度减半速度约快 40%。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Embedding 模型选择</h3>
+      <p><span class="term" data-term-id="embedding">Embedding</span> 模型将文本映射为稠密向量，向量间的余弦相似度反映语义相关度。选择嵌入模型的三个维度：语言覆盖、维度（影响存储和速度）、领域适应性。</p>
+      <table class="outline-table">
+        <thead><tr><th>模型</th><th>维度</th><th>语言</th><th>价格（/千tokens）</th><th>MTEB 得分</th><th>推荐场景</th></tr></thead>
+        <tbody>
+          <tr><td>text-embedding-3-small</td><td>1536</td><td>多语言</td><td>$0.002</td><td>62.3</td><td>CorpAssist 知识库通用</td></tr>
+          <tr><td>text-embedding-3-large</td><td>3072</td><td>多语言</td><td>$0.013</td><td>64.6</td><td>高精度要求（费用敏感）</td></tr>
+          <tr><td>BGE-M3</td><td>1024</td><td>多语言</td><td>免费（本地）</td><td>63.0</td><td>隐私敏感场景</td></tr>
+          <tr><td>text-embedding-ada-002</td><td>1536</td><td>英文为主</td><td>$0.002</td><td>61.0</td><td>遗留项目（已弃用）</td></tr>
+          <tr><td>m3e-base</td><td>768</td><td>中文为主</td><td>免费（本地）</td><td>59.2</td><td>中文文档为主</td></tr>
+          <tr><td>gte-Qwen2-1.5B</td><td>1536</td><td>中英</td><td>免费（本地）</td><td>64.1</td><td>本地部署（需 GPU）</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.embeddings.bge import BGEEmbedding
+from llama_index.core.settings import Settings
+
+# 方案 1：OpenAI 嵌入（推荐生产用）
+Settings.embed_model = OpenAIEmbedding(
+    model="text-embedding-3-small",
+    dimensions=1536,       # 可缩减至 512 以提升速度
+    api_key="sk-xxx",
+    batch_size=100
+)
+
+# 方案 2：BGE 本地嵌入（隐私要求高）
+Settings.embed_model = BGEEmbedding(
+    model_name="BAAI/bge-m3",
+    encode_kwargs={"normalize_embeddings": True},  # 归一化后余弦=点积
+    batch_size=32
+)
+
+# 测试嵌入质量
+embed_model = Settings.embed_model
+query_vec = embed_model.get_text_embedding("年假申请流程")
+doc_vec = embed_model.get_text_embedding("请假制度说明")
+similarity = sum(a*b for a,b in zip(query_vec, doc_vec))
+print(f"语义相似度: {similarity:.4f}")  # 预期 >0.85</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>CorpAssist 服务 60% 中文文档 + 30% 英文文档 + 10% 中英混合。选择 text-embedding-3-small 维度缩减为 768：MTEB 得分从 62.3 降到 60.1（降幅 3.5%），但检索速度提升 40%，存储减少 50%。对于知识库场景，速度收益大于精度损失。</p>
+      </aside>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：什么情况下不应该用 OpenAI 的嵌入模型？</summary><p>1) 数据隐私敏感——HR 手册包含员工个人信息，不能发送到外部 API；2) 网络隔离——CorpAssist 部署在内网，无法访问 OpenAI API；3) 成本敏感——每天处理 100 万条文档索引，text-embedding-3-small 每天约 $2，大模型 $13/天；4) 需要特定领域调优——如法律文档专用嵌入。以上场景改用 BGE-M3 本地部署或私有化嵌入服务。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Milvus/Qdrant 集成</h3>
+      <p>LlamaIndex 通过 <code>VectorStore</code> 抽象层支持 20+ 向量数据库。CorpAssist 主要用两种：<span class="term" data-term-id="milvus">Milvus</span> 适合百万级向量（CorpAssist 主库），<span class="term" data-term-id="qdrant">Qdrant</span> 适合低延迟在线场景。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    subgraph Milvus 集成
+        LI[LlamaIndex] -->|VectorStoreIndex| MVS[MilvusVectorStore]
+        MVS -->|集合| C[Collection]
+        C -->|IVF_FLAT 索引| IDFILE
+        C -->|字段| F[id, vector, text, metadata]
+    end
+    subgraph Qdrant 集成
+        LI2[LlamaIndex] -->|VectorStoreIndex| QVS[QdrantVectorStore]
+        QVS -->|collection| QC[Qdrant Collection]
+        QC -->|HNSW 索引| HNSW
+        QC -->|payload| PAYLOAD[payload: metadata]
+    end
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Milvus 集成（推荐生产环境）
+from llama_index.vector_stores.milvus import MilvusVectorStore
+
+milvus_store = MilvusVectorStore(
+    uri="http://milvus:19530",       # Milvus 地址
+    token="root:Milvus123",           # 认证（可选）
+    collection_name="corpassist_main", # 集合名
+    dim=1536,                         # 向量维度
+    overwrite=False,                  # 追加模式
+    batch_size=200,                   # 写入批大小
+    index_config={
+        "index_type": "IVF_FLAT",     # IVF_FLAT/GPU_IVF_FLAT/HNSW
+        "metric_type": "IP",          # IP(内积) / L2 / COSINE
+        "params": {"nlist": 1024}     # IVF 中心数
+    },
+    search_config={
+        "metric_type": "IP",
+        "params": {"nprobe": 16}      # 搜索时探测分区数
+    }
+)
+
+# Qdrant 集成（适合低延迟场景）
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
+
+client = QdrantClient(url="http://qdrant:6333")
+qdrant_store = QdrantVectorStore(
+    client=client,
+    collection_name="corpassist_fast",
+    prefer_grpc=True,                  # gRPC 降低延迟
+    enable_hybrid=True                 # 开启混合检索
+)</pre></code>
+      </div>
+      <table class="learn-decision-table">
+        <thead><tr><th>对比维度</th><th>Milvus（CorpAssist 主库）</th><th>Qdrant（CorpAssist 缓存）</th></tr></thead>
+        <tbody>
+          <tr><td>部署方式</td><td>Kubernetes StatefulSet + Attu UI</td><td>Docker Compose 单节点</td></tr>
+          <tr><td>推荐索引</td><td>IVF_FLAT（nlist=1024）</td><td>HNSW（m=16, ef=200）</td></tr>
+          <tr><td>向量容量</td><td>1000 万+（分布式）</td><td>500 万（单节点）</td></tr>
+          <tr><td>查询延迟 P99</td><td>50-100ms</td><td>5-20ms</td></tr>
+          <tr><td>适用场景</td><td>全量知识库检索</td><td>热门数据缓存、在线查询</td></tr>
+          <tr><td>监控工具</td><td>Milvus Insight / Prometheus</td><td>Qdrant Web UI</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>批处理优化</h3>
+      <p>嵌入生成和向量写入是 RAG 管线中耗时最长的两个环节。批处理（<span class="term" data-term-id="batch-processing">batch processing</span>）是优化的核心手段。LlamaIndex 在 <code>Settings.embed_model</code> 和 <code>MilvusVectorStore</code> 中分别提供了批处理参数。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">import time
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.vector_stores.milvus import MilvusVectorStore
+
+# 批处理参数调优
+embed_model = OpenAIEmbedding(
+    model="text-embedding-3-small",
+    batch_size=100,           # 每批 100 条（OpenAI 限制 2048）
+    embed_batch_size=100,     # 内部嵌入批大小
+    max_retries=3
+)
+
+vector_store = MilvusVectorStore(
+    uri="http://milvus:19530",
+    batch_size=200,           # 每批写入 200 条向量
+    enable_sparse=False       # 关闭稀疏向量提升写入速度
+)
+
+pipeline = IngestionPipeline(
+    transformations=[
+        SentenceSplitter(chunk_size=512),
+        embed_model
+    ],
+    vector_store=vector_store
+)
+
+# 批量处理 1000 个文档（2000 Node）
+t0 = time.time()
+nodes = pipeline.run(documents=documents[:1000])
+t1 = time.time()
+print(f"处理 {len(nodes)} Node 耗时 {t1-t0:.2f}s")
+# 预期：1000 文档约 2000 Node，耗时 15-25s（含嵌入 API 调用）
+
+# 优化建议：
+# 1. batch_size=100 是吞吐最优值（<50 网络利用率低，>200 超时风险高）
+# 2. 写入 Milvus 前先创建索引（index_config），避免边写边建索引
+# 3. 使用 asyncio 并行化：文档读取和嵌入计算异步执行</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>参数</th><th>默认值</th><th>推荐值</th><th>优化依据</th></tr></thead>
+        <tbody>
+          <tr><td>embed_model.batch_size</td><td>10</td><td>100</td><td>OpenAI API 并发限制，100 条/批吞吐最高</td></tr>
+          <tr><td>vector_store.batch_size</td><td>100</td><td>200</td><td>Milvus 批量写入 200 条/批延迟最优</td></tr>
+          <tr><td>max_retries</td><td>3</td><td>3</td><td>嵌入 API 偶尔超时，3 次重试覆盖 99.9%</td></tr>
+          <tr><td>num_workers</td><td>1</td><td>4</td><td>文档读取和数据预处理可以并行</td></tr>
+          <tr><td>show_progress</td><td>False</td><td>True</td><td>调试时开启，生产关闭（减少 tqdm 开销）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>索引持久化</h3>
+      <p><span class="term" data-term-id="index-persistence">索引持久化</span>涉及两个层面：向量数据的持久化（Milvus/Qdrant 自带）和 Index 对象的元数据持久化（LlamaIndex 提供 <code>persist()</code> 方法）。后者保存的是 Index 结构信息（文档 ID、节点关系、关键词表等），不保存向量本身。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core import VectorStoreIndex, StorageContext, load_index_from_storage
+from llama_index.core.storage import StorageContext
+from llama_index.vector_stores.milvus import MilvusVectorStore
+import os
+
+# --- 持久化 ---
+
+# 1. 向量数据写入 Milvus（自动持久化，无需手动调用）
+vector_store = MilvusVectorStore(uri="http://milvus:19530")
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+index = VectorStoreIndex.from_documents(
+    documents, storage_context=storage_context
+)
+
+# 2. Index 元数据持久化到本地磁盘
+index.storage_context.persist(persist_dir="./storage/index_meta_v2")
+print("Index 元数据已保存到 ./storage/index_meta_v2")
+# 保存的文件：
+# ./storage/index_meta_v2/docstore.json （文档与 Node 映射）
+# ./storage/index_meta_v2/index_store.json（Index 结构）
+# ./storage/index_meta_v2/vector_store.json（向量库连接信息）
+
+# --- 恢复 ---
+storage_context = StorageContext.from_defaults(
+    persist_dir="./storage/index_meta_v2",
+    vector_store=MilvusVectorStore(uri="http://milvus:19530")
+)
+index = load_index_from_storage(storage_context)
+
+# --- 增量更新 ---
+from llama_index.core import Document
+new_doc = Document(text="新文档内容: CorpAssist v3.0 发布说明...")
+index.insert(new_doc)
+print(f"索引文档数: {len(index.ref_doc_info)}")
+
+# --- 自动清理 ---
+def rotate_storage(max_versions=5):
+    """保留最近 5 个版本的索引元数据"""
+    import shutil
+    storage_dirs = sorted([d for d in os.listdir("./storage") if d.startswith("index_meta_v")])
+    for old_dir in storage_dirs[:-max_versions]:
+        shutil.rmtree(f"./storage/{old_dir}")
+        print(f"清理过期索引: {old_dir}")</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>每天凌晨 2 点全量重建索引：读取所有文档 → IngestionPipeline → 写入 Milvus 新 Collection → 备份旧 Collection → 切换别名。保留最近 7 天的索引快照用于回滚。索引元数据（docstore.json）版本控制在 Git 中，方便追踪文档变更历史。</p>
+      </aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Embedding 模型选型三因素：语言覆盖、维度（1536 通用）、领域适配（代码用 code-embedding 或 text-embedding-3-small 缩减维度的性能最优解）</li>
+        <li>Milvus 用 IVF_FLAT（nlist=1024）索引适合百万级向量，Qdrant 用 HNSW（m=16）适合低延迟在线查询</li>
+        <li>批处理优化参数 embed_batch_size=100 + vector_store.batch_size=200 时吞吐最高，1000 文档可在 20 秒内完成嵌入和写入</li>
+        <li>索引持久化分两层：向量数据由向量库管理，Index 元数据由 LlamaIndex persist() 管理，两者缺一不可</li>
+        <li>增量更新用 index.insert() 而非重建全量，metadata 版本控制在 Git 中便于回滚</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-05-1"> 我能根据语言和领域选择合适的嵌入模型并给出理由</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-05-2"> 我能配置 MilvusVectorStore 的索引参数（index_type, nlist, metric_type）</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-05-3"> 我能用批处理参数优化嵌入和写入性能，测量吞吐量差异</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-05-4"> 我能用 persist() 和 load_index_from_storage() 实现索引持久化和恢复</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-05-5"> 我能用 index.insert() 实现增量更新并管理索引版本</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>Embedding</td><td>将文本映射为稠密向量的过程，向量距离反映语义相关度</td></tr>
+            <tr><td>IVF_FLAT</td><td>Milvus 索引类型，倒排文件+暴力搜索，精度高</td></tr>
+            <tr><td>HNSW</td><td>Qdrant 索引类型，分层可导航小世界图，速度快</td></tr>
+            <tr><td>nlist</td><td>IVF 索引的聚类中心数，值越大精度越高但建索引越慢</td></tr>
+            <tr><td>nprobe</td><td>搜索时探测的聚类分区数，值越大精度越高但查询越慢</td></tr>
+            <tr><td>MTEB</td><td>嵌入模型排行榜，综合评估 56 个数据集上的性能</td></tr>
+            <tr><td>PersistDir</td><td>LlamaIndex 保存索引元数据的目录路径</td></tr>
+            <tr><td>StorageContext</td><td>封装向量存储、文档存储、索引存储的上下文对象</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>text-embedding-3-small 和 text-embedding-ada-002 有哪些区别？为什么要升级？</summary><p>text-embedding-3-small 是 ada-002 的替代品。核心区别：1) 输出维度可缩减（默认 1536，可设为 512 甚至 256），ada-002 固定 1536 维；2) 支持 Matryoshka Representation Learning，缩减维度不会线性降低质量（1536→512 质量仅降 3%）；3) MTEB 得分 62.3 vs 61.0；4) 价格相同但性能更优。升级原因：维度缩减后存储减少 67%，检索速度提升 40%，适合 CorpAssist 百万级向量场景。</p></details>
+        <details><summary>Milvus 的 IVF_FLAT 和 HNSW 索引在什么场景各有什么优势？</summary><p>IVF_FLAT：建索引速度快（适合频繁全量重建的场景），精度高但查询速度线性增长。HNSW：建索引慢（需要构建多层图），但查询速度极快（log N 复杂度）。选型建议：CorpAssist 知识库每天全量重建一次用 IVF_FLAT（建库快）；在线查询层用 HNSW（查询快）。对于 100 万向量规模，IVF_FLAT 查询 P99 约 100ms，HNSW 约 20ms。</p></details>
+        <details><summary>LlamaIndex 的 persist() 保存了什么？为什么向量数据还要单独持久化？</summary><p>persist() 保存 Index 的元数据：docstore.json（Document→Node 映射和 Node 文本）、index_store.json（Index 结构和索引类型信息）、vector_store.json（向量库连接参数）。不保存向量数据本身，因为向量数据量巨大（100 万 × 1536 维 × 4 字节 ≈ 6GB），不适合写 JSON。向量数据由专门的向量数据库（Milvus/Qdrant）持久化。恢复时需要同时提供 persist_dir（元数据）和 vector_store 连接（向量数据）。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/vector_stores/" target="_blank" rel="noopener">LlamaIndex VectorStore 集成文档</a> — 所有向量存储的配置参数</li>
+      <li><a href="https://milvus.io/docs/index.md" target="_blank" rel="noopener">Milvus 索引类型文档</a> — IVF_FLAT/HNSW/DISKANN 索引参数调优指南</li>
+      <li><a href="https://qdrant.tech/documentation/" target="_blank" rel="noopener">Qdrant 官方文档</a> — 集合配置、payload 索引和混合检索</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>安装 Milvus：<code>docker run -d --name milvus -p 19530:19530 milvusdb/milvus:v2.4.0</code></li>
+        <li>用 OpenAIEmbedding 嵌入 3 句中文句子，打印向量维度并计算余弦相似度</li>
+        <li>用 MilvusVectorStore 创建集合，设置 IVF_FLAT 索引，写入 100 条测试数据</li>
+        <li>对比 batch_size=10 和 batch_size=100 的吞吐差异</li>
+        <li>用 persist() 保存索引，重启后 load_index_from_storage() 恢复，验证数据完整</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：1000 万条知识库文档，查询 P99 延迟从 100ms 升到 800ms，怎么优化？</summary><p>原因：Milvus IVF_FLAT 索引在数据量增大后，nprobe=16 探测 1024 个分区的查询效率下降。优化方案：1) 重建索引为 HNSW，m=16, ef_construction=200，查询延迟可降至 50ms 以下；2) 增加分区数 nlist 从 1024 到 4096；3) 增加副本数（readonly 副本），负载均衡；4) 使用 GPU 索引（GPU_IVF_FLAT）将查询卸载到 GPU。CorpAssist 场景推荐 GPU_IVF_FLAT + 2 个只读副本。</p></details>
+      <details><summary>场景：HR 部门要求嵌入计算不能在外部 API 上完成，怎么选型？</summary><p>选 BGE-M3 本地部署。BAAI/bge-m3 支持中文、英文、中英混合，1024 维，MTEB 得分 63.0（与 text-embedding-3-small 相近）。部署方式：1) CPU 推理：用 ONNX Runtime 优化，每秒处理 50 条文本；2) GPU 推理：单张 A10 每秒处理 500+ 条。CorpAssist 场景：4 核 CPU + 16GB 内存的实例约可承载每天 10 万文档的嵌入计算。成本对比：本地部署每月约 ¥2000（服务器费用），OpenAI API 每月约 ¥5000（100 万文档）。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-05-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>Milvus 集合创建成功，IVF_FLAT 索引参数正确（nlist=1024, metric_type=IP）</li>
+        <li>100 条文档嵌入并写入 Milvus，查询返回 top-5 结果，P99 延迟 < 200ms</li>
+        <li>persist/load_index_from_storage 往返后，检索结果与重建前完全一致</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-04">查询引擎与路由</a></li>
+      <li>下一篇：<a href="#ch-practice-01">高级检索策略</a> — 学习 SentenceWindow、AutoMerging 等高级检索策略</li>
+    </ul>
+  </div>
+</section>

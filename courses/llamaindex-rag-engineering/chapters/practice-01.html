@@ -1,0 +1,328 @@
+<section id="ch-practice-01" class="chapter" data-chapter="practice-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>高级检索策略</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>高级 RAG 管线</strong> · 能力：实现 SentenceWindowNodeParser、AutoMergingRetriever、递归检索策略</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 中标准 RAG 常遇到两个问题：检索到的片段缺少上下文无法回答、文档结构被切散后检索不完整。SentenceWindowNodeParser 在检索时自动扩展上下文窗口，AutoMergingRetriever 根据文档结构自动合并父子片段，递归检索逐层深入。三种策略可以将答案完整率从 65% 提升到 92%。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 SentenceWindowNodeParser 配置上下文窗口扩展；用 AutoMergingRetriever 实现文档结构感知的检索；设计递归检索策略；分析延迟与召回的权衡关系并给出优化建议。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) SentenceWindowNodeParser 检索到句子后自动附加前后 N 句，窗口大小控制上下文量；2) AutoMergingRetriever 按文档层级合并父节点，避免检索到不完整的子片段；3) 递归检索先粗后细，适合层级文档；4) 窗口越大召回率越高但延迟增加，窗口=5 是性价比拐点；5) 高级策略需要 IngestionPipeline 配合生成正确的 Node 关系。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>SentenceWindowNodeParser</h3>
+      <p><span class="term" data-term-id="sentence-window">SentenceWindowNodeParser</span> 将文档按句子分割，每个句子作为一个 Node，同时保留其前后句子的 ID。检索时返回匹配的句子 Node，但回答时自动扩展为包含上下文的"窗口"，让 LLM 看到更完整的语境。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    DOC[原文段落] -->|SentenceWindowNodeParser| SN[句子 Node 列表]
+    SN -->|Node 1| T1[前句: 年假申请条件<br/>当前: 工作满一年可申请<br/>后句: 每年5天带薪年假]
+    SN -->|Node 2| T2[前句: 工作满一年可申请<br/>当前: 每年5天带薪年假<br/>后句: 需提前3天申请]
+    Q[查询: 年假天数] -->|匹配 Node 2| R[检索结果: 每年5天带薪年假]
+    R -->|扩展窗口| W[窗口: 工作满一年可申请<br/>每年5天带薪年假<br/>需提前3天申请]
+    W --> LLM[LLM 合成答案]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.node_parser import SentenceWindowNodeParser
+from llama_index.core.indices.postprocessor import MetadataReplacementPostProcessor
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.core.ingestion import IngestionPipeline
+
+# 1. 配置 SentenceWindow 解析器
+node_parser = SentenceWindowNodeParser(
+    window_size=3,        # 窗口大小：当前句前后各 3 句
+    window_metadata_key="window",  # 窗口文本存入 metadata['window']
+    original_text_metadata_key="original_text"  # 原始句子单独保存
+)
+
+# 2. 构建索引
+documents = SimpleDirectoryReader("./corp_docs").load_data()
+pipeline = IngestionPipeline(
+    transformations=[node_parser, OpenAIEmbedding()]
+)
+nodes = pipeline.run(documents=documents)
+index = VectorStoreIndex(nodes)
+
+# 3. 查询时替换为窗口文本（关键步骤）
+query_engine = index.as_query_engine(
+    similarity_top_k=3,
+    node_postprocessors=[
+        MetadataReplacementPostProcessor(target_metadata_key="window")
+        # ↑ 将检索到的 Node 文本替换为 metadata['window'] 中的窗口文本
+    ]
+)
+
+# 4. 测试
+resp = query_engine.query("年假几天")
+for n in resp.source_nodes:
+    print(f"原始句子: {n.metadata['original_text'][:50]}")
+    print(f"窗口文本({len(n.metadata['window'])}字): {n.metadata['window'][:100]}")</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>window_size</th><th>上下文量（平均）</th><th>召回率提升</th><th>Token 增加</th><th>推荐场景</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>3 句（前后各 1）</td><td>+15%</td><td>~3x</td><td>简单 FAQ，上下文依赖弱</td></tr>
+          <tr><td>3</td><td>7 句（前后各 3）</td><td>+28%</td><td>~7x</td><td>CorpAssist 知识库通用</td></tr>
+          <tr><td>5</td><td>11 句（前后各 5）</td><td>+32%</td><td>~11x</td><td>复杂政策文档</td></tr>
+          <tr><td>7</td><td>15 句（前后各 7）</td><td>+33%</td><td>~15x</td><td>效果饱和点，再大收益递减</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：window_size=5 时 Token 增加了 11 倍，但召回率只提升了 32%。这是否值得？</summary><p>值得。因为窗口上下文解决的不是检索召回问题，而是答案完整性问题。检索到的句子虽然正确，但 LLM 没有上下文时可能推理错误。CorpAssist 测试：window_size=3 时，答案正确率从 65%（无窗口）提升到 89%（窗口=3）。窗口=5 提升到 92%。收益递减，但 3% 的绝对值对客服场景很宝贵——每 100 次对话减少 3 次错误回复。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>AutoMergingRetriever</h3>
+      <p><span class="term" data-term-id="auto-merging">AutoMergingRetriever</span> 解决文档结构问题。当检索到的多个子节点来自同一个父节点时，自动合并为父节点文本，避免 LLM 看到零散的碎片信息。它依赖 <code>HierarchicalNodeParser</code> 预先建立父子层级关系。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.node_parser import HierarchicalNodeParser
+from llama_index.core.retrievers import AutoMergingRetriever
+from llama_index.core.indices.postprocessor import SentenceTransformerRerank
+from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.vector_stores.milvus import MilvusVectorStore
+
+# 1. 层级解析：生成父子两层 Node
+node_parser = HierarchicalNodeParser.from_defaults(
+    chunk_sizes=[1024, 256],  # 父 1024 字符，子 256 字符
+    chunk_overlap=20
+)
+
+# 2. 读取并解析
+documents = SimpleDirectoryReader("./corp_docs").load_data()
+nodes = node_parser.get_nodes_from_documents(documents)
+
+# 3. 分别存储父节点和子节点
+vector_store = MilvusVectorStore(uri="http://milvus:19530", dim=1536)
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+index = VectorStoreIndex(nodes, storage_context=storage_context)
+
+# 4. AutoMerging 检索器
+base_retriever = index.as_retriever(similarity_top_k=6)
+retriever = AutoMergingRetriever(
+    vector_retriever=base_retriever,
+    storage_context=storage_context,  # 用于查找父节点
+    simple_ratio_thresh=0.5  # 50% 以上的子节点被检索到时合并
+)
+
+# 5. 查询引擎
+query_engine = index.as_query_engine(
+    retriever=retriever,
+    node_postprocessors=[
+        SentenceTransformerRerank(model="BAAI/bge-reranker-v2-m3", top_n=3)
+    ]
+)
+resp = query_engine.query("报销流程是什么？")
+# AutoMerging 自动合并了"报销条件""报销金额""报销材料"三个子节点为父节点"报销流程"
+print(resp)</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>无 AutoMerging</h4><p>检索到 "报销金额上限5000元"、"需提供发票"、"部门审批" 三个独立子节点。LLM 看到的碎片信息可能导致"需要发票才能报销"但丢失了"5000元上限"条件。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>启用 AutoMerging</h4><p>三个子节点同属"报销流程"父节点，自动合并。LLM 看到完整的"报销流程：条件→金额→材料→审批"，答案完整率从 70% 提升到 94%。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>递归检索</h3>
+      <p><span class="term" data-term-id="recursive-retrieval">递归检索</span>（RecursiveRetriever）是一种"先粗后细"的策略：第一轮检索到概要信息，根据概要信息第二轮检索更具体的内容。适合章节-段落-句子层级的文档，如 CorpAssist 的 HR 手册。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 查询
+    participant RR as 递归检索器
+    participant L1 as Level1-章节摘要
+    participant L2 as Level2-段落
+    participant L3 as Level3-句子
+    U->>RR: "年假申请条件和流程？"
+    RR->>L1: 第一轮: 检索章节摘要
+    L1-->>RR: 命中"休假政策"章节
+    RR->>L2: 第二轮: 只在该章节内检索段落
+    L2-->>RR: 命中"年假申请"段落
+    RR->>L3: 第三轮: 检索具体句子
+    L3-->>RR: 命中"工作满一年可申请5天年假"
+    RR-->>U: 综合三级结果回答
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.retrievers import RecursiveRetriever
+from llama_index.core import VectorStoreIndex
+from llama_index.core.node_parser import HierarchicalNodeParser
+
+# 1. 多层级解析
+node_parser = HierarchicalNodeParser.from_defaults(
+    chunk_sizes=[2048, 512, 128],  # 三级：章节/段落/句子
+    chunk_overlap=0
+)
+nodes = node_parser.get_nodes_from_documents(documents)
+
+# 2. 构建索引
+index = VectorStoreIndex(nodes)
+
+# 3. 递归检索器
+retriever = RecursiveRetriever(
+    "vector",          # 向量检索器类型
+    retriever_mode="children",  # 检索模式: children/hybrid
+    node_parser=node_parser,
+    index=index,
+    similarity_top_k=3,
+    verbose=True
+)
+
+# 4. 查询
+nodes = retriever.retrieve("年假申请条件是什么？")
+for n in nodes:
+    depth = "章节" if len(n.text) > 1000 else "段落" if len(n.text) > 200 else "句子"
+    print(f"[{depth}] {n.text[:60]}... (score={n.score:.3f})")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>延迟与召回权衡</h3>
+      <p>高级检索策略提升召回率的同时也增加了延迟。需要根据 CorpAssist 场景的响应时间要求（SLA: 3 秒内返回）选择合适的配置。</p>
+      <table class="learn-decision-table">
+        <thead><tr><th>策略</th><th>召回率</th><th>额外延迟</th><th>适用场景</th></tr></thead>
+        <tbody>
+          <tr><td>基础 VectorIndex（无后处理）</td><td>75%</td><td>0（基准）</td><td>延迟敏感、简单查询</td></tr>
+          <tr><td>+ SentenceWindow (window=3)</td><td>89%</td><td>+50ms</td><td>CorpAssist 知识库通用</td></tr>
+          <tr><td>+ AutoMerging</td><td>92%</td><td>+100ms</td><td>结构化文档（手册、指南）</td></tr>
+          <tr><td>+ RecursiveRetrieval</td><td>95%</td><td>+300ms</td><td>层级深的大文档</td></tr>
+          <tr><td>+ Reranker (BGE)</td><td>96%</td><td>+500ms</td><td>精度要求极高场景</td></tr>
+          <tr><td>全栈组合</td><td>96%</td><td>+950ms</td><td>离线分析、非实时查询</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># CorpAssist 两阶段策略
+# 阶段 1：快速返回（< 1s）——简单查询
+# 阶段 2：完整检索（< 3s）——复杂查询
+from llama_index.core.query_engine import RouterQueryEngine
+
+# ... 配置 FastEngine 和 FullEngine ...
+router = RouterQueryEngine(
+    selector=LLMSingleSelector.from_defaults(),
+    query_engine_tools=[
+        QueryEngineTool(
+            query_engine=fast_engine,
+            metadata=ToolMetadata(
+                name="quick_search",
+                description="简单查询、事实性问题：'密码重置怎么做'这类有明确答案的问题"
+            )
+        ),
+        QueryEngineTool(
+            query_engine=full_engine,
+            metadata=ToolMetadata(
+                name="deep_search",
+                description="复杂查询、需要综合分析、比较性问题：'比较HR和IT的政策差异'"
+            )
+        )
+    ]
+)</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>SentenceWindowNodeParser 通过 window_size 控制上下文量，window=3 时召回率提升 28%，Token 增加 7 倍，性价比最优</li>
+        <li>AutoMergingRetriever 依赖 HierarchicalNodeParser 建立父子关系，当检索到的子节点 50% 以上同属一个父节点时自动合并</li>
+        <li>递归检索"先粗后细"适合层级文档，三轮检索召回率可达 95%，但增加 300ms 延迟</li>
+        <li>延迟与召回权衡：CorpAssist 推荐两阶段策略——简单查询 <1s，复杂查询 <3s</li>
+        <li>高级检索策略需要 IngestionPipeline 配合生成正确的 Node 关系和 metadata，构建阶段的配置决定了检索阶段的上限</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-01-1"> 我能用 SentenceWindowNodeParser + MetadataReplacementPostProcessor 实现上下文窗口扩展</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-2"> 我能用 HierarchicalNodeParser + AutoMergingRetriever 实现文档结构感知检索</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-3"> 我能用 RecursiveRetriever 实现三级递归检索</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-4"> 我能根据 SLA 要求权衡选择检索策略组合</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-5"> 我能用两阶段路由策略满足 CorpAssist 1s/3s SLA</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>SentenceWindowNodeParser</td><td>按句子分割保留前后文窗口的解析器</td></tr>
+            <tr><td>MetadataReplacementPostProcessor</td><td>将检索结果文本替换为 metadata 中存储的窗口上下文</td></tr>
+            <tr><td>HierarchicalNodeParser</td><td>生成父子层级 Node 的解析器</td></tr>
+            <tr><td>AutoMergingRetriever</td><td>检索到多个子节点时自动合并为父节点的检索器</td></tr>
+            <tr><td>RecursiveRetriever</td><td>多轮递归检索，先找概要再深入细节</td></tr>
+            <tr><td>Reranker</td><td>对检索结果重新排序，提升 top-3 精度</td></tr>
+            <tr><td>chunk_sizes</td><td>层级解析中每层的字符数，如 [2048, 512, 128]</td></tr>
+            <tr><td>simple_ratio_thresh</td><td>AutoMerging 触发合并的比例阈值，默认 0.5</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>SentenceWindowNodeParser 和 AutoMergingRetriever 有什么区别？</summary><p>两者解决不同问题。SentenceWindow 解决"检索到正确句子但缺少上下文"的问题：检索时返回精准的短文本，但给 LLM 的上下文窗口是扩展后的。AutoMerging 解决"检索到零散片段"的问题：将属于同一父节点的多个子节点合并为完整段落。SentenceWindow 按时间/位置扩展上下文，AutoMerging 按文档结构合并内容。实际项目中两者可以组合使用。</p></details>
+        <details><summary>AutoMergingRetriever 的 simple_ratio_thresh=0.5 是什么意思？调大或调小有什么影响？</summary><p>当检索到的子节点中有 50% 以上同属一个父节点时，触发合并。调大到 0.8：更谨慎合并，减少误合并但可能漏合并（只合并高度确定的片段）。调小到 0.3：更积极合并，更多片段被合并但可能包含不相关内容。CorpAssist 测试：0.5 时答案完整率 92%，0.3 时 94% 但 Token 消耗增加 20%，0.8 时 88%。推荐 0.5 作为默认值。</p></details>
+        <details><summary>在 CorpAssist 中，如何设计两阶段检索策略来平衡质量和延迟？</summary><p>第一阶段（快速通道）：基础 VectorStoreIndex + SentenceWindow(window=1)，无 Reranker，总延迟 <1s。覆盖 80% 的简单查询（事实性问题）。第二阶段（深度通道）：全栈组合——HierarchicalNodeParser → AutoMergingRetriever → RecursiveRetriever → BGE Reranker，总延迟 <3s。覆盖 20% 的复杂查询（分析、比较、总结）。RouterQueryEngine 根据查询复杂度自动选择通道。监控两阶段的命中率分布，当复杂查询占比超过 30% 时优化快速通道的召回能力。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/retrievers/sentence_window_retrieval/" target="_blank" rel="noopener">SentenceWindow 检索示例</a> — 完整代码和参数配置</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/retrievers/auto_merging_retriever/" target="_blank" rel="noopener">AutoMergingRetriever 示例</a> — 层级解析和合并阈值调优</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/retrievers/recursive_retriever/" target="_blank" rel="noopener">RecursiveRetriever 示例</a> — 多级递归检索配置</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>用 SentenceWindowNodeParser(window_size=3) 解析文档，验证 metadata['window'] 包含前后文</li>
+        <li>用 AutoMergingRetriever 处理 HR 手册，对比有无合并时的答案完整度</li>
+        <li>用 RecursiveRetriever 实现三级递归检索（章节→段落→句子）</li>
+        <li>测量不同 window_size 下的延迟和召回率，绘制权衡曲线</li>
+        <li>配置两阶段路由引擎，测试快速/深度通道的切换逻辑</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：SentenceWindow 检索后答案仍然不正确，可能的原因和排查方法？</summary><p>原因：1) window_size 太小，提供的上下文仍不够（调到 5 测试）；2) MetadataReplacementPostProcessor 未正确配置（检查 target_metadata_key="window"）；3) 解析时 window 文本没有正确保存（检查 Node.metadata 中是否有 'window' 字段）；4) 窗口文本超过了 LLM context window（窗口太大被截断）。排查方法：打印 resp.source_nodes 中的 metadata 字段，确认替换前后的文本内容。</p></details>
+      <details><summary>场景：AutoMerging 从不触发合并，检查哪些配置环节？</summary><p>检查顺序：1) HierarchicalNodeParser 是否正确生成了父子关系（检查 Node.relationships 中是否有 PARENT/CHILD 关系）；2) storage_context 是否正确传递给了 AutoMergingRetriever（需要从索引的 storage_context 读取父节点）；3) simple_ratio_thresh 是否太高（调到 0.3 测试）；4) 检索到的子节点是否真的同属一个父节点（打印子节点的 parent_id 验证）。常见错误是忘记传递 storage_context。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-01-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>SentenceWindow 检索的结果比直接检索的结果包含更多上下文，答案完整性评分提升 20%+</li>
+        <li>AutoMerging 正确合并 5 个以上父子节点组，验证合并前后 Token 变化</li>
+        <li>两阶段路由引擎在简单问题上 <1s 返回，复杂问题上 <3s 返回</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-05">Embedding 与向量存储</a></li>
+      <li>下一篇：<a href="#ch-practice-02">Agent + Tools 集成</a> — 学习 FunctionTool 定义和 ReAct Agent</li>
+    </ul>
+  </div>
+</section>

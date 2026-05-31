@@ -1,0 +1,381 @@
+<section id="ch-practice-04" class="chapter" data-chapter="practice-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多知识库与路由</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>高级 RAG 管线</strong> · 能力：实现多租户索引隔离、意图路由、权限过滤、配置管理</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 服务多个部门（HR、IT、财务），每个部门文档独立且需要隔离。IT 员工搜索 IT 指南不应看到 HR 手册，财务人员只能查看财务文档。Naive RAG 将所有文档混在一起检索，无法满足多租户需求。本章解决多知识库的隔离、路由、鉴权和配置管理问题。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 metadata filter 和 Milvus 分区实现多租户数据隔离；用 RouterQueryEngine 实现意图驱动的知识库路由；用自定义 NodePostprocessor 实现文档级权限过滤；用 YAML 配置管理多索引生命周期。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 多租户隔离方案：Milvus 集合前缀（推荐）或 metadata filter；2) 意图路由用 RouterQueryEngine + LLMSingleSelector；3) 权限过滤在检索后、合成前通过 NodePostprocessor 实现；4) YAML 配置文件管理所有索引的地址、模型、过滤规则；5) 混合方案：全量索引+metadata过滤 vs 独立索引+路由，取决于数据量。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>意图路由实现</h3>
+      <p><span class="term" data-term-id="intent-routing">意图路由</span>根据查询内容判断属于哪个知识域，然后路由到对应的索引引擎。CorpAssist 使用 RouterQueryEngine + LLMSingleSelector 实现。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    Q[用户查询] --> IR[意图识别]
+    IR -->|"请假|年假|考勤"| HR[HR 索引]
+    IR -->|"VPN|邮箱|权限"| IT[IT 索引]
+    IR -->|"报销|发票|预算"| FIN[财务索引]
+    IR -->|"产品功能|API"| PD[产品文档索引]
+    subgraph 权限层
+        HR -->|tenant_id=hr| F1[Metadata Filter]
+        IT -->|tenant_id=it| F2
+        FIN -->|tenant_id=finance| F3
+    end
+    F1 & F2 & F3 --> RS[结果合成]
+    RS --> A[最终答案]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.query_engine import RouterQueryEngine
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.core.selectors import LLMSingleSelector
+
+# 1. 为每个部门创建独立的查询引擎
+def create_department_engine(department: str):
+    """根据部门创建对应的检索引擎"""
+    vector_store = MilvusVectorStore(
+        uri="http://milvus:19530",
+        collection_name=f"corpassist_{department}",
+        dim=1536
+    )
+    index = VectorStoreIndex.from_vector_store(vector_store)
+    return index.as_query_engine(
+        similarity_top_k=5,
+        filters=MetadataFilters(
+            filters=[
+                ExactMatchFilter(key="department", value=department)
+            ]
+        )
+    )
+
+# 2. 工具描述（选择器的决策依据）
+tools = [
+    QueryEngineTool(
+        query_engine=create_department_engine("hr"),
+        metadata=ToolMetadata(
+            name="hr_knowledge_base",
+            description="HR 人力资源知识库：请假制度、年假政策、考勤规则、薪酬福利、入职流程、离职手续等"
+        )
+    ),
+    QueryEngineTool(
+        query_engine=create_department_engine("it"),
+        metadata=ToolMetadata(
+            name="it_knowledge_base",
+            description="IT 技术支持知识库：VPN 配置、邮箱设置、系统权限申请、软件安装、网络故障排查等"
+        )
+    ),
+    QueryEngineTool(
+        query_engine=create_department_engine("finance"),
+        metadata=ToolMetadata(
+            name="finance_knowledge_base",
+            description="财务制度知识库：报销流程、发票要求、预算申请、费用标准、差旅政策等"
+        )
+    ),
+]
+
+# 3. 路由引擎
+router = RouterQueryEngine(
+    selector=LLMSingleSelector.from_defaults(),
+    query_engine_tools=tools,
+    verbose=True
+)
+
+# 4. 测试路由
+for query in ["年假几天?", "VPN 怎么连?", "报销上限多少?"]:
+    resp = router.query(query)
+    print(f"Q: {query} -> A: {resp}")</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工在门户输入"怎么申请年假"，RouterQueryEngine 识别意图匹配到 hr_knowledge_base（score=0.92），查询 HR 部门的索引。返回结果时自动带上 tenant_id=hr 的 metadata filter，保证只检索 HR 文档。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>权限过滤</h3>
+      <p><span class="term" data-term-id="permission-filter">权限过滤</span>在检索完成后、答案合成前执行。用 <code>NodePostprocessor</code> 过滤掉用户无权查看的文档。LlamaIndex 支持自定义后处理器。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.postprocessor import BaseNodePostprocessor
+from llama_index.core.schema import NodeWithScore
+from typing import Optional, List
+
+class PermissionFilter(BaseNodePostprocessor):
+    """根据用户角色过滤检索到的 Node"""
+    def __init__(self, user_roles: List[str]):
+        self.user_roles = user_roles
+
+    def _postprocess_nodes(
+        self, nodes: List[NodeWithScore],
+        query_bundle: Optional = None
+    ) -> List[NodeWithScore]:
+        filtered = []
+        for node in nodes:
+            # Node metadata 中存储了 required_role
+            required_role = node.metadata.get("required_role", "all")
+            if required_role == "all" or required_role in self.user_roles:
+                filtered.append(node)
+        return filtered
+
+# 给 Node 注入权限信息
+def add_permission_metadata(nodes, role_map: dict):
+    """role_map: {文档ID: [允许的角色列表]}"""
+    for node in nodes:
+        doc_id = node.metadata.get("doc_id", "")
+        if doc_id in role_map:
+            allowed_roles = role_map[doc_id]
+            node.metadata["required_role"] = allowed_roles
+        else:
+            node.metadata["required_role"] = "all"
+    return nodes
+
+# 使用权限过滤
+query_engine = index.as_query_engine(
+    similarity_top_k=5,
+    node_postprocessors=[
+        SimilarityPostprocessor(similarity_cutoff=0.5),
+        PermissionFilter(user_roles=["hr_manager", "admin"])
+    ]
+)
+
+resp = query_engine.query("薪资调整政策是什么？")
+# 如果用户没有 hr_manager 角色，包含薪资信息的 Node 会被过滤掉</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>检索前过滤（不安全）</h4><p>只在检索时加 metadata filter。如果 filter 配置错误（漏写），用户可能看到无权访问的内容。攻击者可以通过 API 直接传参绕过。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>检索后过滤（推荐）</h4><p>检索时用 metadata filter 缩小范围，检索后用 NodePostprocessor 二次确认权限。双层保险。metadata filter 拦截 99% 无关文档，NodePostprocessor 拦截剩下的 1% 边界 case。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户索引隔离</h3>
+      <p>多租户隔离有两个方案：独立索引（每个租户单独的 Milvus Collection）和共享索引（一个 Collection 内用 metadata 字段过滤）。选择取决于数据量和租户数量。</p>
+      <table class="learn-decision-table">
+        <thead><tr><th>维度</th><th>独立索引（每个租户一个 Collection）</th><th>共享索引（一个 Collection + metadata 过滤）</th></tr></thead>
+        <tbody>
+          <tr><td>数据隔离</td><td>物理隔离，最强安全</td><td>逻辑隔离，依赖 filter 正确性</td></tr>
+          <tr><td>运维成本</td><td>高（每个租户独立建索引、独立备份）</td><td>低（一个索引管理所有）</td></tr>
+          <tr><td>租户上限</td><td>理论上无限（每个新租户建新 Collection）</td><td>受限于 Collection 容量（Milvus 推荐 <500 万向量/Collection）</td></tr>
+          <tr><td>跨租户搜索</td><td>需要搜索多个 Collection 合并结果</td><td>天然支持（移除 filter 即可）</td></tr>
+          <tr><td>CorpAssist 推荐</td><td>大型租户（>10 万文档）</td><td>中小租户（<10 万文档）</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 方案 A：共享索引 + metadata 过滤（推荐 <10 租户）
+class SharedTenantIndex:
+    def __init__(self, milvus_uri: str):
+        self.vector_store = MilvusVectorStore(
+            uri=milvus_uri,
+            collection_name="corpassist_shared",
+            dim=1536,
+            enable_dynamic_field=True  # 启用动态字段支持 tenant_id
+        )
+        self.index = VectorStoreIndex.from_vector_store(self.vector_store)
+
+    def get_engine(self, tenant_id: str):
+        return self.index.as_query_engine(
+            similarity_top_k=5,
+            filters=MetadataFilters(
+                filters=[ExactMatchFilter(key="tenant_id", value=tenant_id)]
+            )
+        )
+
+# 方案 B：独立索引（推荐大租户）
+class IsolatedTenantIndex:
+    def __init__(self, milvus_uri: str):
+        self.milvus_uri = milvus_uri
+        self.collections = {}  # 租户→Collection 映射
+
+    def get_or_create_index(self, tenant_id: str):
+        if tenant_id not in self.collections:
+            vector_store = MilvusVectorStore(
+                uri=self.milvus_uri,
+                collection_name=f"corpassist_{tenant_id}",
+                dim=1536
+            )
+            self.collections[tenant_id] = VectorStoreIndex.from_vector_store(vector_store)
+        return self.collections[tenant_id]</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>配置管理</h3>
+      <p>多索引系统的配置项多（数据库地址、租户映射、路由规则），需要集中管理。推荐 YAML 配置文件 + Python dataclass 加载模式。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># config/rag_config.yaml
+milvus:
+  uri: "http://milvus:19530"
+  default_dim: 1536
+  index_type: "IVF_FLAT"
+  nlist: 1024
+
+tenants:
+  - id: "hr"
+    collection: "corpassist_hr"
+    embedding_dim: 1536
+    reranker: false
+    similarity_top_k: 5
+  - id: "it"
+    collection: "corpassist_it"
+    embedding_dim: 1536
+    reranker: true
+    similarity_top_k: 3
+  - id: "finance"
+    collection: "corpassist_finance"
+    embedding_dim: 768  # 小维度加速
+    similarity_top_k: 5
+
+routing:
+  selector: "llm"  # llm / embedding
+  fallback_tenant: "general"
+  timeout_ms: 3000</pre></code>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from pydantic import BaseModel
+import yaml
+from typing import List, Optional
+
+class TenantConfig(BaseModel):
+    id: str
+    collection: str
+    embedding_dim: int = 1536
+    reranker: bool = False
+    similarity_top_k: int = 5
+
+class RoutingConfig(BaseModel):
+    selector: str = "llm"
+    fallback_tenant: str = "general"
+    timeout_ms: int = 3000
+
+class RAGConfig(BaseModel):
+    milvus_uri: str
+    tenants: List[TenantConfig]
+    routing: RoutingConfig
+
+    @classmethod
+    def from_yaml(cls, path: str):
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return cls(**data)
+
+# 加载配置
+config = RAGConfig.from_yaml("config/rag_config.yaml")
+print(f"已加载 {len(config.tenants)} 个租户配置")
+
+# 动态创建引擎
+engines = {}
+for t in config.tenants:
+    vector_store = MilvusVectorStore(
+        uri=config.milvus_uri,
+        collection_name=t.collection,
+        dim=t.embedding_dim
+    )
+    index = VectorStoreIndex.from_vector_store(vector_store)
+    engines[t.id] = index.as_query_engine(similarity_top_k=t.similarity_top_k)</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>意图路由用 RouterQueryEngine + LLMSingleSelector，工具描述中列举关键词可提升路由准确率到 95%+</li>
+        <li>权限过滤采用双层策略：检索前 metadata filter + 检索后 NodePostprocessor 二次确认</li>
+        <li>多租户隔离：中小租户用共享索引+metadata 过滤，大型租户用独立 Collection</li>
+        <li>YAML 配置文件管理所有索引的路由规则和租户映射，避免硬编码</li>
+        <li>CorpAssist 10 个以内租户推荐共享索引方案，运维成本低且支持跨租户搜索</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="practice-04-1"> 我能用 RouterQueryEngine 实现基于意图的知识库路由</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-2"> 我能用 NodePostprocessor 实现用户角色鉴权过滤</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-3"> 我能根据租户数据量选择隔离方案（共享 vs 独立）</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-4"> 我能用 YAML 配置文件管理多索引的配置项</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-5"> 我能解释双层权限过滤的工作原理和必要性</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>意图路由</td><td>根据查询语义判断目标知识域并路由到对应索引</td></tr>
+            <tr><td>MetadataFilter</td><td>Milvus/Qdrant 检索时的字段过滤条件</td></tr>
+            <tr><td>NodePostprocessor</td><td>检索后、合成前对 Node 的处理/过滤环节</td></tr>
+            <tr><td>多租户隔离</td><td>不同租户的数据物理或逻辑上相互独立</td></tr>
+            <tr><td>共享索引</td><td>一个 Collection 存储所有租户数据，用字段区分</td></tr>
+            <tr><td>独立索引</td><td>每个租户一个单独的 Collection</td></tr>
+            <tr><td>ExactMatchFilter</td><td>精确匹配的 metadata 过滤条件</td></tr>
+            <tr><td>RAGConfig</td><td>YAML 加载的多索引配置模型</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>共享索引和独立索引各自有什么优缺点？CorpAssist 怎么选？</summary><p>共享索引优点：运维简单（一个 Collection、一套备份策略）、天然支持跨租户搜索。缺点：filter 配置错误可能导致数据泄露、单 Collection 容量有限（Milvus 推荐 <500 万向量）。独立索引优点：物理隔离最安全、容量理论上无限、独立备份和恢复。缺点：管理多个 Collection 运维成本高、跨租户搜索需要分别查询合并。CorpAssist 初始阶段（<10 租户，每个 <50 万文档）用共享索引；大租户入驻（>10 万文档）后切到独立索引。</p></details>
+        <details><summary>RouterQueryEngine 路由错误时（如把 IT 问题路由到 HR），怎么排查和修复？</summary><p>排查：1) 看 verbose 输出中 selector 对各工具的 score（分数差距小说明描述不够区分）；2) 检查 ToolMetadata.description 是否包含足够多的关键词。修复：1) 在描述中添加该域特有的术语和反例（"非HR问题如VPN配置"）；2) 改用 PydanticSingleSelector 添加结构化约束（如 "category = 'hr' | 'it' | 'finance'"）；3) 在系统 prompt 中添加路由规则说明。</p></details>
+        <details><summary>NodePostprocessor 执行顺序重要吗？在 CorpAssist 中怎么安排？</summary><p>顺序重要，因为后处理器按数组顺序执行，每个的输出是下一个的输入。CorpAssist 顺序：1) SimilarityPostprocessor（先过滤低分噪音）；2) PermissionFilter（再过滤无权内容）；3) SentenceTransformerRerank（最后对保留的内容重排序）。这样安排的理由：权限过滤在重排序之前，避免对无权内容做无意义的排序运算。每个后处理器都减少了后续处理的输入量，提升整体效率。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/query_engine/RouterQueryEngine/" target="_blank" rel="noopener">RouterQueryEngine 集成示例</a> — 多工具路由配置</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/querying/node_postprocessors/" target="_blank" rel="noopener">LlamaIndex NodePostprocessor 文档</a> — 自定义后处理器的实现方法</li>
+      <li><a href="https://milvus.io/docs/manage-collections.md" target="_blank" rel="noopener">Milvus 集合管理</a> — Collection 创建、分区和索引配置</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>创建两个 Milvus Collection（hr/it），分别写入 20 条测试文档</li>
+      <li>配置 RouterQueryEngine 路由到对应的 Collection，测试路由准确率</li>
+      <li>实现 PermissionFilter 后处理器，验证用户角色过滤</li>
+      <li>编写 YAML 配置文件，用 pydantic 加载，动态创建查询引擎</li>
+      <li>测试跨租户搜索（移除 filter 后查询所有 Collection）</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：HR 部门的员工可以查看 HR 政策，但薪资信息只有 HR 经理才能看，怎么设计？</summary><p>双层过滤：1) 检索层：所有 HR 文档 metadata 中标记 department=hr，HR 员工检索时 filter department=hr，只返回 HR 文档；2) Node 级别权限：包含薪资的 Node 额外标记 required_role=hr_manager，PermissionFilter 检查用户角色。这样 HR 员工搜"薪资"不会返回结果（因为 metadata filter 不够精确，但 NodePostprocessor 会拦截）；HR 经理搜"薪资"可以看到。</p></details>
+      <details><summary>场景：用户查询"请帮我查一下 VPN 配置和年假政策"，RouterQueryEngine 怎么处理？</summary><p>建议用 SubQuestionQueryEngine + RouterQueryEngine 组合。SubQuestionQueryEngine 先将问题拆为两个子问题："VPN 配置是什么"和"年假政策是什么"，然后分别路由到 IT 和 HR 索引，最后合并结果。如果只用 RouterQueryEngine，它会选择一个"最匹配"的索引，丢失另一个域的信息。所以检测到复合意图时，应切换到子查询模式。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-04-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>RouterQueryEngine 在 10 个测试查询上的路由准确率 >= 90%</li>
+        <li>PermissionFilter 正确拦截用户无权访问的 Node（模拟 3 种角色）</li>
+        <li>YAML 配置改动（添加新租户）后，不需要修改代码就能创建新的查询引擎</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-03">评测与迭代</a></li>
+      <li>下一篇：<a href="#ch-practice-05">实战：CorpAssist 知识库 Python 版</a> — 端到端实现 CorpAssist RAG 服务</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,363 @@
+<section id="ch-basics-02" class="chapter" data-chapter="basics-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Graph 工作流与状态管理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Agent 基础</strong> · 能力：定义节点/边/条件路由、状态管理与传递、可视化调试</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>ReAct Agent 适合简单的工具调用链，但 CorpAssist 中有更复杂的场景：审批流程需要等待人工确认、跨系统调用需要并行执行、条件分支需要根据结果选择不同路径。Spring AI Alibaba 的 Graph（基于 StateGraph）支持节点/边/条件路由，让复杂工作流可编排、可调试、可恢复。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 StateGraph 定义节点和边；实现条件路由和状态管理；可视化 Graph 调试工作流；对比 Graph 与微服务 Saga 模式的异同。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) Graph = 节点(Node) + 边(Edge) + 条件边(ConditionalEdge)；2) State 在节点间传递，每个节点读取并更新 State；3) Spring AI Alibaba 的 StateGraph 兼容 LangGraph 的概念；4) 可视化调试用 mermaid 格式导出 Graph；5) 与 Saga 模式对照：Agent Graph 是编排型，Saga 是 choreography 型。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>节点/边/条件路由</h3>
+      <p><span class="term" data-term-id="state-graph">StateGraph</span> 是有向图工作流：<span class="term" data-term-id="graph-node">节点</span>（Node）是工作单元，<span class="term" data-term-id="graph-edge">边</span>（Edge）定义节点间的顺序，<span class="term" data-term-id="conditional-edge">条件边</span>（ConditionalEdge）根据 State 内容选择不同路径。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    START([开始])
+    START --> N1[查工单状态]
+    N1 --> C1{状态判断}
+    C1 -->|待处理| N2[查处理人信息]
+    C1 -->|已完成| N4[生成完成报告]
+    C1 -->|已关闭| N5[通知工单已关闭]
+    N2 --> N3[发送催办邮件]
+    N3 --> N6[创建跟进日程]
+    N4 --> END
+    N5 --> END
+    N6 --> END
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">import com.alibaba.spring.ai.graph.*;
+import com.alibaba.spring.ai.graph.state.*;
+import java.util.Map;
+import java.util.function.Function;
+
+// 1. 定义 State（工作流的共享状态）
+public record CorpState(
+    String ticketId,
+    String status,
+    String assignee,
+    String report
+) implements AgentState {}
+
+// 2. 定义节点
+public class QueryTicketNode implements Node<CorpState> {
+    @Override
+    public CorpState apply(CorpState state) {
+        // 模拟查工单
+        String status = "待处理";  // 来自工单系统
+        String assignee = "张三";
+        return new CorpState(
+            state.ticketId(), status, assignee, null
+        );
+    }
+}
+
+public class NotifyAssigneeNode implements Node<CorpState> {
+    @Override
+    public CorpState apply(CorpState state) {
+        // 发送邮件通知
+        String report = "已通知处理人: " + state.assignee();
+        return new CorpState(
+            state.ticketId(), state.status(),
+            state.assignee(), report
+        );
+    }
+}
+
+// 3. 构建 Graph
+public class TicketWorkflow {
+    public static StateGraph<CorpState> buildGraph() {
+        StateGraph<CorpState> graph = new StateGraph<>(CorpState::new);
+
+        // 添加节点
+        graph.addNode("query_ticket", new QueryTicketNode());
+        graph.addNode("notify", new NotifyAssigneeNode());
+        graph.addNode("report_completed", state ->
+            new CorpState(state.ticketId(), state.status(),
+                state.assignee(), "工单已完成")
+        );
+        graph.addNode("report_closed", state ->
+            new CorpState(state.ticketId(), state.status(),
+                state.assignee(), "工单已关闭")
+        );
+
+        // 添加入口和边
+        graph.setEntryPoint("query_ticket");
+
+        // 条件边：根据工单状态路由
+        graph.addConditionalEdge(
+            "query_ticket",
+            (Function<CorpState, String>) state -> {
+                return switch (state.status()) {
+                    case "待处理" -> "notify";
+                    case "已完成" -> "report_completed";
+                    case "已关闭" -> "report_closed";
+                    default -> "report_completed";
+                };
+            },
+            Map.of(
+                "notify", "notify",
+                "report_completed", "report_completed",
+                "report_closed", "report_closed"
+            )
+        );
+
+        // 普通边：顺序执行
+        graph.addEdge("notify", "report_completed");
+        graph.setFinishPoint("report_completed");
+
+        return graph;
+    }
+}</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>审批工作流中，State 包含 ticketId/status/approver/comment 字段。节点 checkPermission 检查用户权限后，ConditionalEdge 路由到 approve（自动通过）或 reject（转人工审批）。每个节点更新 State，最终 State 包含完整的审批链路日志。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>状态定义与传递</h3>
+      <p><span class="term" data-term-id="agent-state">AgentState</span> 是 Graph 工作流的核心。它是一个不可变记录（record），每次节点处理返回一个新的 State 实例，保证状态变更可追溯、可回放。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 复杂 State 定义（支持逐步累加）
+public class WorkflowState {
+    private final Map<String, Object> data = new ConcurrentHashMap<>();
+    private final List<String> logs = new ArrayList<>();
+    private final List<Map<String, Object>> artifacts = new ArrayList<>();
+
+    public WorkflowState with(String key, Object value) {
+        this.data.put(key, value);
+        return this;
+    }
+
+    public <T> T get(String key, Class<T> type) {
+        return type.cast(data.get(key));
+    }
+
+    public WorkflowState log(String message) {
+        this.logs.add(
+            LocalDateTime.now() + " - " + message
+        );
+        return this;
+    }
+
+    public List<String> getLogs() { return List.copyOf(logs); }
+}
+
+// 状态传递示例
+public class ProcessTicketNode implements Node<WorkflowState> {
+    @Override
+    public WorkflowState apply(WorkflowState state) {
+        String ticketId = state.get("ticketId", String.class);
+        // 处理逻辑...
+        return state
+            .with("status", "processed")
+            .with("processedAt", Instant.now().toString())
+            .log("工单 " + ticketId + " 已处理");
+    }
+}
+
+// 使用 Graph
+public void executeWorkflow() {
+    StateGraph<WorkflowState> graph = new StateGraph<>(WorkflowState::new);
+    // ... 配置节点和边
+    CompiledGraph<WorkflowState> app = graph.compile();
+
+    WorkflowState result = app.run(
+        new WorkflowState()
+            .with("ticketId", "TKT-001")
+            .with("userId", "u123")
+    );
+    System.out.println("日志:\n" + String.join("\n", result.getLogs()));
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>可视化调试</h3>
+      <p>StateGraph 支持导出 Mermaid 格式用于可视化。调试时可以打印节点的输入输出 State 和耗时。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 1. 导出 Mermaid 图
+public void visualizeGraph(StateGraph<?> graph) {
+    String mermaid = graph.getGraph(Marker.SELECTED);
+    System.out.println("=== Mermaid 流程图 ===");
+    System.out.println(mermaid);
+    // 输出示例：
+    // flowchart TD
+    //   __START__ --> query_ticket
+    //   query_ticket -->|待处理| notify
+    //   query_ticket -->|已完成| report
+    //   notify --> report
+    //   report --> __END__
+}
+
+// 2. 调试拦截器
+public class DebugInterceptor implements NodeInterceptor {
+
+    @Override
+    public void beforeProcess(String nodeName, AgentState state) {
+        System.out.printf("[DEBUG] 进入节点: %s | State: %s%n",
+            nodeName, state);
+    }
+
+    @Override
+    public void afterProcess(String nodeName, AgentState state,
+                              long durationMs) {
+        System.out.printf("[DEBUG] 离开节点: %s | 耗时: %dms%n",
+            nodeName, durationMs);
+    }
+
+    @Override
+    public void onError(String nodeName, Throwable error) {
+        System.err.printf("[ERROR] 节点 %s 异常: %s%n",
+            nodeName, error.getMessage());
+    }
+}
+
+// 3. 启用调试
+StateGraph<CorpState> graph = TicketWorkflow.buildGraph();
+graph.addNodeInterceptor(new DebugInterceptor());
+CompiledGraph<CorpState> app = graph.compile();
+
+// 4. 运行并输出 trace
+AgentState result = app.run(
+    Map.of("ticketId", "TKT-001")
+);
+// 输出:
+// [DEBUG] 进入节点: query_ticket | State: {ticketId=TKT-001}
+// [DEBUG] 离开节点: query_ticket | 耗时: 152ms
+// [DEBUG] 进入节点: notify | State: {ticketId=TKT-001, status=待处理}
+// ...</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>无调试，黑盒运行</h4><p>工作流出错只知道最终 State 不对。需要手动加 System.out 打印每个节点，排查需要 30 分钟+。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>Interceptor + Mermaid</h4><p>Mermaid 图一眼看到所有路径，Interceptor 打印每个节点的输入/输出/耗时，错误节点高亮。排查时间缩短到 5 分钟。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与微服务 Saga 模式对照</h3>
+      <p><span class="term" data-term-id="saga">Saga</span> 是微服务中管理分布式事务的模式。Agent Graph 和 Saga 都解决跨步骤编排的问题，但设计哲学不同。</p>
+      <table class="outline-table">
+        <thead><tr><th>维度</th><th>Agent StateGraph</th><th>微服务 Saga</th></tr></thead>
+        <tbody>
+          <tr><td>编排方式</td><td>编排型（Orchestration）——一个中央编排器决定流程</td><td>编排型 或 协作型（Choreography）</td></tr>
+          <tr><td>状态存储</td><td>内存中 AgentState 对象</td><td>数据库 Saga 日志表</td></tr>
+          <tr><td>补偿机制</td><td>节点级别的错误处理 + 回退节点</td><td>Compensation Transaction（回滚）</td></tr>
+          <tr><td>执行单元</td><td>LLM 节点 + 工具节点</td><td>微服务 API 调用</td></tr>
+          <tr><td>事务语义</td><td>最终一致性（无强事务保证）</td><td>Saga 保证最终一致性</td></tr>
+          <tr><td>适用场景</td><td>AI Agent 工作流</td><td>分布式事务/跨服务数据一致性</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：Agent Graph 和 Saga 可以结合使用吗？</summary><p>可以。架构设计：Agent Graph 负责"决策"——判断工作流的路径、调用哪些工具、何时需要人工介入。Saga 负责"执行"——Agent Graph 中的工具节点调用微服务，微服务通过 Saga 保证数据一致性。例如 CorpAssist 的报销审批流程：Agent Graph 判断是否需要审批、推送到谁；Saga 保证审批通过后，财务系统和报销系统的数据一致性。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>StateGraph 由节点（工作单元）、边（顺序执行）、条件边（状态路由）三要素构成</li>
+        <li>AgentState 作为不可变记录在节点间传递，保证状态变更的完整性和可追溯性</li>
+        <li>Mermaid 可视化 + NodeInterceptor 调试器是定位工作流问题的核心手段</li>
+        <li>Agent Graph 是编排型工作流，与微服务 Saga 在不同抽象层次上互补</li>
+        <li>CorpAssist 审批/流转场景适合用 StateGraph 编排，工具执行部分可选 Saga 保证一致性</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="basics-02-1"> 我能用 StateGraph 定义节点、边、条件边</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-2"> 我能设计一个有状态的工作流 State 结构</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-3"> 我能用 Interceptor 调试 Graph 工作流</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-4"> 我能导出 Mermaid 格式可视化工作流</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-5"> 我能解释 Agent Graph 和 Saga 的异同</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>StateGraph</td><td>Spring AI Alibaba 的有向图工作流引擎</td></tr>
+            <tr><td>Node</td><td>工作流中的处理单元</td></tr>
+            <tr><td>Edge</td><td>定义节点间的顺序关系</td></tr>
+            <tr><td>ConditionalEdge</td><td>根据 State 内容路由到不同节点</td></tr>
+            <tr><td>AgentState</td><td>工作流的共享状态，在节点间传递</td></tr>
+            <tr><td>NodeInterceptor</td><td>节点处理前后的回调拦截器</td></tr>
+            <tr><td>CompiledGraph</td><td>编译后的可执行 Graph</td></tr>
+            <tr><td>Saga</td><td>微服务分布式事务管理模式</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>StateGraph 和 LangGraph 的主要区别是什么？</summary><p>StateGraph（Spring AI Alibaba）是 LangGraph 的 Java 移植版本，概念上兼容：节点/边/条件边/State/EntryPoint/FinishPoint。主要区别：1) Java 版强类型——State 用 record 或 POJO 定义，编译期检查；2) 序列化——Java 版 State 需要可序列化（JSON/Java Serialization），支持跨节点传递；3) 集成——Java 版与 Spring AI 的 ChatClient/ToolCallback 无缝集成；4) 生态——LangGraph 的 checkpoint/回放功能更丰富。功能覆盖度 Java 版约 80%，核心流控能力一致。</p></details>
+        <details><summary>Graph 工作流中节点执行失败怎么恢复？</summary><p>三层恢复策略：1) 节点内部重试——通过 NodeInterceptor 的 onError 捕获异常，判断可重试的异常（网络超时）进行 3 次退避重试；2) 回退节点——在 Graph 中定义 error_handler 节点，ConditionalEdge 从失败节点路由到 error_handler，清理或回滚状态；3) 人工介入——复杂错误路由到 human_approval 节点，等待人工处理后继续。State 的不可变性保证了重试时可以从任意节点恢复。</p></details>
+        <details><summary>多个条件边组合时出现死路（没有匹配的路径），Graph 会怎么处理？</summary><p>StateGraph 的 compile 阶段会做静态分析，检查所有节点是否可达。如果有节点没有边连接，compile 会抛出 IllegalGraphException。运行时如果 ConditionalEdge 的返回值没有对应的边，框架会使用默认路由（如果设置了 defaultEdge）或抛出 NoEdgeMatchException。最佳实践：每个 ConditionalEdge 都设一个 defaultEdge 指向 error_handler 节点，处理未预期的状态值。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://github.com/alibaba/spring-ai-alibaba/blob/main/README.md" target="_blank" rel="noopener">Spring AI Alibaba Graph 文档</a> — StateGraph API 参考</li>
+      <li><a href="https://langchain-ai.github.io/langgraph/concepts/high_level/" target="_blank" rel="noopener">LangGraph 核心概念</a> — StateGraph 的设计原理</li>
+      <li><a href="https://microservices.io/patterns/data/saga.html" target="_blank" rel="noopener">Saga 模式说明</a> — 与 Agent Graph 对照参考</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>实现一个查工单→催办→记录日志的三节点 Graph</li>
+        <li>添加条件边：工单状态为"待处理"时才催办，否则直接记录日志</li>
+        <li>添加 DebugInterceptor 打印每个节点的输入输出和耗时</li>
+        <li>导出 Mermaid 图，验证路径覆盖</li>
+        <li>模拟节点异常，测试 error_handler 回退逻辑</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Graph 中有一个"审批"节点需要等待外部系统响应（异步回调），怎么设计？</summary><p>方案：在审批节点中，将审批请求发送到外部系统后，State 标记为 pending_approval，ConditionalEdge 路由到 wait_node。wait_node 设置轮询或回调机制（CompletableFuture + 超时），每 5 秒检查审批状态。超时 60 秒后路由到 timeout_handler。审批完成后 ConditionalEdge 路由到 continue_processing。这个模式叫做"悬挂节点"——等待外部异步结果时 Graph 不阻塞，通过轮询/回调恢复执行。</p></details>
+      <details><summary>场景：条件边的路由逻辑需要查询外部数据才能确定，怎么设计？</summary><p>在 ConditionalEdge 的 Function 中调用外部服务是反模式——Lambda 不应有副作用。正确做法：增加一个"路由决策"节点，在节点中查询外部数据，将决策结果写入 State（如 routeTo = "path_a"）。ConditionalEdge 只从 State 中读取 routeTo 字段做简单判断。这样职责清晰：节点做"数据获取"，边做"路由决定"。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-02-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>Graph 编译通过，Mermaid 图显示所有节点和路径</li>
+        <li>ConditionalEdge 根据 State 内容正确路由到不同节点</li>
+        <li>Interceptor 输出每个节点的耗时和状态变化</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-01">ReactAgent 基础与 ReAct 循环</a></li>
+      <li>下一篇：<a href="#ch-basics-03">工具调用与 Function Calling</a></li>
+    </ul>
+  </div>
+</section>

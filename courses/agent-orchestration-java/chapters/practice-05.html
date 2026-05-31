@@ -1,0 +1,405 @@
+<section id="ch-practice-05" class="chapter" data-chapter="practice-05">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>实战：CorpAssist 办公 Agent</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>多 Agent 编排与集成</strong> · 能力：实现日历/邮件/工单工具、完整工作流 Demo、步数/Token 监控、验收清单</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>前面 8 章学了 Agent 的各个组件——ReAct 循环、Graph 工作流、工具定义、记忆管理、MCP 协议、分布式部署。本章把这些组件组合成一个完整的 CorpAssist 办公 Agent，实现"帮我安排周会""查工单进度""发通知邮件"等真实办公场景。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>搭建完整的 CorpAssist 办公 Agent（Spring Boot + ReactAgent + MCP + Nacos）；实现日历/邮件/工单工具的端到端流程；配置步数和 Token 监控；通过验收清单检查 Agent 的正确性和性能。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 办公 Agent 核心流程：理解自然语言→规划工具调用→执行→汇总；2) 日历/邮件/工单通过 MCP Server 集成；3) 步数监控确保 Agent 在预算内完成任务；4) 验收清单覆盖功能/性能/可用性/安全四维。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>日历/邮件/工单工具</h3>
+      <p>CorpAssist 办公 Agent 的核心能力围绕日历、邮件、工单三个场景。通过 MCP Server 集成到 Agent。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    U[用户自然语言] --> AG[CorpAssist 办公 Agent]
+    AG -->|ReAct 循环| LLM
+    LLM -->|工具选择| Tools
+    subgraph Tools
+        CAL[日历 MCP]
+        MAIL[邮件 MCP]
+        TICKET[工单 MCP]
+        USER[用户查询 MCP]
+    end
+    CAL -->|create_event| ES[日历系统]
+    MAIL -->|send_email| EMS[邮件系统]
+    TICKET -->|query_ticket| TS[工单系统]
+    USER -->|get_user_info| US[用户系统]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">/ 完整的 CorpAssist Agent 配置
+@Configuration
+public class CorpAgentConfig {
+
+    @Bean
+    public ChatClient corpChatClient(ChatClient.Builder builder) {
+        return builder
+            .defaultSystem("""
+                你是 CorpAssist 办公助手，帮助员工处理日常工作。
+
+                可用工具：
+                1. 日历：创建日程、查询日程、取消日程
+                2. 邮件：发送邮件、查询收件箱、搜索邮件
+                3. 工单：查询工单状态、创建工单、更新工单
+                4. 用户：查询员工信息、查询部门信息
+
+                工作流程：
+                1. 先理解用户意图，拆解为具体任务
+                2. 按顺序调用需要的工具
+                3. 如果某个工具返回错误，尝试修正参数后重试
+                4. 最终用中文给出完整、友好的回答
+                5. 涉及外部操作（发邮件、创建工单）必须先让用户确认
+
+                Token 预算：单次对话不超过 4096 tokens
+                最大步骤：不超过 10 步
+                """)
+            .build();
+    }
+
+    @Bean
+    public ReactAgent corpAssistant(
+            ChatClient chatClient,
+            List<ToolCallback> allTools) {
+
+        return ReactAgent.builder()
+            .chatClient(chatClient)
+            .tools(allTools)
+            .maxIterations(15)
+            .maxTokenUsage(8192)
+            .toolRetryAttempts(2)
+            .build();
+    }
+
+    // 注册所有工具（来自 MCP Server 和本地 @Tool）
+    @Bean
+    public List<ToolCallback> allTools(
+            List<McpClient> mcpClients,
+            List<Object> toolBeans) {
+
+        List<ToolCallback> callbacks = new ArrayList<>();
+
+        // 来自 MCP Server 的工具
+        for (McpClient client : mcpClients) {
+            for (McpTool tool : client.listTools()) {
+                callbacks.add(new McpToolCallback(client, tool));
+            }
+        }
+
+        // 来自本地 @Tool 注解的工具
+        for (Object bean : toolBeans) {
+            // Spring AI 自动扫描 @Tool
+        }
+        return callbacks;
+    }
+}
+
+// 运行 Agent
+@Service
+public class CorpAgentService {
+
+    private final ReactAgent agent;
+
+    public AgentResponse process(String userId, String message) {
+        // 注入用户上下文
+        AgentContext ctx = AgentContext.create()
+            .withUserId(userId)
+            .withTenantId(resolveTenant(userId));
+
+        AgentResponse response = agent.execute(ctx, message);
+        return response;
+    }
+}</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工输入"今天下午 2 点和张三李四开周会，然后给他们发邮件确认时间"。Agent 四步完成：1) 查张三和李四的邮箱（getUserInfo）→ 2) 创建 14:00-15:00 日程（createEvent）→ 3) 给两人发送会议确认邮件（sendEmail）→ 4) 汇总结果返回。整个过程 5 步，消耗约 1500 tokens，30 秒内完成。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>完整工作流 Demo</h3>
+      <p>以下是典型场景的端到端工作流："查我的待办工单，帮我把紧急的催一下，然后安排明天上午的复盘会"。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@RestController
+@RequestMapping("/api/agent/demo")
+public class AgentDemoController {
+
+    private final CorpAgentService agentService;
+
+    // Demo 场景 1：工单催办
+    @PostMapping("/ticket-reminder")
+    public AgentResponse ticketReminder(
+            @RequestParam String userId) {
+        return agentService.process(userId,
+            "查我的待处理工单，把超过3天的紧急工单汇总，给对应的处理人发催办邮件"
+        );
+        // 预期流程：
+        // 1. getTickets(userId, status=pending)
+        // 2. filter: 超过3天且紧急
+        // 3. getUsers(assignees) 查处理人邮箱
+        // 4. sendEmail(assignee, subject="催办提醒", body=...)
+        // 5. 汇总已发送的催办清单
+    }
+
+    // Demo 场景 2：会议安排
+    @PostMapping("/schedule-meeting")
+    public AgentResponse scheduleMeeting(
+            @RequestParam String userId,
+            @RequestBody MeetingRequest request) {
+        return agentService.process(userId,
+            "安排明天上午10点与%s的%s会议，预定会议室A，"
+            + "给参会人发送会议邀请邮件".formatted(
+                String.join(",", request.attendees()),
+                request.topic())
+        );
+        // 预期流程：
+        // 1. getUsers(attendees) 查邮箱
+        // 2. checkRoom("会议室A", "10:00-11:00") 查会议室
+        // 3. createEvent(topic, time, attendees, room)
+        // 4. sendEmail(to, subject="会议邀请", body=...)
+        // 5. 确认会议已创建
+    }
+
+    // Demo 场景 3：复杂工作流（需要路由）
+    @PostMapping("/complex-workflow")
+    public AgentResponse complexWorkflow(
+            @RequestParam String userId) {
+        return agentService.process(userId,
+            "我的工单 TKT-2026-001 一直没处理，帮我看看怎么回事。"
+            + "如果是待分配状态就分配给 IT 部门的张三，然后通知他处理。"
+            + "另外今天下午我有空，帮我查一下下午的日程"
+        );
+        // 涉及：
+        // - queryTicket → 状态判断 → updateTicketAssignee
+        // - sendEmail → querySchedule
+        // 需要条件分支和并行任务
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>步数/Token 监控</h3>
+      <p>Agent 执行的每一步消耗 Token，需要监控确保不超预算。Micrometer + Prometheus 采集指标。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Agent 监控指标
+@Component
+public class AgentMetrics {
+
+    private final MeterRegistry registry;
+
+    public AgentMetrics(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    // 记录每次 Agent 执行
+    public void recordExecution(AgentExecution execution) {
+        // 步数分布
+        registry.counter("agent.steps.total",
+            "agent", execution.getAgentId()).increment(
+                execution.getStepCount());
+
+        // Token 消耗
+        registry.counter("agent.tokens.total",
+            "agent", execution.getAgentId(),
+            "type", "prompt").increment(
+                execution.getPromptTokens());
+        registry.counter("agent.tokens.total",
+            "agent", execution.getAgentId(),
+            "type", "completion").increment(
+                execution.getCompletionTokens());
+
+        // 延迟
+        registry.timer("agent.execution.duration",
+            "agent", execution.getAgentId()).record(
+                execution.getDuration());
+
+        // 工具调用分布
+        for (String tool : execution.getToolsCalled()) {
+            registry.counter("agent.tool.calls",
+                "agent", execution.getAgentId(),
+                "tool", tool).increment();
+        }
+    }
+
+    // 实时监控端点
+    @GetMapping("/api/agent/metrics/summary")
+    public Map<String, Object> getMetricsSummary() {
+        return Map.of(
+            "avg_steps_per_session", getAverage("agent.steps.total"),
+            "avg_tokens_per_session", getAverage("agent.tokens.total"),
+            "p50_latency_ms", getPercentile("agent.execution.duration", 0.5),
+            "p99_latency_ms", getPercentile("agent.execution.duration", 0.99),
+            "total_sessions_today", getTotal("agent.execution.duration")
+        );
+    }
+
+    // 步数异常检测
+    @EventListener
+    public void onStepThreshold(AgentStepEvent event) {
+        if (event.getStepCount() > 10) {
+            // 超过 10 步的会话，记录并告警
+            alertService.sendWarning(
+                "Agent " + event.getAgentId() +
+                " 已执行 " + event.getStepCount() +
+                " 步，超过阈值 10");
+        }
+    }
+}
+
+// 输出示例：
+// avg_steps_per_session: 4.2
+// avg_tokens_per_session: 2150
+// p50_latency_ms: 3500
+// p99_latency_ms: 12000
+// total_sessions_today: 3421</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>验收清单</h3>
+      <table class="outline-table">
+        <thead><tr><th>类别</th><th>验收项</th><th>验收标准</th></tr></thead>
+        <tbody>
+          <tr><td>功能</td><td>日历创建</td><td>输入"明天下午2点开会"创建成功</td></tr>
+          <tr><td>功能</td><td>邮件发送</td><td>输入"给张三发邮件提醒"发送成功</td></tr>
+          <tr><td>功能</td><td>工单查询</td><td>输入"查我的工单"返回正确状态</td></tr>
+          <tr><td>功能</td><td>复杂意图</td><td>"安排会议+发邮件"组合执行成功</td></tr>
+          <tr><td>功能</td><td>错误恢复</td><td>工具失败后 Agent 自动重试并降级</td></tr>
+          <tr><td>性能</td><td>步数控制</td><td>平均每会话 < 8 步</td></tr>
+          <tr><td>性能</td><td>Token 消耗</td><td>平均每会话 < 4096 tokens</td></tr>
+          <tr><td>性能</td><td>响应时间</td><td>P95 < 8秒</td></tr>
+          <tr><td>可用性</td><td>多实例部署</td><td>2+ 实例，Nacos 发现正常</td></tr>
+          <tr><td>可用性</td><td>熔断降级</td><td>MCP Server 不可达时返回友好提示</td></tr>
+          <tr><td>安全</td><td>权限控制</td><td>只能操作本人数据和租户数据</td></tr>
+          <tr><td>安全</td><td>审计日志</td><td>所有工具调用记录在日志中</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># 验收执行脚本
+echo "=== 1. 日历创建 ==="
+curl -s -X POST http://localhost:8080/api/agent/demo/schedule-meeting \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"u001","attendees":["张三","李四"],"topic":"周会"}' | jq .
+
+echo "=== 2. 工单催办 ==="
+curl -s -X POST http://localhost:8080/api/agent/demo/ticket-reminder \
+  -d "userId=u001" | jq .
+
+echo "=== 3. 复杂工作流 ==="
+curl -s -X POST http://localhost:8080/api/agent/demo/complex-workflow \
+  -d "userId=u001" | jq .
+
+echo "=== 4. 监控指标 ==="
+curl -s http://localhost:8080/api/agent/metrics/summary | jq .
+
+echo "=== 5. Token 统计 ==="
+curl -s http://localhost:8080/api/agent/metrics/summary | jq '.avg_tokens_per_session'</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>CorpAssist 办公 Agent 集成日历/邮件/工单三大场景，通过 MCP Server 标准化接入</li>
+        <li>System Prompt 定义了工作流程（理解→规划→执行→确认→汇报）和 Token 预算规则</li>
+        <li>步数监控显示平均每会话 4.2 步，Token 消耗 2150，P99 延迟 12 秒</li>
+        <li>验收清单 12 项覆盖功能/性能/可用性/安全四个维度</li>
+        <li>复杂工作流"查工单+催办+查日程"涉及条件分支和顺序执行，14 步内完成</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="practice-05-1"> 我能配置 CorpAssist 办公 Agent 的完整工具集</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-2"> 我能实现"安排会议+发邮件"的组合场景</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-3"> 我能用 Micrometer 采集 Agent 步数和 Token 指标</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-4"> 我能通过验收清单检查 Agent 的正确性</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-5"> 我能处理 Agent 工具调用失败后的降级</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>CorpAssist Agent</td><td>企业办公助手，集成日历/邮件/工单</td></tr>
+            <tr><td>MCP Server</td><td>邮件系统/日历系统的标准工具接口</td></tr>
+            <tr><td>System Prompt</td><td>Agent 的行为规则和工作流程定义</td></tr>
+            <tr><td>AgentMetrics</td><td>Micrometer 采集的 Agent 性能指标</td></tr>
+            <tr><td>步数监控</td><td>记录每会话的 ReAct 循环次数</td></tr>
+            <tr><td>Token 预算</td><td>单次对话的 Token 上限</td></tr>
+            <tr><td>验收清单</td><td>四维 12 项上线检查表</td></tr>
+            <tr><td>AgentContext</td><td>包含 userId/tenantId 的 Agent 执行上下文</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>办公 Agent 的 System Prompt 中"涉及外部操作必须先让用户确认"这个规则怎么实现？</summary><p>实现方式：在 System Prompt 中定义规则，LLM 在 final answer 前加一个"确认步骤"——Agent 不会直接执行写操作，而是先返回"我将执行以下操作：1) 创建日程...2) 发送邮件...请确认"。用户确认后 Agent 再执行第二轮调用。技术上可以在确认步骤用 interrupt 节点暂停，等待用户输入"确认"后恢复。或者：写操作的工具（sendEmail/createEvent）在执行前先检查 State 中是否有 confirmed=true 字段，没有则返回"请先确认"。</p></details>
+        <details><summary>多步骤场景中（如先查工单再催办），Agent 的 Token 消耗怎么预估？</summary><p>每步消耗 = 调用 LLM 的 prompt（历史+工具描述+工具结果）+ LLM 的 completion（Thought+Action）。一个 N 步的 ReAct 循环约消耗：(历史长度 + 工具Schema + 工具结果) × N + (完成回答)。CorpAssist 经验公式：4 步会话约 2000 tokens，8 步约 4000 tokens，15 步约 9000 tokens。80% 的会话在 8 步内完成，对应约 4096 tokens。</p></details>
+        <details><summary>验收清单中 P95 延迟 8 秒的目标偏高，怎么优化到 3 秒？</summary><p>优化措施：1) 缓存——精确缓存+语义缓存覆盖 55% 的查询，缓存命中时 <200ms；2) 小模型路由——简单查询用 DeepSeek（<1s），复杂查询用 GPT-4.1（3-5s）；3) 预计算热点——Top-50 问题预计算答案，零延迟；4) 工具调用并行化——无依赖的工具调用并行执行（如同时查日程和查工单）；5) 流式输出——首个 token 500ms 内返回，用户感知延迟降低 60%。综合优化后 P95 从 8 秒降到 2.5 秒。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://micrometer.io/docs" target="_blank" rel="noopener">Micrometer 监控文档</a> — Agent 指标采集和 Prometheus 集成</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 参考文档</a> — ReactAgent 和 ToolCallback 配置</li>
+      <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">MCP 协议文档</a> — 邮件/日历 MCP Server 实现参考</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>集成日历/邮件/工单三个 MCP Server 到 Agent</li>
+      <li>测试"安排明天 10 点周会并通知参会人"完整流程</li>
+      <li>查看 Micrometer 指标（/actuator/metrics），确认步数和 Token 正确</li>
+      <li>模拟 MCP Server 故障，验证降级提示</li>
+      <li>运行验收脚本 12 项全部通过</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：验收发现 Agent 在复杂场景（"查工单+催办+查日程"）耗时 15 秒，超过 8 秒目标，怎么优化？</summary><p>该场景涉及 4 步串行调用（queryTicket → getUsers → sendEmail → querySchedule），中间有等待用户确认。瓶颈在 LLM 推理时间（每步约 2 秒）。优化：1) 将最后两步（催办和查日程）并行化——给张三发邮件和查本人日程没有依赖，可以并行；2) 用 prompt 压缩减少每步的 prompt 长度；3) 从 GPT-4.1 降到 GPT-4.1-mini（质量影响小但速度快 2 倍）。优化后预计降到 6 秒。</p></details>
+      <details><summary>场景：员工说"帮我"，Agent 不知道要帮什么（查询不完整），怎么设计 Prompt 引导？</summary><p>在 System Prompt 中加入引导规则："如果用户指令不完整（如只说'帮我'而没有具体说帮什么），请反问用户具体需求并给出选项：'好的，我可以帮您：1) 查看工单进度 2) 安排会议 3) 发送邮件 4) 查询日程。请问您需要什么？'"，让 Agent 主动引导而不是卡住。Agent 的 ChatMemory 会让用户接着说"查工单"时 Agent 理解上下文继续执行。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-05-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>完整场景"安排会议+发送通知"在 10 步内完成</li>
+        <li>/api/agent/metrics/summary 返回正确的步数和 Token 统计</li>
+        <li>验收 12 项全部通过，测试报告输出</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-04">A2A 与 Nacos 分布式 Agent</a></li>
+      <li>下一篇：<a href="#ch-advanced-01">容灾、限流与降级</a></li>
+    </ul>
+  </div>
+</section>

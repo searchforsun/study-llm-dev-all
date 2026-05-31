@@ -1,0 +1,382 @@
+<section id="ch-advanced-04" class="chapter" data-chapter="advanced-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：通义栈 Agent 架构五连问</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与治理</strong> · 能力：Agent vs 纯对话、多步规划与反思、工具失败降级、记忆系统设计、MCP 协议深度</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>通义栈 Agent 面试的高频五连问考察候选人对 Agent 架构的深度理解。不仅是知道概念，还要能解释设计取舍、生产化挑战、以及真实项目中的应用。本章提供每道题的 STAR 答题模板和关键技术细节。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 STAR 模板回答 5 道 Agent 架构面试题；解释 Agent vs 纯对话的 5 个核心区别；设计带反思机制的 Agent 架构；实现工具降级的 3 种策略；画出记忆系统的分层设计。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) Agent vs 纯对话：状态管理/工具调用/多步推理/记忆维护/Monitoring 五维度差异；2) 多步规划用 ReAct + 反思节点实现；3) 工具降级分三层：重试/替代/人工；4) 记忆系统分三层：工作记忆/情景记忆/语义记忆；5) MCP 协议解决工具标准化问题。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Agent vs 纯对话</h3>
+      <p>面试官第一问："什么时候用 Agent，什么时候用纯对话？"核心是理解两者的本质区别。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    subgraph 纯对话
+        Q[用户提问] --> LLM1[LLM 一次回答]
+        LLM1 --> A1[最终答案]
+        subgraph 单轮
+            LLM1
+        end
+    end
+    subgraph Agent
+        Q2[用户提问] --> LLM2[LLM 推理]
+        LLM2 -->|需要工具| TOOL[调用工具]
+        TOOL -->|结果| LLM3[LLM 推理]
+        LLM3 -->|需要更多| TOOL2[另一个工具]
+        TOOL2 -->|结果| LLM4[LLM 推理]
+        LLM4 --> A2[最终答案]
+        subgraph 多轮循环
+            LLM2 --> TOOL --> LLM3 --> TOOL2 --> LLM4
+        end
+    end
+</pre>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>维度</th><th>纯对话</th><th>Agent</th></tr></thead>
+        <tbody>
+          <tr><td>调用模式</td><td>单次 LLM 调用</td><td>多轮循环（ReAct）</td></tr>
+          <tr><td>状态管理</td><td>无状态或简单历史</td><td>复杂 State 管理（AgentState）</td></tr>
+          <tr><td>工具调用</td><td>无</td><td>Function Calling + MCP</td></tr>
+          <tr><td>多步推理</td><td>不感知中间步骤</td><td>Thought→Action→Observation 循环</td></tr>
+          <tr><td>记忆维护</td><td>滑动窗口</td><td>结构化记忆（摘要+窗口）</td></tr>
+          <tr><td>监控手段</td><td>简单日志</td><td>步数/Token/Trace 全链路</td></tr>
+          <tr><td>错误恢复</td><td>重新提问</td><td>重试+降级+回退</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-text">【面试话术 - Agent vs 对话】
+
+"选择 Agent 而不是纯对话的场景有 3 个判断标准：
+1) 需要调用外部系统（查数据库/发邮件/操作工单）
+2) 任务需要多步推理（如'查工单状态→找到处理人→催办→记录日志'）
+3) 需要条件分支（不同工单状态不同处理方式）
+
+CorpAssist 项目中，简单 FAQ（'年假几天'）走纯对话，
+复杂操作（'帮我处理工单并安排会议'）走 Agent。
+路由判断用 RouterQueryEngine 自动分流。"</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多步规划与反思</h3>
+      <p>第二问："Agent 做多步规划时，怎么保证不走偏？如何加入反思（Reflection）机制？"</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 带反思机制的 Agent
+@Component
+public class ReflectiveAgent {
+
+    private final ChatClient planner;    // 规划 LLM
+    private final ChatClient executor;   // 执行 LLM
+    private final ChatClient reflector;  // 反思 LLM
+
+    public AgentResponse execute(String task) {
+        // Step 1: 规划（生成执行计划）
+        String plan = planner.prompt()
+            .user("为以下任务制定执行计划：" + task)
+            .call()
+            .content();
+
+        AgentState state = new AgentState(task, plan);
+        int maxReflections = 3;
+
+        for (int step = 0; step < 10; step++) {
+            // Step 2: 执行（执行单步）
+            String result = executor.prompt()
+                .user("当前步骤: " + plan.split("\n")[step] +
+                      "\n上下文: " + state.getContext())
+                .call()
+                .content();
+
+            state.addStepResult(step, result);
+
+            // Step 3: 反思（检查结果是否偏离计划）
+            if (step > 0 && step % 2 == 0) {
+                String reflection = reflector.prompt()
+                    .user("检查当前进度是否符合原计划:\n" +
+                          "计划: " + plan + "\n" +
+                          "已完成: " + state.getSummary() + "\n" +
+                          "偏离了吗？如果偏离请给出修正方案")
+                    .call()
+                    .content();
+
+                if (reflection.contains("偏离")) {
+                    // 修正计划
+                    plan = planner.prompt()
+                        .user("原计划偏离了，当前进度: " +
+                              state.getSummary() +
+                              "。请重新规划剩余步骤")
+                        .call()
+                        .content();
+                    state.addReflection(reflection);
+                }
+            }
+        }
+        return new AgentResponse(state);
+    }
+}
+
+// 面试重点：反思机制的设计
+// 1. 每 2 步执行一次反思（平衡 Token 和安全性）
+// 2. 反思内容包含：原计划 vs 当前进度的对比
+// 3. 发现偏离时重新规划（不修正已执行的步骤）
+// 4. 反思是用独立的 LLM 调用（不占用主流程的 Context Window）</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具失败降级</h3>
+      <p>第三问："工具调用失败时，Agent 怎么降级？"</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    FAIL[工具调用失败] --> CASE{错误类型}
+    CASE -->|网络超时| RETRY[退避重试 3 次]
+    CASE -->|参数错误| REFIX[LLM 修正参数后重试]
+    CASE -->|权限不足| STOP[停止调用，提示用户]
+    CASE -->|业务异常| ALTER{有替代方案?}
+    ALTER -->|有| ALT[使用替代工具]
+    ALTER -->|无| HUM[转人工处理]
+    RETRY -->|成功| OK
+    REFIX -->|成功| OK
+    ALT -->|成功| OK
+    STOP --> DONE
+    HUM --> DONE
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 三层降级策略
+@Component
+public class ToolDegradationStrategy {
+
+    @Tool(name = "sendEmail", description = "发送邮件")
+    @Retry(name = "email", maxAttempts = 3,
+           backoff = @Backoff(delay = 1000))
+    public EmailResult sendEmail(String to, String subject, String body) {
+        try {
+            return emailClient.send(to, subject, body);
+        } catch (TimeoutException e) {
+            // 第 1 层：重试（由 @Retry 处理）
+            throw e;
+        } catch (PermissionDeniedException e) {
+            // 第 2 层：替代方案
+            return saveToDraft(to, subject, body);
+        } catch (ServiceUnavailableException e) {
+            // 第 3 层：人工介入
+            createManualTicket("send_email", to, subject, body);
+            return new EmailResult("manual",
+                "邮件系统暂时不可用，已创建人工处理工单");
+        }
+    }
+
+    // LLM 级别的降级提示
+    private String getDegradationPrompt() {
+        return """
+            工具调用规则（降级相关）：
+            1. 如果 sendEmail 返回超时，等 2 秒后重试一次
+            2. 如果重试仍然失败，告诉用户"邮件系统繁忙，已保存为草稿"
+            3. 绝对不要连续重试同一个工具超过 2 次
+            4. 如果用户提供了多种联系方式（邮件+企业微信），
+               一种失败时尝试另一种
+            """;
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>记忆系统设计</h3>
+      <p>第四问："Agent 的记忆系统怎么设计？短期和长期记忆如何配合？"</p>
+      <table class="outline-table">
+        <thead><tr><th>记忆层级</th><th>存储</th><th>TTL</th><th>内容</th><th>容量</th></tr></thead>
+        <tbody>
+          <tr><td>工作记忆</td><td>AgentState（内存）</td><td>会话内</td><td>当前任务上下文、工具调用结果</td><td>几千 tokens</td></tr>
+          <tr><td>情景记忆</td><td>RedisChatMemory</td><td>24 小时</td><td>最近 20 轮对话历史</td><td>几万 tokens</td></tr>
+          <tr><td>语义记忆</td><td>向量数据库</td><td>永久</td><td>用户偏好、历史决策摘要</td><td>按需检索</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 三层记忆系统
+@Component
+public class MemorySystem {
+
+    // 工作记忆：当前会话上下文
+    public class WorkingMemory {
+        private final Map<String, Object> context = new HashMap<>();
+        private final List<String> recentActions = new ArrayList<>();
+
+        public void recordAction(String action, String result) {
+            recentActions.add(action + "→" + result);
+            if (recentActions.size() > 20) recentActions.remove(0);
+        }
+    }
+
+    // 情景记忆：跨会话的对话历史
+    public class EpisodicMemory {
+        private final ChatMemory chatMemory;
+
+        public List<Message> recall(String sessionId) {
+            return chatMemory.get(sessionId, 20);
+        }
+
+        public void store(String sessionId, Message msg) {
+            chatMemory.add(sessionId, msg);
+        }
+    }
+
+    // 语义记忆：用户偏好和知识
+    public class SemanticMemory {
+        private final VectorStore vectorStore;
+
+        public void rememberPreference(String userId, String preference) {
+            // 将偏好转为向量存入 Milvus
+            Document doc = new Document(preference,
+                Map.of("user_id", userId, "type", "preference"));
+            index.insert(doc);
+        }
+
+        public List<String> recallPreferences(String userId) {
+            retriever.setFilters(
+                new MetadataFilters(List.of(
+                    new ExactMatchFilter("user_id", userId),
+                    new ExactMatchFilter("type", "preference")
+                )));
+            return retriever.retrieve("用户偏好").stream()
+                .map(n -> n.getText())
+                .toList();
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>MCP 协议深度</h3>
+      <p>第五问："MCP 协议解决了什么问题？为什么不用 OpenAPI？"</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-text">【面试话术 - MCP 协议】
+
+"MCP 解决了三个核心问题：
+
+1. 工具发现的标准化 —— 每个系统不需要单独开发 SDK。
+   邮件系统实现 MCP Server，任何 MCP Client 都能发现和调用。
+   不需要每个 Agent 框架写适配器。
+
+2. 工具调用的可观测性 —— MCP 协议定义了标准的
+   request_id 和 trace 传播，可以在 Jaeger 中
+   Trace 从 Agent → MCP Server → 邮件系统的完整调用链。
+
+3. 鉴权的统一化 —— MCP 协议定义了标准的鉴权握手流程，
+   支持 JWT 和 mTLS。不需要每个系统单独对接 OAuth2 或 API Key。
+
+相比 OpenAPI（REST），MCP 的差异：
+- MCP 的 tool description 是为 LLM 优化的（让模型理解何时调用）
+- MCP 的 list_tools 是动态发现的（OpenAPI 需要编译期生成文档）
+- MCP 支持标准化的结果格式（成功/失败/错误码统一）
+
+CorpAssist 中，MCP Server 部署在邮件/日历/工单系统侧，
+Agent 通过 MCP Client 统一调用，省去了 4 套 API 适配代码。"</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Agent vs 纯对话：7 个维度对比，核心区别在状态管理/工具调用/多步推理</li>
+        <li>多步规划通过 ReAct 循环 + 每 2 步反思机制实现，发现偏离后重新规划</li>
+        <li>工具降级三层：重试（超时）/ 替代（换个工具）/ 人工（创建工单）</li>
+        <li>记忆系统三层：工作记忆（会话内）/ 情景记忆（24h Redis）/ 语义记忆（永久 Milvus）</li>
+        <li>MCP 协议标准化工具发现/调用/鉴权，比 OpenAPI 更适合 LLM 场景</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="advanced-04-1"> 我能从 7 个维度对比 Agent 和纯对话</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-04-2"> 我能设计带反思机制的 Agent 架构</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-04-3"> 我能画出工具降级的三层决策树</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-04-4"> 我能设计三层记忆系统的存储和配合</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-04-5"> 我能解释 MCP 协议解决的三个核心问题</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>ReAct 循环</td><td>思考→行动→观察 的多步推理循环</td></tr>
+            <tr><td>反思机制</td><td>Agent 定期检查执行进度是否偏离原计划</td></tr>
+            <tr><td>三层层降级</td><td>重试→替代→人工 的工具失败处理策略</td></tr>
+            <tr><td>工作记忆</td><td>当前会话内的上下文信息（内存）</td></tr>
+            <tr><td>情景记忆</td><td>跨会话的对话历史（Redis）</td></tr>
+            <tr><td>语义记忆</td><td>用户偏好等长期知识（Milvus）</td></tr>
+            <tr><td>MCP Server</td><td>符合 Model Context Protocol 的工具服务器</td></tr>
+            <tr><td>STAR</td><td>Situation-Task-Action-Result 面试答题模板</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>请用一个你真实做过的 Agent 项目，用 STAR 模板讲给我听。</summary><p>S：CorpAssist 办公 Agent，服务 3 个部门 5000 员工，对接 4 个外部系统。T：我负责 Agent 架构设计和技术选型。A：选择 Spring AI Alibaba + MCP 协议方案，实现日历/邮件/工单/审批 4 个 Agent 协作，设计三层降级和中断审批机制。R：上线后日处理 1 万次查询，P95 3.5 秒，95% 的查询 Agent 自主完成无需人工介入，月节省约 40 人天的工作量。</p></details>
+        <details><summary>反思机制增加了 Token 消耗（大约 30%），怎么判断是否值得？</summary><p>判断标准：Agent 的规划准确率。CorpAssist 中没有反思机制时，Agent 在 5 步以上的复杂任务中规划偏离率 18%（100 次测试中 18 次明显偏离了用户意图）。加入反思后降到了 3%。每 2 步反思消耗约 300 tokens，每天 10 万步约 1500 万 tokens，折合约 ¥75/天。而每次偏离平均需要用户重试 2 次（额外 500 tokens），加上用户体验损失。ROI 明显：投入 ¥75/天 反思成本，避免 ¥300/天的重试成本和用户体验下降。</p></details>
+        <details><summary>你认为 Agent 架构未来 2 年的演进方向是什么？</summary><p>三个方向：1) 协议标准化——MCP/A2A 等协议会让 Agent 间的通信像微服务 REST 一样标准化，跨组织的 Agent 协作成为可能；2) 记忆持久化——从简单的滑动窗口演变为结构化的长期记忆系统（类似 RAG 但针对个人/组织知识），Agent 能记住用户的偏好和历史决策；3) 安全性——随着 Agent 获得更多操作权限（支付/审批/数据删改），安全框架将成为 Agent 架构的一等公民，包含权限模型、审计追踪和异常检测。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct: Synergizing Reasoning and Acting in Language Models</a> — Agent 核心论文</li>
+      <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">MCP 协议官方文档</a> — 协议规范和 Server/Client SDK</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 参考文档</a> — ReactAgent/ChatMemory/ToolCallback 核心 API</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>用 STAR 模板写一份 CorpAssist Agent 项目经验，含 3 个量化指标</li>
+      <li>实现带反思机制的 Agent：每 2 步反思一次，对比有无反思的任务成功率</li>
+      <li>画出三层记忆系统的架构图，标注每层的存储/容量/访问方式</li>
+      <li>模拟面试 5 连问，每题 3 分钟录音，检查是否覆盖关键点</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>面试中被追问"如果 LLM 一直说需要调用工具但参数都不对，怎么处理？"</summary><p>答：这是 Agent 常见的"幻觉循环"问题。三层防护：1) 工具层——工具参数做服务端校验，不符合 Schema 的工具调用拒绝并返回具体错误（"name 字段不能为空"），LLM 看到错误后会修正参数；2) Agent 层——toolRetryAttempts=2，重试 2 次后如果还是错的，停止执行并返回"无法完成此操作"；3) 监控层——检测连续参数错误的模式（N 次调用同一工具失败），告警并可能自动切换到备用模型。</p></details>
+      <details><summary>面试官问"CorpAssist 的 Agent 如果出现幻觉（自己编造工具返回结果），怎么检测和防止？"</summary><p>检测：1) 工具结果验证——所有工具返回结果通过 JSON Schema 验证，不符合 Schema 的视为无效；2) 对比检测——同时对同一问题用不同模型推理，对比结果一致性（如 GPT-4.1 vs DeepSeek）；3) 可信度评分——Agent 在返回答案时附带"自信度"评分，低分答案需要二次确认。防止：1) 在 System Prompt 中强调"不编造数据，如果工具没有返回就说明不知道"；2) 对所有写操作（发邮件/创建工单）增加审批节点；3) 审计日志自动对比 Agent 输出的数据和工具实际返回的数据。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/advanced-04-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>STAR 经验包含 3 个量化指标（日请求量/延迟/成功率）</li>
+        <li>反思机制使 Agent 规划偏离率从 18% 降低到 3%</li>
+        <li>5 连问录音自评：每题覆盖核心概念和真实项目细节</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-advanced-03">多 Agent 框架对比</a></li>
+    </ul>
+  </div>
+</section>

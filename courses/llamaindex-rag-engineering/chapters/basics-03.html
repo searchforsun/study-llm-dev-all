@@ -1,0 +1,324 @@
+<section id="ch-basics-03" class="chapter" data-chapter="basics-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>索引类型选型</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>LlamaIndex 核心抽象</strong> · 能力：掌握 VectorStoreIndex/SummaryIndex/KeywordTableIndex 选型与切换</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 不止一种检索需求：HR 手册需要语义搜索找相似条款，IT 工单需要关键词精确匹配，日报汇总需要按时间顺序生成摘要。VectorStoreIndex 不能覆盖所有场景。LlamaIndex 提供 7+ 种索引类型，每种对应不同检索模式和生成策略，选错索引会导致召回率下降 40% 以上。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>解释 VectorStoreIndex/SummaryIndex/KeywordTableIndex 的数据结构和检索算法；根据场景（语义搜索/摘要/精确匹配）选择正确的索引类型；用 RouterQueryEngine 组合多种索引实现混合检索。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) VectorStoreIndex 对 Node 做嵌入后用向量相似度检索；2) SummaryIndex 按文档顺序遍历 Node 合成答案，适合"总结整个文档"；3) KeywordTableIndex 提取关键词后做精确匹配，适合代码搜索和法规查询；4) TreeIndex 递归构建摘要树；5) 可以通过 RouterQueryEngine 组合多种索引实现最优效果。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>VectorStoreIndex 与语义检索</h3>
+      <p><span class="term" data-term-id="vector-store-index">VectorStoreIndex</span> 是最常用的索引类型。它接收 Node 列表，调用嵌入模型生成向量，写入向量数据库，查询时用 ANN（近似最近邻）搜索。在 LlamaIndex 中，VectorStoreIndex 封装了嵌入、存储和检索三个环节，用户只需指定向量库和嵌入模型。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    N[Node 列表] -->|text-embedding-3-small| E[向量: 1536 维]
+    E -->|存入| VS[向量数据库]
+    Q[查询文本] -->|相同模型| QV[查询向量]
+    QV -->|ANN 搜索| VS
+    VS -->|top-k| R[检索结果]
+    R -->|排序+组合| S[合成阶段]
+    S --> A[最终答案]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.vector_stores.milvus import MilvusVectorStore
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.settings import Settings
+
+# 全局设置
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small", dimensions=1536)
+
+# 指定向量库
+vector_store = MilvusVectorStore(
+    uri="http://milvus:19530",
+    collection_name="corpassist_kb",
+    dim=1536,
+    overwrite=True
+)
+
+# 构建索引
+documents = SimpleDirectoryReader("./corp_docs").load_data()
+index = VectorStoreIndex.from_documents(
+    documents,
+    vector_store=vector_store,
+    show_progress=True
+)
+
+# 检索参数控制
+retriever = index.as_retriever(
+    similarity_top_k=5,           # 返回 top-5
+    vector_store_query_mode="default",  # default/sparse/hybrid
+    filters={"department": "hr"}  # metadata 过滤
+)
+nodes = retriever.retrieve("年假政策是什么")
+for n in nodes:
+    print(f"  Score: {n.score:.3f} | {n.text[:50]}...")</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>参数</th><th>默认值</th><th>说明</th><th>CorpAssist 推荐值</th></tr></thead>
+        <tbody>
+          <tr><td>similarity_top_k</td><td>2</td><td>返回顶部 K 个结果</td><td>5（知识库）/ 3（代码搜索）</td></tr>
+          <tr><td>vector_store_query_mode</td><td>default</td><td>向量检索模式</td><td>hybrid（结合全文检索提升 15% 召回）</td></tr>
+          <tr><td>alpha</td><td>0.5</td><td>hybrid 模式下向量与全文的权重</td><td>0.7（偏好语义）/ 0.3（偏好关键词）</td></tr>
+          <tr><td>filters</td><td>无</td><td>精确 metadata 过滤</td><td>必填 tenant_id 和 department</td></tr>
+          <tr><td>doc_ids</td><td>无</td><td>限定文档 ID 范围</td><td>用于增量更新后的全量刷新</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工提问"怎么申请年假"，VecorStoreIndex 将问题嵌入后搜索 HR 手册中语义最相近的条款，返回"年假申请流程"章节的内容。配合 metadata filter department=hr 仅搜索 HR 部门的文档，精确过滤 3000+ 文档到约 200 个。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>SummaryIndex 与文档摘要</h3>
+      <p><span class="term" data-term-id="summary-index">SummaryIndex</span> 不依赖向量检索。它维护 Node 的原始顺序，查询时将检索到的 Node 按原序拼接后送入 LLM 生成答案。适合"总结整个文档"或"按时间顺序叙述"的场景。</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>用 VectorStoreIndex 做总结</h4><p>向量检索只能返回语义相似的片段，但可能丢失时间顺序。员工问"本周团队完成了什么"，可能只返回"完成知识库建设"这条相似度高的，遗漏"周一修复Bug、周二上线新功能"等顺序信息。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>用 SummaryIndex 做总结</h4><p>按 Node 顺序拼接，LLM 能看到完整时间线。回答"周一修复了3个生产Bug，周二上线了新功能X，周三..."，信息完整且按序排列。</p></div>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core import SummaryIndex
+
+# 假设 documents 是按日期排序的日报
+index = SummaryIndex.from_documents(documents)
+
+# 模式 1：遍历所有 Node 生成摘要
+query_engine = index.as_query_engine(
+    response_mode="tree_summarize",  # tree_summarize: 递归合成摘要
+    verbose=True
+)
+resp = query_engine.query("总结本周所有工作进展")
+print(resp)
+
+# 模式 2：只取前 K 个 Node
+query_engine = index.as_query_engine(
+    response_mode="compact",  # compact: 拼接 top-k Node
+    similarity_top_k=10
+)
+resp = query_engine.query("周一和周二做了什么")
+print(resp)
+
+# 模式 3：逐 Node 回答后组合
+query_engine = index.as_query_engine(
+    response_mode="accumulate"  # accumulate: 逐 Node 回答后合并
+)</pre></code>
+      </div>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：SummaryIndex 的 response_mode 各有什么优劣势？</summary><p>1) <code>compact</code>：拼接 Node 文本后单次 LLM 调用，Token 省但可能超长，适合 20 个以内 Node。2) <code>tree_summarize</code>：递归两两合并摘要，适合大量 Node（100+），但速度慢。3) <code>accumulate</code>：逐 Node 回答后 LLM 再次合并，独立性强但 Token 消耗多 1.5x。CorpAssist 日报总结用 tree_summarize，10 个日报约 50 Node，递归 3 层完成。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>KeywordTableIndex 与关键词匹配</h3>
+      <p><span class="term" data-term-id="keyword-table-index">KeywordTableIndex</span> 从每个 Node 中提取关键词（使用 LLM 或简单 TF-IDF），构建关键词→Node 的映射表。查询时提取查询关键词，精确匹配 Node。适合代码搜索、法规条款查询等需要精确语义匹配而非向量相似度的场景。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core import KeywordTableIndex
+
+# 代码文档索引
+index = KeywordTableIndex.from_documents(
+    documents,
+    max_keywords_per_chunk=10  # 每个 Node 提取 10 个关键词
+)
+
+query_engine = index.as_query_engine(
+    keyword_extract_fn=None,  # 自定义关键词提取函数（可选）
+)
+resp = query_engine.query("如何配置 RocketMQ 消费者")
+# 这里精准匹配到 "RocketMQ", "消费者", "配置" 等关键词
+# 而不是语义搜索相近的 "消息队列" 概念
+print(resp)
+
+# 看一下关键词表
+keyword_table = index.index_struct.keywords
+for kw, node_ids in list(keyword_table.items())[:5]:
+    print(f"关键词 '{kw}' → {len(node_ids)} 个 Node")</pre></code>
+      </div>
+      <table class="learn-decision-table">
+        <thead><tr><th>场景</th><th>推荐索引</th><th>原因</th></tr></thead>
+        <tbody>
+          <tr><td>HR 手册语义搜索（"年假政策"）</td><td>VectorStoreIndex</td><td>需要语义泛化能力，向量搜索找到相关概念（年假、休假、请假）</td></tr>
+          <tr><td>代码函数精确查找（"createUser()"）</td><td>KeywordTableIndex</td><td>需要精确匹配函数名，向量搜索可能匹配到 createAccount、makeUser 等</td></tr>
+          <tr><td>日报周报总结</td><td>SummaryIndex</td><td>需要按时间顺序遍历所有内容</td></tr>
+          <tr><td>法规条款精确匹配（"第37条"）</td><td>KeywordTableIndex</td><td>向量搜索无法精确区分"第37条"和"第38条"</td></tr>
+          <tr><td>FAQ 问答（"密码重置"）</td><td>VectorStoreIndex</td><td>用户表达多样（忘记密码、重置密码、修改密码），需要语义泛化</td></tr>
+          <tr><td>整本手册摘要</td><td>SummaryIndex</td><td>需要遍历全部章节内容</td></tr>
+        </tbody>
+      </article>
+    </div>
+
+    <div class="section-block">
+      <h3>索引选择决策表</h3>
+      <p>实际项目中很少只用一种索引。<span class="term" data-term-id="router-query-engine">RouterQueryEngine</span> 可以根据查询意图自动路由到最合适的索引，同时利用多种索引的优势。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    Q[用户查询] --> R[RouterQueryEngine]
+    R -->|选择器: LLM/Embedding| S{意图判断}
+    S -->|语义搜索| V[VectorStoreIndex]
+    S -->|全文总结| SM[SummaryIndex]
+    S -->|精确匹配| KW[KeywordTableIndex]
+    S -->|层级检索| TR[TreeIndex]
+    V -->|top-k scores| CR1[组合结果]
+    SM -->|压缩文本| CR2
+    KW -->|精确 Node| CR3
+    CR1 & CR2 & CR3 --> CO[合成最终答案]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.core.query_engine import RouterQueryEngine
+from llama_index.core.selectors import LLMSingleSelector
+from llama_index.core import VectorStoreIndex, SummaryIndex, KeywordTableIndex
+
+# 构建三种索引
+vec_index = VectorStoreIndex.from_documents(documents)
+sum_index = SummaryIndex.from_documents(documents)
+kw_index = KeywordTableIndex.from_documents(documents)
+
+# 为每个索引创建工具
+vector_tool = QueryEngineTool(
+    query_engine=vec_index.as_query_engine(similarity_top_k=3),
+    metadata=ToolMetadata(
+        name="vector_search",
+        description="用于语义搜索，查找相关概念和描述"
+    )
+)
+summary_tool = QueryEngineTool(
+    query_engine=sum_index.as_query_engine(response_mode="tree_summarize"),
+    metadata=ToolMetadata(
+        name="summary",
+        description="用于总结整个文档或多个文档的内容"
+    )
+)
+keyword_tool = QueryEngineTool(
+    query_engine=kw_index.as_query_engine(),
+    metadata=ToolMetadata(
+        name="exact_match",
+        description="用于精确匹配关键词、代码函数名、条款编号"
+    )
+)
+
+# 路由查询引擎
+router = RouterQueryEngine(
+    selector=LLMSingleSelector.from_defaults(),
+    query_engine_tools=[vector_tool, summary_tool, keyword_tool],
+    verbose=True
+)
+
+response = router.query("第37条规定了什么")
+# Router 选择 exact_match → KeywordTableIndex</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>VectorStoreIndex 适合需要语义泛化的场景（FAQ、知识搜索），ANN 检索延迟 50-200ms</li>
+        <li>SummaryIndex 按 Node 顺序拼接，适合文档摘要和时间线总结，response_mode 决定 Token 策略</li>
+        <li>KeywordTableIndex 精确匹配关键词，适合代码搜索和法规条款，0 嵌入成本但依赖 LLM 提取关键词</li>
+        <li>RouterQueryEngine 通过查询意图路由到最合适的索引，召回率比单一索引高 25-35%</li>
+        <li>CorpAssist 推荐使用 VectorStoreIndex + KeywordTableIndex 组合，RouterQueryEngine 统一入口</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-03-1"> 我能说出 three 种索引的检索算法和适用场景</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-2"> 我能用 VectorStoreIndex 配置向量检索参数（top_k, filters, hybrid）</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-3"> 我能用 SummaryIndex 的 tree_summarize 模式做多文档摘要</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-4"> 我能用 KeywordTableIndex 实现代码函数名的精确匹配</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-5"> 我能用 RouterQueryEngine 组合三种索引实现智能路由</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>VectorStoreIndex</td><td>嵌入 Node 后用 ANN 向量检索，适用语义搜索</td></tr>
+            <tr><td>SummaryIndex</td><td>按 Node 原始顺序拼接，适用文档摘要</td></tr>
+            <tr><td>KeywordTableIndex</td><td>关键词→Node 映射表，适用精确匹配</td></tr>
+            <tr><td>TreeIndex</td><td>递归构建摘要树，适用层级总结</td></tr>
+            <tr><td>RouterQueryEngine</td><td>根据意图路由到多个子引擎的组合查询器</td></tr>
+            <tr><td>response_mode</td><td>响应合成模式：compact/tree_summarize/accumulate</td></tr>
+            <tr><td>ANN</td><td>近似最近邻搜索，向量检索的核心算法</td></tr>
+            <tr><td>hybrid</td><td>向量检索+全文检索混合，提升召回率</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>VectorStoreIndex 和 KeywordTableIndex 在检索逻辑上的本质区别是什么？</summary><p>VectorStoreIndex 将文本和查询都嵌入为向量，用余弦距离或点积衡量相似度，本质是语义泛化——"年假"和"休假"相似度高。KeywordTableIndex 从文本中提取关键词（用 LLM 或统计方法），构建倒排索引，查询时精确匹配关键词，不涉及向量计算。核心区别：语义泛化 vs 精确匹配。CorpAssist 中 FAQ 用 VectorStoreIndex（用户表述多变），代码搜索用 KeywordTableIndex（函数名必须精确）。</p></details>
+        <details><summary>RouterQueryEngine 的选择器有哪几种？各有什么优劣？</summary><p>LlamaIndex 提供 4 种选择器：1) LLMSingleSelector：用 LLM 选一个工具，准确率高（98%）但延迟高（1-2s）；2) LLMMultiSelector：可选多个工具，适合复杂查询；3) PydanticSingleSelector：基于 Pydantic schema 选择，结构约束强；4) EmbeddingSingleSelector：用嵌入模型选，速度快（50ms）但准确率低（85%）。CorpAssist 场景用 LLMSingleSelector，1-2s 延迟对知识库场景可接受。</p></details>
+        <details><summary>在什么场景下 TreeIndex 比 SummaryIndex 更合适？</summary><p>TreeIndex 递归构建摘要树：根节点是全局摘要，子节点是章节摘要，叶子节点是原始文本。适合：1) 超长文档（100+ 页），直接 summaryIndex 的 compact 模式会超 Token 限制；2) 分层检索需求，用户从"公司政策"→"HR 政策"→"年假政策"逐层深入。TreeIndex 的树结构天然支持这种导航。但构建时间比 SummaryIndex 多 3-5 倍，因为需要多轮 LLM 调用生成摘要。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/indexing/vector_store_index/" target="_blank" rel="noopener">LlamaIndex VectorStoreIndex 文档</a> — 配置参数和向量库集成</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/index_structs/IndexComparison/" target="_blank" rel="noopener">LlamaIndex 索引类型对比</a> — 同一数据集上不同索引的检索效果对比</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/query_engine/RouterQueryEngine/" target="_blank" rel="noopener">RouterQueryEngine 示例</a> — 多索引路由配置和选择器调优</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>用同一个文档集创建 VectorStoreIndex、SummaryIndex、KeywordTableIndex 三种索引</li>
+        <li>对同一查询（如"开发规范"）分别用三种索引检索，对比结果差异</li>
+        <li>用 RouterQueryEngine 配置 LLMSingleSelector，查询"总结开发规范"观察路由选择</li>
+        <li>修改索引参数（top_k、response_mode、keywords_per_chunk）观察效果变化</li>
+        <li>在生产语料上测试 VectorStoreIndex hybrid 模式 vs default 模式的召回率</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：CorpAssist 需要实现"从 5000 个 Java 代码文件中找到 createUser 方法的所有调用处"，选什么索引和参数？</summary><p>选 KeywordTableIndex，max_keywords_per_chunk=5。因为需要精确匹配方法名 createUser，而不是语义相似的 createAccount。代码文件每个方法作为一个 Node，关键词表中会包含 createUser。查询"createUser"时精确匹配。如果混入 VectorStoreIndex，"用户创建"等语义相近的内容也会出现在结果中，干扰精确匹配。补充：KeywordTableIndex 对代码文件要先做 CodeSplitter 分割，确保每个 Node 是一个方法。</p></details>
+      <details><summary>场景：用户查询"说下上周的五个重要事项"，但 VectorStoreIndex 只返回了 2 个 Node。怎么改进？</summary><p>问题在于向量检索只找到语义最相似的片段，丢失了其他重要事项。改进方案：1) 将 similarity_top_k 从默认 2 提高到 10，增加召回量；2) 改用 SummaryIndex 的 tree_summarize 模式，遍历所有 Node 生成摘要；3) 或者用 RouterQueryEngine，对"总结/汇总"类查询路由到 SummaryIndex，对"搜索/找"类查询路由到 VectorStoreIndex。用 LLMSingleSelector 根据查询动词自动判断。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-03-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>同一查询在三种索引上产生不同结果，对比差异并说明原因</li>
+        <li>RouterQueryEngine 根据查询意图正确路由到对应索引</li>
+        <li>索引切换（Vector→Summary→Keyword）在 3 行代码内完成，验证 LlamaIndex 的抽象一致性</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-02">IngestionPipeline 与文档解析</a></li>
+      <li>下一篇：<a href="#ch-basics-04">查询引擎与路由</a> — 深入查询引擎的合成模式和路由策略</li>
+    </ul>
+  </div>
+</section>

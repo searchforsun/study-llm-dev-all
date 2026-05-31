@@ -1,0 +1,394 @@
+<section id="ch-practice-05" class="chapter" data-chapter="practice-05">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>实战：CorpAssist 知识库 Python 版</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>高级 RAG 管线</strong> · 能力：端到端构建 CorpAssist RAG 服务，包含 FastAPI 服务化、流式响应、验收清单</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>前面 9 章学了 LlamaIndex 的各个组件，现在是时候把它们组合成一个完整的 RAG 服务了。CorpAssist Python 知识库是 Java 侧对话服务的检索后盾，需要提供文档上传、检索、流式问答、索引管理等功能。本章从零搭建可部署的 RAG 服务。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>搭建完整的 CorpAssist RAG 服务（文档上传→解析→索引→检索→问答）；用 FastAPI 暴露 REST API 和流式 SSE 端点；实现文档的增删改查和索引重建；通过验收清单验证服务的正确性。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) 服务分为三层：API 层（FastAPI）→ 引擎层（LlamaIndex）→ 存储层（Milvus）；2) 流式响应用 FastAPI StreamingResponse + LlamaIndex streaming=True；3) 文档上传通过后台任务异步处理，避免请求超时；4) 索引管理支持全量重建和增量更新；5) 验收清单覆盖功能、性能和安全。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>端到端管线</h3>
+      <p>CorpAssist RAG 服务由四个模块构成：文档处理模块（上传→解析→索引）、检索模块（查询→检索→合成）、管理模块（索引生命周期）、监控模块（指标和日志）。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TB
+    subgraph 文档处理
+        UP[POST /upload] --> PD[文档解析]
+        PD --> IN[IngestionPipeline]
+        IN -->|VectorStoreIndex| MIL[Milvus]
+        IN -->|元数据| DOC[DocStore]
+    end
+    subgraph 检索问答
+        Q[POST /query] --> RT[Retriever]
+        RT --> MIL
+        RT --> SYN[ResponseSynthesizer]
+        SYN --> ANS[返回答案]
+    end
+    subgraph 流式
+        SQ[POST /query/stream] --> SR[StreamingRetriever]
+        SR --> SS[SSE 流式输出]
+    end
+    subgraph 管理
+        ADMIN[DELETE /documents] --> MIL
+        ADMIN[POST /index/rebuild] --> IN
+        ADMIN[GET /health] --> STATUS
+    end
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># app/main.py — CorpAssist RAG 服务主入口
+from fastapi import FastAPI, UploadFile, BackgroundTasks, HTTPException
+from fastapi.responses import StreamingResponse
+from contextlib import asynccontextmanager
+import os, uuid, json
+
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.vector_stores.milvus import MilvusVectorStore
+from pydantic import BaseModel
+
+# --- 全局配置 ---
+MILVUS_URI = os.getenv("MILVUS_URI", "http://milvus:19530")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small", dimensions=1536)
+
+# --- 生命周期管理 ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动：初始化 Milvus 连接
+    global vector_store, index
+    vector_store = MilvusVectorStore(uri=MILVUS_URI, dim=1536)
+    index = VectorStoreIndex.from_vector_store(vector_store)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    yield
+    # 关闭：清理资源
+    vector_store.close()
+
+app = FastAPI(title="CorpAssist RAG Service", version="1.0.0", lifespan=lifespan)
+
+# --- Pydantic 模型 ---
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 5
+    tenant_id: str = "default"
+    streaming: bool = False
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: list[dict]
+    token_usage: int
+
+# --- API 端点 ---
+@app.post("/api/v1/upload")
+async def upload_document(file: UploadFile, tenant_id: str = "default", background: BackgroundTasks):
+    """上传文档并异步建立索引"""
+    file_path = f"{UPLOAD_DIR}/{uuid.uuid4()}_{file.filename}"
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    background.add_task(process_document, file_path, tenant_id)
+    return {"status": "accepted", "file_id": file_path}
+
+async def process_document(file_path: str, tenant_id: str):
+    """后台处理文档：解析→分割→嵌入→写入 Milvus"""
+    docs = SimpleDirectoryReader(input_files=[file_path]).load_data()
+    for doc in docs:
+        doc.metadata["tenant_id"] = tenant_id
+
+    pipeline = IngestionPipeline(
+        transformations=[
+            SentenceSplitter(chunk_size=512, chunk_overlap=128),
+            Settings.embed_model
+        ],
+        vector_store=vector_store
+    )
+    nodes = pipeline.run(documents=docs)
+    print(f"文档处理完成: {len(nodes)} nodes from {file_path}")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>FastAPI 服务化</h3>
+      <p>检索和问答端点是服务的核心，支持同步和异步两种模式。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># app/routes/query.py — 检索和问答路由
+from fastapi import APIRouter, Depends
+from llama_index.core.postprocessor import SimilarityPostprocessor
+
+router = APIRouter(prefix="/api/v1", tags=["query"])
+
+def get_tenant_engine(tenant_id: str):
+    """根据租户获取检索引擎"""
+    return index.as_query_engine(
+        similarity_top_k=5,
+        filters=MetadataFilters(
+            filters=[ExactMatchFilter(key="tenant_id", value=tenant_id)]
+        ),
+        node_postprocessors=[SimilarityPostprocessor(similarity_cutoff=0.5)]
+    )
+
+@router.post("/query", response_model=QueryResponse)
+async def query(req: QueryRequest):
+    """同步问答"""
+    engine = get_tenant_engine(req.tenant_id)
+    resp = engine.query(req.question)
+
+    return QueryResponse(
+        answer=str(resp),
+        sources=[
+            {"node_id": n.node_id, "score": n.score, "text": n.text[:200]}
+            for n in resp.source_nodes
+        ],
+        token_usage=resp.metadata.get("token_usage", 0)
+    )
+
+@router.post("/query/stream")
+async def query_stream(req: QueryRequest):
+    """流式问答（SSE）"""
+    engine = get_tenant_engine(req.tenant_id)
+    streaming_engine = index.as_query_engine(
+        streaming=True,
+        similarity_top_k=req.top_k,
+        filters=MetadataFilters(
+            filters=[ExactMatchFilter(key="tenant_id", value=req.tenant_id)]
+        )
+    )
+
+    async def event_generator():
+        response = streaming_engine.query(req.question)
+        async for token in response.async_response_gen():
+            yield f"data: {json.dumps({'token': token})}\n\n"
+        # 发送结束标记
+        yield f"data: {json.dumps({'done': True, 'sources': [n.node_id for n in response.source_nodes]})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+@router.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """删除文档及对应索引"""
+    index.delete_ref_doc(doc_id, delete_from_docstore=True)
+    return {"status": "deleted", "doc_id": doc_id}</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>同步接口阻塞</h4><p>大文档检索+合成耗时 5-8 秒，客户端需等待完整响应，用户体验差。FastAPI 工作线程被占用。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>流式 SSE 响应</h4><p>首个 token 在 500ms 内返回（检索完成后立即开始吐字），客户端逐 token 渲染。FastAPI 使用 async generator 不阻塞工作线程。实测用户感知延迟降低 60%。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>流式响应</h3>
+      <p>流式响应是 CorpAssist 客服场景的核心需求。LlamaIndex 通过 <code>streaming=True</code> 参数启用，配合 FastAPI 的 <code>StreamingResponse</code> 实现 SSE（Server-Sent Events）协议。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant Client as Java 门户
+    participant API as FastAPI
+    participant LI as LlamaIndex
+    participant LLM as GPT-4.1
+
+    Client->>API: POST /query/stream
+    API->>LI: query(question, streaming=True)
+    LI->>LLM: chat.completions.create(stream=True)
+    loop 逐 token
+        LLM-->>LI: token_1
+        LI-->>API: token_1
+        API-->>Client: SSE: data:{"token":"年"}
+        LLM-->>LI: token_2
+        LI-->>API: token_2
+        API-->>Client: SSE: data:{"token":"假"}
+    end
+    LI-->>API: 完成 + source_nodes
+    API-->>Client: SSE: data:{"done":true, "sources":[...]}</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Java 侧对接流式响应（Spring WebClient）
+# WebClient.create()
+#     .post()
+#     .uri("http://python-rag:8000/api/v1/query/stream")
+#     .body(Mono.just(new QueryRequest("年假几天")), QueryRequest.class)
+#     .retrieve()
+#     .bodyToFlux(String.class)
+#     .subscribe(data -> {
+#         // 解析 SSE data
+#         JsonNode json = objectMapper.readTree(data.replace("data: ", ""));
+#         if (json.has("token")) {
+#             chatUI.appendToken(json.get("token").asText());
+#         }
+#     });
+
+# Python 端流式测试
+import httpx
+import json
+
+with httpx.stream("POST", "http://localhost:8000/api/v1/query/stream",
+                   json={"question": "年假几天", "tenant_id": "hr"}) as resp:
+    for line in resp.iter_lines():
+        if line.startswith("data: "):
+            data = json.loads(line[6:])
+            if "token" in data:
+                print(data["token"], end="", flush=True)
+            elif "done" in data:
+                print(f"\n[完成] sources: {data['sources']}")</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>验收清单</h3>
+      <p>CorpAssist RAG 服务上线前需通过以下验收项：</p>
+      <table class="outline-table">
+        <thead><tr><th>类别</th><th>验收项</th><th>验收标准</th><th>验证方法</th></tr></thead>
+        <tbody>
+          <tr><td>功能</td><td>文档上传</td><td>上传 PDF/DOCX/MD 后 30s 内索引可用</td><td>curl -F "file=@test.pdf" /api/v1/upload</td></tr>
+          <tr><td>功能</td><td>同步问答</td><td>返回 answer + sources + token_usage</td><td>POST /api/v1/query {"question":"..."}</td></tr>
+          <tr><td>功能</td><td>流式问答</td><td>首个 token 在 1s 内返回，完整响应</td><td>POST /api/v1/query/stream</td></tr>
+          <tr><td>功能</td><td>多租户隔离</td><td>租户 A 检索不到租户 B 的文档</td><td>用不同 tenant_id 查询同一问题</td></tr>
+          <tr><td>性能</td><td>P99 延迟</td><td>同步 < 3s / 流式首个 token < 1s</td><td>压测 100 次取 P99</td></tr>
+          <tr><td>性能</td><td>吞吐量</td><td>10 QPS 下 P99 < 5s</td><td>locust 压测</td></tr>
+          <tr><td>安全</td><td>权限过滤</td><td>无权限用户不能访问敏感文档</td><td>roles 测试矩阵</td></tr>
+          <tr><td>可用性</td><td>健康检查</td><td>/health 返回 200 含 Milvus 连接状态</td><td>GET /health</td></tr>
+          <tr><td>可用性</td><td>索引重建</td><td>全量重建在 10 分钟内完成</td><td>POST /api/v1/index/rebuild</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># 验收脚本
+echo "=== 1. 健康检查 ==="
+curl -s http://localhost:8000/health | jq .
+
+echo "=== 2. 上传文档 ==="
+curl -s -X POST http://localhost:8000/api/v1/upload \
+  -F "file=@test_docs/HR手册.pdf" \
+  -F "tenant_id=hr"
+
+echo "=== 3. 同步查询 ==="
+curl -s -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假政策是什么？","tenant_id":"hr"}'
+
+echo "=== 4. 流式查询 ==="
+curl -s -N -X POST http://localhost:8000/api/v1/query/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假政策是什么？","tenant_id":"hr"}'
+
+echo "=== 5. 多租户隔离 ==="
+curl -s http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"question":"年假政策","tenant_id":"it"}' | jq '.answer'</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>CorpAssist RAG 服务采用三层架构：FastAPI（API 层）+ LlamaIndex（引擎层）+ Milvus（存储层）</li>
+        <li>文档上传通过 BackgroundTasks 异步处理，30s 内完成索引，不阻塞 API 响应</li>
+        <li>流式响应基于 SSE 协议，首个 token 在 1s 内返回，显著提升用户体验</li>
+        <li>多租户隔离通过 metadata filter + PermissionFilter 双层保障</li>
+        <li>验收清单覆盖功能、性能、安全、可用性四个维度，是上线前的必检项</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-05-1"> 我能从零搭建 FastAPI + LlamaIndex + Milvus 的 RAG 服务</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-05-2"> 我能实现文档上传→后台索引→检索问答的完整流程</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-05-3"> 我能用 StreamingResponse 实现流式 SSE 问答</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-05-4"> 我能通过验收清单验证服务的正确性和性能</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-05-5"> 我能解释三层架构的职责和调用关系</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>FastAPI</td><td>Python 异步 Web 框架，支持自动生成 OpenAPI 文档</td></tr>
+            <tr><td>StreamingResponse</td><td>FastAPI 的流式响应类，接收 async generator</td></tr>
+            <tr><td>SSE</td><td>Server-Sent Events，服务端向客户端推送事件的协议</td></tr>
+            <tr><td>BackgroundTasks</td><td>FastAPI 后台任务，在响应返回后异步执行</td></tr>
+            <tr><td>lifespan</td><td>FastAPI 应用生命周期管理（启动/关闭事件）</td></tr>
+            <tr><td>query/stream</td><td>流式问答端点，逐 token SSE 输出</td></tr>
+            <tr><td>delete_ref_doc</td><td>从索引中删除文档及其所有 Node</td></tr>
+            <tr><td>验收清单</td><td>上线前功能/性能/安全/可用性四维检查表</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>FastAPI 作为 RAG 服务的 Web 框架有哪些优势？对比 Flask 和 Django？</summary><p>FastAPI 优势：1) 原生异步支持（async def），流式响应天然高效；2) Pydantic 模型自动生成 OpenAPI 文档，Java 侧可对接生成客户端代码；3) BackgroundTasks 适合异步文档处理。对比 Flask：同步框架，流式响应需要通过 Response 类手动实现。对比 Django：太重，RAG 服务不需要 ORM 和 Admin。CorpAssist 选择 FastAPI 是因为双栈架构中 Python 侧是轻量服务，不需要 Django 的重量级框架。</p></details>
+        <details><summary>流式响应中如何传递 source_nodes 给客户端？</summary><p>有两种常见策略：1) 在 SSE 流的最后发送一个特殊消息（如 {"done": true, "sources": [...]}），客户端解析最后一个消息获取来源。2) 在 SSE 流的第一个消息中发送 sources 元数据，之后逐 token 输出。第一种更常用，因为检索完成后才能确定 source_nodes。CorpAssist 使用策略 1：所有 token 输出完毕后发送 done 消息附带 sources。</p></details>
+        <details><summary>文档上传后索引立即可用，但偶发"找不到刚上传内容"的问题，原因和解决方案？</summary><p>原因：Async indexing 的时序问题——文档上传后立即查询，但后台任务还未完成索引写入（Index not yet ready）。解决方案：1) 上传接口返回 doc_id，查询时携带 doc_id 轮询索引状态；2) 实现索引写入确认机制——Milvus 写入后等待 flush() 完成再返回；3) 上传采用同步模式（第一次上传时阻塞等待索引完成）而不是后台任务；4) 使用 Milvus 的一致性级别（consistency_level="strong"），但会增加写入延迟。CorpAssist 采用方案 4，接受 3-5s 的写入延迟换取查询即时一致。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://fastapi.tiangolo.com/advanced/events/" target="_blank" rel="noopener">FastAPI lifespan 事件文档</a> — 应用启动/关闭的资源管理</li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/background-tasks/" target="_blank" rel="noopener">FastAPI BackgroundTasks 文档</a> — 异步任务处理</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/llm/openai/" target="_blank" rel="noopener">LlamaIndex 流式响应示例</a> — streaming=True 的完整配置</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>搭建项目结构：app/main.py、app/routes/query.py、app/routes/admin.py、app/models/schemas.py</li>
+        <li>实现文档上传端点，用 BackgroundTasks 异步处理索引</li>
+        <li>实现同步和流式问答端点，用 curl 测试</li>
+        <li>实现多租户 filter（tenant_id）和健康检查端点</li>
+        <li>运行验收脚本，确保所有测试通过</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：服务启动后第一次查询很慢（~10s），后续查询正常（~1s），怎么优化？</summary><p>第一次查询慢是因为 Milvus 加载索引数据到内存（warm-up）。优化：1) 在 FastAPI lifespan 启动事件中预加载索引：<code>vector_store.collection.load()</code>；2) 配置 Milvus 的预加载参数 <code>collection.load(replica_number=1)</code>；3) 应用启动后发送一个预热查询空转。CorpAssist 方案：lifespan 中 load() 集合 + 每 5 分钟 health check 自动预热。</p></details>
+      <details><summary>场景：上传了 100 个文档后，查询结果突然变差（Miss），可能的原因？</summary><p>可能原因：1) IngestionPipeline 处理这些文档时 chunk_size 不合理（太大导致语义混杂，或太小导致切碎上下文）；2) 新文档的 metadata 缺少 tenant_id filter 字段，但查询时加了 filter 导致无法检索到；3) 文档内容与之前差异大（如纯英文文档混入中文索引）。排查：检查新文档的 Node.metadata 是否完整；对比新文档与旧文档的检索得分分布。修复：调整 chunk_size（从 512 调到 256），检查 metadata 注入逻辑。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-05-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>上传 3 个不同格式文档（PDF、MD、TXT），索引后检索返回正确结果</li>
+        <li>流式问答端点返回 SSE 格式，首个 token < 1s，包含 sources 信息</li>
+        <li>验收脚本 8 项全部通过，导出测试报告</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-04">多知识库与路由</a></li>
+      <li>下一篇：<a href="#ch-advanced-01">多模态索引与图文检索</a> — 学习图文混合检索和 CLIP 模型集成</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,367 @@
+<section id="ch-basics-03" class="chapter" data-chapter="basics-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>工具调用与 Function Calling</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Agent 基础</strong> · 能力：定义 @Tool 注解、参数 Schema 生成、错误重试策略、OpenAPI 导出</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>工具（Function Calling）是 Agent 与外部系统交互的唯一途径。Spring AI Alibaba 通过 @Tool 注解将 Java 方法暴露为 LLM 可调用的工具，自动生成 Function Schema。定义质量直接影响 LLM 调用的准确率。本章深入工具定义的最佳实践、参数 schema 生成机制、错误处理策略和契约导出。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 @Tool 定义高质量工具（含复杂参数类型）；理解参数 schema 的 JSON Schema 生成机制；实现工具级重试和降级策略；将工具契约导出为 OpenAPI 3.0 文档。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) @Tool 自动生成 Function Calling Schema，基于方法签名和注解；2) 参数必须用 @ToolParam 注解说明类型和含义；3) 工具通过 toolRetryAttempts 配置重试；4) 复杂参数用自定义类型 + JsonTypeInfo 注解；5) OpenAPI 导出用于跨团队协作。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>@Tool 注解定义</h3>
+      <p><span class="term" data-term-id="tool-annotation">@Tool</span> 注解将 Spring Bean 的方法暴露为 Agent 工具。框架在启动时扫描所有带 @Tool 的方法，生成 Function Calling Schema，注册到 ChatClient 的 toolCallbacks 列表中。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">import com.alibaba.spring.ai.tool.annotation.Tool;
+import com.alibaba.spring.ai.tool.annotation.ToolParam;
+import org.springframework.stereotype.Component;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+
+@Component
+public class CalendarTools {
+
+    @Tool(name = "createEvent",
+          description = "创建日历日程，支持设置标题、时间、参会人和地点")
+    public EventResult createEvent(
+            @ToolParam(description = "日程标题，如'周会'") String title,
+            @ToolParam(description = "开始时间，格式 yyyy-MM-dd HH:mm") String startTime,
+            @ToolParam(description = "结束时间，格式 yyyy-MM-dd HH:mm") String endTime,
+            @ToolParam(description = "参会人邮箱列表") List<String> attendees,
+            @ToolParam(description = "地点，可选") String location) {
+
+        // 调用日历 API
+        String eventId = "EVT-" + System.currentTimeMillis();
+        return new EventResult(eventId, title, startTime, "已创建");
+    }
+
+    @Tool(name = "listTodayEvents",
+          description = "查询当天的日程列表，用于了解今天的安排")
+    public List<EventResult> listTodayEvents(
+            @ToolParam(description = "用户邮箱") String userEmail) {
+        // 查询当天日程
+        return List.of(
+            new EventResult("EVT-001", "站会", "09:00", "已确认"),
+            new EventResult("EVT-002", "需求评审", "14:00", "已确认")
+        );
+    }
+}
+
+// 返回值类型
+public record EventResult(
+    String eventId,
+    String title,
+    String time,
+    String status
+) {}</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>@ToolParam 属性</th><th>说明</th><th>JSON Schema 映射</th></tr></thead>
+        <tbody>
+          <tr><td>description</td><td>参数说明，LLM 确定参数值的依据</td><td>"description" 字段</td></tr>
+          <tr><td>required</td><td>是否必需（默认 true）</td><td>"required" 数组</td></tr>
+          <tr><td>defaultValue</td><td>默认值（可选）</td><td>"default" 字段</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工说"下午 2 点安排一个周会，叫上张三和李四"，Agent 识别到 createEvent 工具，自动提取参数 title="周会"、startTime="2026-05-30 14:00"、attendees=["zhangsan@corp.com","lisi@corp.com"]。清晰的 @ToolParam description 让 LLM 能正确解析自然语言输入。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>参数 Schema 生成</h3>
+      <p>Spring AI Alibaba 在应用启动时自动扫描 @Tool 方法，使用方法签名和 @ToolParam 注解生成 <span class="term" data-term-id="json-schema">JSON Schema</span>。生成的 Schema 是 OpenAI Function Calling 格式，描述了工具的名称、描述、参数类型和约束。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant APP as 应用启动
+    participant SCAN as @Tool 扫描器
+    participant GEN as Schema 生成器
+    participant AG as Agent
+    participant LLM as LLM
+
+    APP->>SCAN: 扫描所有 @Component
+    SCAN->>GEN: 发现 @Tool 方法
+    GEN->>GEN: 解析方法签名<br/>提取参数类型+注解
+    GEN->>AG: FunctionCallback (含 Schema)
+    AG->>LLM: ChatCompletionRequest<br/>tools=[createEvent Schema]
+    LLM->>AG: tool_calls(name="createEvent",args={...})
+    AG->>SCAN: 根据 name 找到方法并调用
+    SCAN->>AG: 返回结果
+    AG->>LLM: tool_result Message</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 自动生成的 JSON Schema（调试时查看）
+// 可以在日志中开启：logging.level.com.alibaba.spring.ai.tool=DEBUG
+
+// Schema 示例（对应 createEvent 方法）：
+{
+  "type": "function",
+  "function": {
+    "name": "createEvent",
+    "description": "创建日历日程，支持设置标题、时间、参会人和地点",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "日程标题，如'周会'"
+        },
+        "startTime": {
+          "type": "string",
+          "description": "开始时间，格式 yyyy-MM-dd HH:mm"
+        },
+        "endTime": {
+          "type": "string",
+          "description": "结束时间，格式 yyyy-MM-dd HH:mm"
+        },
+        "attendees": {
+          "type": "array",
+          "items": { "type": "string", "description": "参会人邮箱" },
+          "description": "参会人邮箱列表"
+        },
+        "location": {
+          "type": "string",
+          "description": "地点，可选"
+        }
+      },
+      "required": ["title", "startTime", "endTime", "attendees"]
+    }
+  }
+}</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>参数描述模糊</h4><p><code>@ToolParam(description = "时间")</code> — LLM 可能传"下午"而不是具体的"14:00"，导致工具调用失败。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>参数描述精确</h4><p><code>@ToolParam(description = "开始时间，格式 yyyy-MM-dd HH:mm，如 2026-05-30 14:00")</code> — LLM 参数生成准确率从 72% 提升到 96%。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>错误重试策略</h3>
+      <p>工具调用可能因网络超时、参数不合法、业务逻辑异常而失败。Spring AI Alibaba 提供多层级错误处理。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">import com.alibaba.spring.ai.tool.annotation.Tool;
+import io.github.resilience4j.retry.annotation.Retry;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+
+@Component
+public class ResilientTools {
+
+    @Tool(name = "sendEmail", description = "发送邮件")
+    @Retry(name = "emailService", maxAttempts = 3,
+           backoff = @Backoff(delay = 1000, multiplier = 2))
+    @CircuitBreaker(name = "emailService",
+                    fallbackMethod = "sendEmailFallback")
+    public EmailResult sendEmail(
+            @ToolParam(description = "收件人邮箱") String to,
+            @ToolParam(description = "邮件主题") String subject,
+            @ToolParam(description = "邮件正文") String body) {
+
+        // 调用邮件服务
+        return emailClient.send(to, subject, body);
+    }
+
+    // 降级方法
+    public EmailResult sendEmailFallback(
+            String to, String subject, String body, Throwable t) {
+        // 转存到待发送队列
+        pendingEmailQueue.add(new PendingEmail(to, subject, body));
+        return new EmailResult("queued", "已转存待发送队列");
+    }
+
+    // Agent 级别错误处理
+    @Bean
+    public ReactAgent resilientAgent(ChatClient chatClient,
+                                      List<ToolCallback> tools) {
+        return ReactAgent.builder()
+            .chatClient(chatClient)
+            .tools(tools)
+            .toolRetryAttempts(2)         // 工具级重试
+            .toolTimeout(Duration.ofSeconds(10))
+            .systemPrompt("""
+                工具调用规则：
+                1. 如果工具返回错误，检查参数格式是否正确后重试一次
+                2. 重试仍失败，告诉用户错误信息并建议替代方案
+                3. 不要连续重试同一个工具超过2次
+                """)
+            .build();
+    }
+}</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>错误场景</th><th>LLM 行为</th><th>推荐处理策略</th></tr></thead>
+        <tbody>
+          <tr><td>参数格式错误（时间格式不对）</td><td>重新生成正确参数后重试</td><td>Agent 自行修复，不提示用户</td></tr>
+          <tr><td>网络超时（工具 API 无响应）</td><td>重试（退避 1s/2s/4s）</td><td>Resilience4j @Retry</td></tr>
+          <tr><td>权限不足（403）</td><td>告诉用户并停止调用</td><td>不重试，直接降级</td></tr>
+          <tr><td>业务异常（用户不存在）</td><td>返回错误信息，让 LLM 决策</td><td>以正常返回值返回，非 Exception</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>工具契约 OpenAPI 导出</h3>
+      <p><span class="term" data-term-id="openapi-export">OpenAPI 导出</span>将 @Tool 定义转化为标准 OpenAPI 3.0 规范文档，便于前端、测试、文档团队理解 Agent 的能力边界。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@RestController
+@RequestMapping("/api/tools")
+public class ToolContractController {
+
+    @Autowired
+    private List<ToolCallback> toolCallbacks;
+
+    @GetMapping("/openapi.json")
+    public Map<String, Object> exportOpenApi() {
+        // 将所有 @Tool 导出为 OpenAPI 3.0 格式
+        Map<String, Object> openApi = new LinkedHashMap<>();
+        openApi.put("openapi", "3.0.3");
+        openApi.put("info", Map.of(
+            "title", "CorpAssist Agent Tools",
+            "version", "1.0.0",
+            "description", "CorpAssist 办公 Agent 工具契约"
+        ));
+
+        // 遍历所有 ToolCallback，生成 API 定义
+        Map<String, Object> paths = new LinkedHashMap<>();
+        for (ToolCallback callback : toolCallbacks) {
+            String toolName = callback.getToolDefinition().getName();
+            Map<String, Object> schema = callback.getToolDefinition()
+                .getInputSchema();
+
+            paths.put("/tools/" + toolName, Map.of(
+                "post", Map.of(
+                    "summary", callback.getToolDefinition().getDescription(),
+                    "requestBody", Map.of(
+                        "content", Map.of(
+                            "application/json", Map.of(
+                                "schema", schema
+                            )
+                        )
+                    ),
+                    "responses", Map.of(
+                        "200", Map.of(
+                            "description", "Successful operation",
+                            "content", Map.of(
+                                "application/json", Map.of(
+                                    "schema", Map.of("type", "object")
+                                )
+                            )
+                        )
+                    )
+                )
+            ));
+        }
+        openApi.put("paths", paths);
+        return openApi;
+    }
+}
+
+// 访问 http://localhost:8080/api/tools/openapi.json 获取契约</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>@Tool 注解自动提取方法签名生成 Function Calling Schema，@ToolParam 的 description 影响 LLM 参数填充准确率</li>
+        <li>参数 Schema 生成基于 Java 类型系统和注解，复杂类型（List/Map/Pojo）自动映射为嵌套 JSON Schema</li>
+        <li>错误重试分三层：Resilience4j 工具级重试 + Agent 级 toolRetryAttempts + System Prompt 规则引导</li>
+        <li>OpenAPI 导出让工具契约可跨团队消费，便于前端和测试理解 Agent 能力</li>
+        <li>CorpAssist 6 个工具（日历/邮件/工单/审批/用户/通知）的 Schema 导出后用于前端对话页面生成参数表单</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-03-1"> 我能用 @Tool 定义工具，包含复杂参数类型</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-2"> 我能解释 @ToolParam 如何影响 JSON Schema 生成</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-3"> 我能用 @Retry 和 @CircuitBreaker 实现工具弹性</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-4"> 我能将工具契约导出为 OpenAPI 3.0</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-03-5"> 我能用 debug 日志查看自动生成的 Schema</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>@Tool</td><td>将 Java 方法标记为 Agent 可调用工具的注解</td></tr>
+            <tr><td>@ToolParam</td><td>工具参数的描述注解</td></tr>
+            <tr><td>JSON Schema</td><td>工具参数的 JSON 格式描述标准</td></tr>
+            <tr><td>FunctionCallback</td><td>Spring AI 的工具回调接口</td></tr>
+            <tr><td>@Retry</td><td>Resilience4j 重试注解，支持退避策略</td></tr>
+            <tr><td>@CircuitBreaker</td><td>熔断器，防止连续失败</td></tr>
+            <tr><td>OpenAPI</td><td>REST API 描述标准，用于工具契约导出</td></tr>
+            <tr><td>FallbackMethod</td><td>熔断后的降级方法</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>@Tool 方法返回复杂对象（嵌套 List/Map），Schema 怎么生成？</summary><p>Spring AI Alibaba 通过 Jackson 序列化自动处理。返回类型如果是 List、Map、Record 或 POJO，Schema 生成器会用 Jackson ObjectMapper 推断类型结构。例如返回 <code>List&lt;EventResult&gt;</code> 会在 Schema 的 "response" 字段中生成嵌套数组结构。建议返回类型用 Record 或 POJO（纯数据容器），避免用原始类型。框架也会检查返回类型是否可序列化（实现 Serializable 或有无参构造）。</p></details>
+        <details><summary>工具调用返回的结果太长（如查询返回 100 条工单），Agent 怎么处理？</summary><p>三种策略：1) 工具层截断——如果返回列表超过 5 条，只返回 5 条 + 总数提示"共 100 条，显示前 5 条"；2) 分页——工具设计时加 page/size 参数，让 LLM 按需请求；3) 摘要——工具在返回前用 LLM 对长列表做摘要，只返回摘要和数量。CorpAssist 推荐策略 1+3：显示前 5 条 + 统计信息"共 100 条工单，其中待处理 20 条、已完成 80 条"。</p></details>
+        <details><summary>多个 @Tool 方法来自不同的 @Component，重复的工具名会怎么样？</summary><p>Spring 启动时会检测到 ToolCallback 的 name 冲突，抛出 BeanDefinitionParsingException。解决方案：1) 确保不同组件的工具名全局唯一（推荐前缀命名，如 email_send、ticket_query）；2) 如果需要同名的不同实现，使用 @Primary 指定默认实现，或通过 @Qualifier 注入时区分。CorpAssist 规范：工具名采用 <domain>_<action> 格式，如 email_send、calendar_create。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chat/functions/tool-callbacks.html" target="_blank" rel="noopener">Spring AI ToolCallback 文档</a> — Function Calling 实现原理</li>
+      <li><a href="https://resilience4j.readme.io/docs/retry" target="_blank" rel="noopener">Resilience4j Retry 文档</a> — 重试和退避策略配置</li>
+      <li><a href="https://swagger.io/specification/" target="_blank" rel="noopener">OpenAPI 3.0 规范</a> — 工具契约导出标准</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>定义 3 个 @Tool 方法（创建日程、查日程、发邮件）</li>
+      <li>启动应用，在日志中查看自动生成的 JSON Schema</li>
+      <li>模拟工具超时异常，验证 @Retry 退避重试</li>
+      <li>实现 OpenAPI 导出端点，访问验证格式正确</li>
+      <li>测试参数格式错误（如日期传"下午"），观察 Agent 如何修正</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：查询工具返回了空结果，Agent 应该继续下一步还是终止流程？</summary><p>取决于空结果的含义。如果 getUserInfo 返回空，表示用户不存在，Agent 应该终止并提示"用户不存在"。如果 queryTicket 返回空列表，表示没有工单，Agent 应该继续执行其他任务（如"没有待处理的工单，是否需要查找其他用户？"）。设计工具时，空结果和异常是不同信号：空结果=正常业务（无数据），异常=技术故障。Agent 的 System Prompt 需要定义这两种情况的处理规则。</p></details>
+      <details><summary>场景：工具 Schema 导出后发现参数类型错误（int 被识别为 string），怎么排查？</summary><p>原因：@ToolParam 未指定 type 属性，框架使用了方法参数类型的默认映射（Java int → JSON integer，String → JSON string）。如果参数类型是自定义类（如 LocalDateTime），框架可能不知道如何映射。解决：1) 参数类型用基础类型（String/Long/Integer）传输，方法内部转换；2) 在 @ToolParam 中明确 type = "string", format = "date-time"；3) 注册自定义 Jackson 序列化器处理特殊类型。推荐实践：所有工具参数用 String 类型传，方法内解析。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-03-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>@Tool 自动生成的 JSON Schema 在 debug 日志中可查看，结构与方法签名一致</li>
+        <li>模拟工具 3 次失败后，返回降级结果而非异常</li>
+        <li>OpenAPI 导出文件包含所有 @Tool 方法的定义</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-02">Graph 工作流与状态管理</a></li>
+      <li>下一篇：<a href="#ch-basics-04">会话与记忆管理</a></li>
+    </ul>
+  </div>
+</section>

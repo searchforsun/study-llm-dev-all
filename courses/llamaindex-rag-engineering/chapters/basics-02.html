@@ -1,0 +1,361 @@
+<section id="ch-basics-02" class="chapter" data-chapter="basics-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>IngestionPipeline 与文档解析</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>LlamaIndex 核心抽象</strong> · 能力：掌握 IngestionPipeline 配置、PDF/HTML/代码解析、元数据提取</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 需要处理来自不同部门的文档：HR 的 PDF 手册、IT 的 Markdown 文档、开发团队的代码注释。直接喂原始文本会丢失格式信息和文档结构。IngestionPipeline 提供了可配置的文档处理管线，包括文本分割、元数据提取、嵌入生成，是企业 RAG 的第一步。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 IngestionPipeline 配置 PDF/HTML/代码解析管线；集成 Unstructured 解析复杂文档；自定义元数据提取器；为 CorpAssist 设计多租户文档管线。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) IngestionPipeline 由 transforms 列表组成，顺序执行；2) PDF 解析推荐 PyMuPDF + Unstructured；3) 元数据提取器可以从文件名、路径、内容中抽取信息；4) 代码解析需保留语言标签和函数签名；5) 管线输出可直接写入向量库。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>PDF/HTML/代码解析</h3>
+      <p>LlamaIndex 的 <span class="term" data-term-id="ingestion-pipeline">IngestionPipeline</span> 是一个可配置的文档处理管线，通过 <code>transformations</code> 列表定义每个处理步骤。对于不同文档类型，需要选择合适的解析器：PDF 用 <code>PyMuPDFReader</code> 保留文本布局；HTML 用 <code>HtmlReader</code> 提取标题层级；代码文件用 <code>SimpleDirectoryReader</code> 配合 <code>CodeSplitter</code> 保留语言语义。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core import SimpleDirectoryReader
+from llama_index.core.node_parser import CodeSplitter, SentenceSplitter
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.extractors import TitleExtractor, QuestionsAnsweredExtractor
+
+# 代码文件解析
+code_splitter = CodeSplitter(
+    language="python",
+    chunk_lines=50,            # 每块 50 行
+    chunk_lines_overlap=10,    # 10 行重叠
+    max_chars=1500             # 最大字符数
+)
+
+# PDF/文本解析
+text_splitter = SentenceSplitter(
+    chunk_size=512,
+    chunk_overlap=128
+)
+
+pipeline = IngestionPipeline(
+    transformations=[
+        text_splitter,           # 或 code_splitter（按需切换）
+        TitleExtractor(),        # 自动提取标题
+        QuestionsAnsweredExtractor(questions=3),  # 提取可能的问题
+        OpenAIEmbedding(model="text-embedding-3-small", dimensions=512)
+    ]
+)
+
+# 读取目录中的文档
+documents = SimpleDirectoryReader("./corp_docs").load_data()
+nodes = pipeline.run(documents=documents)
+print(f"生成了 {len(nodes)} 个 Node")
+for n in nodes[:2]:
+    print(f"  {n.node_id}: {n.metadata.get('title', '无标题')}")</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>文档类型</th><th>推荐 Reader</th><th>推荐 Splitter</th><th>注意事项</th></tr></thead>
+        <tbody>
+          <tr><td>PDF</td><td>PyMuPDFReader</td><td>SentenceSplitter</td><td>保留页码信息，表格解析需 Unstructured</td></tr>
+          <tr><td>HTML</td><td>HtmlReader</td><td>HTMLNodeParser</td><td>保留 h1/h2/h3 层级，过滤导航和广告</td></tr>
+          <tr><td>Python 代码</td><td>SimpleDirectoryReader</td><td>CodeSplitter(language="python")</td><td>保留函数/类定义边界，不去除注释</td></tr>
+          <tr><td>Java 代码</td><td>SimpleDirectoryReader</td><td>CodeSplitter(language="java")</td><td>按方法签名分割，保留 package/import</td></tr>
+          <tr><td>Markdown</td><td>MarkdownReader</td><td>MarkdownNodeParser</td><td>保留 # ## 标题层级和代码块</td></tr>
+          <tr><td>CSV/Excel</td><td>PandasExcelReader</td><td>SentenceSplitter</td><td>每行作为一个 Document，列名作为 metadata</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>Unstructured 集成</h3>
+      <p>对于复杂 PDF（含表格、多栏布局、扫描件），LlamaIndex 基础解析器可能丢失布局信息。<span class="term" data-term-id="unstructured">Unstructured</span> 是一个开源文档解析框架，支持 PDF、图片、PPT、邮件等格式，能将文档还原为结构化元素（标题、段落、表格、列表）。LlamaIndex 通过 <code>UnstructuredReader</code> 集成。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    PDF[复杂 PDF] --> UR[UnstructuredReader]
+    HTML --> UR
+    IMG[扫描件图片] --> OCR[OCR 预处理]
+    OCR --> UR
+    UR --> ELE[元素列表]
+    ELE -->|Title| T1[# 报销流程]
+    ELE -->|Table| T2[|部门|金额|]
+    ELE -->|Narrative| T3[报销需要提供发票...]
+    T1 & T2 & T3 --> ST[Splitter]
+    ST --> N1[Node 1: 报销流程]
+    ST --> N2[Node 2: 金额表格]
+    ST --> N3[Node 3: 发票说明]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.readers.file import UnstructuredReader
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.node_parser import SentenceSplitter
+
+# Unstructured 解析 PDF（保留表格和标题）
+reader = UnstructuredReader(
+    api_key=None,  # 用本地模式，无需 API Key
+    strategy="hi_res"  # hi_res 适合复杂布局，auto 适合简单文档
+)
+
+# 解析 PDF 返回 Document 列表（每个元素一个 Document）
+documents = reader.load_data(
+    file_path="./corp_docs/hr_handbook.pdf",
+    extra_info={"department": "hr", "version": "v3.2"}
+)
+
+# 后续管线
+pipeline = IngestionPipeline(
+    transformations=[
+        SentenceSplitter(chunk_size=256, chunk_overlap=32),
+        OpenAIEmbedding()
+    ]
+)
+nodes = pipeline.run(documents=documents)
+print(f"Unstructured 生成了 {len(documents)} 个原始元素")
+print(f"管线产出 {len(nodes)} 个 Node")</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>PyMuPDF 直接解析</h4><p>输出纯文本，表格内容混排，多栏文档段落错序。CorpAssist 中 HR 手册的报销表格被解析为"部门A费用5000部门B费用3000"无结构文本。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>Unstructured hi_res 模式</h4><p>输出结构化元素：标题"报销流程"、表格"|部门|费用上限|"、段落"报销需提供发票"。CorpAssist 检索时可以精确返回"表格"结构。</p></div>
+      </div>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：什么情况下不应该用 Unstructured？</summary><p>1) 纯文本 Markdown 文档——Unstructured 增加了处理时间（hi_res 模式每页约 2-3 秒），直接用 MarkdownReader 更快；2) 只需要简单文本搜索——PyMuPDF 的纯文本输出足够，无需结构化元素；3) API 成本敏感——Unstructured Cloud API 按页计费，本地模式依赖 Tesseract OCR 需要额外安装。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>元数据提取策略</h3>
+      <p>元数据是 RAG 质量的关键，它决定了检索时能否按租户、日期、文档类型过滤。LlamaIndex 提供四种元数据提取方式：<span class="term" data-term-id="metadata-extractor">MetadataExtractor</span> 基类、<span class="term" data-term-id="property-extractor">PropertyExtractor</span> 内置提取器、自定义提取器、以及 IngestionPipeline 中的全局提取器。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.extractors import (
+    TitleExtractor,
+    QuestionsAnsweredExtractor,
+    SummaryExtractor,
+    KeywordExtractor
+)
+from llama_index.core.ingestion import IngestionPipeline
+from pydantic import Field
+
+# 自定义元数据提取器：从文件名提取租户信息
+class TenantExtractor(TitleExtractor):
+    async def aextract(self, nodes):
+        metadata_list = []
+        for node in nodes:
+            filename = node.metadata.get("file_name", "")
+            if filename.startswith("HR_"):
+                tenant = "hr"
+            elif filename.startswith("IT_"):
+                tenant = "it"
+            elif filename.startswith("FIN_"):
+                tenant = "finance"
+            else:
+                tenant = "general"
+            metadata_list.append({"tenant_id": tenant, "filename": filename})
+        return metadata_list
+
+pipeline = IngestionPipeline(
+    transformations=[
+        SentenceSplitter(chunk_size=512, chunk_overlap=128),
+        TitleExtractor(),          # 自动提取标题
+        KeywordExtractor(keywords=5),  # 提取 5 个关键词
+        SummaryExtractor(summaries=["self", "prev", "next"]),  # 本段+前后摘要
+        TenantExtractor(),         # 自定义租户提取
+        OpenAIEmbedding()
+    ]
+)
+
+nodes = pipeline.run(documents=documents)
+for n in nodes[:3]:
+    print(f"标题: {n.metadata.get('title')}, 租户: {n.metadata.get('tenant_id')}")</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>提取器</th><th>提取内容</th><th>适用场景</th><th>额外 Token 消耗</th></tr></thead>
+        <tbody>
+          <tr><td>TitleExtractor</td><td>文档/段落标题</td><td>所有文档，提升检索相关性</td><td>约 50 tokens/Node</td></tr>
+          <tr><td>QuestionsAnsweredExtractor</td><td>可能被问到的问题</td><td>FAQ 类文档，HyDE 检索</td><td>约 150 tokens/Node</td></tr>
+          <tr><td>KeywordExtractor</td><td>5-10 个关键词</td><td>关键词检索（KeywordTableIndex）</td><td>约 80 tokens/Node</td></tr>
+          <tr><td>SummaryExtractor</td><td>本段+前后段落摘要</td><td>上下文感知检索</td><td>约 200 tokens/Node</td></tr>
+          <tr><td>CustomExtractor</td><td>自定义逻辑</td><td>租户、权限、日期等业务字段</td><td>0（纯代码逻辑）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 文档管线</h3>
+      <p>CorpAssist 需要处理来自多个部门、多种格式的文档，且每个部门的数据需隔离。以下是为 CorpAssist 设计的完整文档管线：</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户/管理员
+    participant API as FastAPI Upload
+    participant MQ as RocketMQ
+    participant W as Worker
+    participant UP as IngestionPipeline
+    participant VS as Milvus
+
+    U->>API: 上传 HR 手册.pdf
+    API->>MQ: 发送文档处理消息
+    MQ->>W: 消费消息
+    W->>UP: 加载文档
+    UP->>UP: PyMuPDF 解析
+    UP->>UP: Unstructured 结构化
+    UP->>UP: 元数据提取(tenant=hr)
+    UP->>UP: 分割(SentenceSplitter)
+    UP->>UP: 嵌入(OpenAI)
+    UP->>VS: 写入向量库(含metadata)
+    VS-->>W: 确认写入成功
+    W-->>MQ: 处理完成 ack
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># CorpAssist 文档处理 Worker（运行在 RocketMQ 消费者中）
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.readers.file import PyMuPDFReader, UnstructuredReader
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.vector_stores.milvus import MilvusVectorStore
+from llama_index.core.extractors import TitleExtractor
+import json, os
+
+async def process_document(file_path: str, tenant_id: str, doc_type: str):
+    # 1. 文档读取
+    if doc_type == "pdf" and "table" in file_path:
+        reader = UnstructuredReader(strategy="hi_res")
+    else:
+        reader = PyMuPDFReader()
+    docs = reader.load_data(file_path)
+
+    # 2. 注入租户元数据
+    for doc in docs:
+        doc.metadata["tenant_id"] = tenant_id
+        doc.metadata["doc_type"] = doc_type
+        doc.metadata["upload_time"] = os.path.getmtime(file_path)
+
+    # 3. 管线处理
+    vector_store = MilvusVectorStore(
+        uri="http://milvus:19530",
+        collection_name=f"corpassist_{tenant_id}",  # 按租户隔离
+        dim=1536
+    )
+    pipeline = IngestionPipeline(
+        transformations=[
+            SentenceSplitter(chunk_size=512, chunk_overlap=128),
+            TitleExtractor(),
+            OpenAIEmbedding(model="text-embedding-3-small", dimensions=1536)
+        ],
+        vector_store=vector_store
+    )
+    nodes = pipeline.run(documents=docs)
+    return {"status": "ok", "node_count": len(nodes), "tenant_id": tenant_id}
+
+# 调用示例
+result = await process_document(
+    file_path="/data/uploads/HR_Handbook_v3.pdf",
+    tenant_id="tenant_hr",
+    doc_type="pdf"
+)</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>IngestionPipeline 通过 transformations 列表定义可复用的文档处理流程，输入 Document 输出 Node</li>
+        <li>PDF 解析选 PyMuPDFReader（快速），复杂布局（表格、多栏）选 UnstructuredReader hi_res 模式</li>
+        <li>代码解析用 CodeSplitter 保留语言边界，Python 代码按函数/类分割，Java 代码按方法签名分割</li>
+        <li>元数据提取器中 TitleExtractor 和 KeywordExtractor 是 RAG 效果提升性价比最高的两个，额外 Token 消耗仅 50-80/Node</li>
+        <li>CorpAssist 文档管线需按租户隔离向量库 collection，元数据中注入 tenant_id 和 doc_type 用于过滤</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-02-1"> 我能配置一个 IngestionPipeline 处理 PDF 文档并输出带 metadata 的 Node</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-2"> 我能判断什么时候要用 Unstructured 而不是 PyMuPDF</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-3"> 我能用 CodeSplitter 按语言分割代码文件，并验证分割边界在函数/类定义处</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-4"> 我能自定义一个元数据提取器从文件名提取租户信息</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-5"> 我能设计一个按租户隔离的多文档管线架构</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>IngestionPipeline</td><td>可配置的文档处理管线，从 Document 到 Node 再到向量库</td></tr>
+            <tr><td>SimpleDirectoryReader</td><td>读取目录中所有文档，按扩展名自动选择 Reader</td></tr>
+            <tr><td>CodeSplitter</td><td>按语言语法分割代码，保留函数/类边界</td></tr>
+            <tr><td>UnstructuredReader</td><td>集成 Unstructured 框架，将复杂文档解析为结构化元素</td></tr>
+            <tr><td>TitleExtractor</td><td>自动提取段落标题，存入 Node.metadata</td></tr>
+            <tr><td>KeywordExtractor</td><td>提取关键词，用于关键词检索</td></tr>
+            <tr><td>SentenceSplitter</td><td>按句子边界分割文本，默认 chunk_size=1024</td></tr>
+            <tr><td>PyMuPDFReader</td><td>基于 PyMuPDF 的 PDF 解析器，速度比 Unstructured 快 10 倍</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>IngestionPipeline 的 transformations 顺序重要吗？为什么？</summary><p>重要。transformations 按顺序执行，每个 transform 的输出是下一个的输入。典型的顺序是：先分割（产生小文本块），再提取元数据（在分割后的文本上提取标题和关键词），最后嵌入（对最终文本块生成向量）。如果先嵌入再分割，每个大块的向量会丢失细粒度语义。正确的顺序可以保证每个 Node 的向量精准对应其文本内容。</p></details>
+        <details><summary>CorpAssist 中一个 PDF 含有表格，检索时既要返回表格又要返回文字描述，怎么设计解析管线？</summary><p>用 UnstructuredReader 的 hi_res 模式，它会将表格识别为独立的 Table 元素，文字描述为 Narrative 元素。IngestionPipeline 中用自定义 Splitter：对 Table 元素不分割（保持表格完整性），对 Narrative 元素用 SentenceSplitter 分割。在 metadata 中标记 element_type=table/narrative，检索时可以根据查询类型（"金额"可能查表格，"流程"可能查文字）过滤。</p></details>
+        <details><summary>CodeSplitter 支持哪些语言？分割单元是什么？</summary><p>CodeSplitter 支持 Python、Java、JavaScript、TypeScript、C++、Go、Rust 等主流语言。分割单元是：Python 按函数/类定义，Java 按方法签名，JavaScript 按函数声明。通过 tree-sitter 解析 AST 确定分割边界，保证分割后的代码块语法完整。参数包括 chunk_lines（默认 50）、chunk_lines_overlap（默认 10）、max_chars（默认 1500）。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/loading/ingestion_pipeline/" target="_blank" rel="noopener">LlamaIndex IngestionPipeline 文档</a> — 详细配置说明和所有 Transform 类型</li>
+      <li><a href="https://docs.unstructured.io/" target="_blank" rel="noopener">Unstructured 官方文档</a> — 解析策略（auto/fast/hi_res）选择和 API 配置</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/loading/node_parsers/" target="_blank" rel="noopener">LlamaIndex Node Parser 文档</a> — 所有解析器的参数和行为说明</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>安装依赖：<code>pip install llama-index llama-index-readers-file pymupdf unstructured</code></li>
+        <li>下载示例 PDF，用 PyMuPDFReader 解析并输出节点数和平均字符数</li>
+        <li>用 UnstructuredReader hi_res 解析同一个 PDF，对比节点数和内容结构差异</li>
+        <li>自定义 TenantExtractor，从文件路径提取部门名称注入 metadata</li>
+        <li>用 IngestionPipeline 组合 SentenceSplitter + TitleExtractor + TenantExtractor，验证输出 Node 的 metadata</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：需要处理 1000 个 Markdown 文档，每个 5000 字，要求提取标题和关键词并 20 分钟内完成。设计管线并估算时间。</summary><p>用 SimpleDirectoryReader 读取，transformations: MarkdownNodeParser(保留标题) → SentenceSplitter(chunk_size=1024) → TitleExtractor → KeywordExtractor → OpenAIEmbedding。估算：读取 1000 个文件约 30 秒；分割约 5 秒；TitleExtractor 每个 Node 约 50 tokens × 5000 Node ≈ 250K tokens，调用模型约 2 分钟；KeywordExtractor 类似；Embedding 约 10 秒。总时间约 3 分钟，远低于 20 分钟。注意 MarkdownNodeParser 不要解析过细，保持每章一个 Node。</p></details>
+      <details><summary>场景：代码仓库中有 200 个 Python 文件，每个文件一个类，需要为代码助手 RAG 建立索引。分割策略怎么设计？</summary><p>用 CodeSplitter(language="python", chunk_lines=30, chunk_lines_overlap=5)。每个 Python 文件通常是一个类，30 行每块确保一个方法在一个块内。需要额外在 IngestionPipeline 中添加自定义提取器：从文件路径提取模块名，从代码中提取函数名列表存入 metadata。检索时代码助手可以通过"模块名"过滤，通过"函数名"精确查找。注意保留 import 语句所在 Node，因为代码生成需要了解依赖。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-02-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>用 IngestionPipeline 处理 HR 手册 PDF，输出 Node 数量和平均字符数</li>
+        <li>用 Unstructured 解析含表格的 PDF，验证表格元素被正确识别为 Table 类型</li>
+        <li>验证 TenantExtractor 从文件名提取的 tenant_id 正确注入每个 Node 的 metadata</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-01">LlamaIndex 与 LangChain 对比</a> — 理解 LlamaIndex 数据模型</li>
+      <li>下一篇：<a href="#ch-basics-03">索引类型选型</a> — 学习不同索引类型的适用场景</li>
+    </ul>
+  </div>
+</section>

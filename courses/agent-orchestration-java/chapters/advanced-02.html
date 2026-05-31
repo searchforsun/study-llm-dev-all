@@ -1,0 +1,442 @@
+<section id="ch-advanced-02" class="chapter" data-chapter="advanced-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>观测与调试</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与治理</strong> · 能力：Micrometer 指标埋点、OTel Trace 贯通、Prompt 回放调试、Dashboard 仪表盘</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>Agent 出错时排查困难——是 LLM 推理错了？工具调用参数不对？还是外部系统数据有误？观测的三件套：Metrics（指标）、Tracing（链路）、Logging（日志）可以定位问题。OTel 贯穿 Agent 调用 LLM→工具→MCP→外部系统的全链路，Prompt 回放可以复现 LLM 的输入输出。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 Micrometer 采集 Agent 关键指标；用 OpenTelemetry 实现全链路 Trace；用 Prompt 回放调试 Agent 行为；构建 Grafana Dashboard 可视化 Agent 健康状态。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) Micrometer 指标：步数/Token/延迟/工具调用次数；2) OTel Trace 贯穿 Agent→LLM→MCP→外部系统；3) Prompt 回放：保存每次 LLM 的输入和输出，按 session 回放；4) Grafana Dashboard 实时显示 QPS/延迟/熔断状态。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Micrometer 指标埋点</h3>
+      <p><span class="term" data-term-id="micrometer">Micrometer</span> 是 Spring Boot 内置的指标采集库。Agent 的关键指标包括步数、Token 消耗、延迟、工具调用频率，全部通过 Micrometer 暴露到 Prometheus。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Agent 指标采集器
+@Component
+public class AgentTelemetry {
+
+    private final MeterRegistry registry;
+    private final Map<String, Timer> timerCache = new ConcurrentHashMap<>();
+    private final Map<String, Counter> counterCache = new ConcurrentHashMap<>();
+
+    public AgentTelemetry(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    // 1. 步数指标
+    public void recordStep(String agentId, int stepNumber) {
+        registry.counter("agent.steps",
+            "agent", agentId,
+            "step", String.valueOf(stepNumber)
+        ).increment();
+    }
+
+    // 2. Token 指标（按模型拆分）
+    public void recordTokens(String agentId, String model,
+                              int promptTokens, int completionTokens) {
+        registry.counter("agent.tokens",
+            "agent", agentId,
+            "model", model,
+            "type", "prompt"
+        ).increment(promptTokens);
+
+        registry.counter("agent.tokens",
+            "agent", agentId,
+            "model", model,
+            "type", "completion"
+        ).increment(completionTokens);
+    }
+
+    // 3. 延迟指标（按工具拆分）
+    public void recordToolLatency(String toolName, long ms) {
+        registry.timer("agent.tool.latency",
+            "tool", toolName
+        ).record(Duration.ofMillis(ms));
+    }
+
+    // 4. 工具调用结果
+    public void recordToolResult(String toolName, boolean success) {
+        registry.counter("agent.tool.calls",
+            "tool", toolName,
+            "result", success ? "success" : "failure"
+        ).increment();
+    }
+}
+
+// 拦截器自动采集指标
+@Component
+public class MetricInterceptor implements ToolCallbackInterceptor {
+
+    @Override
+    public void beforeCall(ToolCallback callback, Map<String, Object> args) {
+        // 开始计时
+        RequestContextHolder.set("start_time", System.nanoTime());
+    }
+
+    @Override
+    public void afterCall(ToolCallback callback, Object result) {
+        long start = RequestContextHolder.get("start_time");
+        long ms = (System.nanoTime() - start) / 1_000_000;
+
+        telemetry.recordToolLatency(callback.getName(), ms);
+        telemetry.recordToolResult(callback.getName(), result != null);
+    }
+}
+
+// Prometheus 配置（application.yml）
+// management:
+//   endpoints:
+//     web:
+//       exposure:
+//         include: health,metrics,prometheus
+//   metrics:
+//     export:
+//       prometheus:
+//         enabled: true</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OTel Trace 贯通</h3>
+      <p><span class="term" data-term-id="opentelemetry">OpenTelemetry</span> 提供端到端的 Trace 追踪。从用户请求进入 Agent 开始，到调用 LLM、执行工具、调用 MCP Server、访问外部系统的全链路追踪。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant AG as Agent
+    participant LLM as LLM API
+    participant MCP as MCP Server
+    participant ES as 邮件系统
+
+    U->>AG: 发邮件给张三
+    Note over AG: Trace ID: abc-123
+    AG->>LLM: chat completion (span 1)
+    LLM-->>AG: tool_calls
+    AG->>MCP: sendEmail (span 2)
+    Note over MCP: span 2 parent: span 1
+    MCP->>ES: HTTP POST (span 3)
+    Note over ES: span 3 parent: span 2
+    ES-->>MCP: 200 OK
+    MCP-->>AG: success
+    AG-->>U: 邮件已发送
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// OTel 配置
+@Configuration
+public class TelemetryConfig {
+
+    @Bean
+    public Tracer tracer() {
+        return OpenTelemetrySdk.builder()
+            .setTracerProvider(
+                SdkTracerProvider.builder()
+                    .addSpanProcessor(
+                        BatchSpanProcessor.builder(
+                            OtlpGrpcSpanExporter.builder()
+                                .setEndpoint("http://otel-collector:4317")
+                                .build()
+                        ).build())
+                    .build())
+            .build()
+            .getTracer("corp-agent");
+    }
+}
+
+// Agent 执行追踪
+@Service
+public class TracedAgentService {
+
+    private final Tracer tracer;
+
+    @WithSpan("agent.execute")  // OTel 自动 span
+    public AgentResponse execute(String userId, String query) {
+        // 创建 Trace
+        Span span = tracer.spanBuilder("agent.execute")
+            .setAttribute("user.id", userId)
+            .setAttribute("query.length", query.length())
+            .startSpan();
+
+        try (Scope scope = span.makeCurrent()) {
+            // Agent 执行
+            AgentResponse response = agent.process(userId, query);
+            span.setAttribute("response.length",
+                response.getContent().length());
+            span.setStatus(StatusCode.OK);
+            return response;
+        } catch (Exception e) {
+            span.setStatus(StatusCode.ERROR, e.getMessage());
+            span.recordException(e);
+            throw e;
+        } finally {
+            span.end();
+        }
+    }
+}
+
+// 工具调用自动埋点（通过 AOP）
+@Aspect
+@Component
+public class ToolTracingAspect {
+
+    @Around("@annotation(com.alibaba.spring.ai.tool.annotation.Tool)")
+    public Object traceTool(ProceedingJoinPoint pjp) throws Throwable {
+        Span span = tracer.spanBuilder("tool." + getToolName(pjp))
+            .setSpanKind(SpanKind.CLIENT)
+            .startSpan();
+
+        try (Scope scope = span.makeCurrent()) {
+            Object result = pjp.proceed();
+            span.setStatus(StatusCode.OK);
+            return result;
+        } catch (Exception e) {
+            span.setStatus(StatusCode.ERROR);
+            span.recordException(e);
+            throw e;
+        } finally {
+            span.end();
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Prompt 回放调试</h3>
+      <p><span class="term" data-term-id="prompt-replay">Prompt 回放</span>保存每次 LLM 调用的完整输入输出，按 session 组织，用于回放调试。当 Agent 输出错误时，回放当时的 Prompt 定位问题。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Prompt 录制器
+@Component
+public class PromptRecorder {
+
+    private final JdbcTemplate jdbc;
+
+    // 录制每次 LLM 调用
+    public void record(PromptRecord record) {
+        jdbc.update("""
+            INSERT INTO prompt_records
+            (session_id, step, span_id, model, system_prompt,
+             user_prompt, tool_definitions, completion,
+             prompt_tokens, completion_tokens, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            """, record.sessionId(), record.step(),
+            record.spanId(), record.model(),
+            record.systemPrompt(), record.userPrompt(),
+            toJson(record.toolDefinitions()),
+            record.completion(),
+            record.promptTokens(), record.completionTokens()
+        );
+    }
+
+    // 按 session 回放
+    public List<PromptRecord> replaySession(String sessionId) {
+        return jdbc.query("""
+            SELECT * FROM prompt_records
+            WHERE session_id = ?
+            ORDER BY step ASC
+            """, new PromptRecordMapper(), sessionId);
+    }
+
+    // 回放界面（Web UI）
+    @GetMapping("/api/debug/replay/{sessionId}")
+    public String replayPage(@PathVariable String sessionId) {
+        List<PromptRecord> records = replaySession(sessionId);
+        StringBuilder html = new StringBuilder();
+        html.append("<h1>Prompt 回放: ").append(sessionId).append("</h1>");
+        for (PromptRecord rec : records) {
+            html.append("<div class='step'>")
+                .append("<h3>Step ").append(rec.step()).append("</h3>")
+                .append("<pre>System: ").append(esc(rec.systemPrompt()))
+                .append("</pre>")
+                .append("<pre>User: ").append(esc(rec.userPrompt()))
+                .append("</pre>")
+                .append("<pre>Tools: ").append(esc(rec.toolDefinitions()))
+                .append("</pre>")
+                .append("<pre>Response: ").append(esc(rec.completion()))
+                .append("</pre>")
+                .append("</div>");
+        }
+        return html.toString();
+    }
+}
+
+// Agent 调用时注入录制
+@Component
+public class RecordingInterceptor implements ChatClient.RequestInterceptor {
+
+    @Override
+    public void intercept(Request request) {
+        // 自动录制所有 LLM 调用
+        recorder.record(new PromptRecord(
+            request.getSessionId(),
+            request.getStep(),
+            Span.current().getSpanContext().getSpanId(),
+            request.getModel(),
+            request.getSystemPrompt(),
+            request.getUserPrompt(),
+            request.getTools(),
+            null, 0, 0
+        ));
+    }
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Dashboard 仪表盘</h3>
+      <p>Grafana Dashboard 实时展示 Agent 的关键指标，帮助运维团队快速定位问题。</p>
+      <table class="outline-table">
+        <thead><tr><th>面板</th><th>指标</th><th>告警规则</th></tr></thead>
+        <tbody>
+          <tr><td>QPS 总览</td><td>rate(agent.steps[1m])</td><td>QPS > 200 告警</td></tr>
+          <tr><td>延迟分布</td><td>agent.execution.duration P50/P95/P99</td><td>P99 > 10s 告警</td></tr>
+          <tr><td>Token 消耗</td><td>agent.tokens{type="total"}</td><td>日消耗 > 1000M 告警</td></tr>
+          <tr><td>工具调用</td><td>agent.tool.calls{result="failure"}</td><td>失败率 > 5% 告警</td></tr>
+          <tr><td>熔断状态</td><td>circuit.breaker.state</td><td>变为 OPEN 告警</td></tr>
+          <tr><td>限流情况</td><td>sentinel.blocked_requests</td><td>阻塞率 > 10% 告警</td></tr>
+          <tr><td>模型使用</td><td>agent.tokens{model="gpt-4.1"}</td><td>降级比例 > 20% 关注</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">// Grafana Dashboard JSON 片段
+{
+  "title": "CorpAssist Agent Dashboard",
+  "panels": [
+    {
+      "title": "QPS - 每秒请求数",
+      "type": "graph",
+      "targets": [{
+        "expr": "rate(agent.steps_total[1m])",
+        "legendFormat": "{{agent}}"
+      }]
+    },
+    {
+      "title": "延迟 P99 (毫秒)",
+      "type": "graph",
+      "targets": [{
+        "expr": "histogram_quantile(0.99, rate(agent_execution_duration_seconds_bucket[5m]))",
+        "legendFormat": "P99"
+      }]
+    },
+    {
+      "title": "Token 消耗趋势",
+      "type": "graph",
+      "targets": [{
+        "expr": "sum(rate(agent_tokens_total[1h])) by (model)",
+        "legendFormat": "{{model}}"
+      }]
+    },
+    {
+      "title": "工具调用失败率",
+      "type": "graph",
+      "targets": [{
+        "expr": "sum(rate(agent_tool_calls_total{result=\"failure\"}[5m])) / sum(rate(agent_tool_calls_total[5m]))",
+        "legendFormat": "失败率"
+      }]
+    }
+  ]
+}</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Micrometer 指标覆盖步数/Token/延迟/工具调用结果，通过 actuaotr/prometheus 暴露</li>
+        <li>OTel Trace 从用户请求→Agent→LLM→MCP→外部系统全链路追踪，span 自动嵌套</li>
+        <li>Prompt 回放保存每次 LLM 调用的完整输入输出，按 session_id 组织，用于调试复现</li>
+        <li>Grafana Dashboard 7 个面板覆盖 QPS/延迟/Token/工具/熔断/限流/模型使用</li>
+        <li>CorpAssist 观测栈：Micrometer + OTel + Prometheus + Grafana + 自建 Prompt 回放</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <h4>过关清单</h4>
+      <ul>
+        <li><label><input type="checkbox" data-check-id="advanced-02-1"> 我能用 Micrometer 采集 Agent 步数和 Token 指标</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-02-2"> 我能用 OTel 实现 Agent 全链路 Trace</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-02-3"> 我能实现 Prompt 录制和回放功能</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-02-4"> 我能配置 Grafana Dashboard 监控 Agent</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-02-5"> 我能从 Trace 和日志定位 Agent 错误</label></li>
+      </ul>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>Micrometer</td><td>Spring Boot 指标采集库</td></tr>
+            <tr><td>OpenTelemetry</td><td>可观测性标准，Trace/Metrics/Logs</td></tr>
+            <tr><td>Span</td><td>Trace 中的单个操作单元</td></tr>
+            <tr><td>@WithSpan</td><td>OTel 自动生成 span 的注解</td></tr>
+            <tr><td>OTel Collector</td><td>接收和转发 Trace 数据的代理</td></tr>
+            <tr><td>Prompt 回放</td><td>按 session 回放 LLM 调用记录</td></tr>
+            <tr><td>Grafana</td><td>指标可视化平台</td></tr>
+            <tr><td>PromQL</td><td>Prometheus 查询语言</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>全链路 Trace 中，Agent 的 span 如何与 LLM API 的 span 关联？</summary><p>通过 Trace Context 传播。Agent 发起 LLM API 调用时，将当前 Trace 的 traceId 和 spanId 以 HTTP Header 的形式（W3C Trace Context: traceparent）传递给 LLM API 网关。LLM API 如果也接了 OTel，会在自己的系统中创建子 span，并关联到 Agent 的 span。这样在 Jaeger 中可以看到完整的调用链：Agent→LLM API→模型推理。CorpAssist 通过 Spring Cloud Gateway 自动在 HTTP 调用中注入 traceparent header。</p></details>
+        <details><summary>Prompt 回放存储量很大（每天 10 万次 LLM 调用），怎么管理存储成本？</summary><p>分层存储策略：1) 在线保留（7 天）——完整 Prompt 记录，用于实时调试，存储在 PostgreSQL；2) 近线保留（30 天）——压缩记录（去掉冗余的 system prompt，只保留差异部分），存储在 Parquet；3) 离线保留（1 年）——只保留 session 级别的摘要（步数、Token 消耗、成功/失败），不保留具体 Prompt 文本，存储在 HDFS。压缩后每天存储量从 10GB 降到 500MB。</p></details>
+        <details><summary>Agent 回答质量下降怎么通过观测工具定位根因？</summary><p>三步定位：1) 检视告警——看 QPS/延迟/Token 消耗是否有突增，如果有则是系统级问题（如模型降级）；2) 回放 Prompt——找到质量差的 session，回放 LLM 输入输出，看是 System Prompt 没生效还是上下文被截断了；3) 查看 Trace——如果 Agent 调用了工具但结果不对，看 Trace 中工具调用的参数和返回结果。常见根因：Context Window 溢出导致早期指令被遗忘、工具返回格式不符合预期、System Prompt 被用户 Prompt 注入覆盖。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-boot/reference/actuator/metrics.html" target="_blank" rel="noopener">Spring Boot Actuator Metrics</a> — Micrometer 配置指南</li>
+      <li><a href="https://opentelemetry.io/docs/instrumentation/java/" target="_blank" rel="noopener">OpenTelemetry Java 文档</a> — SDK 配置和 span 创建</li>
+      <li><a href="https://grafana.com/docs/grafana/latest/panels/" target="_blank" rel="noopener">Grafana 面板文档</a> — Dashboard 创建和 PromQL 查询</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <ol>
+      <li>在 Agent 中添加 Micrometer 指标（步数、Token、工具延迟）</li>
+      <li>用 OTel Java Agent 自动埋点，查看 Jaeger UI 中的 Trace</li>
+      <li>实现 Prompt 录制器，session 回放页面显示每步 Prompt</li>
+      <li>在 Grafana 中导入 Prometheus 数据源，创建 Agent Dashboard</li>
+    </ol>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Agent 在某个特定查询上返回错误，但回放 Prompt 时发现 LLM 的回复完全正确，问题出在哪？</summary><p>问题可能出在 Prompt 回放和实际执行不同步。检查：1) Prompt 回放记录是否完整包括了 tool_results？如果只录了 LLM 的请求没录工具的返回结果，看不到 LLM 观察到的数据；2) 工具调用的结果是否被截断或序列化错误？如果工具返回了长列表但只保留了摘要，LLM 看到的上下文和回放记录不一致。确保 Prompt 回放同时记录 LLM 请求和工具返回结果（系统消息）。</p></details>
+      <details><summary>场景：延迟 P99 从 3 秒飙升到 20 秒，从 Trace 看每个节点耗时都正常，怎么排查？</summary><p>每个节点耗时正常但整体延迟异常——可能是"等待"时间（非阻塞时间）。排查方向：1) 限流排队——检查 Sentinel 的 blocked_requests 指标，可能请求在限流队列中等待；2) 线程池排队——Agent 的线程池是否已满，请求在等待线程；3) LLM API 的 queue time——看 Trace 中 LLM API 的 span 是否包含了"queue_time"属性（表示在 API 端排队）；4) 数据库连接池——JDBC 连接池是否耗尽。CorpAssist 经验：60% 的延迟异常是线程池或连接池等待，不是 LLM 本身变慢。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/advanced-02-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>Micrometer 指标在 /actuator/metrics 中可查</li>
+        <li>OTel Trace 在 Jaeger 中显示完整的 Agent→LLM→MCP 调用链</li>
+        <li>Prompt 回放页面正确显示每个 session 的每步 Prompt</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-advanced-01">容灾、限流与降级</a></li>
+      <li>下一篇：<a href="#ch-advanced-03">多 Agent 框架对比</a></li>
+    </ul>
+  </div>
+</section>

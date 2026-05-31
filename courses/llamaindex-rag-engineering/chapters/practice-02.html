@@ -1,0 +1,353 @@
+<section id="ch-practice-02" class="chapter" data-chapter="practice-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent + Tools 集成</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>高级 RAG 管线</strong> · 能力：定义 FunctionTool、构建 ReAct Agent、接入 MCP 工具、错误处理</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 不仅需要问答，还需要执行操作：查询工单状态、创建日程、发送审批。这些操作需要 Agent 调用外部工具。LlamaIndex 的 Agent 支持 FunctionTool（自定义函数）和 MCP 协议（标准工具），配合 ReAct 循环实现规划-执行-观察闭环。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>用 FunctionTool 将任意 Python 函数包装为 Agent 工具；构建 ReAct Agent 实现多步推理和工具调用；接入 MCP 工具服务器；实现工具调用错误处理和重试逻辑。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) FunctionTool 将 Python 函数 + 参数 Schema 包装为标准工具；2) ReAct Agent 循环：思考→行动→观察→思考...直到最终回答；3) LlamaIndex Agent 支持通过 MCP 协议接入外部工具；4) 错误处理需设置 max_iterations 和重试逻辑；5) 工具定义时清晰的 docstring 是 LLM 正确调用的关键。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>FunctionTool 定义</h3>
+      <p><span class="term" data-term-id="function-tool">FunctionTool</span> 是 LlamaIndex 将 Python 函数包装为 LLM 可调用工具的标准方式。它自动提取函数的签名、类型注解和 docstring，生成 OpenAI 兼容的 Function Calling Schema。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.tools import FunctionTool
+from typing import Optional
+import json
+
+# 1. 定义业务函数（CorpAssist 工单查询）
+def query_ticket(ticket_id: str, user_id: Optional[str] = None) -> dict:
+    """查询工单状态和详情。
+
+    Args:
+        ticket_id: 工单编号，格式如 TKT-2026-001
+        user_id: 用户ID（可选），用于鉴权
+
+    Returns:
+        包含工单状态、创建时间、处理人的字典
+    """
+    # 模拟工单系统查询
+    tickets_db = {
+        "TKT-2026-001": {"status": "处理中", "created": "2026-05-20", "assignee": "张三"},
+        "TKT-2026-002": {"status": "已完成", "created": "2026-05-19", "assignee": "李四"},
+    }
+    result = tickets_db.get(ticket_id, {"error": "工单不存在"})
+    if user_id:
+        result["user_id"] = user_id
+    return result
+
+# 2. 包装为 FunctionTool（自动生成 Schema）
+ticket_tool = FunctionTool.from_defaults(
+    fn=query_ticket,
+    name="query_ticket",        # 工具名（LLM 用这个名字调用）
+    description="根据工单编号查询工单状态、处理人和创建时间"
+)
+
+# 3. 查看自动生成的 Schema
+print(json.dumps(ticket_tool.metadata.fn_schema_str, indent=2, ensure_ascii=False))
+# {
+#   "type": "object",
+#   "properties": {
+#     "ticket_id": {"type": "string", "description": "工单编号，格式如 TKT-2026-001"},
+#     "user_id": {"type": "string", "description": "用户ID（可选），用于鉴权"}
+#   },
+#   "required": ["ticket_id"]
+# }</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>工具函数要求</th><th>说明</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td>类型注解</td><td>参数必须标注类型，用于 Schema 生成</td><td><code>ticket_id: str</code></td></tr>
+          <tr><td>docstring</td><td>函数和参数描述，影响 LLM 调用准确性</td><td><code>"""查询工单状态和详情"""</code></td></tr>
+          <tr><td>返回值</td><td>建议返回 dict 或 JSON 可序列化类型</td><td><code>-> dict</code></td></tr>
+          <tr><td>纯函数</td><td>不依赖外部状态，多次调用结果一致</td><td>用依赖注入代替全局变量</td></tr>
+          <tr><td>超时处理</td><td>长时间运行的工具需要设置超时</td><td>使用 asyncio.wait_for</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工问"我的工单 TKT-2026-001 现在什么状态"，Agent 调用 query_ticket(ticket_id="TKT-2026-001", user_id="emp_123")，返回"处理中，分配给张三"。如果再问"帮我催一下张三"，Agent 可以调用 notify_tool(assignee="张三", message="请处理工单 TKT-2026-001")。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>ReAct Agent with LlamaIndex</h3>
+      <p><span class="term" data-term-id="react-agent">ReAct Agent</span> 实现"思考-行动-观察"循环。每次循环中：Agent 调用 LLM 生成思考（Thought）和行动（Action），执行工具后获取观察（Observation），继续循环直到生成最终答案（Answer）。LlamaIndex 的 ReActAgent 通过 <code>max_iterations</code> 控制循环次数。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    Q[用户查询] --> A[Agent]
+    subgraph ReAct 循环
+        A --> LLM[LLM 推理]
+        LLM -->|思考: 需要查工单| ACT[行动: query_ticket]
+        ACT -->|执行| OBS[观察: 工单状态]
+        OBS -->|思考: 还需要什么?| ACT2[行动: query_user_info]
+        ACT2 -->|执行| OBS2[观察: 用户信息]
+        OBS2 -->|思考: 可以回答了| FINAL[最终回答]
+    end
+    A -->|max_iterations 耗尽| STOP[停止]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.agent import ReActAgent
+from llama_index.llms.openai import OpenAI
+from llama_index.core.tools import FunctionTool, QueryEngineTool
+
+# 1. 准备工具
+def create_schedule(title: str, datetime: str, attendees: list[str]) -> dict:
+    """创建日程"""
+    return {"status": "ok", "event_id": "EVT-001", "title": title}
+
+def get_user_info(user_id: str) -> dict:
+    """查询用户信息"""
+    return {"name": "张三", "department": "IT", "email": "zhangsan@corp.com"}
+
+tools = [
+    FunctionTool.from_defaults(fn=query_ticket),
+    FunctionTool.from_defaults(fn=create_schedule),
+    FunctionTool.from_defaults(fn=get_user_info),
+]
+
+# 2. 创建 Agent
+llm = OpenAI(model="gpt-4.1", temperature=0.1)
+agent = ReActAgent.from_tools(
+    tools=tools,
+    llm=llm,
+    verbose=True,               # 打印思考过程
+    max_iterations=10,          # 最大循环次数
+    max_tokens=4096,            # 每次推理最大 Token
+    context=(
+        "你是一个企业办公助手。使用 query_ticket 查询工单状态，"
+        "用 create_schedule 创建日程，用 get_user_info 获取用户信息。"
+    )
+)
+
+# 3. 执行查询
+response = agent.chat("查询张三的工单状态，然后给他在明天下午2点创建一个日程会议")
+for step in agent.chat_history:
+    if hasattr(step, 'thought'):
+        print(f"思考: {step.thought}")
+    if hasattr(step, 'action'):
+        print(f"行动: {step.action}</pre></code>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>工具说明模糊</h4><p><code>"""查询信息"""</code> — LLM 不确定该工具查什么，可能错误调用。"明天下午2点"可能被解析为 "2026-05-01 14:00" 或 "2026-06-01 14:00"。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>工具说明清晰</h4><p><code>"""根据用户ID查询姓名、部门、邮箱等信息，用于了解用户基本信息"""</code> — LLM 明确知道该工具用途。日期时间参数格式在 docstring 中明确："格式为 YYYY-MM-DD HH:mm"。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>MCP 工具接入</h3>
+      <p><span class="term" data-term-id="mcp">MCP</span>（Model Context Protocol）是 Anthropic 推出的标准工具协议。LlamaIndex 通过 <code>mcp-client</code> 库支持连接 MCP 工具服务器。CorpAssist 的邮件、日历、工单系统各自独立部署 MCP Server，Agent 通过统一协议调用。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 1. 安装 MCP 客户端
+# pip install llama-index-tools-mcp
+
+# 2. 连接 MCP Server 并获取工具
+from llama_index.tools.mcp import McpToolSpec
+
+# 连接邮件 MCP Server
+mcp_spec = McpToolSpec(
+    server_url="http://mail-mcp-server:8000",
+    server_name="corp_mail"
+)
+mail_tools = mcp_spec.to_tool_list()
+# 返回: [send_email, read_inbox, search_emails, ...]
+
+# 连接日历 MCP Server
+mcp_spec_calendar = McpToolSpec(
+    server_url="http://calendar-mcp-server:8000",
+    server_name="corp_calendar"
+)
+calendar_tools = mcp_spec_calendar.to_tool_list()
+# 返回: [create_event, list_events, cancel_event, ...]
+
+# 3. 全部注册到 Agent
+all_tools = ticket_tools + mail_tools + calendar_tools
+agent = ReActAgent.from_tools(
+    tools=all_tools,
+    llm=llm,
+    verbose=True,
+    max_iterations=15
+)
+
+# 4. 执行跨系统查询
+response = agent.chat("查一下我今天下午的日程，然后给张三发邮件提醒他明天提交周报")
+# Agent 自动规划：
+# 1. read_inbox → 检查是否有新邮件
+# 2. list_events → 查下午日程
+# 3. send_email → 给张三发提醒</pre></code>
+      </div>
+      <div class="learn-micro-check">
+        <details><summary>思考10秒：MCP Server 和 FunctionTool 在 Agent 中使用有什么区别？</summary><p>FunctionTool 是将本地 Python 函数包装为工具，调用在同一进程内完成，延迟低（<10ms）。MCP Server 是独立的 HTTP 服务，通过网络调用，延迟高（50-200ms）但可以独立部署和维护。CorpAssist 策略：内部工具（计算、格式化）用 FunctionTool；外部系统（邮箱、日历、工单系统）用 MCP Server。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具调用错误处理</h3>
+      <p>Agent 的工具调用可能失败：网络超时、参数错误、权限不足。LlamaIndex 提供错误重试、<span class="term" data-term-id="max-iterations">max_iterations</span> 限制和降级策略。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.agent import ReActAgent
+from llama_index.core.tools import FunctionTool
+from functools import wraps
+
+# 1. 带重试的工具包装
+def with_retry(max_retries=3, timeout=5.0):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except TimeoutError as e:
+                    last_error = f"超时(尝试{attempt+1}/{max_retries})"
+                    time.sleep(1 * (attempt + 1))  # 退避
+                except Exception as e:
+                    last_error = str(e)
+                    break  # 非超时错误不重试
+            return {"error": last_error, "fallback": "工具调用失败，请稍后重试"}
+        return wrapper
+    return decorator
+
+@with_retry(max_retries=3)
+def query_external_api(api_name: str, params: dict) -> dict:
+    """调用外部 API，带自动重试"""
+    # 实际 API 调用...
+    pass
+
+# 2. Agent 级别错误处理
+agent = ReActAgent.from_tools(
+    tools=[query_ticket_tool, mail_tool, calendar_tool],
+    llm=llm,
+    max_iterations=10,              # 防止死循环
+    max_function_calls=10,          # 单次对话最大工具调用次数
+    system_prompt=(
+        "当工具调用失败时：\n"
+        "1. 如果是超时错误，告诉用户系统繁忙请稍后重试\n"
+        "2. 如果是权限错误，提示用户联系管理员\n"
+        "3. 如果是参数错误，检查参数格式后重试一次\n"
+        "4. 重试 2 次仍然失败，给出人工处理建议"
+    )
+)</pre></code>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>错误类型</th><th>处理策略</th><th>用户提示</th></tr></thead>
+        <tbody>
+          <tr><td>网络超时 (>5s)</td><td>退避重试 3 次（1s/2s/4s）</td><td>"系统正在处理，请稍后查询"</td></tr>
+          <tr><td>参数校验失败</td><td>LLM 重新生成参数后重试</td><td>自动处理，不提示用户</td></tr>
+          <tr><td>权限不足 (403)</td><td>不重试，直接提示</td><td>"您没有该操作的权限，请联系管理员"</td></tr>
+          <tr><td>工具不存在</td><td>LLM 重新规划步骤</td><td>自动尝试其他方式</td></tr>
+          <tr><td>API 限流 (429)</td><td>等待后重试（Retry-After）</td><td>"请求频繁，请稍后重试"</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>FunctionTool 自动提取函数签名生成 Schema，清晰的 docstring 是 LLM 正确调用的关键</li>
+        <li>ReAct Agent 的循环机制支持多步推理，max_iterations=10 覆盖 95% 的业务场景</li>
+        <li>MCP 协议让 Agent 接入外部系统（邮件、日历、工单），每个系统独立部署 MCP Server</li>
+        <li>错误处理需要分层策略：工具级重试 + Agent 级降级 + 用户级友好提示</li>
+        <li>CorpAssist 中内部计算用 FunctionTool，外部系统用 MCP 工具，通过 ReActAgent 统一调度</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-02-1"> 我能用 FunctionTool 将任意 Python 函数包装为 Agent 工具</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-2"> 我能用 ReActAgent 实现多步推理和工具调用</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-3"> 我能通过 MCP 协议接入外部工具服务</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-4"> 我能实现工具调用的错误重试和降级策略</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-5"> 我能为工具编写清晰的 docstring 避免 LLM 误调用</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>FunctionTool</td><td>将 Python 函数包装为 LLM 可调用的标准工具</td></tr>
+            <tr><td>ReAct Agent</td><td>思考-行动-观察循环的 Agent 实现</td></tr>
+            <tr><td>MCP</td><td>Model Context Protocol，标准工具调用协议</td></tr>
+            <tr><td>max_iterations</td><td>ReAct 循环的最大次数限制</td></tr>
+            <tr><td>max_function_calls</td><td>单次对话最大工具调用次数</td></tr>
+            <tr><td>fn_schema_str</td><td>FunctionTool 的函数签名 Schema 字符串</td></tr>
+            <tr><td>ToolMetadata</td><td>工具的元数据（名称、描述、参数 Schema）</td></tr>
+            <tr><td>退避重试</td><td>指数级间隔的重试策略：1s, 2s, 4s</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>LlamaIndex 的 ReActAgent 和 LangChain 的 Agent 有什么区别？</summary><p>LlamaIndex ReActAgent 基于 ReAct 循环格式（Thought/Action/Observation），每一步都结构化输出。LangChain Agent 支持更多 Agent 类型（OpenAI Tools、XML、Structured Chat）。LlamaIndex 优势：1) 与 Index 和 QueryEngine 深度集成，直接传 QueryEngineTool 即可；2) 工具定义更简洁（FunctionTool 自动生成 Schema）；3) 支持 MCP 协议。LangChain 优势：1) Agent 生态更丰富；2) 记忆和回调系统更成熟。CorpAssist 选择 LlamaIndex Agent 因为其检索能力原生集成。</p></details>
+        <details><summary>如果 Agent 陷入死循环（不断调用同一个工具），怎么处理？</summary><p>多层防护：1) max_iterations=10，达到后强制停止并返回当前结果；2) max_function_calls=10，限制总工具调用次数；3) 检测重复工具调用模式——如果连续 N 次调用相同工具且参数相同，触发中断；4) 在每个工具的执行结果中添加"fix_hint"字段，引导 LLM 换方向。CorpAssist 还加了一个监控：单次对话超过 20 步自动上报告警。</p></details>
+        <details><summary>MCP 协议的安全性如何？在 CorpAssist 中怎么鉴权？</summary><p>MCP Server 通过 HTTP 暴露，安全性取决于传输层。CorpAssist 方案：1) 每个 MCP Server 部署在内部网络，不对外暴露；2) 使用 mTLS 双向认证；3) 每个请求携带 JWT Token（包含用户 ID、角色、租户 ID）；4) MCP Server 端校验 Token，根据角色限制可用工具。Agent 调用工具时自动将用户上下文透传到 MCP 请求头中。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/deploying/agents/" target="_blank" rel="noopener">LlamaIndex Agent 文档</a> — ReActAgent、FunctionTool、MCP 集成完整指南</li>
+      <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">MCP 协议官方文档</a> — Model Context Protocol 规范和 Server/Client 实现</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/agent/mcp/" target="_blank" rel="noopener">LlamaIndex MCP 集成示例</a> — 连接 MCP Server 并注册工具的完整代码</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>定义一个查询天气的 Python 函数，用 FunctionTool 包装，验证 Schema 自动生成</li>
+        <li>用 ReActAgent 组合 3 个工具（查询工单+创建日程+发邮件），测试"查工单→创建日程→发邮件通知"流程</li>
+        <li>模拟工具超时，验证退避重试逻辑是否生效</li>
+        <li>连接一个 MCP Server（如 MCP 的 SQLite Server），通过 Agent 查询数据库</li>
+        <li>故意传错参数，验证 Agent 的错误处理和重试行为</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：Agent 调用了 query_user_info 工具，但返回了空结果，接下来 Agent 应该怎么做？</summary><p>ReAct Agent 的观察阶段会收到 {"error": "用户不存在"}。下一步推理为：用户不存在 → 可能是工单的创建者被删除 → 不阻碍工单处理流程 → 跳过用户查询直接返回工单状态。或者：需要用户信息但查不到 → 提示用户提供正确的用户 ID。Agent 会自动根据工具返回结果调整计划，不需要硬编码处理分支。</p></details>
+      <details><summary>场景：MCP Server 返回了非预期的数据格式（如字符串而不是 JSON），Agent 会怎么处理？</summary><p>ReAct Agent 将工具返回的原始文本作为 Observation 放入下一轮推理。LLM 会尝试解析：如果返回的是纯字符串"success"，Agent 会将其解读为工具执行成功并继续下一步。如果返回的是错误信息"500 Internal Server Error"，Agent 会在下一轮思考中说"工具调用返回了服务器错误，请检查 MCP Server 状态"，然后可能重试或跳过。规范的做法：MCP 工具统一返回 JSON 格式的 dict。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/practice-02-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>FunctionTool 自动生成的 Schema 与函数签名一致，参数类型和描述正确</li>
+        <li>ReActAgent 在 10 步以内正确完成"查工单→查用户→汇总结果"的三步流程</li>
+        <li>模拟超时场景，工具在 3 次重试后给出降级提示</li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-01">高级检索策略</a></li>
+      <li>下一篇：<a href="#ch-practice-03">评测与迭代</a> — 学习 RAG 管线评测和迭代优化</li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,271 @@
+<section id="ch-basics-01" class="chapter" data-chapter="basics-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>LlamaIndex 与 LangChain 对比</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>LlamaIndex 核心抽象</strong> · 能力：理解 LlamaIndex 数据模型、对比 LangChain LCEL、完成选型决策</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么学这章</h4>
+        <p>CorpAssist 知识库当前使用 LangChain 做 RAG，但索引管理和检索灵活性不足。LlamaIndex 以 Document/Node/Index 为核心的数据模型，能直接映射企业文档结构（PDF 章节、代码段、数据库表），且内置 10+ 索引类型。团队需要决策：是继续 LangChain LCEL 路线，还是引入 LlamaIndex 作为检索层。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完后能做什么</h4>
+        <p>对比 Document/Node/Index vs LangChain Document/Splitter/VectorStore 的映射差异；解释 LlamaIndex 的"索引即抽象层"设计哲学；在 CorpAssist 场景中给出选型建议并列出 3 条迁移收益。</p>
+      </div>
+      <div class="notice">
+        <h4>本章要点速记</h4>
+        <p>1) LlamaIndex 用 Node 代替 LangChain 的 Document Chunk，自带 metadata 和关系；2) Index 是中心抽象，封装向量库+检索策略；3) LCEL 是声明式管线，LlamaIndex 是面向索引的封装；4) 路由查询是 LlamaIndex 独有特性；5) CorpAssist 适合用 LlamaIndex 做检索层 + LangChain 做对话层。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Document/Node/Index 数据模型</h3>
+      <p>LlamaIndex 的数据模型由三个层次构成。<span class="term" data-term-id="document">Document</span> 是原始输入的容器，对应一篇 PDF、一个 Markdown 文件或一段代码。Document 不要求纯文本——可以是 JSON、CSV 甚至二进制流，通过 <code>metadata</code> 字典挂载来源信息。<span class="term" data-term-id="node">Node</span> 是 LlamaIndex 最小语义单元，每个 Node 包含文本块、元数据和关系列表（<code>relationships</code>），关系可以指向前驱/后继 Node 或引用，这对理解文档结构至关重要。<span class="term" data-term-id="index">Index</span> 是对 Node 集合的变换与存储抽象，不限于向量索引——还有树索引、关键词表索引等。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+  D[Document: PDF/HTML/代码] -->|IngestionPipeline| N[Node 列表]
+  N -->|嵌入 + 存储| VI[VectorStoreIndex]
+  N -->|关键词提取| KI[KeywordTableIndex]
+  N -->|文档树| SI[SummaryIndex]
+  VI -->|query| QE[QueryEngine]
+  QE -->|top-k| R[检索结果]
+  subgraph LangChain 对照
+    LDoc[Document] -->|TextSplitter| LChunk[Document chunks]
+    LChunk -->|embedding| LVS[VectorStore]
+  end
+</pre>
+      </div>
+      <p>LangChain 的 Document 经 TextSplitter 切分后仍是 Document 列表，丢失了段落关系。LlamaIndex 的 Node 通过 <code>NodeRelationship.SOURCE</code>、<code>NodeRelationship.NEXT</code>、<code>NodeRelationship.PREVIOUS</code> 保留文档拓扑，在进行 <code>SentenceWindowNodeParser</code> 等高级检索时能回溯上下文窗口。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from llama_index.core.schema import Document, TextNode, NodeRelationship
+
+# Document 是输入容器
+doc = Document(
+    text="# 第一章\nCorpAssist 是企业智能助手...",
+    metadata={"source": "corpassist_manual.pdf", "page": 1, "version": "v2.1"}
+)
+
+# Node 是最小检索单元，保留关系
+node = TextNode(
+    text="CorpAssist 是企业智能助手",
+    metadata={"source": "corpassist_manual.pdf", "page": 1},
+    relationships={
+        NodeRelationship.SOURCE: doc.as_related_node_info(),
+        NodeRelationship.NEXT: TextNode(text="它支持以下功能...").as_related_node_info()
+    }
+)
+print(f"Node ID: {node.node_id}, 关系数: {len(node.relationships)}")
+# Node ID: a1b2c3..., 关系数: 2</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 LangChain LCEL 对照</h3>
+      <p>LangChain LCEL 使用 <code>|</code> 操作符将组件串联成管道：<code>prompt | model | output_parser</code>。LlamaIndex 则围绕 <code>Index</code> 提供 <code>as_query_engine()</code>、<code>as_chat_engine()</code> 等方法。两者哲学不同：LCEL 是函数式管线，LlamaIndex 是面向索引的服务封装。</p>
+      <table class="outline-table">
+        <thead><tr><th>维度</th><th>LangChain LCEL</th><th>LlamaIndex</th></tr></thead>
+        <tbody>
+          <tr><td>核心抽象</td><td>Runnable 管线</td><td>Index + QueryEngine</td></tr>
+          <tr><td>文档分割</td><td>TextSplitter → Document list</td><td>IngestionPipeline → Node list</td></tr>
+          <tr><td>检索策略</td><td>VectorStore.similarity_search</td><td>Index.as_retriever(similarity_top_k=5)</td></tr>
+          <tr><td>多步推理</td><td>LCEL chain 手动串联</td><td>RouterQueryEngine 自动路由</td></tr>
+          <tr><td>流式支持</td><td>.stream() 在链上</td><td>.as_query_engine(streaming=True)</td></tr>
+          <tr><td>评估工具</td><td>LangSmith 需付费</td><td>内置 evaluation 模块</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>LangChain LCEL 方式</h4><p><code>chain = prompt | model | output_parser</code> 适合简单对话，但在 CorpAssist 多文档检索场景中，需要手写 <code>RouterChain</code> 或 <code>LLMChain</code> 组合，代码量多且调试困难。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>LlamaIndex 方式</h4><p><code>engine = index.as_query_engine()</code> 一行即可。需要路由时切换 <code>RouterQueryEngine.from_defaults(...)</code>，检索与生成深度集成，调试时查看 retrieved Node 元数据即可。</p></div>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># LangChain 方式
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+prompt = ChatPromptTemplate.from_template("基于{context}回答：{question}")
+chain = {"context": retriever, "question": RunnablePassthrough()} | prompt | model | output_parser
+
+# LlamaIndex 方式（更简洁）
+from llama_index.core import VectorStoreIndex
+index = VectorStoreIndex.from_documents(documents)
+query_engine = index.as_query_engine(similarity_top_k=3, streaming=True)
+response = query_engine.query("CorpAssist 支持哪些集成方式?")
+print(response)</pre></code>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>在 CorpAssist 中，用户上传的文档来自多个部门（HR 手册、IT 运维指南、产品文档）。用 LangChain 需要为每个文档集创建独立 VectorStore 并手写路由。LlamaIndex 的 <code>Index</code> 抽象允许一个 <code>SummaryIndex</code> 管理多个文档，通过 <code>RouterQueryEngine</code> 自动路由到对应子索引。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>选型决策树</h3>
+      <p>选型不是非此即彼。CorpAssist 架构中，对话管理用 LangChain 的 <code>ChatModel</code> 接口（Spring AI Python 侧兼容），而检索层用 LlamaIndex。以下是决策树：</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    Q[需要什么能力？] --> Q1{需要复杂文档索引?}
+    Q1 -->|是,多文档关联| LI[选 LlamaIndex]
+    Q1 -->|否,简单向量检索| LC[选 LangChain]
+    LI --> Q2{需要多步推理?}
+    Q2 -->|是| Router[RouterQueryEngine]
+    Q2 -->|否| Simple[as_query_engine]
+    LC --> Q3{需要 Agent?}
+    Q3 -->|是| LCA[LangChain Agent]
+    Q3 -->|否| LCR[RetrievalQA chain]
+    Router --> C{CorpAssist 场景}
+    C -->|客服| KB[选 LlamaIndex + 缓存]
+    C -->|代码助手| LI
+    C -->|简单 FAQ| LC
+</pre>
+      </div>
+      <table class="learn-decision-table">
+        <thead><tr><th>场景</th><th>推荐方案</th><th>原因</th></tr></thead>
+        <tbody>
+          <tr><td>单文档 FAQ 问答</td><td>LangChain RetrievalQA</td><td>代码简洁，无额外学习成本，百页内文档表现一致</td></tr>
+          <tr><td>多文档跨章节检索</td><td>LlamaIndex + RouterQueryEngine</td><td>Node 关系保留文档拓扑，路由精准度比手写 RouterChain 高 35%</td></tr>
+          <tr><td>Agent + 检索 + 工具</td><td>LangChain Agent + LlamaIndex Tool</td><td>LangChain Agent 生态成熟，LlamaIndex 提供 <code>QueryEngineTool</code> 桥接</td></tr>
+          <tr><td>需要评估与迭代</td><td>LlamaIndex</td><td>内置 <code>RetrieverEvaluator</code> 和 <code>ResponseEvaluator</code>，无需额外工具</td></tr>
+          <tr><td>多模态检索</td><td>LlamaIndex + CLIP</td><td>多模态索引原生支持，LangChain 需自行组装</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 场景适配</h3>
+      <p>CorpAssist 采用双栈架构：Java Spring AI 处理对话编排，Python 服务处理检索和 RAG。LlamaIndex 在 Python 侧承担检索层职责。适配策略如下：</p>
+      <ul>
+        <li><strong>文档摄入管线</strong>：Python 侧用 LlamaIndex <code>IngestionPipeline</code> 解析 PDF/HTML/代码，生成带关系的 Node，存入 Milvus 向量库。</li>
+        <li><strong>检索 API</strong>：FastAPI 封装 <code>Index.as_retriever()</code>，暴露 <code>/api/v1/retrieve</code> 接口，返回 JSON 给 Java 侧。</li>
+        <li><strong>双栈对齐</strong>：LlamaIndex 的 <code>TextNode</code> metadata 字段与 Java 侧 <code>Document</code> 类 JSON 对应，保证 session_id、tenant_id 透传。</li>
+        <li><strong>增量更新</strong>：Python 侧监听消息队列（RocketMQ），文档变更时调用 <code>index.insert_nodes()</code> 增量更新，无需重建全量。</li>
+      </ul>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># CorpAssist Python 侧检索服务
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from llama_index.core import VectorStoreIndex
+from llama_index.vector_stores.milvus import MilvusVectorStore
+
+app = FastAPI()
+vector_store = MilvusVectorStore(uri="http://milvus:19530", dim=1024)
+index = VectorStoreIndex.from_vector_store(vector_store)
+
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 3
+    tenant_id: str  # 多租户
+
+class QueryResponse(BaseModel):
+    answer: str
+    source_nodes: list[str]
+
+@app.post("/api/v1/retrieve", response_model=QueryResponse)
+async def retrieve(req: QueryRequest):
+    retriever = index.as_retriever(
+        similarity_top_k=req.top_k,
+        filters={"tenant_id": req.tenant_id}  # 租户过滤
+    )
+    nodes = retriever.retrieve(req.question)
+    return QueryResponse(
+        answer=f"检索到 {len(nodes)} 条相关结果",
+        source_nodes=[n.node_id for n in nodes]
+    )</pre></code>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>LlamaIndex 的 Document/Node/Index 三层模型比 LangChain 的 Document-Chunk-VectorStore 更细粒度，Node 通过 relationships 保留文档拓扑，支持高级检索策略</li>
+        <li>LCEL 是函数式管线适合简单链，LlamaIndex Index + QueryEngine 是面向场景的封装，路由和子查询内置</li>
+        <li>CorpAssist 场景推荐双框架共存：LlamaIndex 做检索层，LangChain/LangGraph 做对话编排层</li>
+        <li>LlamaIndex 内置评估模块在迭代周期上比 LangChain + LangSmith 更快，且无需额外付费</li>
+        <li>双栈架构中 LlamaIndex Python 侧负责检索 API，通过 JSON 协议与 Java 侧交互，metadata 字段对齐可保证多租户隔离</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-01-1"> 我能说出 Document/Node/Index 三者的职责和区别</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-2"> 我能用 LlamaIndex 从 Document 创建 Index 并执行一次查询</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-3"> 我能对比 LCEL 的 Runnable 管线与 LlamaIndex QueryEngine 的设计差异</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-4"> 我能在 CorpAssist 场景中给出选 LlamaIndex 或 LangChain 的决策条件</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-01-5"> 我能用 FastAPI + LlamaIndex 实现一个包含多租户过滤的检索 API</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>Document</td><td>LlamaIndex 的原始输入容器，可包含文本、文件路径、二进制数据</td></tr>
+            <tr><td>Node</td><td>最小语义单元，包含文本块 + metadata + 关系列表</td></tr>
+            <tr><td>Index</td><td>对 Node 集合的变换与存储抽象，VectorStoreIndex/SummaryIndex 等</td></tr>
+            <tr><td>QueryEngine</td><td>Index 的查询接口，封装检索+合成</td></tr>
+            <tr><td>LCEL</td><td>LangChain 声明式管线语言，用 | 串联组件</td></tr>
+            <tr><td>RouterQueryEngine</td><td>LlamaIndex 的路由查询引擎，根据意图分发到子索引</td></tr>
+            <tr><td>NodeRelationship</td><td>Node 间的关系枚举（SOURCE/NEXT/PREVIOUS/PARENT）</td></tr>
+            <tr><td>VectorStoreIndex</td><td>最常见索引类型，对 Node 做 embedding 并存入向量库</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>LlamaIndex 的 Node 和 LangChain 的 Document 有什么区别？为什么 LlamaIndex 要重新定义数据模型？</summary><p>LangChain Document 只包含 page_content 和 metadata，切分后丢失了段落间关系。LlamaIndex 的 Node 多了 relationships 字段，可以指向 SOURCE（来源 Document）、NEXT/PREVIOUS（前后段落）、PARENT（父节点）。这在 SentenceWindow 检索中至关重要：检索到子节点时可以回溯到父节点获取完整上下文。LlamaIndex 重新定义模型是因为检索需要文档结构感知，而不仅是扁平文本。</p></details>
+        <details><summary>CorpAssist 选择 LlamaIndex 还是 LangChain？请给出决策逻辑。</summary><p>按文档复杂度决策：1) 单文档、百页内、简单 FAQ → LangChain RetrievalQA，代码少维护成本低；2) 多文档交叉检索、结构文档（PDF 带目录）→ LlamaIndex，Node 关系和 RouterQueryEngine 天然适合；3) 需要 Agent + 检索 → LangChain Agent 通过 QueryEngineTool 调用 LlamaIndex。CorpAssist 客服场景有多部门文档，推荐 LlamaIndex 检索层 + LangChain 对话层共存。</p></details>
+        <details><summary>LlamaIndex 的 Index 是一个 VectorStore 吗？有哪些 Index 类型？</summary><p>不是。Index 是抽象层，VectorStoreIndex 只是其中一种。还有 SummaryIndex（按文档顺序合成答案）、KeywordTableIndex（关键词匹配）、TreeIndex（树形摘要索引）、KnowledgeGraphIndex（知识图谱索引）等。每种 Index 实现了不同的检索策略，共享相同的 Node 数据模型。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.llamaindex.ai/en/stable/module_guides/indexing/" target="_blank" rel="noopener">LlamaIndex Indexing 模块文档</a> — 深入理解所有 Index 类型和选择标准</li>
+      <li><a href="https://python.langchain.com/docs/concepts/lcel/" target="_blank" rel="noopener">LangChain LCEL 概念文档</a> — 对比 LCEL 函数的组合与 LlamaIndex Index 抽象</li>
+      <li><a href="https://docs.llamaindex.ai/en/stable/examples/index_structs/IndexComparison/" target="_blank" rel="noopener">LlamaIndex Index 对比示例</a> — 各 Index 在相同数据上的检索效果对比</li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>安装 LlamaIndex：<code>pip install llama-index==0.11.0</code></li>
+        <li>创建示例 Document：<code>doc = Document(text="CorpAssist 支持日程管理、工单创建和知识检索", metadata={"source": "test.md"})</code></li>
+        <li>构建索引并查询：<code>index = VectorStoreIndex.from_documents([doc]); engine = index.as_query_engine(); print(engine.query("CorpAssist 支持什么?"))</code></li>
+        <li>在 LangChain 中做同样查询：<code>from langchain_community.vectorstores import FAISS; from langchain.text_splitter import CharacterTextSplitter</code> 对比代码量</li>
+        <li>用 FastAPI 封装检索接口，添加响应模型和异常处理</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：有一个 500 页的 PDF 用户手册，需要实现"第几章的第几节提到什么功能"这种精确检索，选 LangChain 还是 LlamaIndex？</summary><p>选 LlamaIndex。因为 500 页 PDF 包含章节层级，LangChain 的 TextSplitter 切分后丢失了"第几章第几节"信息。LlamaIndex 的 Node 通过 relationships 保留文档拓扑，配合 SentenceWindowNodeParser 可以回溯到父章节标题。具体实现：用 IngestionPipeline + HierarchicalNodeParser 生成父-子层级 Node，检索时返回子节点和父节点标题。</p></details>
+      <details><summary>场景：团队已有 LangChain + FAISS 实现，想迁移到 LlamaIndex，最安全的切入口是什么？</summary><p>最安全切入口是检索层替换：保留 LangChain 的 ChatModel 和 Prompt Template，只将 FAISS 检索替换为 LlamaIndex VectorStoreIndex。因为 LlamaIndex 的 index.as_retriever() 返回的 Node 可以从 metadata 提取文本，传入 LangChain 的 prompt。这样改动范围最小，验证通过后再逐步替换。迁移成本约 2-3 人天。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 <code>demos/basics-01-lab/</code></p>
+      <ul class="demo-acceptance">
+        <li>运行对比 demo 脚本，输出 LangChain vs LlamaIndex 在同一份文档上的检索差异</li>
+        <li>修改 metadata 过滤条件（如 source=training.pdf），验证检索结果过滤正确</li>
+        <li>用 FastAPI 启动检索服务，curl 测试 <code>GET /api/v1/retrieve?question=CorpAssist&top_k=3</code></li>
+      </ul>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>下一篇：<a href="#ch-basics-02">IngestionPipeline 与文档解析</a> — 学习如何用 IngestionPipeline 处理 PDF/HTML/代码文档</li>
+    </ul>
+  </div>
+</section>
