@@ -1,0 +1,313 @@
+<section id="ch-basics-02" class="chapter" data-chapter="basics-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>整体架构与 Spring AI 技术选型</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>知识库 RAG 系统架构决定了后续所有的开发、运维和扩展决策。不理解分层架构会在 BFF 里堆 RAG 逻辑、在编排层暴露 API Key，最终无法治理。本章建立 CorpAssist S1 的架构蓝图，让你后续编码时有架构直觉。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能画出 CorpAssist S1 的三层架构图并标注每层职责；能对比 6 种 VectorStore 给出选型建议；能用「五步回答法」在面试中清晰回答架构设计题。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>三层架构：接入层/编排层/数据层，与微服务架构一一映射</li><li>Spring AI 6 种 VectorStore 的选型矩阵和性能对比</li><li>数据写入流（MQ 触发）和读取流（双路检索 + Rerank）</li><li>面试架构题的「五步回答法」框架</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>三层架构：Gateway/编排层/数据层</h3>
+      <p>CorpAssist S1 知识库采用经典的三层架构，与微服务架构中的 BFF/Service/DAO 一一映射。</p>
+      <table class="outline-table">
+        <thead><tr><th>层级</th><th>CorpAssist 组件</th><th>核心职责</th><th>不应做</th></tr></thead>
+        <tbody>
+          <tr><td><strong>接入层</strong></td><td>corpassist-bff + llm-gateway</td><td>JWT 鉴权、SSE 透传、模型路由、API Key 托管、用量落库</td><td>文档分块策略、向量重建、复杂 Agent 规划</td></tr>
+          <tr><td><strong>编排层</strong></td><td>dialog-orchestrator</td><td>RAG 检索链调用、Prompt 模板版本管理、多轮对话状态维护、降级处理</td><td>持有厂商 API Key、直接暴露给公网</td></tr>
+          <tr><td><strong>数据层</strong></td><td>rag-index + 对象存储 + 审计仓</td><td>文档入库解析、Embedding 索引、引用片段管理、审计日志</td><td>同步调用 LLM 生成最终用户可见的回答</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 三层逻辑架构（含 RAG 索引）</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph access["接入层 Access"]
+        WEB[Web/钉钉/API]
+        BFF[corpassist-bff]
+        GW[llm-gateway]
+    end
+    subgraph orchestration["编排层 Orchestration"]
+        ORCH[dialog-orchestrator]
+        AGT[agent-runtime]
+        RAGS[rag-service]
+    end
+    subgraph data["数据层 Data"]
+        IDX[(Milvus+ES 索引)]
+        OBJ[(MinIO 对象存储)]
+        AUD[(审计日志 MongoDB)]
+    end
+    subgraph models["模型提供方"]
+        LLM[Chat API]
+        EMB[Embedding API]
+    end
+    subgraph biz["业务系统"]
+        HR[HR 系统]
+        ERP[ERP 系统]
+    end
+    WEB -->|HTTPS JWT| BFF
+    BFF -->|REST/SSE| ORCH
+    BFF -->|流式透传| GW
+    ORCH -->|检索| RAGS
+    ORCH -->|编排| AGT
+    ORCH -->|补全| GW
+    RAGS -->|向量化| EMB
+    RAGS -->|ANN| IDX
+    RAGS -->|BM25| IDX
+    GW -->|Chat| LLM
+    GW -->|计量| AUD
+    AGT -->|工具| HR
+    AGT -->|工具| ERP</pre>
+      </div>
+      <p>一次 RAG 问答的完整调用序：</p>
+      <ol>
+        <li>BFF 校验 JWT 获取用户租户/角色，附带 <code>session_id</code> 转发至 orchestrator</li>
+        <li>Orchestrator 调 rag-service：混合检索（Milvus ANN + ES BM25 + RRF）→ 得到 top-k 片段与 chunk_id</li>
+        <li>拼装 messages（system prompt + 引用块 + user query），经 gateway POST /v1/chat/completions</li>
+        <li>流式 SSE chunk 经 BFF 转发到客户端；末包中 usage 写入审计库，按部门归因 Token 消耗</li>
+      </ol>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># CorpAssist 分层职责配置 (application-corpassist.yml)
+corpassist:
+  layers:
+    access:
+      bff: corpassist-bff
+      gateway: llm-gateway
+    orchestration:
+      dialog: dialog-orchestrator
+      agent: agent-runtime
+    data:
+      rag_index: corpassist-hr-v3
+      object_store: minio://corpassist-docs
+  retrieval:
+    top_k: 6
+    rerank: true
+  ingest:
+    queue: corpassist-doc-ingest
+    dead_letter: corpassist-doc-dlq</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring AI VectorStore 选型矩阵</h3>
+      <p>Spring AI 1.0.0-M6 支持 6 种 VectorStore 实现。选型需要综合性能指标、运维成本和现有生态。</p>
+      <table class="outline-table">
+        <thead><tr><th>实现</th><th>索引类型</th><th>P50 延迟 (1K dim)</th><th>运维成本</th><th>适用场景</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Milvus</strong></td><td>IVF_FLAT / HNSW</td><td>12ms</td><td>中（需 K8s 或 Docker）</td><td>大规模生产 > 1M 向量</td></tr>
+          <tr><td><strong>Elasticsearch</strong></td><td>HNSW + BM25</td><td>18ms</td><td>低（复用已有 ES 集群）</td><td>混合检索 + 已有 ES 生态</td></tr>
+          <tr><td><strong>PgVector</strong></td><td>IVFFlat</td><td>25ms</td><td>低（PostgreSQL 插件）</td><td>小团队快速原型</td></tr>
+          <tr><td><strong>Qdrant</strong></td><td>HNSW</td><td>15ms</td><td>中（Docker 可跑）</td><td>独立向量库需求</td></tr>
+          <tr><td><strong>Redis</strong></td><td>FLAT（暴力）</td><td>8ms</td><td>低</td><td>缓存级 / 小规模</td></tr>
+          <tr><td><strong>Cosmos DB</strong></td><td>DiskANN</td><td>20ms</td><td>高（Azure 生态）</td><td>Azure 原生栈</td></tr>
+        </tbody>
+      </table>
+      <p>CorpAssist 推荐 <strong>Milvus + Elasticsearch 双路</strong>：Milvus 负责向量 ANN 检索，ES 负责 BM25 关键词召回 + 元数据过滤。双路结果通过 RRF 融合后由 Reranker 精排。这比单一向量库召回率提升 8.2 个百分点。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Configuration
+public class VectorStoreConfig {
+
+    @Bean
+    @Primary
+    public VectorStore milvusVectorStore(MilvusServiceClient milvusClient,
+                                          EmbeddingModel embeddingModel) {
+        return new MilvusVectorStore(milvusClient, embeddingModel,
+            MilvusVectorStoreConfig.builder()
+                .collectionName("corpassist_policies")
+                .dimension(1024)
+                .metricType(MetricType.COSINE)
+                .indexType(IndexType.IVF_FLAT)
+                .build());
+    }
+
+    @Bean
+    public VectorStore elasticsearchVectorStore(
+            ElasticsearchClient esClient,
+            EmbeddingModel embeddingModel) {
+        return new ElasticsearchVectorStore(esClient, embeddingModel,
+            ElasticsearchVectorStoreConfig.builder()
+                .indexName("corpassist_policies_text")
+                .build());
+    }
+
+    @Bean
+    public HybridSearchService hybridSearchService(
+            @Qualifier("milvusVectorStore") VectorStore milvus,
+            @Qualifier("elasticsearchVectorStore") VectorStore es,
+            EmbeddingModel embeddingModel) {
+        return new HybridSearchService(milvus, es, embeddingModel);
+    }
+}</code></pre></div>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：如果你的团队已经有 ES 集群，选型时优先考虑 ES Vector Store 还是额外部署 Milvus？</summary>
+        <p>如果数据量 &lt; 500 万向量且 ES 集群有资源——优先用 ES Vector Store，省去运维 Milvus 的复杂度。当向量规模增大或延迟敏感时再考虑 Milvus。CorpAssist 初期用 ES 单路，v2 引入 Milvus 做双路。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 知识库的数据流设计</h3>
+      <p>数据流分为<strong>写入流</strong>（文档索引 Pipeline）和<strong>读取流</strong>（问答检索 Pipeline），两者通过索引存储解耦。</p>
+      <h4>写入流（文档索引 Pipeline）</h4>
+      <ol>
+        <li>OA 系统通过 Webhook 通知文档变更 → 发送 MQ 消息到 corpassist-doc-ingest 队列</li>
+        <li>索引服务消费消息，调用 TikaDocumentReader 解析文档</li>
+        <li>TokenTextSplitter 分块（chunk-size: 512, overlap: 64）</li>
+        <li>MetadataEnricher 提取元数据（作者/部门/版本/权限标签）</li>
+        <li>调用 Embedding API 向量化后并行写入 Milvus + ES</li>
+        <li>确认双写成功后 ACK 消息；失败进入 DLQ 重试</li>
+      </ol>
+      <div class="mermaid-wrap">
+        <h5>写入流：文档索引 Pipeline</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant OA as OA 系统
+    participant MQ as RabbitMQ
+    participant IS as Index Service
+    participant TK as Tika Parser
+    participant SP as Splitter
+    participant EM as Embedding API
+    participant ML as Milvus
+    participant ES as Elasticsearch
+
+    OA->>MQ: Webhook: 文档已更新
+    MQ->>IS: 消费 corpassist-doc-ingest
+    IS->>TK: 解析 PDF/Word/MD
+    TK-->>IS: 原始文本 + 元数据
+    IS->>SP: TokenTextSplitter
+    SP-->>IS: N 个 Chunk
+    IS->>EM: 批量向量化
+    EM-->>IS: float[] 向量
+    IS->>ML: 批量写入向量
+    IS->>ES: 批量写入文本+元数据
+    ML-->>IS: OK
+    ES-->>IS: OK
+    IS->>MQ: ACK</pre>
+      </div>
+      <h4>读取流（问答检索 Pipeline）</h4>
+      <ol>
+        <li>用户输入问题 → BFF 鉴权 → orchestrator 收到 session_id</li>
+        <li>Orchestrator 并行调用 Milvus（向量）+ ES（BM25）双路检索</li>
+        <li>双路结果通过 RRF 融合入候选池（各取 Top-50 融合为 Top-20）</li>
+        <li>BGE-Reranker 对 Top-20 精排，取 Top-5</li>
+        <li>Prompt 模板将引用片段拼入 System Message + User Message</li>
+        <li>ChatClient 调用 LLM 生成回答 + 引用溯源</li>
+      </ol>
+    </div>
+
+    <div class="section-block">
+      <h3>面试答题框架：架构题的五步回答法</h3>
+      <p>面试被问到「请设计一个知识库 RAG 系统」时，用五步框架回答会显得思路清晰、经验丰富。</p>
+      <table class="outline-table">
+        <thead><tr><th>步骤</th><th>话术示例</th><th>考察点</th></tr></thead>
+        <tbody>
+          <tr><td><strong>① 明确需求边界</strong></td><td>「首先确认场景——是内部制度问答还是客服文档检索？预期 QPS 和文档量级？」</td><td>需求分析能力，不做过度设计</td></tr>
+          <tr><td><strong>② 分层架构</strong></td><td>「我们采用三层——接入层处理鉴权和流式透传，编排层组装 RAG 链路，数据层管理索引」</td><td>系统设计能力，职责清晰</td></tr>
+          <tr><td><strong>③ 选型对比</strong></td><td>「向量库选 Milvus vs ES？看数据规模和现有生态。Milvus 适合大规模纯向量，ES 适合已有搜索集群」</td><td>技术广度，不唯技术</td></tr>
+          <tr><td><strong>④ 关键指标</strong></td><td>「我们的目标是 Recall@5 ≥ 90%、P99 延迟 ≤ 2s、单次查询 Token 成本 ≤ ¥0.2」</td><td>量化思维，指标驱动</td></tr>
+          <tr><td><strong>⑤ 权衡与局限</strong></td><td>「RAG 不擅长数学推理和多跳推理，在这些场景需要结合 Agent 或 Chain-of-Thought」</td><td>工程务实，知道边界</td></tr>
+        </tbody>
+      </table>
+      <p>完整回答示例：<em>「我们采用三层架构——接入层用 Spring Cloud Gateway + LLM Gateway 做鉴权和流式转发，编排层用 Spring AI ChatClient 组装检索与生成，数据层用 Milvus + ES 双路索引 + BGE-Reranker。Recall@5 92.3% ，P99 1.8s，单次查询 Token 成本约 ¥0.18。主要局限是多跳推理场景效果差，正在结合 Agent 方案。」</em></p>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist 面试场景模拟</span>
+        <p>面试官追问：「你负责的知识库最近检索不准，排查思路是什么？」回答应结构化：① 查检索日志看实际召回了哪些片段及其 RRF 分数；② 检查分块参数是否合理（512/64 还是默认值）；③ 看 Rerank 权重配置是否需要调优；④ 检查文档版本——是否混入废止版本文档；⑤ 将该查询加入黄金评测集做回归。</p>
+      </aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>三层架构（接入/编排/数据）与微服务架构一一映射，每层职责清晰不可越界</li>
+        <li>Spring AI 支持 6 种 VectorStore，生产推荐 Milvus + ES 双路，Recall@5 92.3%</li>
+        <li>数据流分写入（MQ 触发索引 Pipeline）和读取（双路检索 + RRF + Rerank）两个方向</li>
+        <li>面试架构题采用五步回答法：需求 → 分层 → 选型 → 指标 → 权衡</li>
+        <li>具体选型关注 P99 延迟 / Recall@K / 运维成本三维度，避免唯向量论</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="basics-02-1"> 能画出三层架构图并标注每层组件</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-2"> 能解释 Milvus vs ES vs PgVector 的选型依据和适用场景</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-3"> 能描述数据写入流和读取流的完整链路</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-4"> 能用五步框架在面试中回答架构设计题</label></li>
+          <li><label><input type="checkbox" data-check-id="basics-02-5"> 能给出 CorpAssist S1 的推荐选型和理由</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td><strong>BFF</strong></td><td>Backend For Frontend，接入层负责鉴权、聚合和 SSE 透传</td></tr>
+            <tr><td><strong>Orchestrator</strong></td><td>编排层，负责组装 RAG 链路、管理 Prompt 模板和工具调用</td></tr>
+            <tr><td><strong>LLM Gateway</strong></td><td>OpenAI 兼容的模型网关，提供路由、Key 管理和用量审计</td></tr>
+            <tr><td><strong>Recall@K</strong></td><td>K 条检索结果中包含相关文档的比例，衡量检索覆盖率</td></tr>
+            <tr><td><strong>P99 延迟</strong></td><td>99% 的请求在多少毫秒内完成，衡量系统长尾性能</td></tr>
+            <tr><td><strong>RRF</strong></td><td>Reciprocal Rank Fusion，基于排名的结果融合算法</td></tr>
+            <tr><td><strong>Reranker</strong></td><td>交叉编码器对候选重排，精度高于向量相似度匹配</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: 三层架构中编排层和接入层的职责边界在哪里？</summary>
+        <p>接入层负责<strong>非智能</strong>的透传职责：JWT 鉴权、SSE 流式转发、模型路由、API Key 托管、用量落库。编排层负责<strong>智能</strong>的组装职责：RAG 检索链调用、Prompt 模板版本管理、多轮对话状态维护、工具调用编排与降级。关键约束：编排层不持有厂商 API Key，不暴露公网；接入层不做 RAG 核心逻辑。</p></details>
+        <details><summary>Q2: 为什么选 Milvus + ES 双路而不是单一向量库？</summary>
+        <p>纯向量库的缺点：① 关键词精确匹配弱，特殊编号（HR-2024-001）无法精确命中；② 元数据过滤依赖向量库实现，不如 ES 成熟。双路的优势：向量召回语义相似文档 + BM25 精确匹配编号/专有名词 + RRF 融合排序。实际业务中 Recall@5 从 84.1% 提升到 92.3%，代价是额外 15-25ms 延迟。</p></details>
+        <details><summary>Q3: 数据写入流被脏文档堵住了怎么办？</summary>
+        <p>生产级方案：① MQ 消费端设置 max-retry: 3 和死信队列 DLQ；② 脏文档进入 DLQ 后通过管理后台人工审核和重试；③ DocumentReader 设置 <code>skip-on-error: true</code> 跳过异常文档；④ 监控仪表板跟踪索引队列积压和失败率；⑤ 定期巡检 DLQ 并实现半自动重放机制。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 官方参考</a> — VectorStore/ChatClient/Advisor 核心 API</li>
+      <li><a href="https://milvus.io/docs/ivf_flat.md" target="_blank" rel="noopener">Milvus IVFFLAT 索引</a> — nprobe 参数调优指南</li>
+      <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-bm25.html" target="_blank" rel="noopener">ES BM25 查询</a> — BM25 评分算法参数（k1, b）调优</li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>打开 IntelliJ IDEA 创建 Spring Boot 3.3 项目，添加 spring-ai-milvus-store 和 spring-ai-openai 依赖</li>
+        <li>在 application.yml 中分别配置 Milvus 和 OpenAI 连接（参考上方代码块）</li>
+        <li>编写 @Configuration 注入双路 VectorStore Bean</li>
+        <li>实现 HybridSearchService 的 RRF 融合方法（参考 practice 章节）</li>
+        <li>用 curl 测试 /api/v1/kb/ask?question=产假天数 验证检索-生成完整链路</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：项目初期想只用 ES 做关键词搜索不加向量检索，你怎么评估？</summary>
+      <p>可以接受 v1 快速上线，但需预知局限：① 用户用同义词/近义词提问时无法匹配（如「年假」vs「带薪休假」）；② 长文本语义理解差，无法根据内容相关性排序；③ 不支持模糊语义查询。建议 v1 用 ES + 同义词扩展词典做快速验证；v2 引入向量检索做语义增强。</p></details>
+      <details><summary>场景：架构评审中有人建议编排层直接调用 LLM 不通过 Gateway，你怎么反驳？</summary>
+      <p>Gateway 承担三大核心价值：① API Key 统一托管——避免密钥散落在各微服务中，轮换时只需改一处；② 用量审计——每个租户/部门的 Token 消耗可追溯归因；③ 模型路由——可按部门/场景路由到不同模型（HR 用 qwen-plus、技术用 gpt-4o）。去掉 Gateway 意味着这些职责分散到各服务，无法统一治理和审计。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/basics-02-lab/</p>
+      <ul class="demo-acceptance">
+        <li>三层架构图绘制完成并标注组件</li>
+        <li>application.yml 双路配置通过启动验证</li>
+        <li>双路检索 Java 代码编译通过</li>
+        <li>REST 接口返回正确格式的检索结果</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-basics-03">分块策略在 Java 侧的配置</a></li>
+      <li><a href="https://martinfowler.com/articles/enterprise-integration-patterns.html" target="_blank" rel="noopener">企业集成模式（Martin Fowler）</a></li>
+    </ul>
+  </div>
+</section>

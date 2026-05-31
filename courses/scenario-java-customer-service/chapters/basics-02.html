@@ -1,0 +1,166 @@
+<section id="ch-basics-02" class="chapter" data-chapter="basics-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>核心模块划分</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服是 CorpAssist 中最复杂的模块——涉及意图识别、多轮对话、工具调用、人工转接、质检五大子系统。没有清晰的模块划分，代码会变成一团乱麻。本章建立 S2 的架构蓝图。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能画出 CorpAssist S2 的五模块架构并说明每模块职责；能配置 Spring Cloud Gateway 路由到客服服务；能描述模块间的数据流和接口契约。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>五大模块：意图路由/对话引擎/工具层/人工坐席/质检</li><li>Spring Cloud Gateway 作为统一入口，路由到不同的客服服务</li><li>模块间通过事件驱动和 REST API 两种模式交互</li><li>CorpAssist S2 架构总图含完整数据流</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>五大模块</h3>
+      <table class="outline-table">
+        <thead><tr><th>模块</th><th>职责</th><th>核心组件</th><th>关键接口</th></tr></thead>
+        <tbody>
+          <tr><td><strong>意图路由</strong></td><td>识别用户意图，路由到对应处理器</td><td>Spring AI StructuredOutput + 规则引擎</td><td>POST /api/v1/intent/classify</td></tr>
+          <tr><td><strong>对话引擎</strong></td><td>管理多轮对话，调用 LLM 生成回答</td><td>ChatClient + ChatMemory + Advisor Chain</td><td>POST /api/v1/chat/completions</td></tr>
+          <tr><td><strong>工具层</strong></td><td>执行业务操作（查单/退款/改址）</td><td>@Tool 注解 + Bean Validation</td><td>POST /api/v1/tools/*</td></tr>
+          <tr><td><strong>人工坐席</strong></td><td>处理转接请求，分配坐席</td><td>Redis 排队 + WebSocket 坐席端</td><td>WebSocket /ws/agent</td></tr>
+          <tr><td><strong>质检</strong></td><td>对话质量抽检，敏感内容审核</td><td>Advisor 链 + 异步分析</td><td>MQ corpassist-quality-check</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>五大模块关系图</h5>
+        <pre class="mermaid">flowchart TB
+    USER[用户] -->|消息| GW[Spring Cloud Gateway]
+    GW --> IR[意图路由]
+    IR -->|高置信度| DE[对话引擎]
+    IR -->|低置信度| HA[人工坐席]
+    DE -->|需要查数据| TL[工具层]
+    DE -->|需要政策| KB[(S1 知识库)]
+    DE -->|检测到敏感| QC[质检]
+    TL -->|订单API| ORD[订单系统]
+    TL -->|售后API| AFT[售后系统]
+    HA -->|排队+分配| AGT[坐席工作台]
+    QC -->|告警| AM[坐席管理员]</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring Cloud Gateway 配置</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml">spring:
+  cloud:
+    gateway:
+      routes:
+        - id: cs-intent-router
+          uri: lb://cs-intent-router
+          predicates:
+            - Path=/api/v1/intent/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+        - id: cs-chat-engine
+          uri: lb://cs-chat-engine
+          predicates:
+            - Path=/api/v1/chat/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: csChatEngineCB
+                fallbackUri: forward:/fallback/chat
+        - id: cs-tools
+          uri: lb://cs-tools
+          predicates:
+            - Path=/api/v1/tools/**
+        - id: cs-agent-ws
+          uri: lb:ws://cs-agent-ws
+          predicates:
+            - Path=/ws/agent/**</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>模块间数据流与接口契约</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 意图路由 -> 对话引擎 契约
+public record IntentResult(
+    String sessionId,
+    String intent,         // order_query | return | refund | policy
+    double confidence,     // 0.0 ~ 1.0
+    Map<String, Object> slots,  // {orderId: "ORD-123"}
+    @Nullable String fallbackReason
+) {}
+
+// 对话引擎 -> 工具层 契约
+public record ToolCallRequest(
+    String sessionId,
+    String toolName,       // queryOrder | createReturn | changeAddress
+    Map<String, Object> parameters,
+    String idempotencyKey
+) {}
+
+// 人工坐席转接 契约
+public record HandoffRequest(
+    String sessionId,
+    String userId,
+    String reason,          // low_confidence | sensitive_content | user_request
+    List<ChatMessage> chatHistory,
+    @Nullable String preferredAgentId
+) {}</code></pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>五大模块职责清晰：意图路由 -> 对话引擎 -> 工具层 -> 人工坐席 -> 质检</li>
+        <li>Spring Cloud Gateway 统一入口，配置路由/限流/熔断</li>
+        <li>模块间通过契约化的数据对象解耦（IntentResult/ToolCallRequest/HandoffRequest）</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="cs-basics-02-1"> 能画出五模块架构图</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-basics-02-2"> 能配置 Gateway 路由</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-basics-02-3"> 能定义模块间接口契约</label></li>
+        </ul>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: 意图路由和对话引擎为什么是两个独立模块？</summary>
+        <p>职责分离：意图路由专注分类（输入 -> intent），对话引擎专注生成（intent + context -> 回答）。独立模块的好处：① 可以独立部署和扩缩（意图路由需要 GPU 分类器，对话引擎需要 LLM）；② 独立升级（换分类模型不影响对话流程）；③ 更清晰的可观测性（分别监控分类准确率和回答质量）。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-cloud-gateway/reference/" target="_blank">Spring Cloud Gateway</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>创建 Spring Cloud Gateway 配置路由到意图路由和对话引擎</li>
+        <li>定义 IntentResult/ToolCallRequest/HandoffRequest 三个契约类</li>
+        <li>用 Docker 启动 Redis 并配置 Gateway 的 RequestRateLimiter</li>
+      </ol>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/basics-02-lab/</p>
+      <ul class="demo-acceptance">
+        <li>Gateway 启动并路由到正确服务</li>
+        <li>限流和熔断配置验证通过</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-basics-03">多轮上下文与会话管理</a></li>
+    </ul>
+  </div>
+</section>

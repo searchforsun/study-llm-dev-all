@@ -1,0 +1,160 @@
+<section id="ch-advanced-01" class="chapter" data-chapter="advanced-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>生产化：网关、限流与 SSO</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>客服系统从 MVP 到生产化需要解决网关路由、限流熔断和 SSO 集成三大基础问题。这些能力直接决定了系统能否承载真实用户流量。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能配置 Spring Cloud Gateway + Resilience4j 限流熔断；能配置 SSE 流式的全链路超时；能实现 JWT + Spring Security 鉴权；能制定 7x24 运维值班手册。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring Cloud Gateway + Resilience4j 限流</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml">spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter:
+              replenishRate: 100   # 每秒 100 个请求
+              burstCapacity: 200   # 突发 200
+              requestedTokens: 1
+        - name: CircuitBreaker
+          args:
+            name: csServiceCB
+            fallbackUri: forward:/fallback/cs
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      csChatEngineCB:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+  timelimiter:
+    instances:
+      csChatEngineTL:
+        timeout-duration: 30s</code></pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@RestController
+@RequestMapping("/fallback")
+public class FallbackController {
+
+    @PostMapping("/cs")
+    public Mono<ServerSentEvent<String>> fallback() {
+        return Mono.just(ServerSentEvent.<String>builder()
+            .event("error")
+            .data("系统繁忙，请稍后再试。或直接联系人工客服电话 400-xxx-xxxx。")
+            .build());
+    }
+}</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>JWT + Spring Security 鉴权</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Configuration
+@EnableWebFluxSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(
+            ServerHttpSecurity http) {
+        return http
+            .authorizeExchange(exchanges -> exchanges
+                .pathMatchers("/api/v1/cs/chat/**").authenticated()
+                .pathMatchers("/api/v1/cs/handoff/**").hasRole("AGENT")
+                .pathMatchers("/fallback/**").permitAll()
+                .anyExchange().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(Customizer.withDefaults())
+            )
+            .build();
+    }
+
+    @Bean
+    public ReactiveJwtDecoder jwtDecoder() {
+        return NimbusReactiveJwtDecoder
+            .withJwkSetUri("https://auth.corp.example/.well-known/jwks.json")
+            .build();
+    }
+}</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>SSE 全链路超时配置</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># Gateway 层
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: cs-chat-stream
+          uri: lb://cs-chat-engine
+          predicates:
+            - Path=/api/v1/cs/chat/stream
+          metadata:
+            response-timeout: 60000  # 60 秒 SSE 超时
+
+# 应用层
+server:
+  reactive:
+    session:
+      timeout: 30m
+  netty:
+    max-keep-alive-requests: 1000
+
+# LLM 调用超时
+spring:
+  ai:
+    openai:
+      chat:
+        options:
+          timeout: 30s  # LLM 调用 30 秒超时</code></pre></div>
+      <p>SSE 超时策略的三层配置：Gateway 层 60s -> 应用层 30s(LIM) -> LLM 层 30s。任何一层超时都会返回友好错误给用户，并记录超时事件到监控系统。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Gateway + Resilience4j 限流(100 QPS) + 熔断(50% 失败率)</li>
+        <li>JWT + Spring Security OAuth2 鉴权，坐席角色额外权限</li>
+        <li>SSE 三层超时：Gateway 60s -> 应用 30s -> LLM 30s</li>
+        <li>熔断降级到 FallbackController 返回友好提示</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="cs-advanced-01-1"> 能配置 Gateway 限流熔断</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-advanced-01-2"> 能配置 JWT 鉴权</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-advanced-01-3"> 能配置 SSE 三层超时</label></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>配置 application.yml Gateway 限流和熔断</li>
+        <li>配置 spring-security JWT 鉴权</li>
+        <li>配置 SSE 三层超时参数</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-advanced-02">业务数据叙事</a></li>
+    </ul>
+  </div>
+</section>

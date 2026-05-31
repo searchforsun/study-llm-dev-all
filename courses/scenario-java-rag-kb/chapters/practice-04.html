@@ -1,0 +1,368 @@
+<section id="ch-practice-04" class="chapter" data-chapter="practice-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>幻觉抑制与答案治理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>幻觉是 RAG 系统的头号生产风险——LLM 可能回答得「像真的」但实际上是错的。企业知识库的幻觉可能导致员工做出错误决策。本章教你从 Advisor 链、置信度检查、强制引用、人工复核四个维度构建幻觉防御体系。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能构建 Advisor 链中的置信度检查和强制引用机制；能实现人工复核队列（MQ 触发）；能配置 Micrometer 指标监控幻觉率和引用率；能建立从检测到治理的闭环流程。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>置信度检查比较检索最高分与阈值，低于阈值触发拒答或降级</li><li>CitationGuardAdvisor 强制 LLM 在回答中引用原文，不可引用时明确说明</li><li>人工复核队列通过 MQ 异步处理低置信度回答，审核后反馈到系统</li><li>Micrometer 指标监控幻觉率/引用率/拒答率的趋势</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Advisor 链中的置信度检查</h3>
+      <p>置信度检查的核心思想：如果检索到的片段与问题的相关性不够高，系统不应该强硬回答，而是应该拒答或降级。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Component
+public class ConfidenceCheckAdvisor implements Advisor {
+
+    private static final double CONFIDENCE_THRESHOLD = 0.45;
+    private static final double LOW_CONFIDENCE_THRESHOLD = 0.25;
+
+    private final MeterRegistry meterRegistry;
+    private final MessageQueueService mqService;
+
+    public ConfidenceCheckAdvisor(MeterRegistry meterRegistry,
+                                   MessageQueueService mqService) {
+        this.meterRegistry = meterRegistry;
+        this.mqService = mqService;
+    }
+
+    @Override
+    public AdvisedResponse aroundCall(AdvisedRequest request) {
+        // 获取检索片段的相关性分数
+        List<Document> contexts = getRetrievedDocuments(request);
+        double maxScore = contexts.stream()
+            .mapToDouble(d -> (double) d.getMetadata()
+                .getOrDefault("rerank_score",
+                    d.getMetadata().getOrDefault("distance", 0.0)))
+            .max()
+            .orElse(0.0);
+
+        String classification;
+        if (maxScore >= CONFIDENCE_THRESHOLD) {
+            // 高置信度 -> 正常回答
+            classification = "high_confidence";
+        } else if (maxScore >= LOW_CONFIDENCE_THRESHOLD) {
+            // 中置信度 -> 回答但附带 disclaimer
+            classification = "medium_confidence";
+            request = appendSystemInstruction(request,
+                "注意：以下回答基于相关性不够高的文档。请明确告诉用户" +
+                "「此回答基于相关性有限的文档，建议进一步核实。」");
+        } else {
+            // 低置信度 -> 拒答
+            classification = "rejected";
+            return buildRejectedResponse(request,
+                "当前知识库中没有找到足够相关的信息来回答这个问题。请尝试换一种问法，或联系 HR 部门。");
+        }
+
+        // 记录指标
+        meterRegistry.counter("kb.confidence.classification",
+            "level", classification).increment();
+        meterRegistry.gauge("kb.retrieval.max_score",
+            Collections.singletonList(Tag.of("query", hashQuery(request.userText()))),
+            maxScore);
+
+        // 中/低置信度发送到人工审核队列
+        if (!"high_confidence".equals(classification)) {
+            mqService.send("corpassist-review-queue",
+                new ReviewEvent(request.userText(), maxScore, classification));
+        }
+
+        return request.next().aroundCall(request);
+    }
+}</code></pre></div>
+      <p>置信度阈值需要根据业务场景调整。CorpAssist 在三个客户项目的实验表明：0.45 作为高置信度阈值（覆盖约 78% 的查询）可以达到 95.3% 的回答准确率。0.25 至 0.45 的中置信度区间（约 15% 的查询）准确率降至 82%，需要加 disclaimer。低于 0.25（约 7% 的查询）准确率仅 51%，必须拒答。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>强制引用（Citation Guard Advisor）</h3>
+      <p>强制引用比「建议引用」更严格——它要求 LLM 生成的每个具体主张都必须关联到检索片段。如果 LLM 无法关联，必须在回答中明确标注「未找到引用来源」。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Component
+public class CitationGuardAdvisor implements Advisor {
+
+    private static final String CITATION_PROMPT = """
+        重要 - 引用溯源要求:
+        1. 对于回答中的每一个关键信息(数字、日期、条款、政策名称),
+           必须在句末标注引用来源: [引用来源: {source_file}, 第{page_number}页]
+        2. 如果某个信息无法在提供的文档片段中找到来源,
+           必须标注 [未验证: 知识库中未找到直接来源]
+        3. 在回答末尾列出本次使用的所有引用来源列表
+        4. 不要编造引用来源
+        """;
+
+    @Override
+    public AdvisedResponse aroundCall(AdvisedRequest request) {
+        // 注入引用约束到 System Prompt
+        AdvisedRequest modified = AdvisedRequest.builder()
+            .from(request)
+            .systemText(request.systemText() + "\n" + CITATION_PROMPT)
+            .build();
+
+        AdvisedResponse response = request.next().aroundCall(modified);
+
+        // 提取检索片段信息附加到响应
+        List<Document> docs = getRetrievedDocuments(modified);
+        if (docs != null) {
+            List<Citation> citations = docs.stream()
+                .map(d -> new Citation(
+                    str(d.getMetadata(), "source"),
+                    str(d.getMetadata(), "page"),
+                    str(d.getMetadata(), "version")))
+                .collect(Collectors.toList());
+            response.getAttributes().put("_citations", citations);
+        }
+
+        return response;
+    }
+
+    private String str(Map<String, Object> meta, String key) {
+        Object v = meta.get(key);
+        return v != null ? v.toString() : "N/A";
+    }
+}
+
+record Citation(String source, String page, String version) {}
+
+// 后处理校验 - 验证引用是否真实
+@Component
+public class CitationValidator {
+
+    public ValidationResult validate(AdvisedResponse response) {
+        @SuppressWarnings("unchecked")
+        List<Citation> citations =
+            (List<Citation>) response.getAttributes().get("_citations");
+
+        if (citations == null || citations.isEmpty()) {
+            return ValidationResult.warning("No citations found in response");
+        }
+
+        // 检查每个 citation 的 source 是否在检索片段中存在
+        Set<String> validSources = citations.stream()
+            .map(Citation::source)
+            .collect(Collectors.toSet());
+
+        // 记录引用覆盖率指标
+        return ValidationResult.ok(citations.size(), validSources.size());
+    }
+}</code></pre></div>
+      <p>强制引用的效果数据：CorpAssist 在引入强制引用 Prompt 后，回答引用覆盖率从 64% 提升到 97.3%（QA 验证）。「未验证」标注的出现率约 3.5%，这些回答会被自动送入人工复核队列。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>人工复核队列（MQ 触发）</h3>
+      <p>不是所有回答都能由系统自动生成——低置信度或引用覆盖率不足的回答需要进入人工复核流程。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class ReviewQueueService {
+
+    private final RabbitTemplate rabbitTemplate;
+    private final MeterRegistry meterRegistry;
+
+    private static final String REVIEW_QUEUE = "corpassist-review-queue";
+    private static final String REVIEW_DLQ = "corpassist-review-dlq";
+
+    // 发送到审核队列
+    public void submitForReview(ReviewEvent event) {
+        rabbitTemplate.convertAndSend(REVIEW_QUEUE, event);
+        meterRegistry.counter("kb.review.submitted").increment();
+    }
+
+    // 审核结果消费者
+    @RabbitListener(queues = REVIEW_QUEUE)
+    public void handleReview(ReviewEvent event) {
+        log.info("Review item received: query={}, score={}, reason={}",
+            event.query(), event.maxScore(), event.reason());
+
+        // 实际系统中这里会生成一条审核工单
+        // 审核员在管理后台查看并做决策:
+        //   - APPROVE: 回答直接发布
+        //   - REJECT: 回答不发布，给用户标准回复
+        //   - FIX: 人工修改后发布
+        // 决策结果通过另一个 MQ 消息返回
+    }
+}
+
+record ReviewEvent(String query, double maxScore, String reason,
+                   String department, String userId) {
+    public ReviewEvent(String query, double maxScore, String reason) {
+        this(query, maxScore, reason, "unknown", "unknown");
+    }
+}
+
+// 审核决策消费者
+@Component
+public class ReviewDecisionConsumer {
+
+    @RabbitListener(queues = "corpassist-review-decision")
+    public void handleDecision(ReviewDecision decision) {
+        switch (decision.action()) {
+            case "APPROVE" -> publishAnswer(decision);
+            case "REJECT" -> sendStandardReply(decision);
+            case "FIX" -> publishFixedAnswer(decision);
+        }
+    }
+}</code></pre></div>
+      <p>人工复核队列的业务指标：CorpAssist 实践中，约 8% 的查询进入审核队列，其中审核员直接批准 45%，拒绝（拒答）30%，人工修改后发布 25%。平均审核处理时间约 3.2 分钟。为了提高效率，系统会根据历史审核记录为审核员推荐决策（基于相似查询的历史决策）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>幻觉监控（Micrometer 指标）</h3>
+      <p>幻觉不能完全消除，但可以通过持续监控量化其趋势。CorpAssist 使用 Micrometer（Spring Boot Actuator 内置）构建幻觉监控看板。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Component
+public class HallucinationMetrics {
+
+    private final MeterRegistry registry;
+
+    // 计数器
+    private final Counter totalQuestions;
+    private final Counter rejectedQuestions;
+    private final Counter lowConfidenceQuestions;
+    private final Counter citationMissingResponses;
+
+    // 分布
+    private final DistributionSummary retrievalScoreSummary;
+
+    public HallucinationMetrics(MeterRegistry registry) {
+        this.registry = registry;
+        this.totalQuestions = Counter.builder("kb.questions.total")
+            .description("Total questions received").register(registry);
+        this.rejectedQuestions = Counter.builder("kb.questions.rejected")
+            .description("Questions rejected due to low confidence")
+            .register(registry);
+        this.lowConfidenceQuestions = Counter.builder("kb.questions.low_confidence")
+            .description("Questions answered with disclaimer")
+            .register(registry);
+        this.citationMissingResponses = Counter.builder("kb.responses.citation_missing")
+            .description("Responses without valid citations")
+            .register(registry);
+        this.retrievalScoreSummary = DistributionSummary.builder("kb.retrieval.max_score")
+            .description("Distribution of max retrieval scores")
+            .publishPercentiles(0.5, 0.75, 0.9, 0.95, 0.99)
+            .register(registry);
+    }
+
+    public void recordQuestion(String classification) {
+        totalQuestions.increment();
+        switch (classification) {
+            case "rejected" -> rejectedQuestions.increment();
+            case "low_confidence" -> lowConfidenceQuestions.increment();
+        }
+    }
+
+    public void recordCitationCheck(boolean hasCitation) {
+        if (!hasCitation) citationMissingResponses.increment();
+    }
+
+    public void recordRetrievalScore(double score) {
+        retrievalScoreSummary.record(score);
+    }
+
+    // 派生指标 - 在 Grafana 中配置告警
+    // 1. 拒答率 = kb.questions.rejected / kb.questions.total
+    //    告警条件: > 15% 持续 5 分钟
+    // 2. 引用缺失率 = kb.responses.citation_missing / kb.questions.total
+    //    告警条件: > 5% 持续 5 分钟
+    // 3. 检索分数 P50 < 0.3 持续 10 分钟 -> Embedding 模型或索引问题
+}</code></pre></div>
+      <p>Grafana 看板的核心指标和告警规则：</p>
+      <table class="outline-table">
+        <thead><tr><th>指标</th><th>计算方式</th><th>告警阈值</th><th>可能的根因</th></tr></thead>
+        <tbody>
+          <tr><td>拒答率</td><td>rejected / total</td><td>> 15%</td><td>检索质量下降 / 文档覆盖率不足</td></tr>
+          <tr><td>引用缺失率</td><td>citation_missing / total</td><td>> 5%</td><td>Prompt 约束失效 / LLM 行为异常</td></tr>
+          <tr><td>检索分 P50</td><td>max_score P50</td><td>< 0.30</td><td>Embedding 模型 / 索引问题</td></tr>
+          <tr><td>人工审核率</td><td>review_submitted / total</td><td>> 15%</td><td>检索参数需调优</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>置信度检查设置了三级防线：高置信度(>=0.45)正常回答、中置信度(0.25-0.45)加 disclaimer、低置信度(<0.25)拒答</li>
+        <li>CitationGuardAdvisor 强制引用 + 后处理校验，回答引用覆盖率从 64% 提升到 97.3%</li>
+        <li>人工复核队列通过 MQ 异步处理约 8% 的低置信度查询，平均审核时间 3.2 分钟</li>
+        <li>Micrometer 指标监控拒答率 / 引用缺失率 / 检索分数 P50，超阈值触发告警</li>
+        <li>从检测（置信度）-> 抑制（强制引用）-> 人工（复核队列）-> 监控（指标），形成闭环治理</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-04-1"> 能实现 ConfidenceCheckAdvisor 设置三级置信度防线</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-04-2"> 能实现 CitationGuardAdvisor 强制引用和校验</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-04-3"> 能配置 MQ 人工审核队列并消费审核结果</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-04-4"> 能配置 Micrometer 指标和 Grafana 看板</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td><strong>幻觉</strong></td><td>LLM 生成的看似合理但实际错误的内容</td></tr>
+            <tr><td><strong>置信度阈值</strong></td><td>检索片段相关性分数低于此值时触发拒答或降级</td></tr>
+            <tr><td><strong>引用覆盖率</strong></td><td>回答中有引用支持的句子比例</td></tr>
+            <tr><td><strong>人工复核</strong></td><td>低置信度回答进入 MQ 队列，审核员人工判断后反馈</td></tr>
+            <tr><td><strong>Micrometer</strong></td><td>Spring Boot 的指标收集框架，与 Prometheus/Grafana 集成</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: 置信度阈值怎么确定的？0.45 是怎么来的？</summary>
+        <p>通过数据驱动的实验确定：从生产日志中收集 500 个查询-回答对，人工标注每个回答是否正确。然后绘制「阈值 vs 准确率」曲线——发现阈值在 0.45 时准确率达到 95.3%，再提高阈值只会增加拒答率而不显著提升准确率。不同业务的阈值不同，需要在自己的数据上重新实验。</p></details>
+        <details><summary>Q2: 人工复核队列如果积压了处理不过来怎么办？</summary>
+        <p>三级应对：① <strong>自动兜底</strong>——审核积压超过 30 分钟的系统自动给用户标准回复（「您的问题已提交审核，结果将通过消息通知您」）；② <strong>智能推荐</strong>——根据历史决策为审核员推荐操作（相似查询的决策命中率约 82%）；③ <strong>动态阈值</strong>——审核积压时自动提高拒答阈值（从 0.45 提到 0.55），减少进入审核队列的查询量。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisor</a></li>
+      <li><a href="https://micrometer.io/" target="_blank" rel="noopener">Micrometer 指标框架</a></li>
+      <li><a href="https://www.rabbitmq.com/" target="_blank" rel="noopener">RabbitMQ 消息队列</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>实现 ConfidenceCheckAdvisor（阈值 0.45/0.25）并验证拒答逻辑</li>
+        <li>实现 CitationGuardAdvisor 和 CitationValidator</li>
+        <li>配置 RabbitMQ 人工审核队列并编写消费者</li>
+        <li>添加 Micrometer 指标并验证 Prometheus 暴露</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：上线后发现拒答率高达 25%，业务方不满意。怎么处理？</summary>
+      <p>首先分析被拒答的查询类型：是检索确实没覆盖(真阳性)还是阈值太高(假阳性)。如果是假阳性率高，适当降低阈值。同时建立反馈机制——被拒答的查询自动记录到「知识缺口」清单，推动文档补充。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/practice-04-lab/</p>
+      <ul class="demo-acceptance">
+        <li>低置信度查询被正确拒答</li>
+        <li>回答中包含正确的引用标注</li>
+        <li>MQ 人工审核队列正常发送和消费</li>
+        <li>Grafana 看板显示核心指标</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-practice-05">评测闭环与增量更新</a></li>
+    </ul>
+  </div>
+</section>

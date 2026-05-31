@@ -1,0 +1,172 @@
+<section id="ch-practice-03" class="chapter" data-chapter="practice-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>客服 Agent Spring AI 实现</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服的核心是 Agent —— 它能理解用户意图、决策是否需要调用工具、根据工具返回信息生成回答。Spring AI 的 ReactAgent 提供了完整的思考-行动-观察循环。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring AI ReactAgent 构建完整的客服对话流程；能配置工具节点与 LLM 节点的协作逻辑；能实现 SSE 流式响应的端到端链路；能实现会话状态跨请求传递。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring AI ReactAgent 对话流程</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class CustomerServiceAgent {
+
+    private final ChatClient chatClient;
+    private final ChatMemory chatMemory;
+    private final IntentClassifier intentClassifier;
+
+    private static final int MAX_STEPS = 8;
+
+    public CustomerServiceAgent(ChatClient.Builder builder,
+                                 ChatMemory chatMemory,
+                                 IntentClassifier intentClassifier,
+                                 OrderTools orderTools,
+                                 ReturnTools returnTools) {
+
+        this.chatMemory = chatMemory;
+        this.intentClassifier = intentClassifier;
+
+        this.chatClient = builder
+            .defaultSystem("""
+                你是一个智能客服助手。你的工作流程：
+                1. 理解用户问题，确定意图
+                2. 如果需要查数据，使用 available functions
+                3. 基于工具返回结果，生成友好、准确的回答
+                4. 如果用户要求退货/退款，先查订单再创建退货
+                5. 如果无法处理，主动提出转人工
+
+                可用工具：
+                - query_order: 查订单状态和物流
+                - create_return: 创建退货申请
+                - change_address: 修改收货地址
+
+                注意：
+                - 每次调用前先确认用户意图
+                - 工具返回错误时，用通俗语言解释给用户
+                - 涉及金额的决策须用户明确确认
+                """)
+            .defaultTools(orderTools, returnTools)
+            .defaultAdvisors(
+                new ConversationAdvisor(chatMemory),
+                new SafeOutputAdvisor()
+            )
+            .build();
+    }
+
+    public Flux<String> chat(String sessionId, String userMessage) {
+        return chatClient.prompt()
+            .user(userMessage)
+            .advisors(a -> a.param("chat_memory_conversation_id", sessionId))
+            .stream()
+            .content();
+    }
+}</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具节点与 LLM 节点的协作</h3>
+      <p>ReactAgent 在每次迭代中执行「思考 -> 行动 -> 观察」循环。Spring AI 通过 ChatClient 的 <code>defaultTools()</code> 注册可用工具，LLM 自主决策何时调用哪个工具。</p>
+      <div class="mermaid-wrap">
+        <h5>ReactAgent 思考-行动-观察循环</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant USER as 用户
+    participant LLM as LLM
+    participant TOOL as 工具层
+    participant API as 业务系统
+
+    USER->>LLM: 我的订单还没到
+    LLM->>LLM: 思考：用户意图是查订单
+    LLM->>TOOL: 行动：query_order(orderId="")
+    TOOL->>API: 查订单 API
+    API-->>TOOL: 返回物流信息
+    TOOL-->>LLM: 观察：订单已发货，在途
+    LLM->>LLM: 思考：基于结果生成回答
+    LLM-->>USER: 您的订单已于昨日发出，预计2-3天到达
+    USER->>LLM: 那我要退货
+    LLM->>LLM: 思考：意图转为退货
+    LLM->>TOOL: 行动：query_order(确认订单)
+    TOOL-->>LLM: 订单可退货
+    LLM->>LLM: 思考：需要用户确认退货原因
+    LLM-->>USER: 好的，请问您退货的原因是什么？</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>SSE 流式响应的端到端链路</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@RestController
+@RequestMapping("/api/v1/cs")
+public class CustomerServiceController {
+
+    private final CustomerServiceAgent agent;
+
+    @PostMapping(value = "/chat/stream",
+                 produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<String>> chatStream(
+            @RequestBody ChatRequest request,
+            @AuthenticationPrincipal UserPrincipal user) {
+
+        return agent.chat(request.sessionId(), request.message())
+            .map(token -> ServerSentEvent.<String>builder()
+                .event("token")
+                .data(token)
+                .build())
+            .concatWithValues(
+                ServerSentEvent.<String>builder()
+                    .event("done")
+                    .data("[DONE]")
+                    .build());
+    }
+}
+
+record ChatRequest(String sessionId, String message) {}
+
+// 前端 EventSource 示例:
+// const es = new EventSource('/api/v1/cs/chat/stream');
+// es.onmessage = (e) => console.log(e.data);</code></pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Spring AI ReactAgent 通过 ChatClient + defaultTools + Advisor 实现完整客服 Agent</li>
+        <li>思考-行动-观察循环：LLM 自主决策工具调用，最大步数 8 次</li>
+        <li>SSE 流式接口通过 Flux<ServerSentEvent> 实现端到端流式输出</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="cs-practice-03-1"> 能构建 CustomerServiceAgent</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-practice-03-2"> 能配置工具节点与 LLM 协作</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-practice-03-3"> 能实现 SSE 流式 Controller</label></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>构建 CustomerServiceAgent 并注册 orderTools</li>
+        <li>实现 SSE 流式 Controller</li>
+        <li>编写模拟对话测试验证工具调用</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-practice-04">降级与人工转接</a></li>
+    </ul>
+  </div>
+</section>

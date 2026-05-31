@@ -1,0 +1,334 @@
+<section id="ch-advanced-01" class="chapter" data-chapter="advanced-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>生产化：权限、审计与多租户</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>知识库从 MVP 到生产化，需要解决三个核心问题：谁可以看什么（权限）、出了事能不能追溯（审计）、多个客户怎么隔离（多租户）。这三个能力直接决定了系统能否通过企业合规审核。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 FilterExpression 实现行级权限过滤；能使用 Spring AOP + MongoDB 实现审计日志；能配置 Milvus 多租户索引前缀隔离；能对照等保 2.0 合规检查清单完成安全加固。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>行级权限通过 FilterExpression 在检索层注入角色/部门条件</li><li>审计日志记录每次问答的完整上下文（时间/用户/问题/回答/引用）</li><li>多租户通过索引前缀隔离，每个租户独立的 collection/index</li><li>等保 2.0「数据存储完整性」和「访问控制」是重点</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>行级权限的检索过滤 FilterExpression</h3>
+      <p>企业知识库中，不同角色的用户只能看到不同范围的文档。权限过滤必须在检索层完成——不是在检索后丢弃无权结果，而是在检索时就通过 FilterExpression 限定。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class SecureKnowledgeService {
+
+    private final VectorStore vectorStore;
+
+    public SearchResponse secureSearch(String query, UserPrincipal user) {
+        // 1. 构建权限过滤条件
+        FilterExpression.Builder filter = FilterExpression.builder();
+
+        // 基础过滤: 安全等级
+        if (user.hasRole("admin") || user.hasRole("vp")) {
+            // 管理员和 VP 可以看到所有等级
+            filter.in("security_level",
+                List.of("public", "internal", "confidential"));
+        } else if (user.hasRole("manager")) {
+            // 经理可以看到 internal 及以上
+            filter.in("security_level", List.of("public", "internal"));
+        } else {
+            // 普通员工只能看 public
+            filter.eq("security_level", "public");
+        }
+
+        // 部门过滤: 员工只看自己部门的文档
+        if (!user.hasRole("admin")) {
+            filter.or(
+                eq("department", user.getDepartment()),
+                eq("department", "ALL")
+            );
+        }
+
+        // 2. 执行带权限过滤的检索
+        SearchRequest request = SearchRequest.builder()
+            .query(query)
+            .topK(5)
+            .similarityThreshold(0.5)
+            .filterExpression(filter.build())
+            .build();
+
+        return vectorStore.search(request);
+    }
+}
+
+// 用户上下文（从 JWT 解析）
+record UserPrincipal(
+    String userId,
+    String department,
+    List<String> roles
+) {
+    public boolean hasRole(String role) {
+        return roles.contains(role);
+    }
+}
+
+// JWT 鉴权过滤器
+@Component
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain)
+            throws ServletException, IOException {
+        String token = extractToken(request);
+        if (token != null) {
+            UserPrincipal user = parseToken(token);
+            SecurityContextHolder.getContext()
+                .setAuthentication(new JwtAuthentication(user));
+        }
+        chain.doFilter(request, response);
+    }
+}</code></pre></div>
+      <p>检索层过滤的安全原则：<strong>人在哪一层鉴权，就在哪一层过滤</strong>。如果在 Controller 层鉴权但不在检索层过滤，检索结果仍然包含了用户无权访问的文档——信息可能通过缓存、日志、错误信息等侧信道泄露。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>审计日志：Spring AOP + MongoDB</h3>
+      <p>知识库的每一次问答都必须可审计——谁、什么时间、问了什么、系统怎么回答的、引用了哪些文档。Spring AOP 提供了声明式的审计方案。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Aspect
+@Component
+public class AuditLogAspect {
+
+    private final AuditLogRepository auditLogRepository;
+
+    @Around("@annotation(auditable)")
+    public Object logAudit(ProceedingJoinPoint pjp,
+                            Auditable auditable) throws Throwable {
+        long startTime = System.currentTimeMillis();
+
+        // 获取请求参数
+        Object[] args = pjp.getArgs();
+        String query = extractQuery(args);
+        UserPrincipal user = getCurrentUser();
+
+        // 执行原方法
+        Object result = pjp.proceed();
+
+        // 记录审计日志
+        long duration = System.currentTimeMillis() - startTime;
+        AuditLog log = AuditLog.builder()
+            .timestamp(Instant.now())
+            .userId(user.userId())
+            .department(user.department())
+            .query(query)
+            .duration(duration)
+            .build();
+
+        if (result instanceof Answer answer) {
+            log.setResponse(answer.content());
+            log.setCitations(answer.citations());
+            log.setConfidenceScore(computeScore(answer));
+        }
+
+        auditLogRepository.save(log);
+        return result;
+    }
+}
+
+// MongoDB 文档
+@Document(collection = "kb_audit_logs")
+@Data
+@Builder
+class AuditLog {
+    @Id private String id;
+    private Instant timestamp;
+    private String userId;
+    private String department;
+    private String query;
+    private String response;
+    private List<Citation> citations;
+    private long duration;
+    private double confidenceScore;
+
+    // 复合索引: userId + timestamp 提高查询效率
+    // db.kb_audit_logs.createIndex({userId:1, timestamp:-1})
+}
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+@interface Auditable {
+    String action() default "QUERY";
+}</code></pre></div>
+      <p>审计日志的关键设计决策：</p>
+      <ul>
+        <li><strong>存储选型 MongoDB</strong>——审计日志是写多读少、Schema 灵活的数据，MongoDB 比 MySQL 更适合</li>
+        <li><strong>TTL 策略</strong>——审计日志保存 180 天（合规要求），到期自动删除（MongoDB TTL 索引）</li>
+        <li><strong>复合索引</strong>——userId + timestamp 用于单个用户的操作追溯</li>
+        <li><strong>数据脱敏</strong>——查询中包含个人身份信息时自动脱敏（如员工姓名 -> 工号）</li>
+        <li><strong>保留策略</strong>——180 天后归档到冷存储（S3/OSS），保留 7 年</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户索引前缀隔离</h3>
+      <p>SaaS 化部署时，多个租户共享同一个 Milvus/ES 集群。通过索引前缀实现数据隔离，比每个租户一个独立集群更经济。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Component
+public class TenantAwareVectorStore {
+
+    private final MilvusServiceClient milvusClient;
+
+    // 获取租户专属的 Collection 名称
+    private String tenantCollection(String tenantId) {
+        return "kb_" + tenantId + "_policies";
+    }
+
+    // 写入时按租户写入独立 Collection
+    public void addDocuments(String tenantId,
+                              List<Document> documents) {
+        String collection = tenantCollection(tenantId);
+
+        // 确保租户 Collection 存在
+        ensureCollectionExists(collection);
+
+        // 写入数据
+        documents.forEach(doc ->
+            doc.getMetadata().put("tenant_id", tenantId));
+        vectorStore.add(documents);
+    }
+
+    // 检索时按租户检索
+    public List<Document> search(String tenantId, String query) {
+        String collection = tenantCollection(tenantId);
+
+        SearchRequest request = SearchRequest.builder()
+            .query(query)
+            .topK(5)
+            .filterExpression(
+                FilterExpression.builder()
+                    .eq("tenant_id", tenantId)
+                    .build()
+            )
+            .build();
+
+        return vectorStore.search(request);
+    }
+
+    @Bean
+    @RequestScope
+    public TenantContext tenantContext(HttpServletRequest request) {
+        String tenantId = request.getHeader("X-Tenant-Id");
+        return new TenantContext(tenantId);
+    }
+}
+
+record TenantContext(String tenantId) {
+    public boolean isValid() {
+        return tenantId != null && !tenantId.isBlank();
+    }
+}</code></pre></div>
+      <p>多租户隔离的三个层次：</p>
+      <table class="outline-table">
+        <thead><tr><th>层次</th><th>实现对</th><th>优点</th><th>缺点</th></tr></thead>
+        <tbody>
+          <tr><td><strong>索引前缀</strong></td><td>Milvus collection 前缀 + metadata 过滤</td><td>资源利用率高</td><td>一个租户的查询可能影响集群性能</td></tr>
+          <tr><td><strong>集群级</strong></td><td>每个租户独立 Milvus 集群</td><td>完全隔离</td><td>成本高，资源浪费</td></tr>
+          <tr><td><strong>混合</strong></td><td>大租户独立集群，小租户前缀共享</td><td>平衡成本和隔离</td><td>运维复杂</td></tr>
+        </tbody>
+      </table>
+      <p>CorpAssist 推荐混合模式：大客户（>10 万文档）独立集群，小客户共享集群 + 索引前缀隔离。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>等保合规检查清单</h3>
+      <p>企业级知识库系统需要通过等保 2.0 合规检查。以下是 CorpAssist 整理的检查清单（三级等保要求）：</p>
+      <table class="outline-table">
+        <thead><tr><th>控制点</th><th>要求</th><th>CorpAssist 实现</th></tr></thead>
+        <tbody>
+          <tr><td><strong>身份鉴别</strong></td><td>用户登录认证，密码策略</td><td>JWT + OAuth2 / SSO 集成</td></tr>
+          <tr><td><strong>访问控制</strong></td><td>按角色/部门控制数据访问</td><td>FilterExpression + TenantContext</td></tr>
+          <tr><td><strong>安全审计</strong></td><td>记录所有操作日志</td><td>Spring AOP -> MongoDB 审计</td></tr>
+          <tr><td><strong>数据完整性</strong></td><td>防止数据篡改</td><td>content_hash 验证 + 只读消费层</td></tr>
+          <tr><td><strong>数据保密性</strong></td><td>传输加密和存储加密</td><td>HTTPS + Milvus TLS + 字段级加密</td></tr>
+          <tr><td><strong>数据备份</strong></td><td>定期备份可恢复</td><td>Milvus 备份 + 对象存储冗余</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>行级权限通过 FilterExpression 在检索层注入角色/部门条件，安全设计原则——不在检索后丢弃</li>
+        <li>审计日志用 Spring AOP + MongoDB 实现，TTL 180 天，归档 7 年</li>
+        <li>多租户采用混合隔离模式（大客户独立集群，小客户前缀共享）</li>
+        <li>等保三级合规覆盖身份鉴别/访问控制/安全审计/数据完整性/保密性/备份六个方面</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="advanced-01-1"> 能实现行级权限 FilterExpression 过滤</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-01-2"> 能配置 Spring AOP 审计日志</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-01-3"> 能实现多租户索引前缀隔离</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-01-4"> 能对照等保清单位完成安全加固</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td><strong>FilterExpression</strong></td><td>检索时过滤元数据的条件表达式</td></tr>
+            <tr><td><strong>行级安全</strong></td><td>在数据行级别控制用户能访问哪些行</td></tr>
+            <tr><td><strong>多租户</strong></td><td>一个系统实例服务多个客户（租户）的数据隔离模式</td></tr>
+            <tr><td><strong>等保 2.0</strong></td><td>中国网络安全等级保护 2.0 标准</td></tr>
+            <tr><td><strong>AOP</strong></td><td>Spring AOP 面向切面编程，用于横切关注点</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: 多租户场景下，如果两个租户的文档都包含「产假天数」，怎么保证各自只搜到各自的文档？</summary>
+        <p>两层保证：① <strong>物理隔离</strong>——租户 A 的文档写入 collection "kb_tenant_a_policies"，租户 B 写入 "kb_tenant_b_policies"，写入时 metadata 中标记 tenant_id；② <strong>检索过滤</strong>——检索时从请求 Header X-Tenant-Id 获取租户 ID，通过 FilterExpression.eq("tenant_id", tenantId) 过滤。即使误写了也不影响。</p></details>
+        <details><summary>Q2: 审计日志量很大（日均 10 万条），存储成本高怎么办？</summary>
+        <p>分层存储策略：① MongoDB 保留最近 30 天的热数据（快速查询）；② 30-180 天的温数据存储在 MongoDB 但缩采样（去掉 response 完整内容）；③ 180 天以上的冷数据压缩后存到 OSS/S3 对象存储。查询时先查 MongoDB，查不到再从 OSS 拉取。总存储成本降低约 70%。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectorestores/milvus.html" target="_blank">Spring AI Milvus</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/core/aop.html" target="_blank">Spring AOP</a></li>
+      <li><a href="https://www.mongodb.com/docs/" target="_blank">MongoDB 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>实现 SecureKnowledgeService 和 FilterExpression 权限过滤</li>
+        <li>实现 AuditLogAspect 和 MongoDB 审计日志存储</li>
+        <li>实现 TenantAwareVectorStore 多租户隔离</li>
+        <li>对照等保检查清单逐项验证</li>
+      </ol>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/advanced-01-lab/</p>
+      <ul class="demo-acceptance">
+        <li>不同角色的用户检索结果不同</li>
+        <li>审计日志完整记录问答</li>
+        <li>多租户数据完全隔离</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-advanced-02">效果数据与优化复盘</a></li>
+    </ul>
+  </div>
+</section>

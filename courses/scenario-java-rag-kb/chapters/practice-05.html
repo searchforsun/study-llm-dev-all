@@ -1,0 +1,377 @@
+<section id="ch-practice-05" class="chapter" data-chapter="practice-05">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>评测闭环与增量更新</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>RAG 系统上线后不是终点——需要持续评测效果、发现坏例、增量更新知识。没有评测闭环就无法量化优化效果，没有增量更新机制索引就会越来越陈旧。本章教你建立从评测到更新的自动化流水线。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能编写集成测试（Testcontainers）验证检索和回答质量；能实现 Advisor 断言验证引用存在；能与 Python RAGAS 评测结果对照；能配置索引蓝绿部署实现版本管理和无缝切换。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>Testcontainers 集成测试：启动 Milvus/ES 容器，注入黄金评测集验证 Recall@5</li><li>Advisor 断言：在集成测试中验证 CitationGuardAdvisor 的引用输出</li><li>Python RAGAS 评测结果通过 HTTP 传入 Java 侧，触发回归测试</li><li>索引蓝绿部署：别名切换实现零停机索引重建</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>集成测试设计（Testcontainers）</h3>
+      <p>Spring AI + Testcontainers 可以启动真实的 Milvus 和 ES 容器进行集成测试。这是最可信的检索质量验证方式。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@SpringBootTest
+@Testcontainers
+class RetrievalIntegrationTest {
+
+    @Container
+    static MilvusContainer milvus = new MilvusContainer("milvusdb/milvus:v2.4.0")
+        .withStartupTimeout(Duration.ofMinutes(5));
+
+    @Container
+    static ElasticsearchContainer es = new ElasticsearchContainer(
+            "docker.elastic.co/elasticsearch/elasticsearch:8.15.0")
+        .withEnv("xpack.security.enabled", "false")
+        .withEnv("ES_JAVA_OPTS", "-Xms512m -Xmx512m");
+
+    @Autowired
+    private HybridSearchService hybridSearch;
+
+    @Autowired
+    private RerankService rerankService;
+
+    private static List<TestQuery> goldenQueries;
+
+    @BeforeAll
+    static void setup() {
+        // 加载黄金评测集
+        goldenQueries = List.of(
+            new TestQuery("产假天数", List.of("doc-hr-001", "doc-hr-002")),
+            new TestQuery("年假计算方法", List.of("doc-hr-003")),
+            new TestQuery("加班费标准", List.of("doc-hr-004", "doc-hr-005")),
+            new TestQuery("HR-2024-001 条款", List.of("doc-hr-001")),
+            new TestQuery("医疗保险报销比例", List.of("doc-hr-006"))
+        );
+    }
+
+    @Test
+    void testHybridRetrievalRecall() {
+        int hits = 0;
+        for (TestQuery tq : goldenQueries) {
+            List<Document> results = hybridSearch.hybridSearch(
+                tq.query(), 5);
+            boolean hasRelevant = results.stream()
+                .anyMatch(d -> tq.relevantDocIds().contains(d.getId()));
+            if (hasRelevant) hits++;
+        }
+
+        double recall = (double) hits / goldenQueries.size();
+        System.out.println("Recall@5: " + (recall * 100) + "%");
+        assertThat(recall).isGreaterThanOrEqualTo(0.85);
+    }
+
+    @Test
+    void testRerankImprovement() {
+        for (TestQuery tq : goldenQueries) {
+            // 不加 Rerank
+            List<Document> withoutRerank = hybridSearch.hybridSearch(
+                tq.query(), 5);
+            // 加 Rerank
+            List<Document> withRerank = rerankService.rerank(
+                tq.query(), withoutRerank);
+
+            // 验证 Rerank 后的第一个结果相关性分数更高
+            double beforeScore = withoutRerank.isEmpty() ? 0 :
+                (double) withoutRerank.get(0).getMetadata()
+                    .getOrDefault("distance", 0.0);
+            double afterScore = withRerank.isEmpty() ? 0 :
+                (double) withRerank.get(0).getMetadata()
+                    .getOrDefault("rerank_score", 0.0);
+
+            System.out.printf("Query: %s | Before: %.4f | After: %.4f%n",
+                tq.query(), beforeScore, afterScore);
+        }
+    }
+}</code></pre></div>
+      <p>Testcontainers 的优点：测试环境与生产环境完全一致（同样的 Milvus/ES 版本），测试结果可重复。CI/CD 流水线中自动运行，每次代码变更都验证 Recall@K 指标不退化。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Advisor 断言：验证引用存在</h3>
+      <p>除了检索质量的集成测试，还需要验证回答生成阶段的 Advisor 行为是否正确。通过断言检查响应的 attributes 中是否包含正确的引用信息。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@SpringBootTest
+class AdvisorAssertionTest {
+
+    @Autowired
+    private ChatClient chatClient;
+
+    @MockBean
+    private VectorStore vectorStore;
+
+    @Test
+    void testCitationGuardAdvisorProducesCitations() {
+        // 准备模拟的检索结果
+        Document mockDoc = Document.builder()
+            .id("doc-hr-001")
+            .text("产假天数根据国家规定为128天。")
+            .metadata(Map.of(
+                "source", "hr_policy_2024.pdf",
+                "page", "3",
+                "version", "2024"
+            ))
+            .build();
+
+        when(vectorStore.search(any(SearchRequest.class)))
+            .thenReturn(List.of(mockDoc));
+
+        // 执行问答
+        Answer answer = chatClient.prompt()
+            .user("产假多少天？")
+            .advisors(new QuestionAnswerAdvisor(vectorStore,
+                SearchRequest.builder().topK(5).build()))
+            .call()
+            .entity(Answer.class);
+
+        // 断言引用存在
+        assertThat(answer.citations())
+            .isNotEmpty()
+            .anyMatch(c -> "hr_policy_2024.pdf".equals(c.source()));
+
+        // 断言回答内容包含引用标注
+        assertThat(answer.content())
+            .contains("128")
+            .contains("引用来源");
+    }
+
+    @Test
+    void testConfidenceCheckAdvisorRejectsLowConfidence() {
+        // 模拟低相关性检索结果
+        Document lowScoreDoc = Document.builder()
+            .id("doc-low-001")
+            .text("不相干的文档内容")
+            .metadata(Map.of(
+                "distance", 0.15,
+                "source", "unrelated.pdf"
+            ))
+            .build();
+
+        when(vectorStore.search(any(SearchRequest.class)))
+            .thenReturn(List.of(lowScoreDoc));
+
+        // 执行问答
+        Answer answer = chatClient.prompt()
+            .user("产假多少天？")
+            .advisors(
+                new QuestionAnswerAdvisor(vectorStore,
+                    SearchRequest.builder().topK(5).build()),
+                new ConfidenceCheckAdvisor(...)
+            )
+            .call()
+            .entity(Answer.class);
+
+        // 断言被拒答
+        assertThat(answer.content())
+            .contains("没有找到足够相关的信息");
+    }
+}</code></pre></div>
+      <p>Advisor 断言测试是「测试金字塔」中比集成测试更高一层的测试——不仅验证检索是否正确，还验证回答生成过程是否遵循了业务规则（引用/拒答/disclaimer）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Python RAGAS 评测结果对照</h3>
+      <p>Python 的 RAGAS 框架提供了全面的 RAG 评测指标（Faithfulness / Answer Relevance / Context Precision）。评测结果应该通过 HTTP 回传 Java 侧，触发回归测试。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@RestController
+@RequestMapping("/api/v1/eval")
+public class EvalReportController {
+
+    private final RegressionTestRunner regressionTestRunner;
+
+    @PostMapping("/ragas-report")
+    public ResponseEntity<String> receiveRagasReport(
+            @RequestBody RagasReport report) {
+
+        log.info("Received RAGAS report: " +
+            "faithfulness={}, relevance={}, precision={}",
+            report.faithfulness(),
+            report.answerRelevance(),
+            report.contextPrecision());
+
+        // 规则：如果 RAGAS 分数低于阈值，自动运行回归测试
+        if (report.faithfulness() < 0.80 || report.contextPrecision() < 0.85) {
+            RegressionTestResult result = regressionTestRunner.runAll();
+            log.warn("RAGAS report triggered regression tests: {}",
+                result.summary());
+
+            // 如果回归测试也失败，创建告警
+            if (result.hasFailures()) {
+                alertService.sendAlert("RAG quality regression detected. " +
+                    "RAGAS faithfulness: " + report.faithfulness() +
+                    ", Regression failures: " + result.failureCount());
+            }
+        }
+
+        return ResponseEntity.ok("Report received");
+    }
+}
+
+record RagasReport(
+    double faithfulness,
+    double answerRelevance,
+    double contextPrecision,
+    double contextRecall,
+    List<BadCase> badCases
+) {}
+
+record BadCase(String question, String answer,
+               List<String> contexts, double score) {}</code></pre></div>
+      <p>CorpAssist 实践中，RAGAS 触发回归测试的阈值为：faithfulness < 0.80 或 contextPrecision < 0.85。回归测试失败时会自动创建 Jira 工单并通知值班工程师。这种 Java-Python 交叉验证机制确保了 RAG 系统持续达到质量标准。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>索引蓝绿部署（别名切换）</h3>
+      <p>当文档更新或分块参数变化时，需要重建索引。蓝绿部署使用别名实现零停机索引切换。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class BlueGreenIndexService {
+    private static final String ALIAS = "corpassist-policies-active";
+    private static final String BLUE = "corpassist-policies-blue";
+    private static final String GREEN = "corpassist-policies-green";
+
+    private final MilvusServiceClient milvusClient;
+    private final ElasticsearchClient esClient;
+
+    // 切换到下一个索引
+    public void switchIndex() {
+        String current = identifyActiveIndex();
+        String next = current.equals(BLUE) ? GREEN : BLUE;
+
+        log.info("Switching active index: {} -> {}", current, next);
+
+        // 1. 将别名从当前索引移除
+        removeAlias(current);
+
+        // 2. 将别名赋给新索引
+        assignAlias(next);
+
+        // 3. 验证新索引可用
+        validateIndex(next);
+
+        log.info("Active index switched to: {}", next);
+    }
+
+    // 初始创建索引
+    public void initializeIndexes() {
+        // 创建 blue 和 green 两个索引集合
+        createCollection(BLUE);
+        createCollection(GREEN);
+
+        // 初始将别名指向 green（空索引可正常服务）
+        assignAlias(GREEN);
+    }
+
+    // 重建索引(在新索引上)
+    public void rebuildIndex(Collection<Document> documents) {
+        String next = identifyInactiveIndex();
+        log.info("Rebuilding index: {}", next);
+
+        // 清空旧数据
+        clearCollection(next);
+
+        // 批量写入
+        vectorStore.add(documents);
+
+        // 验证数据完整性
+        int docCount = countDocuments(next);
+        log.info("Index {} rebuilt with {} documents", next, docCount);
+
+        // 自动切换
+        switchIndex();
+
+        // 清理旧索引中的过期数据
+        clearCollection(identifyInactiveIndex());
+    }
+}</code></pre></div>
+      <p>蓝绿部署的关键优势：重建索引耗时（大型文档库可能需要数小时）完全不影响在线问答服务。旧索引在重建期间继续服务，新索引就绪后通过别名切换秒级生效。如果新索引有问题，别名可以立即切换回旧索引实现回滚。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Testcontainers 集成测试启动真实 Milvus/ES 容器，可信验证 Recall@K >= 85%</li>
+        <li>Advisor 断言测试验证引用输出和拒答行为，是测试金字塔的关键环节</li>
+        <li>Python RAGAS 评测结果通过 HTTP 回传 Java 侧，faithfulness < 0.80 触发回归测试</li>
+        <li>索引蓝绿部署通过别名切换实现零停机索引重建，回滚秒级完成</li>
+        <li>从集成测试 -> Advisor 断言 -> RAGAS 交叉验证 -> 索引更新，形成完整评测闭环</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-05-1"> 能使用 Testcontainers 编写检索集成测试</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-05-2"> 能编写 Advisor 断言测试验证引用</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-05-3"> 能接收 RAGAS 评测结果并触发回归测试</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-05-4"> 能实现索引蓝绿部署的别名切换</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Testcontainers</strong></td><td>Java 测试库，在 JUnit 中启动 Docker 容器进行集成测试</td></tr>
+            <tr><td><strong>蓝绿部署</strong></td><td>两个索引环境交替切换，实现零停机部署</td></tr>
+            <tr><td><strong>RAGAS</strong></td><td>Python 的 RAG 评测框架，评估 faithfulness/relevance/precision</td></tr>
+            <tr><td><strong>回归测试</strong></td><td>代码变更后重新运行所有测试，确保没有引入退化</td></tr>
+            <tr><td><strong>Advisor 断言</strong></td><td>在测试中验证 Advisor 行为是否符合预期</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: Testcontainers 集成测试和单元测试的比例怎么分配？</summary>
+        <p>测试金字塔：单元测试 70% + 集成测试 20% + E2E 测试 10%。单元测试测试单个组件（Splitter/MetadataEnricher），集成测试测试检索链路完整正确性（用真实 Milvus/ES），E2E 测试从 HTTP 请求到回答的端到端链路。Testcontainers 适合集成测试层。</p></details>
+        <details><summary>Q2: 蓝绿部署切换时如果新索引有问题，怎么快速回滚？</summary>
+        <p>别名切换的特性：切换别名到新索引后，旧索引的数据并没有删除。如果发现问题，只需要将别名再切回旧索引即可（秒级）。旧索引在切换后保留 72 小时作为回滚窗口，72 小时后自动清理。清理前发通知确认是否还有回滚需求。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://testcontainers.com/" target="_blank" rel="noopener">Testcontainers 官网</a></li>
+      <li><a href="https://docs.ragas.io/" target="_blank" rel="noopener">RAGAS 评测框架</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>编写 Testcontainers 集成测试（启动 Milvus + ES 容器）</li>
+        <li>编写 Advisor 断言测试验证引用输出</li>
+        <li>模拟 Python 发送 RAGAS 报告并验证触发回归测试</li>
+        <li>实现 BlueGreenIndexService 的别名切换逻辑</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：CI 流水线中集成测试经常因为 Testcontainers 拉取镜像慢而超时。怎么优化？</summary>
+      <p>优化方向：① CI 环境预拉取镜像到本地缓存；② 使用镜像预热策略——在 CI 启动时先拉取镜像再并行运行其他步骤；③ 增加 Testcontainers 超时时间（Ryuk 默认 30s 改为 60s）；④ 考虑使用 <code>withReuse(true)</code> 在开发环境复用容器。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/practice-05-lab/</p>
+      <ul class="demo-acceptance">
+        <li>Testcontainers 集成测试通过</li>
+        <li>Advisor 断言测试覆盖引用验证</li>
+        <li>RAGAS 报告接收端点正常响应</li>
+        <li>蓝绿索引切换验证成功</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-advanced-01">生产化：权限、审计与多租户</a></li>
+    </ul>
+  </div>
+</section>

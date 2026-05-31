@@ -1,0 +1,364 @@
+<section id="ch-practice-03" class="chapter" data-chapter="practice-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>混合检索+Rerank 联调</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>basics-04 讲了混合检索的理论，本章动手实现完整联调。从双路配置、RRF 融合、Rerank 集成到延迟基准测试——每个步骤都需要正确的 Spring Boot 配置和 Java 代码。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能配置 Milvus + ES 双路检索的 Spring Boot 完整联调代码；能进行权重消融实验找到最佳融合参数；能测量 Rerank 延迟 P50/P95/P99 并做优化决策。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>双路检索需要 Milvus 和 ES 各自独立的 VectorStore Bean 配置</li><li>RRF 权重消融实验：向量 0.7: 关键词 0.3 在 CorpAssist 实践中最优</li><li>Rerank P50/P95/P99 延迟基准：50 条候选时分别为 180ms/320ms/400ms</li><li>Spring Boot 集成测试验证双路检索的召回率</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Elasticsearch BM25 + Milvus 向量双路</h3>
+      <p>双路检索需要两个 VectorStore 实例协同工作。Milvus 负责向量 ANN 检索，ES 负责 BM25 关键词检索，两者通过 RRF 融合。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Configuration
+public class DualRetrievalConfig {
+
+    @Value("${spring.ai.vectorstore.milvus.host:localhost}")
+    private String milvusHost;
+
+    @Value("${spring.ai.vectorstore.milvus.port:19530}")
+    private int milvusPort;
+
+    @Bean
+    public MilvusServiceClient milvusClient() {
+        ConnectParam connectParam = ConnectParam.newBuilder()
+            .withHost(milvusHost)
+            .withPort(milvusPort)
+            .build();
+        return new MilvusServiceClient(connectParam);
+    }
+
+    @Bean
+    @Primary
+    public MilvusVectorStore milvusVectorStore(
+            MilvusServiceClient milvusClient,
+            EmbeddingModel embeddingModel) {
+        return new MilvusVectorStore(milvusClient, embeddingModel,
+            MilvusVectorStoreConfig.builder()
+                .collectionName("corpassist_policies")
+                .dimension(1024)
+                .metricType(MetricType.COSINE)
+                .indexType(IndexType.IVF_FLAT)
+                .indexParam("nlist", 1024)
+                .build());
+    }
+
+    @Bean
+    public ElasticsearchVectorStore elasticsearchVectorStore(
+            ElasticsearchClient esClient,
+            EmbeddingModel embeddingModel) {
+        return new ElasticsearchVectorStore(esClient, embeddingModel,
+            ElasticsearchVectorStoreConfig.builder()
+                .indexName("corpassist_policies_text")
+                .build());
+    }
+
+    @Bean
+    public HybridSearchService hybridSearchService(
+            @Qualifier("milvusVectorStore") MilvusVectorStore milvusStore,
+            @Qualifier("elasticsearchVectorStore") ElasticsearchVectorStore esStore,
+            EmbeddingModel embeddingModel) {
+        return new HybridSearchService(milvusStore, esStore, embeddingModel);
+    }
+}
+
+// application.yml 添加 ES 配置
+// spring.ai.elasticsearch.host=localhost
+// spring.ai.elasticsearch.port=9200</code></pre></div>
+      <div class="mermaid-wrap">
+        <h5>双路检索的配置与数据流</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph config["Spring Boot @Configuration"]
+        MILVUS[MilvusVectorStore Bean]
+        ES[ElasticsearchVectorStore Bean]
+        HYBRID[HybridSearchService Bean]
+    end
+    subgraph search["双路检索流程"]
+        Q[用户查询] --> H[HybridSearchService]
+        H --> V[Milvus ANN 检索]
+        H --> K[ES BM25 检索]
+        V --> R[RRF 融合]
+        K --> R
+        R --> RE[BGE-Reranker]
+        RE --> RES[Top-5 结果]
+    end
+    subgraph store["物理存储"]
+        ML[(Milvus: 向量索引)]
+        ELS[(ES: 全文索引)]
+    end
+    MILVUS --> ML
+    ES --> ELS
+    MILVUS --> V
+    ES --> K</pre>
+      </div>
+      <p>双路检索的关键配置要点：两个 VectorStore 使用<strong>不同的索引名/collection名</strong>、但共用一个 Embedding 模型（保证向量维度一致）。写入时双写（同时写入 Milvus 和 ES），检索时各读各的。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>权重调优与 Ablation 实验</h3>
+      <p>RRF 融合权重（vectorWeight : keywordWeight）直接影响检索效果。通过消融实验找到最佳权重组合。</p>
+      <table class="outline-table">
+        <thead><tr><th>向量权重</th><th>关键词权重</th><th>Recall@5</th><th>NDCG@5</th><th>特征</th></tr></thead>
+        <tbody>
+          <tr><td>1.0</td><td>0.0</td><td>84.1%</td><td>0.81</td><td>纯向量，语义匹配但编号检索弱</td></tr>
+          <tr><td>0.0</td><td>1.0</td><td>76.3%</td><td>0.72</td><td>纯 BM25，精确匹配强但语义差</td></tr>
+          <tr><td>0.5</td><td>0.5</td><td>89.8%</td><td>0.85</td><td>均等权重，中庸</td></tr>
+          <tr><td><strong>0.7</strong></td><td><strong>0.3</strong></td><td><strong>92.3%</strong></td><td><strong>0.88</strong></td><td>CorpAssist 推荐</td></tr>
+          <tr><td>0.8</td><td>0.2</td><td>91.5%</td><td>0.87</td><td>偏向量</td></tr>
+          <tr><td>0.6</td><td>0.4</td><td>90.2%</td><td>0.86</td><td>偏 BM25</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-micro-check">
+        <summary>为什么 0.7:0.3 比 0.5:0.5 更好？</summary>
+        <p>企业知识库中 <strong>60% 的查询偏向语义匹配</strong>（「年假多少天」），40% 包含精确关键词（「HR-2024-001」）。给向量路稍高权重（0.7）可以覆盖语义为主的多数查询，同时给 BM25 保留足够的权重（0.3）来保证编号类查询的精确命中。实际数据的查询分布决定了这一最优比例。</p>
+      </aside>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class AblationExperimentService {
+
+    private final HybridSearchService hybridSearchService;
+    private final List<TestQuery> goldenQueries;
+
+    public AblationReport runAblation() {
+        List<FusionWeights> weightCombinations = List.of(
+            new FusionWeights(1.0, 0.0),
+            new FusionWeights(0.7, 0.3),
+            new FusionWeights(0.5, 0.5),
+            new FusionWeights(0.3, 0.7),
+            new FusionWeights(0.0, 1.0)
+        );
+
+        AblationReport report = new AblationReport();
+
+        for (FusionWeights weights : weightCombinations) {
+            int hits = 0;
+            double ndcg = 0;
+
+            for (TestQuery tq : goldenQueries) {
+                List<Document> results = hybridSearchService.hybridSearch(
+                    tq.query(), 5, weights);
+
+                boolean hasRelevant = results.stream()
+                    .anyMatch(d -> tq.relevantDocIds()
+                        .contains(d.getId()));
+                if (hasRelevant) hits++;
+
+                ndcg += computeNdcg(results, tq.relevantDocIds(), 5);
+            }
+
+            report.addResult(weights,
+                new MetricResult(
+                    (double) hits / goldenQueries.size(),
+                    ndcg / goldenQueries.size()));
+        }
+
+        return report;
+    }
+}</code></pre></div>
+      <p>黄金评测集的构建方法：从生产日志中采集 200 个真实用户查询，为每个查询标注其对应的正确答案文档 ID。标注工作可以众包给业务部门同事完成（每人标 20-30 条，5 分钟可完成）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Rerank 延迟基准（P50/P95/P99）</h3>
+      <p>Reranker 的延迟是企业关注的关键指标。以下是 CorpAssist 在不同配置下的实测数据（GPU: T4, 模型: BGE-Reranker-v2-m3, batch=8）：</p>
+      <table class="outline-table">
+        <thead><tr><th>候选数</th><th>P50 延迟</th><th>P95 延迟</th><th>P99 延迟</th><th>批次大小</th></tr></thead>
+        <tbody>
+          <tr><td>20</td><td>95ms</td><td>140ms</td><td>180ms</td><td>4</td></tr>
+          <tr><td>50</td><td>180ms</td><td>320ms</td><td>400ms</td><td>8</td></tr>
+          <tr><td>100</td><td>350ms</td><td>590ms</td><td>720ms</td><td>16</td></tr>
+          <tr><td>200</td><td>680ms</td><td>1150ms</td><td>1400ms</td><td>32</td></tr>
+        </tbody>
+      </table>
+      <p>CorpAssist 生产推荐 50 条候选（P99 400ms），在 Recall 提升和延迟之间取得平衡。如果对延迟敏感可以降为 20 条（P99 180ms），但 Recall@5 会从 92.3% 降到 89.7%。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class LatencyBenchmarkService {
+
+    private final RerankService rerankService;
+    private final MeterRegistry meterRegistry;
+
+    public void benchmarkRerankLatency() {
+        List<String> testQueries = loadTestQueries();
+        List<Document> candidates = loadCandidates();
+
+        for (int candidateCount : List.of(20, 50, 100)) {
+            List<Document> subset = candidates.subList(0, candidateCount);
+            List<Long> latencies = new ArrayList<>();
+
+            for (String query : testQueries) {
+                long start = System.nanoTime();
+                rerankService.rerank(query, subset);
+                long elapsed = TimeUnit.NANOSECONDS.toMillis(
+                    System.nanoTime() - start);
+                latencies.add(elapsed);
+            }
+
+            Collections.sort(latencies);
+            long p50 = latencies.get((int) (latencies.size() * 0.50));
+            long p95 = latencies.get((int) (latencies.size() * 0.95));
+            long p99 = latencies.get((int) (latencies.size() * 0.99));
+
+            // 记录到 Micrometer
+            Timer.Sample sample = Timer.start(meterRegistry);
+            sample.stop(Timer.builder("rerank.latency")
+                .tag("candidates", String.valueOf(candidateCount))
+                .register(meterRegistry));
+
+            log.info("Candidates={}: P50={}ms, P95={}ms, P99={}ms",
+                candidateCount, p50, p95, p99);
+        }
+    }
+}</code></pre></div>
+      <p>Rerank 延迟优化的三个方向：① 减少候选数（50 -> 20），牺牲 2.6% 召回率换取 220ms P99 优化；② 升级 GPU（T4 -> A10G），P99 延迟降低约 40%；③ 对高频查询做缓存——Top-100 热门查询的 Rerank 结果缓存 5 分钟，命中率约 30%。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring Boot 完整联调代码</h3>
+      <p>完整的 RAG 检索 Controller，整合双路检索 + Rerank + 流式输出：</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@RestController
+@RequestMapping("/api/v1/rag")
+public class RagController {
+
+    private final HybridSearchService hybridSearch;
+    private final RerankService rerankService;
+    private final ChatClient chatClient;
+
+    @PostMapping("/retrieve")
+    public ResponseEntity<RagResponse> retrieve(
+            @RequestBody RagRequest request) {
+        // 1. 双路检索
+        List<Document> hybridResults = hybridSearch.hybridSearch(
+            request.query(), 50);
+
+        // 2. Rerank 精排
+        List<Document> reranked = rerankService.rerank(
+            request.query(), hybridResults);
+
+        // 3. 构建响应（包含检索片段信息）
+        List<RetrievedChunk> chunks = reranked.stream()
+            .map(doc -> new RetrievedChunk(
+                doc.getId(),
+                doc.getText().substring(0,
+                    Math.min(200, doc.getText().length())),
+                (String) doc.getMetadata().get("source"),
+                (double) doc.getMetadata().getOrDefault("rerank_score", 0.0)
+            ))
+            .collect(Collectors.toList());
+
+        return ResponseEntity.ok(new RagResponse(chunks));
+    }
+
+    @PostMapping(value = "/ask/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<String>> askStream(@RequestBody RagRequest request) {
+        return chatClient.prompt()
+            .user(request.query())
+            .advisors(new QuestionAnswerAdvisor(hybridSearch, 5))
+            .stream()
+            .content()
+            .map(token -> ServerSentEvent.<String>builder()
+                .event("token").data(token).build())
+            .concatWithValues(
+                ServerSentEvent.<String>builder()
+                    .event("done").data("[DONE]").build());
+    }
+}
+
+record RagRequest(String query, @Nullable String sessionId) {}
+record RagResponse(List<RetrievedChunk> chunks) {}
+record RetrievedChunk(String id, String snippet, String source,
+                      double score) {}</code></pre></div>
+      <p><code>/api/v1/rag/retrieve</code> 用于调试和展示检索中间结果，<code>/api/v1/rag/ask/stream</code> 用于最终的问答流式接口。生产环境中可以暴露 retrieve 接口给调试工具而只向最终用户暴露 ask/stream 接口。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>双路检索需配置两个 VectorStore Bean（Milvus + ES），共用 Embedding 模型</li>
+        <li>RRF 权重消融实验：向量 0.7: 关键词 0.3 在 CorpAssist 实践中 Recall@5 最高（92.3%）</li>
+        <li>Rerank 50 条候选 P99 400ms，降为 20 条可降到 180ms（Recall 牺牲 2.6%）</li>
+        <li>Spring Boot 联调 Controller 提供 /retrieve（调试）和 /ask/stream（生产）两个接口</li>
+        <li>延迟优化方向：减候选数、升 GPU 型号、高频查询缓存</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-03-1"> 能配置双路 VectorStore Bean 和 HybridSearchService</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-2"> 能进行 RRF 权重消融实验并分析结果</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-3"> 能测量和解读 Rerank 延迟 P50/P95/P99</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-4"> 能编写完整的 Spring Boot 联调 Controller</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Ablation</strong></td><td>消融实验——逐一去除/调整组件以测量其贡献</td></tr>
+            <tr><td><strong>P50/P95/P99</strong></td><td>延迟百分位——50%/95%/99% 的请求在此值以下完成</td></tr>
+            <tr><td><strong>黄金评测集</strong></td><td>人工标注的标准问答对，用于自动化评估检索效果</td></tr>
+            <tr><td><strong>批次推理</strong></td><td>将多个 Rerank 请求合并为 batch 推理，提高 GPU 利用率</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: 权重消融实验的具体步骤是怎样的？</summary>
+        <p>步骤：① 准备黄金评测集（200 个查询，每个标注相关文档 ID）；② 选择 5-6 组权重组合（从纯向量到纯 BM25）；③ 对每组权重计算 Recall@K 和 NDCG@K；④ 分析结果选择最优组合。CorpAssist 结果：0.7:0.3 最优。企业知识库的查询分布决定——60% 语义型 + 40% 编号型，偏向量可覆盖多数查询。</p></details>
+        <details><summary>Q2: Rerank 延迟高怎么办？什么时候该放弃 Rerank 降级？</summary>
+        <p>优化顺序：① 减少候选数（50->20），P99 从 400ms 到 180ms；② 升级 GPU（T4->A10G），P99 再降 40%；③ 对热门查询做结果缓存（5 分钟 TTL，约 30% 命中率）。降级条件：当 Rerank 连续 3 次超时（>1s）时自动降级到 RRF 排序，降级期间记录指标；当恢复后自动切回。CorpAssist 政策：P99 > 1s 触发降级。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectorestores/milvus.html" target="_blank">Spring AI Milvus</a></li>
+      <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/knn-search.html" target="_blank">ES kNN Search</a></li>
+      <li><a href="https://huggingface.co/BAAI/bge-reranker-v2-m3" target="_blank">BGE-Reranker-v2-m3</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>启动本地 Milvus + ES Docker 实例</li>
+        <li>配置双路 VectorStore Bean 并注入 HybridSearchService</li>
+        <li>运行消融实验，计算 5 组权重组合的 Recall@5</li>
+        <li>部署 BGE-Reranker 并测量 20/50/100 候选时的 P50/P95/P99</li>
+        <li>实现 /api/v1/rag/retrieve 调试接口并验证返回片段</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：上线后发现双路检索比之前单路向量还慢（+200ms），但 Recall 只提升 3%。该怎么办？</summary>
+      <p>评估决策：如果 Recall 已经达到业务标准（如 >=90%），那就没必要为了 3% 提升增加 200ms 延迟。建议：① 将双路作为可选模式（通过配置开关控制），默认单路向量；② 对 Recall 敏感的场景（制度编号查询）走双路；③ 持续监控 Recall——如果后续掉到 90% 以下再切回双路。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/practice-03-lab/</p>
+      <ul class="demo-acceptance">
+        <li>双路检索 Spring Boot 服务正常启动</li>
+        <li>消融实验输出权重对比表</li>
+        <li>Rerank 延迟基准测试报告</li>
+        <li>/api/v1/rag/retrieve 返回 Top-5 片段</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-practice-04">幻觉抑制与答案治理</a></li>
+    </ul>
+  </div>
+</section>

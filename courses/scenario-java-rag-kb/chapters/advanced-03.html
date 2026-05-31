@@ -1,0 +1,210 @@
+<section id="ch-advanced-03" class="chapter" data-chapter="advanced-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：RAG 架构五连问（Java 视角）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>RAG 是 LLM 应用面试最高频的系统设计题。面试官关心的不是你背了多少概念，而是你有没有真实落地经验。本章从 Java 工程师的视角，用 CorpAssist 的真实数据回答 5 个必问题。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能用 Java 技术栈的落地数据回答 RAG 架构/分块/检索/RAG vs 微调/评估五类面试题；能展示 CorpAssist 的具体数据（Recall@5 / P99 延迟 / 成本）支撑你的回答。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>Q1 架构：三层架构 + 双路检索 + 蓝绿部署</li><li>Q2 分块：512/64 最优 + 表格/代码块保持完整性</li><li>Q3 检索不准：五步排查法 + 五种失败模式</li><li>Q4 RAG vs 微调：更新成本/幻觉可控/审计追溯</li><li>Q5 评估：Recall/NDCG/MRR + RAGAS faithfulness + 黄金评测集</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Q1: 架构怎么画</h3>
+      <p><strong>面试官问：请画一个企业 RAG 知识库的系统架构图，并说明你的设计思路。</strong></p>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist S1 架构总图</h5>
+        <pre class="mermaid">flowchart TB
+    subgraph access["接入层"]
+        GW[Spring Cloud Gateway]
+        BFF[corpassist-bff]
+    end
+    subgraph orchestration["编排层"]
+        ORCH[dialog-orchestrator]
+        RAGS[rag-service]
+    end
+    subgraph data["数据层"]
+        MILVUS[(Milvus)]
+        ES[(Elasticsearch)]
+        MONGO[(MongoDB 审计)]
+    end
+    subgraph ai["AI 服务"]
+        LLM[Chat API gpt-4o-mini]
+        EMB[Embedding API]
+        RERANK[BGE-Reranker]
+    end
+    USER[用户] -->|JWT| GW
+    GW --> BFF
+    BFF -->|REST/SSE| ORCH
+    ORCH --> RAGS
+    RAGS --> EMB
+    RAGS --> MILVUS
+    RAGS --> ES
+    RAGS --> RERANK
+    ORCH --> LLM
+    BFF --> MONGO</pre>
+      </div>
+      <p>面试回答框架（五步法）：</p>
+      <ol>
+        <li><strong>需求边界</strong>：企业内部制度问答场景，5000 用户，日均 400 次问答。文档以 PDF/Word 为主约 5000 份</li>
+        <li><strong>分层架构</strong>：接入层做鉴权和透传，编排层做 RAG 链路，数据层做存储。每层职责分离</li>
+        <li><strong>选型对比</strong>：VectorStore 选 Milvus + ES 双路（Recall@5 92.3%），Embedding 用 text-embedding-3-small</li>
+        <li><strong>关键指标</strong>：Recall@5 >= 90%，P99 <= 2s，单次成本约 ¥0.18</li>
+        <li><strong>权衡局限</strong>：多跳推理用 RAG 效果差，正在结合 Agent 方案</li>
+      </ol>
+    </div>
+
+    <div class="section-block">
+      <h3>Q2: 分块怎么选</h3>
+      <p><strong>面试官问：你的知识库分块参数怎么确定的？为什么这样选？</strong></p>
+      <p>回答结构：</p>
+      <ol>
+        <li><strong>初始选择</strong>：chunk-size 512 + chunk-overlap 64，基于 Spring AI TokenTextSplitter 的 tiktoken 计算</li>
+        <li><strong>实验验证</strong>：在 CorpAssist 的 846 页 HR 制度文档上做消融实验，对比 5 组参数（256/512/768/1024）。<strong>512 在 Recall@5(92.3%) 和回答完整性(4.5/5)上均为最优</strong></li>
+        <li><strong>特殊处理</strong>：表格和代码块保持完整性——表格问答准确率 +34%，技术文档问答 +28%</li>
+        <li><strong>元数据标记</strong>：通过 MetadataEnricher 自动标记 content_type/security_level/policy_code，检索时用 FilterExpression 精确过滤</li>
+        <li><strong>配置化</strong>：分块参数通过配置中心管理，不硬编码，支持运行时调优</li>
+      </ol>
+      <p>加分项：提及「分块参数需要根据文档类型调整——操作手册类可以稍大（768），制度类 512 最优」。这展示了你的实际落地经验。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Q3: 检索不准</h3>
+      <p><strong>面试官问：用户反馈知识库回答不准，你的排查思路是什么？</strong></p>
+      <p>回答使用「五步排查法」：</p>
+      <table class="outline-table">
+        <thead><tr><th>步骤</th><th>具体操作</th><th>工具</th></tr></thead>
+        <tbody>
+          <tr><td>① 查检索日志</td><td>查看该查询实际召回了哪些文档、RRF 分数、Rerank 分数</td><td>检索日志 / Elasticsearch</td></tr>
+          <tr><td>② 查分块</td><td>检查召回片段是否被切碎，边界处是否语义完整</td><td>chunk 查看器</td></tr>
+          <tr><td>③ 查元数据</td><td>FilterExpression 是否误过滤了有效文档</td><td>FilterExpression 调试</td></tr>
+          <tr><td>④ 查模型</td><td>单独对查询做 Embedding 和相似度对比</td><td>Python 脚本验证</td></tr>
+          <tr><td>⑤ 做回归</td><td>将查询加入黄金评测集，运行回归测试验证修复</td><td>Testcontainers + JUnit</td></tr>
+        </tbody>
+      </table>
+      <p>典型根因举例：「HR-2024-001」查询不准 -> 排查发现 BM25 权重 0.3 太低，编号类查询向量化后精度丢失。调整权重到 0.5:0.5 后解决。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Q4: RAG vs 微调</h3>
+      <p><strong>面试官问：知识库为什么用 RAG 而不是微调？什么场景该用微调？</strong></p>
+      <p>回答框架：</p>
+      <table class="outline-table">
+        <thead><tr><th>维度</th><th>RAG</th><th>微调</th></tr></thead>
+        <tbody>
+          <tr><td><strong>知识更新</strong></td><td>改文档后重新索引，分钟级生效</td><td>需要标注->训练->评估->部署，以周计</td></tr>
+          <tr><td><strong>幻觉可控</strong></td><td>强制引用原文片段，引用准确率 97.3%</td><td>模型可能「记住」了但无法追溯来源</td></tr>
+          <tr><td><strong>审计追溯</strong></td><td>每个回答附带 citations 列表，逐条可追溯</td><td>无法追溯</td></tr>
+          <tr><td><strong>适用场景</strong></td><td>知识频繁变化/内容多的制度问答</td><td>格式固定/术语专有的场景（如合同模板生成）</td></tr>
+          <tr><td><strong>成本</strong></td><td>每次问答消耗 Token（约 ¥0.18）</td><td>一次性训练成本（数千元）+ 推理成本</td></tr>
+        </tbody>
+      </table>
+      <p>结论：CorpAssist 的<strong>制度问答优先 RAG</strong>。微调仅在两种场景考虑：① 需要固定输出格式（如合同条款必须按固定模板输出）；② 需要理解深度行业术语（如法律文本解析）。实际落地中，80% 的场景用 RAG，20% 用 RAG + 微调增强。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Q5: 评估指标</h3>
+      <p><strong>面试官问：你怎么评估 RAG 系统的好坏？线上用什么指标监控？</strong></p>
+      <p>评估分三层：</p>
+      <p><strong>1. 检索层（自动化）</strong></p>
+      <ul>
+        <li><strong>Recall@5</strong>：目标 >= 90%，黄金评测集周运行</li>
+        <li><strong>NDCG@5</strong>：目标 >= 0.88，考虑排序位置的质量</li>
+        <li><strong>MRR</strong>：目标 >= 0.85，第一个相关结果的排名</li>
+      </ul>
+      <p><strong>2. 生成层（自动化 + RAGAS）</strong></p>
+      <ul>
+        <li><strong>Faithfulness（忠实度）</strong>：回答是否基于检索内容，RAGAS 评分目标 >= 0.85</li>
+        <li><strong>引用覆盖率</strong>：有引用支持的句子比例 >= 95%</li>
+        <li><strong>拒答准确率</strong>：该拒答时正确拒答 >= 98%</li>
+      </ul>
+      <p><strong>3. 体验层（人工）</strong></p>
+      <ul>
+        <li><strong>CSAT</strong>：用户满意度评分，目标 >= 4.5/5.0</li>
+        <li><strong>人工抽检</strong>：每周随机抽检 100 条回答，标注正确/部分正确/错误</li>
+        <li><strong>坏例库</strong>：积累的 Bad Case 驱动持续优化</li>
+      </ul>
+      <p>面试加分：提到「我们建立了从评估 -> 发现 Bad Case -> 归因 -> 修复 -> 回归的闭环流程，每周迭代一次。坏例库从最初的 200 条降到 30 条。」</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Q1 架构：三层 + 双路 + 蓝绿，用五步法回答</li>
+        <li>Q2 分块：512/64 最优，消融实验验证，表格/代码块特殊处理</li>
+        <li>Q3 检索不准：五步排查法，五种失败模式</li>
+        <li>Q4 RAG vs 微调：80% RAG + 20% RAG+微调增强</li>
+        <li>Q5 评估：三层指标体系（检索/生成/体验）+ 闭环迭代流程</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="advanced-03-1"> 能用五步法回答架构设计题</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-2"> 能用实验数据支撑分块参数选择</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-3"> 能用五步排查法回答检索不准</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-4"> 能说清 RAG vs 微调的适用边界</label></li>
+          <li><label><input type="checkbox" data-check-id="advanced-03-5"> 能给出三层评估指标体系</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Recall@K</strong></td><td>K 条结果中相关文档的比例</td></tr>
+            <tr><td><strong>NDCG</strong></td><td>考虑排序位置的加权召回质量</td></tr>
+            <tr><td><strong>Faithfulness</strong></td><td>回答忠实于检索内容的程度</td></tr>
+            <tr><td><strong>RAGAS</strong></td><td>Python RAG 评测框架</td></tr>
+            <tr><td><strong>CSAT</strong></td><td>用户满意度评分</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问（附加题）</h4>
+        <details><summary>Q6: 你们做 RAG 过程中踩过最大的坑是什么？</summary>
+        <p>最大的坑是<strong>脏文档</strong>。上线第三周，一个 500MB 的扫描件 PDF 导致 DocumentReader OOM，整个索引 Pipeline 阻塞了 2 小时。之前完全没想到企业文档质量能这么差。之后的改进：① 前置校验（文件大小/页数限制）；② 扫描件 OCR 预处理；③ Pipeline 设置 skip-on-error + DLQ 机制；④ 文档上传时做格式检查和用户提示。这件事教会我们：企业级系统的稳定性取决于最薄弱的那个环节。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 官方文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>用五步法写下 Q1 的完整面试回答</li>
+        <li>用 CorpAssist 数据填写 Q2-Q5 的回答草稿</li>
+        <li>与同事做模拟面试，互相问这 5 个问题</li>
+        <li>录下自己的回答，检查是否有模糊/不确定的地方</li>
+      </ol>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/advanced-03-lab/</p>
+      <ul class="demo-acceptance">
+        <li>Q1-Q5 回答草稿完成</li>
+        <li>模拟面试完成</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="../scenario-java-customer-service/chapters/basics-01.html">智能客服场景与 KPI（下一课程）</a></li>
+    </ul>
+  </div>
+</section>

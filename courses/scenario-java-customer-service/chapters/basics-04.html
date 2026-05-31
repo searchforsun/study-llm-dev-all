@@ -1,0 +1,191 @@
+<section id="ch-basics-04" class="chapter" data-chapter="basics-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>政策话术与合规</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服的回答必须符合公司政策——不能说错话、不能承诺做不到的事。政策话术统一管理和输出合规审核是企业客服系统的核心要求。任何不符合政策的回答都可能带来法律风险。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring AI 的检索增强实现政策库问答；能实现话术模板统一管理；能配置 Advisor 链实现输出内容安全审核；能实现敏感场景的自动识别与升级。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>政策库 RAG 通过 Spring AI VectorStore 检索最新政策文档</li><li>话术模板用 MessageTemplate 管理，确保口径一致</li><li>Advisor 链实现输出合规审核（敏感词/政策冲突/承诺限制）</li><li>敏感场景（投诉/索赔/法律）自动识别并转人工</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>政策库 RAG：Spring AI 检索增强</h3>
+      <p>客服场景的政策问答与 S1 知识库共享同一套检索基础设施，但需要额外的「版本锁」确保回答基于最新政策。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class PolicyRagService {
+
+    private final VectorStore vectorStore;
+    private final ChatClient chatClient;
+
+    public Answer answerWithPolicy(String query, String department) {
+        // 1. 检索最新政策（按版本过滤）
+        SearchRequest request = SearchRequest.builder()
+            .query(query)
+            .topK(3)
+            .filterExpression(FilterExpression.builder()
+                .eq("department", department)
+                .eq("status", "active")     // 只查生效政策
+                .eq("policy_type", "customer_service")
+                .build())
+            .build();
+
+        List<Document> policies = vectorStore.search(request);
+
+        // 2. 如果没有相关政策，明确告知
+        if (policies.isEmpty()) {
+            return new Answer("抱歉，当前知识库中没有找到相关的政策信息。请转接人工坐席获取帮助。",
+                List.of(), false);
+        }
+
+        // 3. 回答并强制引用政策原文
+        return chatClient.prompt()
+            .system("你是一个客服政策助手。请基于提供的政策文档回答。" +
+                "每次引述政策时必须标注政策编号和生效版本。")
+            .user(query)
+            .call()
+            .entity(Answer.class);
+    }
+}</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>话术模板与 MessageTemplate</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Component
+public class ScriptTemplateManager {
+
+    private final Map<String, MessageTemplate> templates = new HashMap<>();
+
+    @PostConstruct
+    public void init() {
+        // 退货话术 - 必须与政策严格一致
+        templates.put("return_policy", MessageTemplate.builder()
+            .name("return_policy")
+            .template("""
+                根据《退换货政策》(v{version})：
+                1. 商品签收后 {returnDays} 天内可申请无理由退货
+                2. 退货商品需保持原包装完好
+                3. 运费承担：{shippingRule}
+
+                请问您需要我为您创建退货申请吗？
+                """)
+            .build());
+
+        // 道歉话术
+        templates.put("apology", MessageTemplate.builder()
+            .name("apology")
+            .template("很抱歉给您带来不便。{reason}。我们会尽快为您处理。")
+            .build());
+    }
+
+    public String render(String templateName, Map<String, Object> params) {
+        MessageTemplate template = templates.get(templateName);
+        if (template == null) {
+            throw new IllegalArgumentException("Template not found: " + templateName);
+        }
+        return template.render(params);
+    }
+}</code></pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>输出内容安全审核（Advisor 链）</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Component
+public class ComplianceAdvisor implements Advisor {
+
+    // 禁止承诺词列表
+    private static final List<String> FORBIDDEN_PROMISES = List.of(
+        "一定退款", "保证赔偿", "100% 解决", "24小时内解决",
+        "全额赔付", "免费升级", "无条件"
+    );
+
+    // 需要转人工的关键词
+    private static final List<String> SENSITIVE_KEYWORDS = List.of(
+        "投诉", "律师", "起诉", "媒体", "曝光", "315", "工商"
+    );
+
+    @Override
+    public AdvisedResponse aroundCall(AdvisedRequest request) {
+        AdvisedResponse response = request.next().aroundCall(request);
+
+        String content = response.getResponse();
+        List<String> violations = new ArrayList<>();
+
+        // 检查禁止承诺
+        for (String word : FORBIDDEN_PROMISES) {
+            if (content.contains(word)) {
+                violations.add("包含禁止承诺词: " + word);
+            }
+        }
+
+        // 检查与政策的冲突
+        if (hasPolicyConflict(content)) {
+            violations.add("回答可能与最新政策冲突，请人工复核");
+        }
+
+        if (!violations.isEmpty()) {
+            response.getAttributes().put("compliance_violations", violations);
+            response.getAttributes().put("needs_review", true);
+        }
+
+        return response;
+    }
+}</code></pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>政策库 RAG 通过 FilterExpression(eq status=active)确保回答基于最新政策</li>
+        <li>话术模板统一管理退货/退款/道歉等场景，确保口径一致</li>
+        <li>ComplianceAdvisor 检查禁止承诺词和政策冲突，标记待审核</li>
+        <li>敏感关键词自动触发转人工（投诉/律师/媒体）</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="cs-basics-04-1"> 能配置政策库 RAG 检索最新政策</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-basics-04-2"> 能实现话术模板管理</label></li>
+          <li><label><input type="checkbox" data-check-id="cs-basics-04-3"> 能实现 ComplianceAdvisor 合规审核</label></li>
+        </ul>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: 政策版本切换时正在进行的对话怎么处理？</summary>
+        <p>不中断当前对话——已经开始的会话继续使用旧版本回答。新开会话使用新版本。政策版本切换后，旧索引保留 72 小时后删除。系统监听政策变更事件，生成通知提示坐席组。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank">Spring AI</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>实现 PolicyRagService 检索最新政策</li>
+        <li>配置 5 个话术模板并测试渲染</li>
+        <li>实现 ComplianceAdvisor 检查禁止承诺词</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-practice-01">意图识别与路由</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,378 @@
+<section id="ch-practice-02" class="chapter" data-chapter="practice-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Spring AI 问答编排</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>问答编排是 RAG 系统的「大脑」——它把检索结果、Prompt 模板、LLM 调用串联成完整的问答链路。Spring AI 的 ChatClient 和 QuestionAnswerAdvisor 提供了标准化的编排能力，但需要正确配置才能保证回答质量、引用溯源和流式输出。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>能使用 Spring AI ChatClient 和 QuestionAnswerAdvisor 构建完整的问答服务；能实现引用溯源让回答可审计；能实现 SSE 流式输出的 Controller；能配置 Advisor 链实现检索增强和内容过滤。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><ul><li>QuestionAnswerAdvisor 是检索增强的核心 Advisor，自动注入检索片段到 Prompt</li><li>ChatClient 提供流式（Stream）和非流式（Call）两种调用模式</li><li>引用溯源通过 Document 的 metadata 中的 chunk_id/source/page 字段实现</li><li>Advisor 链支持按顺序组装多个 Advisor（检索 -> 内容审查 -> 格式控制）</li></ul></div>
+    </div>
+
+    <div class="section-block">
+      <h3>QuestionAnswerAdvisor 链路配置</h3>
+      <p>Spring AI 的 <code>QuestionAnswerAdvisor</code> 是 RAG 编排的核心组件。它在调用 LLM 之前自动将检索结果注入到 Prompt 的上下文中，并约束 LLM 基于检索内容回答。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class RagQuestionService {
+
+    private final ChatClient chatClient;
+    private final VectorStore vectorStore;
+
+    public RagQuestionService(ChatClient.Builder chatClientBuilder,
+                               VectorStore vectorStore) {
+        // 创建 Advisor 链
+        var advisorChain = new DelegatingAdvisorChain(
+            List.of(
+                // 1. 检索增强 Advisor - 核心
+                new QuestionAnswerAdvisor(vectorStore,
+                    SearchRequest.builder()
+                        .topK(5)
+                        .similarityThreshold(0.5)
+                        .build()),
+                // 2. 引用溯源 Advisor - 确保回答带引用
+                new CitationGuardAdvisor(),
+                // 3. 安全检查 Advisor - 内容过滤
+                new SafeOutputAdvisor()
+            )
+        );
+
+        this.chatClient = chatClientBuilder
+            .defaultAdvisors(advisorChain)
+            .build();
+        this.vectorStore = vectorStore;
+    }
+
+    public Answer answer(String question) {
+        return chatClient.prompt()
+            .user(question)
+            .call()
+            .entity(Answer.class);
+    }
+
+    public Flux<String> streamAnswer(String question) {
+        return chatClient.prompt()
+            .user(question)
+            .stream()
+            .content();
+    }
+}</code></pre></div>
+      <p>QuestionAnswerAdvisor 的工作流程：</p>
+      <ol>
+        <li>拦截用户请求，提取 query</li>
+        <li>调用 VectorStore.search() 检索相关片段</li>
+        <li>将检索片段格式化为 <code>&lt;context&gt;...&lt;/context&gt;</code> 注入到 System Prompt</li>
+        <li>LLM 根据上下文 + 用户问题生成回答</li>
+        <li>在响应中携带检索片段的 metadata（source / page / chunk_id）</li>
+      </ol>
+      <div class="mermaid-wrap">
+        <h5>Advisor 链处理流程</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant USER as 用户
+    participant BFF as BFF
+    participant CC as ChatClient
+    participant QA as QuestionAnswerAdvisor
+    participant VS as VectorStore
+    participant LLM as LLM
+    participant CIT as CitationGuard
+
+    USER->>BFF: 问题："产假几天？"
+    BFF->>CC: ChatClient.prompt()
+    CC->>QA: 拦截请求
+    QA->>VS: search(query)
+    VS-->>QA: Top-5 片段 + metadata
+    QA->>QA: 注入上下文到 System Prompt
+    QA->>CIT: 传递给下一 Advisor
+    CIT->>CIT: 注入引用约束指令
+    CIT->>LLM: System + User 消息
+    LLM-->>CIT: 流式 Token
+    CIT-->>CC: Token + 引用 metadata
+    CC-->>BFF: SSE 流式输出
+    BFF-->>USER: 回答 + 引用链接</pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>VectorStore 检索 -> Prompt 模板 -> ChatClient 调用</h3>
+      <p>除了使用 QuestionAnswerAdvisor 的自动化方式，也可以手动控制检索和 Prompt 组装，适合需要精细控制 Prompt 内容的场景。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Service
+public class ManualRagService {
+
+    private final VectorStore vectorStore;
+    private final ChatClient chatClient;
+
+    // 手动定义的 RAG Prompt 模板
+    private static final String RAG_PROMPT_TEMPLATE = """
+        你是一个企业知识库问答助手。请基于以下检索到的文档片段，准确回答用户的问题。
+        如果检索到的片段不足以回答问题，请明确说明"当前知识库中没有足够的信息"。
+
+        ## 检索到的文档片段
+        {context}
+
+        ## 回答要求
+        1. 只基于提供的文档片段回答，不要编造信息
+        2. 在回答中引用文档来源（格式：[来源: {source}, 第{page}页]）
+        3. 如果多个片段有冲突，指出冲突并说明哪个是更新版本
+        4. 用中文回答，保持专业和简洁
+
+        ## 用户问题
+        {question}
+        """;
+
+    public Answer answer(String question) {
+        // 1. 检索
+        List<Document> docs = vectorStore.search(
+            SearchRequest.builder()
+                .query(question)
+                .topK(5)
+                .build()
+        );
+
+        // 2. 构建上下文
+        String context = buildContext(docs);
+
+        // 3. 填充 Prompt 模板
+        PromptTemplate template = new PromptTemplate(RAG_PROMPT_TEMPLATE);
+        Message systemMessage = template.createMessage(
+            Map.of("context", context, "question", question));
+
+        // 4. 调用 LLM
+        return chatClient.prompt()
+            .messages(systemMessage)
+            .user(question)
+            .call()
+            .entity(Answer.class);
+    }
+
+    private String buildContext(List<Document> docs) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < docs.size(); i++) {
+            Document doc = docs.get(i);
+            sb.append("--- 片段 ").append(i + 1).append(" ---\n");
+            sb.append("来源: ").append(doc.getMetadata().get("source")).append("\n");
+            sb.append("版本: ").append(doc.getMetadata().get("version")).append("\n");
+            sb.append("内容: ").append(doc.getText()).append("\n\n");
+        }
+        return sb.toString();
+    }
+}</code></pre></div>
+      <p>手动编排的适用场景：当 QuestionAnswerAdvisor 默认的 Prompt 格式无法满足业务需求时（例如需要自定义引用格式、需要多片段冲突检测、需要特定输出格式约束）。CorpAssist 实践中有 70% 的场景使用 QuestionAnswerAdvisor 自动化编排，30% 的场景需要手动控制。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>引用溯源：让回答可审计</h3>
+      <p>企业知识库的每个回答必须能追溯到原文——这是合规审计的基本要求。引用溯源通过 Document 的 metadata 实现。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@Component
+public class CitationGuardAdvisor implements Advisor {
+
+    @Override
+    public AdvisedResponse aroundCall(AdvisedRequest request) {
+        // 在 System Prompt 末尾添加引用约束
+        String systemText = request.systemText() + """
+
+            重要约束 - 引用溯源：
+            - 你必须在回答中引用每个关键信息的来源文档
+            - 引用格式：[来源: {filename}, 版本 {version}, 第{page}页]
+            - 如果信息不在提供的文档中，必须说明"当前知识库未覆盖此内容"
+            - 不要编造引用来源
+            """;
+
+        AdvisedRequest modified = AdvisedRequest.builder()
+            .from(request)
+            .systemText(systemText)
+            .build();
+
+        // 调用下一 Advisor 或 LLM
+        AdvisedResponse response = request.next().aroundCall(modified);
+
+        // 将检索片段的引用信息附加到响应中
+        List<Document> contexts = (List<Document>) modified.getAttributes()
+            .get(QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS);
+        if (contexts != null) {
+            List<Citation> citations = contexts.stream()
+                .map(doc -> new Citation(
+                    (String) doc.getMetadata().get("source"),
+                    (String) doc.getMetadata().get("version"),
+                    (String) doc.getMetadata().get("page", "N/A"),
+                    doc.getText().substring(0,
+                        Math.min(200, doc.getText().length()))
+                ))
+                .collect(Collectors.toList());
+            response.getAttributes().put("citations", citations);
+        }
+
+        return response;
+    }
+}
+
+// 引用数据传输对象
+record Citation(String source, String version, String page,
+                String snippet) {}
+
+record Answer(String content, List<Citation> citations) {}</code></pre></div>
+      <p>在前端展示时，Citation 列表渲染为可点击的引用链接。用户点击后可跳转到原文的对应页面（通过 source + page 定位）。审计日志中记录每次问答的 Answer.citations 字段，确保每句话可追溯。</p>
+      <p>CorpAssist 实践中的引用溯源准确率：QA 验证表明，配合引用约束 Prompt 和 CitationGuardAdvisor，引用准确率可达 97.3%（即 97.3% 的回答中所有引用都可以在检索片段中找到对应源文本）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>SSE 流式输出的 Controller 实现</h3>
+      <p>知识库问答必须支持流式输出（SSE）——用户不需要等待完整回答生成完毕，可以边生成边阅读，体验大幅提升。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">@RestController
+@RequestMapping("/api/v1/kb")
+public class KbController {
+
+    private final RagQuestionService ragService;
+    private final AuditService auditService;
+
+    public KbController(RagQuestionService ragService,
+                         AuditService auditService) {
+        this.ragService = ragService;
+        this.auditService = auditService;
+    }
+
+    // 非流式接口 - 适合简单测试
+    @PostMapping("/ask")
+    public ResponseEntity<Answer> ask(
+            @RequestBody @Valid QuestionRequest request,
+            @AuthenticationPrincipal UserPrincipal user) {
+        Answer answer = ragService.answer(request.question());
+        auditService.log(user, request.question(), answer);
+        return ResponseEntity.ok(answer);
+    }
+
+    // 流式接口 - 生产环境使用
+    @PostMapping(value = "/ask/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<String>> streamAsk(
+            @RequestBody @Valid QuestionRequest request,
+            @AuthenticationPrincipal UserPrincipal user) {
+
+        return ragService.streamAnswer(request.question())
+            .map(content -> ServerSentEvent.<String>builder()
+                .event("token")
+                .data(content)
+                .build())
+            .concatWithValues(
+                ServerSentEvent.<String>builder()
+                    .event("done")
+                    .data("[DONE]")
+                    .build()
+            )
+            .doOnComplete(() ->
+                auditService.logAsync(user, request.question(), null));
+    }
+}
+
+// 请求/响应 DTO
+record QuestionRequest(@NotBlank String question,
+                       @Nullable String sessionId) {}
+
+record QuestionResponse(String question, String answer,
+                        List<Citation> citations) {}</code></pre></div>
+      <p>流式接口的注意事项：</p>
+      <ul>
+        <li><strong>超时配置</strong>：SSE 长连接需要配置合理的超时时间（Spring Boot 默认 30s，建议设为 60s）</li>
+        <li><strong>跨域处理</strong>：前端 SSE 客户端（EventSource API）不支持自定义 Header，需用 GET + query param 或 iframe fallback</li>
+        <li><strong>背压控制</strong>：LLM 生成速度远快于网络传输，Reactor 框架自动处理背压</li>
+        <li><strong>审计延迟</strong>：流式输出无法在响应中直接携带 citations，审计在 doOnComplete 中异步执行</li>
+      </ul>
+      <p>流式接口的前端调用示例：<code>fetch('/api/v1/kb/ask/stream', {method:'POST', body:JSON.stringify({question:'产假几天'})})</code> 后通过 ReadableStream 读取 SSE 事件。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>QuestionAnswerAdvisor 是检索增强的核心 Advisor，自动注入检索片段到 Prompt，降低 RAG 编排代码量约 60%</li>
+        <li>ChatClient 支持流式（Flux）和非流式（Call）两种调用模式，生产推荐流式 SSE</li>
+        <li>引用溯源通过 CitationGuardAdvisor 实现，引用准确率可达 97.3%（QA 验证）</li>
+        <li>Advisor 链支持顺序组装多个 Advisor（检索 -> 引用 -> 安全），职责清晰且可扩展</li>
+        <li>手动 Prompt 编排适合 30% 需要精细控制的场景（自定义引用格式 / 冲突检测）</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-02-1"> 能配置 QuestionAnswerAdvisor 并理解其内部工作机制</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-2"> 能使用 ChatClient 实现流式和非流式两种问答模式</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-3"> 能实现引用溯源功能并验证引用准确率</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-4"> 能编写 SSE 流式输出的 Controller 并配置超时和跨域</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-5"> 能组装 Advisor 链并理解各 Advisor 的职责顺序</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td><strong>ChatClient</strong></td><td>Spring AI 的 LLM 调用入口，支持同步和流式</td></tr>
+            <tr><td><strong>QuestionAnswerAdvisor</strong></td><td>检索增强 Advisor，自动注入检索片段到 System Prompt</td></tr>
+            <tr><td><strong>Advisor 链</strong></td><td>按顺序组装多个 Advisor，每个处理特定的横切关注点</td></tr>
+            <tr><td><strong>SSE</strong></td><td>Server-Sent Events，单向流式传输协议，适合 LLM 流式输出</td></tr>
+            <tr><td><strong>引用溯源</strong></td><td>每个回答附带原文片段链接，确保回答可审计可追溯</td></tr>
+            <tr><td><strong>PromptTemplate</strong></td><td>Spring AI 的 Prompt 模板，支持变量替换和格式化</td></tr>
+            <tr><td><strong>Flux</strong></td><td>Reactor 框架的响应式流，用于 SSE 输出</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Q1: QuestionAnswerAdvisor 的原理是什么？怎么保证它只注入相关片段而不是全部检索结果？</summary>
+        <p>QuestionAnswerAdvisor 的工作原理：① 实现 Advisor 接口的 aroundCall 方法；② 在调用 LLM 前拦截请求，提取 query；③ 调用 VectorStore.search(query, topK, similarityThreshold) 检索；④ 将检索结果格式化为 <code>&lt;context&gt;...&lt;/context&gt;</code> 追加到 System Prompt；⑤ 将检索片段通过 attributes 传递到响应侧。相关性通过 similarityThreshold（CorpAssist 推荐 0.5）和 topK（5）两个参数控制——低于阈值的片段不会被注入，避免噪声。</p></details>
+        <details><summary>Q2: 引用溯源怎么确保 LLM 真的基于检索内容回答而不编造引用？</summary>
+        <p>三层保证：① <strong>Prompt 约束</strong>——在 System Prompt 中明确要求「只基于提供的文档片段回答」「不编造引用来源」；② <strong>CitationGuardAdvisor</strong>——在响应后检查 answer.citations 中的 source/page 是否能对应到检索片段的 metadata，不匹配的标记为「未验证」；③ <strong>离线评测</strong>——定期用黄金评测集验证引用准确率，低于 95% 触发告警。CorpAssist 实践中三层结合的引用准确率为 97.3%。</p></details>
+        <details><summary>Q3: SSE 流式输出的超时怎么配置？流式连接断了怎么处理？</summary>
+        <p>配置：① Spring Boot application.yml 中设置 <code>spring.webflux.base-path</code> 和 <code>spring.codec.max-in-memory-size</code>；② 网关层配置 <code>spring.cloud.gateway.routes[0].filters[0].name=RequestRateLimiter</code> 限制并发流式连接数。断连处理：① LLM 侧无需处理——Reactor Flux 自动在连接断开时取消上游；② 客户端需要实现断线重连——指数退避（1s, 2s, 4s, 8s）最多重试 5 次；③ 记录断连事件到监控——帮助判断是客户端网络问题还是服务端超时。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient 文档</a> — 流式/非流式调用 API</li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisor 文档</a> — QuestionAnswerAdvisor 配置</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events" target="_blank" rel="noopener">MDN SSE 文档</a> — 前端 EventSource API 用法</li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate">
+      <h4>操作步骤</h4>
+      <ol>
+        <li>配置 ChatClient.Builder，注入 QuestionAnswerAdvisor（topK=5, threshold=0.5）</li>
+        <li>实现 CitationGuardAdvisor，在响应中携带 citations 列表</li>
+        <li>编写 Controller 实现流式 SSE 接口（/api/v1/kb/ask/stream）</li>
+        <li>用 curl 测试流式接口：<code>curl -N -X POST http://localhost:8080/api/v1/kb/ask/stream -d '{"question":"产假几天"}' -H "Content-Type:application/json"</code></li>
+        <li>验证响应中包含正确的 citation 列表和引用链接</li>
+      </ol>
+    </div>
+    <div class="steps-judgment-list">
+      <h4>判断练习</h4>
+      <details><summary>场景：有同事提议「不用 Advisor 链，直接在 Controller 里手动调 VectorStore 再调 LLM，更简单」。你同意吗？</summary>
+      <p>不推荐。Advisor 链的三个优势：① <strong>职责分离</strong>——每个 Advisor 只处理一个横切关注点（检索/引用/安全），可以独立测试和替换；② <strong>可组合性</strong>——可以灵活增删 Advisor（例如新加一个 PII 脱敏 Advisor），不需要改 Controller 代码；③ <strong>统一拦截</strong>——ChatClient 的 Advisor 链在所有调用中生效，不会遗漏。手动在 Controller 里编排，上述能力都需要自己实现。</p></details>
+      <details><summary>场景：线上发现某些回答没有引用来源（citation 为空），可能是什么原因？怎么修？</summary>
+      <p>原因分析：① 检索结果为空（VectorStore 未命中任何文档）——检查索引是否正常、FilterExpression 是否过严；② QuestionAnswerAdvisor 的 similarityThreshold 过高（如 0.9）——所有片段都被过滤；③ CitationGuardAdvisor 代码逻辑有 Bug——attributes 中未正确传递检索片段。排查：先看检索日志确认是否有检索结果；再看 Advisor 链配置确认阈值是否合理；最后看 CitationGuardAdvisor 的 attributes 读取逻辑。修复：降阈值 / 修 Bug。</p></details>
+    </div>
+    <div class="demo-box">
+      <h4>配套实验室</h4>
+      <p>见 demos/practice-02-lab/</p>
+      <ul class="demo-acceptance">
+        <li>ChatClient 配置通过启动验证</li>
+        <li>流式 SSE 接口返回连续 Token</li>
+        <li>响应中包含正确的 citations 引用列表</li>
+        <li>引用准确率 >= 90%（测试集验证）</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>Next: <a href="#ch-practice-03">混合检索+Rerank 联调</a></li>
+    </ul>
+  </div>
+</section>
