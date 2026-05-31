@@ -1,0 +1,356 @@
+<section id="ch-practice-03" class="chapter" data-chapter="practice-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多 Agent 协作（SAA）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>单个 Agent 的能力有限，复杂的办公任务需要多个专业 Agent 协作完成。Spring AI Alibaba 提供了三种多 Agent 协作模式：Sequential（流水线）、Parallel（并行处理）、Routing（按需路由）。理解这些模式是构建企业级 Agent 系统的核心能力。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 Sequential/Parallel/Routing 三种多 Agent 协作模式；使用 Nacos 事件作为 Agent 间的消息总线；实现 Agent Handoff 交接；设计冲突检测和解决方案。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) Sequential Agent：上一个 Agent 的输出是下一个 Agent 的输入，适合流水线处理；2) Parallel Agent：多个 Agent 独立处理不同维度，最后汇总；3) Routing Agent：根据任务类型路由到不同的专业 Agent；4) Handoff 交接通过共享的 Context 对象实现，包含状态和会话历史；5) 冲突检测使用向量相似度对比和规则引擎两种方式。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Sequential/Parallel/Routing Agent</h3>
+      <p>Spring AI Alibaba 提供了三种多 Agent 协作模式，每种对应不同的业务场景和编排方式。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    subgraph Sequential
+        A1[用户输入] --> SA1[Agent A<br/>信息收集] --> SA2[Agent B<br/>分析处理] --> SA3[Agent C<br/>输出生成]
+    end
+    subgraph Parallel
+        A2[用户输入] --> FA[任务分派]
+        FA --> PA1[Agent A<br/>查日程]
+        FA --> PA2[Agent B<br/>查工单]
+        FA --> PA3[Agent C<br/>查邮件]
+        PA1 --> AG[汇总 Agent]
+        PA2 --> AG
+        PA3 --> AG
+    end
+    subgraph Routing
+        A3[用户输入] --> RA[路由 Agent<br/>分类]
+        RA -->|工单类| R1[工单 Agent]
+        RA -->|日程类| R2[日程 Agent]
+        RA -->|邮件类| R3[邮件 Agent]
+    end
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 多 Agent 协作框架
+@Component
+public class MultiAgentOrchestrator {
+
+    @Autowired
+    private List&lt;SpecializedAgent&gt; agents;
+
+    /**
+     * Sequential 模式
+     */
+    public String executeSequential(String input, List&lt;String&gt; agentIds) {
+        String context = input;
+        for (String id : agentIds) {
+            SpecializedAgent agent = findAgent(id);
+            context = agent.process(context);
+        }
+        return context;
+    }
+
+    /**
+     * Parallel 模式
+     */
+    public String executeParallel(String input, List&lt;String&gt; agentIds) {
+        Map&lt;String, CompletableFuture&lt;String&gt;&gt; futures = new HashMap&lt;&gt;();
+        for (String id : agentIds) {
+            SpecializedAgent agent = findAgent(id);
+            futures.put(id, CompletableFuture.supplyAsync(
+                () -&gt; agent.process(input)));
+        }
+        // 等待所有 Agent 完成
+        StringBuilder result = new StringBuilder();
+        futures.forEach((id, future) -&gt; {
+            try {
+                result.append("【").append(id).append("】")
+                    .append(future.get()).append("\n");
+            } catch (Exception e) {
+                result.append("【").append(id).append("】失败: ")
+                    .append(e.getMessage()).append("\n");
+            }
+        });
+        return result.toString();
+    }
+
+    /**
+     * Routing 模式
+     */
+    public String executeRouting(String input) {
+        // 路由 Agent 根据输入决定交给哪个 Agent
+        String routingDecision = routingAgent.analyze(input);
+        SpecializedAgent target = findAgent(routingDecision);
+        return target.process(input);
+    }
+
+    private SpecializedAgent findAgent(String id) {
+        return agents.stream()
+            .filter(a -&gt; a.getAgentId().equals(id))
+            .findFirst()
+            .orElseThrow(() -&gt; new IllegalArgumentException("Agent not found: " + id));
+    }
+}</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>消息总线（Nacos 事件）</h3>
+      <p>在多 Agent 系统中，Agent 间需要异步通信。CorpAssist 使用 Nacos 事件机制实现 Agent 间的消息发布和订阅。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Nacos 事件驱动的 Agent 消息总线
+@Component
+public class AgentEventBus {
+
+    private final NacosEventPublisher eventPublisher;
+    private final Map&lt;String, List&lt;AgentEventHandler&gt;&gt; handlers = new ConcurrentHashMap&lt;&gt;();
+
+    public AgentEventBus(NacosEventPublisher eventPublisher) {
+        this.eventPublisher = eventPublisher;
+    }
+
+    public void publish(AgentEvent event) {
+        // 发布事件到 Nacos
+        eventPublisher.publishEvent(
+            "agent:event:" + event.getTargetAgent(),
+            event
+        );
+    }
+
+    @EventListener
+    public void handleEvent(AgentEvent event) {
+        String target = event.getTargetAgent();
+        List&lt;AgentEventHandler&gt; agentHandlers = handlers.get(target);
+        if (agentHandlers != null) {
+            agentHandlers.forEach(h -&gt; h.onEvent(event));
+        }
+    }
+
+    public void subscribe(String agentId, AgentEventHandler handler) {
+        handlers.computeIfAbsent(agentId, k -&gt; new CopyOnWriteArrayList&lt;&gt;())
+            .add(handler);
+    }
+}
+
+// Agent 事件定义
+@Data
+public class AgentEvent {
+    private String eventId;
+    private String sourceAgent;
+    private String targetAgent;
+    private String eventType;  // TASK_ASSIGN, TASK_COMPLETE, TASK_FAILED, HANDOFF
+    private String payload;    // JSON 数据
+    private Instant timestamp;
+}
+
+// 使用示例：Agent A 完成任务后通知 Agent B
+// AgentEvent event = new AgentEvent();
+// event.setEventId(UUID.randomUUID().toString());
+// event.setSourceAgent("calendar-agent");
+// event.setTargetAgent("email-agent");
+// event.setEventType("TASK_COMPLETE");
+// event.setPayload("{\"eventId\":\"EVT-001\",\"attendees\":[\"user1@corp.com\"]}");
+// eventBus.publish(event);</pre></code></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>用户请求"帮我安排一个明天下午 2 点的项目评审会"。路由 Agent 分析后交给 schedule-agent 处理，schedule-agent 查空闲时间后通过 Nacos 事件发送 TASK_ASSIGN 给 meeting-agent 创建会议，meeting-agent 完成后发送 TASK_COMPLETE 给 email-agent 发送邀请通知，email-agent 发送完成后发送 TASK_COMPLETE 给汇总 Agent 生成最终结果。整个过程通过事件驱动，每个 Agent 异步处理，总耗时约 3 秒。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Handoff 交接实现</h3>
+      <p>Agent Handoff 是指将一个任务从当前 Agent 转移给另一个 Agent 的过程。交接需要传递上下文（Context）和会话状态。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Agent Handoff 上下文
+@Data
+@Builder
+public class HandoffContext {
+    private String sessionId;
+    private String userId;
+    private String taskId;
+    private String sourceAgent;
+    private String targetAgent;
+    private Map&lt;String, Object&gt; collectedData;  // 已收集的数据
+    private List&lt;Message&gt; conversationHistory;  // 对话历史
+    private String handoffReason;               // 交接原因
+    private Instant handoffAt;
+}
+
+// Handoff 管理器
+@Component
+public class AgentHandoffManager {
+
+    private final AgentEventBus eventBus;
+    private final RedisTemplate&lt;String, Object&gt; redisTemplate;
+
+    public void handoff(HandoffContext context) {
+        // 1. 持久化上下文到 Redis
+        String key = "handoff:" + context.getSessionId();
+        redisTemplate.opsForValue().set(key, context, Duration.ofHours(1));
+
+        // 2. 发送 Handoff 事件
+        AgentEvent event = new AgentEvent();
+        event.setEventId(UUID.randomUUID().toString());
+        event.setSourceAgent(context.getSourceAgent());
+        event.setTargetAgent(context.getTargetAgent());
+        event.setEventType("HANDOFF");
+        event.setPayload(context.getSessionId());
+        eventBus.publish(event);
+
+        // 3. 源 Agent 清理（释放资源）
+        cleanupSourceAgent(context);
+    }
+
+    public HandoffContext acceptHandoff(String sessionId) {
+        String key = "handoff:" + sessionId;
+        HandoffContext context = (HandoffContext) redisTemplate
+            .opsForValue().get(key);
+        if (context == null) {
+            throw new HandoffException("Handoff context not found: " + sessionId);
+        }
+        return context;
+    }
+}
+
+// 交接示例：日历 Agent 完成查时间后交接给邮件 Agent
+// HandoffContext context = HandoffContext.builder()
+//     .sessionId("SESS-001").userId("u123")
+//     .sourceAgent("calendar-agent").targetAgent("email-agent")
+//     .collectedData(Map.of("freeSlots", slots, "selectedTime", "14:00"))
+//     .handoffReason("需要发送会议邀请")
+//     .build();
+// handoffManager.handoff(context);</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>冲突检测</h3>
+      <p>多 Agent 并行执行时可能出现冲突：两个 Agent 同时修改同一条数据、一个 Agent 的操作被另一个 Agent 覆盖。CorpAssist 使用乐观锁和向量对比两种方式检测冲突。</p>
+      <table class="outline-table">
+        <thead><tr><th>冲突类型</th><th>检测方式</th><th>解决策略</th></tr></thead>
+        <tbody>
+          <tr><td>数据修改冲突</td><td>乐观锁（版本号）</td><td>后修改者回退，重新读取最新数据再提交</td></tr>
+          <tr><td>资源分配冲突</td><td>分布式锁（Redis SETNX）</td><td>等待锁释放或选择备用资源</td></tr>
+          <tr><td>决策矛盾</td><td>向量相似度对比</td><td>两个 Agent 输出相似度 > 90% 则一致，< 50% 需人工裁决</td></tr>
+          <tr><td>时间冲突</td><td>时间范围覆盖检测</td><td>重叠时间段合并或提示用户选择</td></tr>
+        </tbody>
+      </button>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 冲突检测器
+@Component
+public class ConflictDetector {
+
+    @Value("${app.conflict.similarity-threshold:0.7}")
+    private double similarityThreshold;
+
+    /**
+     * 检测两个 Agent 输出的决策是否存在冲突
+     */
+    public ConflictResult detectConflict(String sessionId,
+                                          AgentOutput outputA,
+                                          AgentOutput outputB) {
+        // 1. 检查数据修改冲突
+        if (outputA.getTargetResource() != null
+            && outputA.getTargetResource().equals(outputB.getTargetResource())
+            && outputA.getVersion() != outputB.getVersion()) {
+            return ConflictResult.conflict("DATA_VERSION",
+                "数据版本不一致: A=" + outputA.getVersion()
+                    + ", B=" + outputB.getVersion());
+        }
+
+        // 2. 检查时间冲突
+        if (outputA.getTimeRange() != null && outputB.getTimeRange() != null) {
+            if (isTimeOverlapping(outputA.getTimeRange(), outputB.getTimeRange())) {
+                return ConflictResult.conflict("TIME_OVERLAP",
+                    "时间范围重叠: " + outputA.getTimeRange()
+                        + " vs " + outputB.getTimeRange());
+            }
+        }
+
+        // 3. 检查决策矛盾（使用向量相似度）
+        double similarity = cosineSimilarity(
+            outputA.getDecisionEmbedding(),
+            outputB.getDecisionEmbedding()
+        );
+        if (similarity < similarityThreshold) {
+            return ConflictResult.conflict("DECISION_CONFLICT",
+                "决策差异大: 相似度=" + similarity);
+        }
+
+        return ConflictResult.ok();
+    }
+
+    private double cosineSimilarity(float[] a, float[] b) {
+        double dot = 0, normA = 0, normB = 0;
+        for (int i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            normA += a[i] * a[i];
+            normB += b[i] * b[i];
+        }
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+}</pre></code></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>三种多 Agent 协作模式：Sequential（流水线）、Parallel（并行汇总）、Routing（按需路由），覆盖不同业务需求</li>
+      <li>Nacos 事件作为 Agent 间消息总线，支持 TASK_ASSIGN/TASK_COMPLETE/HANDOFF 等事件类型</li>
+      <li>Agent Handoff 通过 Redis 持久化上下文实现，交接后源 Agent 自动清理资源</li>
+      <li>冲突检测涵盖数据版本、时间范围、决策一致性三类，使用余弦相似度对比决策冲突</li>
+      <li>CorpAssist 使用 Routing + Sequential 混合模式：先路由到专业 Agent，再在 Agent 内串行执行多步</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-03-1"> 我能实现 Sequential/Parallel/Routing 三种协作模式</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-2"> 我能使用 Nacos 事件作为 Agent 间消息总线</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-3"> 我能实现 Agent Handoff 交接和上下文传递</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-4"> 我能设计和实现冲突检测和解决策略</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-03-5"> 我能按业务场景选择合适的协作模式</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>Sequential Agent</td><td>前一个 Agent 输出作为下一 Agent 输入的流水线模式</td></tr>
+        <tr><td>Parallel Agent</td><td>多个 Agent 独立处理不同维度后汇总的模式</td></tr>
+        <tr><td>Routing Agent</td><td>根据任务类型路由到对应专业 Agent 的模式</td></tr>
+        <tr><td>Handoff</td><td>将任务上下文从一个 Agent 传递给另一个 Agent</td></tr>
+        <tr><td>Nacos 事件总线</td><td>基于 Nacos 的事件发布/订阅机制</td></tr>
+        <tr><td>冲突检测</td><td>多 Agent 并行执行时数据一致性和决策矛盾的检测机制</td></tr>
+        <tr><td>余弦相似度</td><td>衡量两个 Agent 决策向量之间的相似程度</td></tr>
+        <tr><td>乐观锁</td><td>通过版本号检测数据修改冲突的并发控制机制</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Routing Agent 如何判断输入应该交给哪个子 Agent？</summary><p>Routing Agent 本身是一个 LLM 调用，System Prompt 中定义路由规则。示例 Prompt："分析用户输入，判断应该交给哪个 Agent 处理。可选 Agent：1) schedule-agent——处理日程查询和会议安排；2) ticket-agent——处理工单创建和查询；3) email-agent——处理邮件发送和查询。输出格式：{"agent":"schedule-agent","confidence":0.95,"reason":"用户请求查日程"}。" Routing Agent 返回的 confidence 如果低于阈值（如 0.7），则触发"澄清模式"反问用户。CorpAssist 还使用 fallback 路由：如果 Routing Agent 的置信度低，将请求同时发送给所有候选 Agent，取第一个返回结果的。</p></details>
+        <details><summary>Handoff 过程中如何保证数据不丢失？</summary><p>使用两阶段提交（2PC）风格的交接协议：1) Prepare 阶段——源 Agent 将 HandoffContext 持久化到 Redis，状态标记为 HANDOFF_PREPARED；2) Commit 阶段——源 Agent 发送 HANDOFF 事件到目标 Agent；3) Ack 阶段——目标 Agent 收到事件后从 Redis 加载 Context，处理完成后发送 HANDOFF_ACK 事件；4) 清理——源 Agent 收到 ACK 后删除 Redis 中的 Context（或保留 24 小时用于审计）。如果目标 Agent 处理失败，源 Agent 在超时后（如 30 秒）重试发送 HANDOFF 事件。如果 Redis 宕机，使用数据库作为后备存储。</p></details>
+        <details><summary>三个 Parallel Agent 的执行结果矛盾，如何自动解决？</summary><p>三阶段解决：1) 多数决——如果三个 Agent 中有两个输出一致（相似度 > 0.8），采用多数结果；2) 权重决——每个 Agent 有历史准确率权重（如 schedule-agent 准确率 95%，高于 ticket-agent 的 88%），加权投票；3) 仲裁决——如果前两阶段无法解决，调用一个专门的仲裁 Agent 分析三个矛盾结果并做出最终决定。如果仲裁 Agent 也无法解决（置信度 < 0.6），转人工。CorpAssist 统计数据：约 85% 的矛盾可通过多数决解决，10% 通过加权投票，5% 需要仲裁 Agent，不到 1% 需要转人工。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://github.com/alibaba/spring-ai-alibaba" target="_blank" rel="noopener">Spring AI Alibaba</a> — 多 Agent 协作示例</li>
+    <li><a href="https://nacos.io/docs/latest/what-is-nacos/" target="_blank" rel="noopener">Nacos 事件驱动</a> — 配置中心事件机制</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现三个专业 Agent（schedule-agent、ticket-agent、email-agent），各处理一种任务</li>
+      <li>实现 Routing Agent 分析输入并路由到对应专业 Agent</li>
+      <li>使用 Nacos 事件总线实现 Agent 间的异步通信</li>
+      <li>实现 Agent Handoff 交接和上下文传递</li>
+      <li>设计冲突检测：两个 Agent 同时分配同一会议室时的检测和解决</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：schedule-agent 和 email-agent 都需要获取用户信息，应该各查一次还是共享结果？</summary><p>应该共享结果。设计思路：1) 在 HandoffContext 的 collectedData 中存放已获取的公共数据（如用户信息、部门信息）；2) Agent 在处理前先检查 collectedData 中是否已有需要的数据，如果有则直接使用，不需重新查询；3) 对于大型数据（如工单列表），使用 Redis 缓存并传入 cacheKey 而非完整数据。CorpAssist 的实现中，collectedData 包含一个 dataRegistry（Map<String, String>），key 是数据名称，value 是 Redis key。Agent 按需从 Redis 加载数据，避免 HandoffContext 过大。</p></details>
+      <details><summary>场景：Parallel 模式中一个 Agent 超时了（超过 10s），应该等还是跳过？</summary><p>取决于任务类型：1) 如果该 Agent 的结果是"补充信息"（如查天气信息），可以跳过并在最终结果中标注"部分数据获取超时"；2) 如果该 Agent 的结果是"关键信息"（如查用户 ID，后续步骤依赖此 ID），则等待超时后整体失败。CorpAssist 的实现：每个 AgentTask 有 timeout 和 critical 两个属性。如果 critical=true 的超时，整个任务失败；如果 critical=false 的超时，使用默认值继续。默认的超时阈值是：重要信息 5 秒，非重要信息 2 秒。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-03-lab/</code></p><ul class="demo-acceptance">
+      <li>Routing Agent 正确将任务路由到对应专业 Agent</li>
+      <li>Nacos 事件总线在 Agent 间正确传递任务事件</li>
+      <li>Agent Handoff 正确传递上下文且数据不丢失</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-04">人工审批节点</a> — 审批中断、超时降级与审计</li>
+  </ul></div>
+</section>

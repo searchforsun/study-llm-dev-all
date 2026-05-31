@@ -1,0 +1,354 @@
+<section id="ch-practice-04" class="chapter" data-chapter="practice-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>人工审批节点</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>不是所有 Agent 决策都可以全自动执行。审批节点（Human-in-the-Loop）是 Agent 在企业落地的关键能力——Agent 执行到关键步骤时暂停，等待人工审批通过后继续。理解审批中断、超时降级、审计追溯是构建可信 Agent 系统的基础。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 Agent 审批中断和恢复机制；配置审批超时自动降级策略；实现审批记录全链路审计；支持 Resume 从审批结果恢复 Agent 执行。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 审批中断三阶段：Agent 执行到审批点→保存检查点→等待审批结果；2) 审批超时降级策略：等待→自动通过→自动拒绝→转其他审批人；3) 审批记录包含：审批人 ID、审批时间、审批意见、审批前后的 State 快照；4) Resume 恢复时从检查点加载历史，不重复执行已完成的步骤；5) CorpAssist 审批网关支持：单人审批、会签（多人同意）、或签（一人同意即可）。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>审批中断实现</h3>
+      <p>审批中断的核心机制是"暂停 Agent，等待外部信号恢复"。Agent 执行到标记了 <code>approvalRequired</code> 的步骤时，自动暂停并等待审批结果。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant A as Agent
+    participant DB as 检查点存储
+    participant AP as 审批系统
+    participant A2 as Agent(恢复)
+
+    U->>A: "发送10万元付款给供应商"
+    A->>A: 执行到审批节点<br/>金额>1万元需要审批
+    A->>DB: 保存检查点(status=WAITING_APPROVAL)
+    DB-->>A: 检查点已保存
+    A-->>U: "需要财务主管审批此付款"
+    A->>AP: 创建审批请求
+    AP-->>AP: 通知审批人
+
+    Note over AP: 审批人审核中...
+
+    AP->>A2: 审批通过回调<br/>POST /agent/resume
+    A2->>DB: 加载检查点
+    A2->>AP: 验证审批结果
+    A2->>A2: 继续执行后续步骤
+    A2-->>U: "10万元付款已成功发送"
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 审批节点实现
+@Component
+public class ApprovalGateway {
+
+    private final CheckpointStore checkpointStore;
+    private final KafkaTemplate&lt;String, Object&gt; kafkaTemplate;
+
+    public void requestApproval(String sessionId, ApprovalRequest request) {
+        // 1. 保存检查点
+        checkpointStore.saveCheckpoint(sessionId, ApprovalState.WAITING);
+
+        // 2. 创建审批任务并发送到审批系统
+        ApprovalTask task = ApprovalTask.builder()
+            .taskId(UUID.randomUUID().toString())
+            .sessionId(sessionId)
+            .userId(request.getUserId())
+            .title(request.getTitle())
+            .description(request.getDescription())
+            .amount(request.getAmount())
+            .approvalType(request.getType())  // SINGLE / ALL / ANY
+            .approvers(request.getApprovers())
+            .status(ApprovalStatus.PENDING)
+            .createdAt(Instant.now())
+            .timeoutMinutes(request.getTimeoutMinutes())
+            .build();
+
+        kafkaTemplate.send("approval-tasks", task.getTaskId(), task);
+    }
+
+    /**
+     * 审批结果回调
+     */
+    @KafkaListener(topics = "approval-results")
+    public void handleApprovalResult(ApprovalResult result) {
+        // 1. 验证审批结果
+        if (!result.isApproved()) {
+            // 审批拒绝：Agent 执行拒绝流程
+            checkpointStore.updateState(result.getSessionId(),
+                ApprovalState.REJECTED);
+            notifyUser(result.getSessionId(), "审批被拒绝: " + result.getComment());
+            return;
+        }
+
+        // 2. 审批通过：恢复 Agent 执行
+        checkpointStore.updateState(result.getSessionId(),
+            ApprovalState.APPROVED);
+        resumeAgent(result.getSessionId(), result);
+    }
+
+    private void resumeAgent(String sessionId, ApprovalResult result) {
+        // 加载检查点，从断点继续执行
+        Checkpoint cp = checkpointStore.loadCheckpoint(sessionId);
+        // 注入审批结果到上下文
+        cp.getContext().put("approvalResult", result);
+        // 继续执行
+        agentEngine.resume(cp);
+    }
+}</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>审批超时自动降级</h3>
+      <p>如果审批人在规定时间内未响应，Agent 需要自动降级——不能无限等待。CorpAssist 提供三种降级策略。</p>
+      <table class="outline-table">
+        <thead><tr><th>降级策略</th><th>行为</th><th>适用场景</th><th>风险</th></tr></thead>
+        <tbody>
+          <tr><td>AUTO_APPROVE</td><td>超时后自动通过</td><td>低风险、常规操作</td><td>审批人可能不同意</td></tr>
+          <tr><td>AUTO_REJECT</td><td>超时后自动拒绝</td><td>高风险、敏感操作</td><td>可能阻塞正常业务</td></tr>
+          <tr><td>ESCALATE</td><td>转给上级审批人</td><td>中等风险</td><td>上级也可能超时</td></tr>
+          <tr><td>REQUEUE</td><td>重发审批请求（最多 2 次）</td><td>审批人可能未看到通知</td><td>引起审批人厌烦</td></tr>
+        </tbody>
+      </button>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 审批超时调度器
+@Component
+public class ApprovalTimeoutScheduler {
+
+    @Scheduled(fixedRate = 30000)  // 每 30 秒检查一次
+    public void checkTimeouts() {
+        List&lt;ApprovalTask&gt; pendingTasks = approvalRepository
+            .findByStatusAndCreatedAtBefore(
+                ApprovalStatus.PENDING,
+                Instant.now().minus(Duration.ofMinutes(30))
+            );
+
+        for (ApprovalTask task : pendingTasks) {
+            handleTimeout(task);
+        }
+    }
+
+    private void handleTimeout(ApprovalTask task) {
+        switch (task.getTimeoutPolicy()) {
+            case AUTO_APPROVE:
+                // 自动通过
+                processResult(new ApprovalResult(task.getTaskId(), true,
+                    "系统自动通过（超时）"));
+                break;
+            case AUTO_REJECT:
+                // 自动拒绝
+                processResult(new ApprovalResult(task.getTaskId(), false,
+                    "系统自动拒绝（超时）"));
+                notifyUser(task.getSessionId(), "审批超时已自动拒绝");
+                break;
+            case ESCALATE:
+                // 升级给上级
+                String managerId = getManagerId(task.getOriginalApprover());
+                task.setApprover(managerId);
+                task.setCreatedAt(Instant.now());
+                task.setEscalationCount(task.getEscalationCount() + 1);
+                if (task.getEscalationCount() &lt;= 2) {
+                    approvalRepository.save(task);
+                    notifyApprover(managerId, task);
+                } else {
+                    // 升级超过 2 次，自动拒绝
+                    processResult(new ApprovalResult(task.getTaskId(), false,
+                        "升级超过 2 次无人处理，自动拒绝"));
+                }
+                break;
+        }
+    }
+}</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>审批记录审计</h3>
+      <p>每个审批操作都需要完整记录，以便后续审计追溯。CorpAssist 使用专门的审计表存储审批历史和 State 快照。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 审批审计实体
+@Entity
+@Table(name = "approval_audit")
+@Data
+public class ApprovalAudit {
+    @Id
+    private String auditId;
+    private String sessionId;
+    private String taskId;
+    private String userId;
+    private String userName;
+    private String approverId;
+    private String approverName;
+    private String approvalType;      // SINGLE / ALL / ANY
+    private String status;            // PENDING / APPROVED / REJECTED / TIMEOUT
+    private String comment;
+    @Column(columnDefinition = "TEXT")
+    private String stateSnapshot;     // 审批时的 State JSON 快照
+    @Column(columnDefinition = "TEXT")
+    private String stateAfter;        // 审批后的 State JSON
+    private Instant createdAt;
+    private Instant decidedAt;
+    private String timeoutPolicy;     // 超时策略
+    private int escalationCount;
+}
+
+// 审计查询 Service
+@Service
+public class AuditService {
+
+    public Page&lt;ApprovalAudit&gt; queryByUser(String userId, Pageable pageable) {
+        return auditRepository.findByUserIdOrderByCreatedAtDesc(userId, pageable);
+    }
+
+    public List&lt;ApprovalAudit&gt; queryBySession(String sessionId) {
+        return auditRepository.findBySessionIdOrderByCreatedAt(sessionId);
+    }
+
+    public long countPendingApprovals(String approverId) {
+        return auditRepository.countByApproverIdAndStatus(
+            approverId, ApprovalStatus.PENDING);
+    }
+
+    // 生成审计报告
+    public AuditReport generateReport(String sessionId) {
+        List&lt;ApprovalAudit&gt; audits = queryBySession(sessionId);
+        return new AuditReport(
+            sessionId,
+            audits.size(),
+            audits.stream().filter(a -&gt; "APPROVED".equals(a.getStatus())).count(),
+            audits.stream().filter(a -&gt; "REJECTED".equals(a.getStatus())).count(),
+            audits.stream().filter(a -&gt; "TIMEOUT".equals(a.getStatus())).count(),
+            audits
+        );
+    }
+}</pre></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>财务主管王经理审批了一个 Agent 发起的 "10 万元付款" 请求。事后审计时，通过 sessionId 可以查到：谁发起的（张三）、谁审批的（王经理）、审批时间（2026-05-20 14:30）、审批意见（"同意，已核对合同编号"）、审批时的系统状态（付款单已创建、发票已上传）、审批后的系统变更（资金已划转、状态已更新）。完整的审计链确保每一笔 Agent 操作都可追溯。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Resume 恢复</h3>
+      <p>审批完成后，Agent 需要从保存的检查点恢复执行。恢复时需注意：不重复执行已完成的步骤、正确处理审批结果对后续步骤的影响。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Agent 恢复执行器
+@Component
+public class AgentResumeHandler {
+
+    private final CheckpointStore checkpointStore;
+    private final ChatClient chatClient;
+
+    public AgentSession resume(String sessionId, ApprovalResult result) {
+        // 1. 加载检查点
+        Checkpoint checkpoint = checkpointStore.loadCheckpoint(sessionId);
+        if (checkpoint == null) {
+            throw new ResumeException("检查点不存在: " + sessionId);
+        }
+
+        // 2. 重建 ChatClient 历史
+        List&lt;Message&gt; history = checkpoint.getHistory();
+        ChatClient resumeClient = chatClient.mutate()
+            .chatMemory(memory -&gt; memory.withMessages(history))
+            .build();
+
+        // 3. 注入审批结果作为系统消息
+        String approvalContext = String.format(
+            "【审批结果】步骤 %s 的审批结果: %s。审批意见: %s。继续执行后续步骤。",
+            checkpoint.getPendingStep(),
+            result.isApproved() ? "已通过" : "已拒绝",
+            result.getComment()
+        );
+
+        // 4. 从暂停的步骤继续执行
+        String response = resumeClient.prompt()
+            .user(approvalContext)
+            .tools(checkpoint.getRegisteredTools())
+            .call()
+            .content();
+
+        // 5. 返回恢复后的会话
+        return new AgentSession(sessionId, resumeClient, response);
+    }
+
+    // 恢复状态接口（供审批系统回调）
+    @PostMapping("/api/agent/resume")
+    public ResponseEntity&lt;String&gt; resumeEndpoint(
+            @RequestBody ResumeRequest request) {
+        try {
+            AgentSession session = resume(
+                request.getSessionId(),
+                request.getApprovalResult()
+            );
+            return ResponseEntity.ok("Agent 已从审批恢复，继续执行");
+        } catch (Exception e) {
+            return ResponseEntity.status(500)
+                .body("恢复失败: " + e.getMessage());
+        }
+    }
+}</pre></code></div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>审批恢复时重新执行所有步骤</h4><p>审批通过后 Agent 从头开始执行，导致重复查用户信息、重复创建工单（可能需要先删除已创建的工单）。Token 浪费 3 倍，时间浪费 5 倍。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>审批恢复时从断点继续</h4><p>审批通过后 Agent 从暂停的步骤继续执行，已完成的步骤不重复。Token 消耗仅增加 10%（用于注入审批结果上下文），时间无额外增加。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>审批中断三阶段：Agent 执行到审批点→保存检查点→等待审批结果回调恢复</li>
+      <li>审批超时降级提供四种策略（AUTO_APPROVE/AUTO_REJECT/ESCALATE/REQUEUE），按风险等级配置</li>
+      <li>审批审计表包含 State 快照，支持全链路追溯和生成审计报告</li>
+      <li>Resume 恢复从检查点加载历史，不重复执行已完成的步骤，注入审批结果作为上下文</li>
+      <li>CorpAssist 审批网关支持单人审批、会签、或签三种模式，通过 Kafka 异步解耦</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-04-1"> 我能实现 Agent 审批中断和 Kafka 异步回调恢复</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-2"> 我能配置审批超时降级策略并理解各自风险</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-3"> 我能设计审批审计表和实现审计查询</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-4"> 我能实现 Resume 恢复且不重复执行已完成步骤</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-5"> 我能对比单人审批、会签、或签的适用场景</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>审批节点</td><td>Agent 流程中需要人工审批才能继续的暂停点</td></tr>
+        <tr><td>Human-in-the-Loop</td><td>人在回路中，关键步骤需人工介入</td></tr>
+        <tr><td>检查点</td><td>审批暂停时保存的 Agent 执行状态快照</td></tr>
+        <tr><td>审批超时降级</td><td>审批人未在规定时间内处理时的自动策略</td></tr>
+        <tr><td>会签</td><td>需要所有审批人同意的审批模式</td></tr>
+        <tr><td>或签</td><td>任意一位审批人同意即可的审批模式</td></tr>
+        <tr><td>审计链</td><td>从审批发起到完成的全链路操作记录</td></tr>
+        <tr><td>Resume</td><td>从检查点恢复 Agent 执行的过程</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>审批节点如何与业务系统（如 OA 系统）集成？</summary><p>两种集成方式：1) API 回调集成——OA 系统审批完成后调用 CorpAssist 的 /api/agent/resume 接口，传入 sessionId 和审批结果。这种方式简单直接，但需要 OA 系统支持回调。2) 消息队列集成——CorpAssist 将审批任务发送到 Kafka/RocketMQ，OA 系统消费后处理审批，将结果发送到结果队列。推荐方式 2，因为解耦、支持异步、可追溯。CorpAssist 具体实现：审批任务发送到 approval-requests 队列，OA 系统消费并展示给审批人；审批人操作后 OA 发送结果到 approval-results 队列，Agent 监听并恢复执行。</p></details>
+        <details><summary>审批环节的 State 快照包含哪些信息？占多少存储？</summary><p>State 快照包含：1) 会话元数据——sessionId, userId, 任务描述；2) Agent 状态——已完成步骤列表、当前步骤、已收集数据；3) 对话历史——最近 20 条消息（用于 LLM 上下文重建）；4) 工具注册表——已注册的工具列表（用于恢复时重建 ToolCallback）；5) 审批上下文——触发审批的原因、审批类型、审批人列表。典型 State 快照大小约 5-20KB。CorpAssist 设置存储上限 50KB，超过后会截断对话历史（保留最近 10 条）和精简数据。审计表使用 TEXT 列存储 JSON，百万级数据量约占用 10-20GB 存储。</p></details>
+        <details><summary>会签（ALL）模式下，审批人 A 通过、B 拒绝，结果如何？</summary><p>会签模式要求所有审批人同意。如果 A 通过、B 拒绝：1) Agent 在 B 拒绝时立即判定审批失败（不需要等 C、D 的审批）；2) 发送通知给所有审批人"由于 XXX 拒绝，审批流程已终止"；3) 恢复 Agent 执行审批拒绝的后续流程（如通知申请人不通过原因）。如果会签人数较多（如 5 人），Agent 可以采用"逐步判定"策略——每收到一个人的结果就判断一次，如果已经有人拒绝则直接终止走拒绝流程，不需要等剩余审批人。但审批系统层面的状态仍需要标记完整（A=APPROVED, B=REJECTED, C=PENDING_WITHDRAWN）。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-kafka/reference/" target="_blank" rel="noopener">Spring Kafka</a> — 审批任务的异步消息</li>
+    <li><a href="https://github.com/alibaba/spring-ai-alibaba" target="_blank" rel="noopener">Spring AI Alibaba</a> — 审批节点集成示例</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现 ApprovalGateway：创建审批任务，保存检查点，监听审批结果</li>
+      <li>实现 Kafka 审批结果回调，根据结果通过或拒绝执行不同分支</li>
+      <li>配置审批超时 5 分钟，设置 AUTO_REJECT 策略</li>
+      <li>实现审批审计表 JPA Entity，编写审计查询 Service</li>
+      <li>测试 Resume 恢复：审批通过后 Agent 从断点继续，不重复执行</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：审批人 A 审批了一个请求，但 2 分钟后发现审批错了，需要撤回重审。如何设计？</summary><p>设计"审批撤回"机制：1) Agent 在执行审批后续步骤之前，预留一个"撤回窗口"（如 30 秒）。在这段时间内审批人可以通过撤回接口 /api/approval/revoke 撤回审批结果；2) 撤回后 Agent 恢复到审批等待状态，审批人可以重新审批（通过或拒绝）；3) 如果 Agent 已经执行了审批后的步骤（如已发送付款），则不能撤回——Agent 会记录"财务操作已完成，无法撤回，请联系系统管理员"。CorpAssist 实现中，撤回窗口通过 Agent 恢复时的延迟执行机制实现：Agent 先恢复但不执行操作，等待 30 秒确认窗口，无撤回信号再执行后续步骤。</p></details>
+      <details><summary>场景：Agent 需要 3 个审批人依次审批（先部门主管→再财务→最后总经理），如何实现？</summary><p>实现链式审批（sequential approval）：1) ApprovalTask 中定义 approverChain（List<String>），按顺序排列；2) Agent 先发送审批给部门主管，等待结果；3) 部门主管通过后，Agent 自动将审批发送给财务（不是重新创建审批，而是更新当前审批的当前审批人）；4) 财务通过后发送给总经理；5) 任何人拒绝则终止整个链式审批。链式审批的关键设计：使用 currentStep 和 totalSteps 两个字段标记当前审批环节，每个环节可以使用不同的超时策略（如部门主管超时 1 小时，财务超时 2 小时，总经理超时 8 小时）。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-04-lab/</code></p><ul class="demo-acceptance">
+      <li>审批中断后 Agent 正确保存检查点并等待 Kafka 回调</li>
+      <li>审批超时 5 分钟后自动执行降级策略</li>
+      <li>审批审计表完整记录审批前后状态</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-05">完整 Agent 演示</a> — 端到端周报自动生成演示</li>
+  </ul></div>
+</section>

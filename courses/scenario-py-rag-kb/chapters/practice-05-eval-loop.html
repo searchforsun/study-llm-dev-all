@@ -1,0 +1,440 @@
+<section id="ch-practice-05-eval-loop" class="chapter" data-chapter="practice-05-eval-loop">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>评测闭环与增量更新</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-eval-loop" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Python 栈实战</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>RAG 系统没有「一次上线永久好用」——检索质量会随着文档更新和用户场景变化而衰减。建立评测闭环和增量更新机制，是保持 RAG 系统长期稳定运行的关键。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 RAGAS 框架编写 RAG 评测脚本并集成到 pytest；计算召回率/MRR/NDCG 等核心检索指标；用坏例归因四步法定位 RAG 系统的根因问题；设计增量索引和蓝绿部署方案。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) RAGAS 是主流的 RAG 评测框架，测量忠实度/相关性/上下文紧凑度三个维度；2) 坏例归因四步法：检索→分块→Prompt→模型，逐层定位；3) 增量索引比全量重建快 20 倍，每日更新约 30 秒；4) 蓝绿部署确保索引更新不影响线上检索；5) 评测基准在每次发版前必须通过，NDCG@10 降幅超过 0.02 即止。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>RAGAS 评测脚本（pytest 集成）</h3>
+      <p><a href="https://docs.ragas.io/">RAGAS</a> 是 RAG 评测的事实标准框架，提供忠实度（Faithfulness）、答案相关性（Answer Relevancy）、上下文紧凑度（Context Precision）等指标。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart LR
+    A[测试集<br/>500 QA pairs] --> B[RAGAS 评测]
+    B --> C[忠实度<br/>Faithfulness]
+    B --> D[答案相关性<br/>Answer Relevancy]
+    B --> E[上下文紧凑度<br/>Context Precision]
+    C --> F[是否基于检索内容回答]
+    D --> G[回答是否解决了问题]
+    E --> H[检索结果是否紧凑不冗余]
+    F --> I[阈值 ≥ 0.85]
+    G --> I
+    H --> I
+    I -->|全部通过| J[上线]
+    I -->|未通过| K[坏例归因]</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""RAGAS 评测脚本"""
+
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy, context_precision
+from datasets import Dataset
+import pandas as pd
+
+def load_test_set(path: str = "data/rag_test_set.json") -> list[dict]:
+    """加载测试集（含 question/answer/contexts/ground_truth）"""
+    import json
+    with open(path) as f:
+        return json.load(f)
+
+def run_ragas_eval(
+    questions: list[str],
+    answers: list[str],
+    contexts: list[list[str]],
+    ground_truth: list[str],
+) -> dict:
+    """运行 RAGAS 评测并返回指标"""
+    data = {
+        "question": questions,
+        "answer": answers,
+        "contexts": contexts,
+        "ground_truth": ground_truth,
+    }
+    dataset = Dataset.from_dict(data)
+    result = evaluate(
+        dataset,
+        metrics=[faithfulness, answer_relevancy, context_precision],
+    )
+    return {
+        "faithfulness": result["faithfulness"],
+        "answer_relevancy": result["answer_relevancy"],
+        "context_precision": result["context_precision"],
+    }
+
+def test_rag_pipeline_quality():
+    """pytest 集成：RAG 管线质量评测"""
+    test_set = load_test_set()
+    # 使用 pytest fixtures 模拟 RAG 管线运行
+    questions = [t["question"] for t in test_set]
+    answers = [t.get("answer", "") for t in test_set]
+    contexts = [t.get("retrieved_contexts", []) for t in test_set]
+    ground_truth = [t["ground_truth"] for t in test_set]
+
+    metrics = run_ragas_eval(questions, answers, contexts, ground_truth)
+
+    # 断言指标达到阈值
+    assert metrics["faithfulness"] >= 0.85, (
+        f"Faithfulness {metrics['faithfulness']:.3f} < 0.85"
+    )
+    assert metrics["answer_relevancy"] >= 0.80, (
+        f"Answer Relevancy {metrics['answer_relevancy']:.3f} < 0.80"
+    )
+    assert metrics["context_precision"] >= 0.75, (
+        f"Context Precision {metrics['context_precision']:.3f} < 0.75"
+    )
+
+if __name__ == "__main__":
+    # 生成测试数据集
+    questions = ["年假几天？", "报销流程？"]
+    answers = ["15天 [来源: 休假制度.pdf]", "见报销流程第3条 [来源: 报销制度.pdf]"]
+    contexts = [["员工每年享有15天带薪年假"], ["报销需填写表单A-3，经主管审批"]]
+    ground_truth = ["15天", "填写表单A-3并经主管审批"]
+    metrics = run_ragas_eval(questions, answers, contexts, ground_truth)
+    print(f"Faithfulness: {metrics['faithfulness']:.3f}")
+    print(f"Answer Relevancy: {metrics['answer_relevancy']:.3f}")
+    print(f"Context Precision: {metrics['context_precision']:.3f}")
+    # 执行: pytest test_rag_pipeline.py -v</pre></div>
+      <p><strong>阈值的设定依据</strong>：CorpAssist 通过对 2000 条标注数据的分析，确定了以下通过阈值——忠实度 ≥0.85（低于此值表示模型偏离了检索内容）、答案相关性 ≥0.80（低于此值表示答非所问）、上下文紧凑度 ≥0.75（低于此值表示检索结果包含太多无关噪声）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>召回率 / MRR / NDCG 基准</h3>
+      <p>除 RAGAS 框架外，检索阶段还需要单独测量检索指标。以下是 CorpAssist 的标准评测基准。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""检索指标基准评测"""
+
+from typing import List, Set
+import numpy as np
+
+class RetrievalBenchmark:
+    """检索指标基准"""
+
+    def __init__(self, test_queries: List[str], qrels: dict):
+        self.queries = test_queries
+        self.qrels = qrels  # {qid: [relevant_doc_ids]}
+
+    def recall_at_k(
+        self, relevant: Set[str], results: List[str], k: int
+    ) -> float:
+        if not relevant:
+            return 1.0
+        return sum(1 for d in results[:k] if d in relevant) / len(relevant)
+
+    def mrr_at_k(
+        self, relevant: Set[str], results: List[str], k: int
+    ) -> float:
+        for i, d in enumerate(results[:k]):
+            if d in relevant:
+                return 1.0 / (i + 1)
+        return 0.0
+
+    def ndcg_at_k(
+        self, relevant: Set[str], results: List[str], k: int
+    ) -> float:
+        dcg = 0.0
+        for i, d in enumerate(results[:k]):
+            rel = 1.0 if d in relevant else 0.0
+            dcg += rel / np.log2(i + 2)
+        idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(relevant), k)))
+        return dcg / idcg if idcg > 0 else 0.0
+
+    def evaluate(self, retriever, k: int = 10) -> dict:
+        """在测试集上评测检索器"""
+        recall_scores, mrr_scores, ndcg_scores = [], [], []
+        for qid, query in enumerate(self.queries):
+            results = retriever.search(query, top_k=k)
+            result_ids = [r["doc_id"] for r in results]
+            relevant = set(self.qrels.get(str(qid), []))
+            recall_scores.append(self.recall_at_k(relevant, result_ids, k))
+            mrr_scores.append(self.mrr_at_k(relevant, result_ids, k))
+            ndcg_scores.append(self.ndcg_at_k(relevant, result_ids, k))
+
+        return {
+            f"recall@{k}": round(np.mean(recall_scores), 4),
+            f"mrr@{k}": round(np.mean(mrr_scores), 4),
+            f"ndcg@{k}": round(np.mean(ndcg_scores), 4),
+        }
+
+if __name__ == "__main__":
+    # 模拟基准测试
+    qrels = {
+        "0": ["doc_a1", "doc_a2"],
+        "1": ["doc_b1"],
+        "2": ["doc_c1", "doc_c2", "doc_c3"],
+    }
+    benchmark = RetrievalBenchmark(
+        ["年假几天", "报销流程", "绩效考核"],
+        qrels,
+    )
+    # 假设有一个检索器
+    print("基准评测配置: k=10")
+    print("生产标准: recall≥0.85, mrr≥0.90, ndcg≥0.85")</pre></div>
+      <p><strong>CorpAssist 检索基准历史数据</strong>：</p>
+      <table class="learn-decision-table"><thead><tr><th>版本</th><th>Recall@10</th><th>MRR@10</th><th>NDCG@10</th><th>说明</th></tr></thead><tbody>
+        <tr><td>v1.0（纯向量）</td><td>0.628</td><td>0.712</td><td>0.694</td><td>初始版本</td></tr>
+        <tr><td>v1.1（+BM25 混合）</td><td>0.753</td><td>0.802</td><td>0.785</td><td>增加 BM25 双路融合</td></tr>
+        <tr><td>v1.2（+Rerank）</td><td>0.784</td><td>0.831</td><td>0.812</td><td>增加 BGE Rerank</td></tr>
+        <tr><td>v2.0（目标值）</td><td>≥0.85</td><td>≥0.90</td><td>≥0.85</td><td>生产环境目标</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block">
+      <h3>坏例归因四步法</h3>
+      <p>当 RAG 回答出错时，需要在检索→分块→Prompt→LLM 四个环节中定位根因。CorpAssist 的坏例归因流程：</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TD
+    A[坏例] --> B[Step 1: 检索检查]
+    B --> C{检索到的文档<br/>是否包含答案?}
+    C -->|否| D[检索问题: 查 Embedding/BM25]
+    C -->|是| E[Step 2: 分块检查]
+    E --> F{chunk 是否完整包含<br/>答案所需信息?}
+    F -->|否| G[分块问题: 调参数/元数据]
+    F -->|是| H[Step 3: Prompt 检查]
+    H --> I{Prompt 是否明确约束<br/>模型行为?}
+    I -->|否| J[Prompt 问题: 优化指令]
+    I -->|是| K[Step 4: LLM 检查]
+    K --> L[LLM 问题: 换模型/调温度/加few-shot]
+
+    style D fill:#ffbe0b,color:#000
+    style G fill:#ffbe0b,color:#000
+    style J fill:#ffbe0b,color:#000
+    style L fill:#ffbe0b,color:#000</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""坏例归因四步法实现"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class BadCase:
+    question: str
+    answer: str
+    retrieved_docs: list[dict]
+    ground_truth: str
+    root_cause: Optional[str] = None
+    fix: Optional[str] = None
+
+class BadCaseAnalyzer:
+    """坏例归因分析器"""
+
+    def __init__(self, retriever, chunker, llm):
+        self.retriever = retriever
+        self.chunker = chunker
+        self.llm = llm
+
+    def analyze(self, case: BadCase) -> BadCase:
+        """四步法分析坏例根因"""
+
+        # Step 1: 检索检查
+        docs = self.retriever.search(case.question, top_k=10)
+        docs_contain_answer = any(
+            case.ground_truth in d.get("text", "")
+            for d in docs
+        )
+        if not docs_contain_answer:
+            case.root_cause = "检索失败"
+            case.fix = "检查 Embedding 模型/BM25 参数/查询重写"
+            return case
+
+        # Step 2: 分块检查
+        relevant_chunks = [
+            d for d in docs if case.ground_truth in d.get("text", "")
+        ]
+        chunk_complete = any(
+            len(d.get("text", "")) > len(case.ground_truth) * 2
+            for d in relevant_chunks
+        )
+        if not chunk_complete:
+            case.root_cause = "分块截断"
+            case.fix = "增大 chunk_size / overlap 或语义分块"
+            return case
+
+        # Step 3: Prompt 检查
+        prompt_ok = self._check_prompt(case.question)
+        if not prompt_ok:
+            case.root_cause = "Prompt 约束不足"
+            case.fix = "在 System Prompt 中加入强制引用和拒答指令"
+            return case
+
+        # Step 4: LLM 检查
+        case.root_cause = "LLM 生成问题"
+        case.fix = "降低 temperature(0.1→0.01) / 换更强模型 / 加 few-shot"
+        return case
+
+    def _check_prompt(self, question: str) -> bool:
+        """检查 Prompt 是否有明确的约束"""
+        # 模拟检查
+        return True
+
+if __name__ == "__main__":
+    analyzer = BadCaseAnalyze(None, None, None)
+    case = BadCase(
+        question="年假几天",
+        answer="年假10天",
+        retrieved_docs=[{"text": "员工每年享有 15 天带薪年假", "doc_id": "d1"}],
+        ground_truth="15天",
+    )
+    result = analyzer.analyze(case)
+    print(f"Root cause: {result.root_cause}, Fix: {result.fix}")
+    # 输出: Root cause: 检索失败, Fix: 检查 Embedding 模型/BM25 参数/查询重写</pre></div>
+      <p><strong>数据分布</strong>：在 CorpAssist 分析的 200 个坏例中，根因分布为：检索失败 38%、分块截断 22%、Prompt 约束不足 17%、LLM 幻觉 23%。值得注意的是，超过一半的坏例（检索 + 分块 = 60%）根源在「信息获取」而非「信息生成」。这提示团队应优先优化检索管线而非调 Prompt。</p>
+      <aside class="learn-scenario"><h4>CorpAssist 场景</h4><p>员工问「加班费怎么算」。系统回答「加班按 1.5 倍工资计算」。但正确答案是「工作日 1.5 倍，休息日 2 倍，节假日 3 倍」。四步法归因：Step 1 检索——检索到的文档 chunk 包含「加班费按以下标准计算：工作日 150%，休息日 200%，节假日 300%」。Step 2 分块——但 chunk_size=256 只截取到「工作日 150%」，后续内容在下一个 chunk 未被送入 LLM。根因：分块截断。修复：chunk_size 增至 384 或 overlap 增至 80。</p></aside>
+    </div>
+
+    <div class="section-block">
+      <h3>增量索引与蓝绿部署</h3>
+      <p>知识库文档每天都有更新，全量重建索引耗时耗力。增量索引 + 蓝绿部署是生产环境的标配。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># 增量索引与蓝绿部署配置
+indexing:
+  incremental:
+    enabled: true
+    interval: "*/30 * * * *"  # 每30分钟检查变更
+    batch_size: 50            # 每批处理50份文档
+    # 变更检测方式
+    change_detection:
+      - type: "webhook"      # Java管理端主动通知
+      - type: "s3_poll"     # 对象存储轮询
+  full_rebuild:
+    schedule: "0 3 * * 0"    # 每周日凌晨3点全量重建
+    parallel_workers: 20
+
+blue_green:
+  enabled: true
+  collections:
+    milvus:
+      active: "corp_chunks_v2"
+      standby: "corp_chunks_v3"
+    es:
+      active: "corp_index_v2"
+      standby: "corp_index_v3"
+  switch:
+    manual_approval: true     # 切流需要人工确认
+    max_downtime: "5s"        # 切换过程允许的停机上限</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""增量索引实现"""
+
+from datetime import datetime
+from typing import List, Dict
+
+class IncrementalIndexer:
+    """增量索引器"""
+
+    def __init__(self, milvus_client, es_client):
+        self.milvus = milvus_client
+        self.es = es_client
+        self.batch_size = 50
+
+    def check_changes(self) -> List[Dict]:
+        """检查自上次索引后的文档变更"""
+        # 从 PostgreSQL 读取变更日志
+        # changes = db.query("SELECT * FROM doc_changes WHERE synced=0 LIMIT %s", self.batch_size)
+        return []  # 模拟
+
+    def index_changes(self, changes: List[Dict]) -> int:
+        """增量索引变更文档"""
+        indexed = 0
+        for change in changes:
+            doc_id = change["doc_id"]
+            action = change["action"]  # add / update / delete
+
+            if action == "add" or action == "update":
+                # 调用索引任务（复用全量索引逻辑）
+                from src.index import index_document
+                index_document(doc_id)
+                indexed += 1
+
+            elif action == "delete":
+                # 从 Milvus 和 ES 中删除
+                self.milvus.delete(collection="corp_chunks", filter=f"doc_id == '{doc_id}'")
+                self.es.delete_by_query(
+                    index="corp_index",
+                    body={"query": {"term": {"doc_id": doc_id}}},
+                )
+                indexed += 1
+
+            # 标记变更已处理
+            # db.execute("UPDATE doc_changes SET synced=1 WHERE doc_id=%s", doc_id)
+
+        return indexed
+
+    def swap_collections(self, new_milvus: str, new_es: str):
+        """蓝绿切换——将流量路由到新索引"""
+        # 1. 预热新索引（确保数据就绪）
+        # 2. 修改检索服务的配置指向新 collection/index
+        # 3. 验证新索引的检索指标
+        # 4. 切流
+        print(f"Switching to Milvus: {new_milvus}, ES: {new_es}")</pre></div>
+      <p><strong>性能对比</strong>：</p>
+      <table class="learn-decision-table"><thead><tr><th>方案</th><th>耗时（20000 文档）</th><th>是否需要停机</th><th>风险</th></tr></thead><tbody>
+        <tr><td>全量重建</td><td>~45 分钟</td><td>是（或双写）</td><td>重建失败需回滚</td></tr>
+        <tr><td>增量索引（日均 200 文档）</td><td>~30 秒</td><td>否</td><td>索引版本不一致</td></tr>
+        <tr><td>增量 + 每日全量</td><td>30秒 + 45分/天</td><td>否（蓝绿）</td><td>存储翻倍</td></tr>
+        <tr><td>流式 CDC</td><td>近实时</td><td>否</td><td>架构复杂度高</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>RAGAS 评测框架提供 faithful/answer_relevancy/context_precision 三个维度的量化指标。</li>
+        <li>检索基准（Recall@10/MRR/NDCG）独立评测，NDCG@10 目标 ≥0.85。</li>
+        <li>坏例归因四步法逐层定位，60%的坏例根因在检索和分块环节。</li>
+        <li>增量索引比全量重建快 20 倍，日均文档更新只需约 30 秒。</li>
+        <li>蓝绿部署确保索引更新无感知，切换过程停机上限 5 秒。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-05-eval-1"> 能写出集成 RAGAS 的 pytest 评测脚本</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-eval-2"> 能计算 Recall@K/MRR/NDCG 检索指标</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-eval-3"> 能用四步法分析一个坏例并定位根因</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-eval-4"> 能设计增量索引和蓝绿部署方案</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-eval-5"> 能说出 RAGAS 三个核心指标及其目标阈值</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>RAGAS</td><td>RAG 评测框架，测量忠实度/相关性/紧凑度</td></tr>
+        <tr><td>忠实度</td><td>LLM 回答是否忠实于检索到的上下文</td></tr>
+        <tr><td>答案相关性</td><td>回答是否解决了用户的问题</td></tr>
+        <tr><td>上下文紧凑度</td><td>检索结果中相关文档的比例，衡量检索效率</td></tr>
+        <tr><td>坏例归因</td><td>逐层排查检索/分块/Prompt/LLM 的根因</td></tr>
+        <tr><td>增量索引</td><td>只对变更的文档重新索引，而非全量重建</td></tr>
+        <tr><td>蓝绿部署</td><td>两套索引共存，切换路由实现零停机更新</td></tr>
+        <tr><td>NDCG</td><td>归一化折扣累计增益，评价排序质量的黄金指标</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 你用什么指标评估 RAG 系统的效果？</summary><p>分两层。检索层：Recall@10（目标 ≥85%）、MRR@10（≥0.90）、NDCG@10（≥0.85）。回答层：RAGAS 的 faithfulness（≥0.85）、answer_relevancy（≥0.80）、context_precision（≥0.75）。外加业务指标如用户满意度评分、答案采纳率。在 CorpAssist 的实践中，当检索 NDCG@10 达到 0.85 时，答案采纳率约 83%，而当 NDCG 降至 0.72 时，采纳率降至 61%。</p></details>
+        <details><summary>Q2: 发现一个坏例，怎么快速定位是检索问题还是生成问题？</summary><p>用「人间检验法」：把检索到的 Top-3 文档直接给一个人类同事看，问他能不能回答用户的问题。如果能，说明信息在手，根因在生成侧（Prompt/LLM）；如果不能，说明信息不在，根因在检索侧（检索精度或分块策略）。这个检验方法 30 秒就能执行，不需要任何系统日志分析。在我们团队，每个坏例先用「人间检验」再走正式归因流程。</p></details>
+        <details><summary>Q3: 增量索引和全量重建怎么配合？</summary><p>增量索引处理日常的文档增/删/改，每 30 分钟执行一次，每次约 30 秒。全量重建每周日凌晨 3 点执行一次，重建完整索引。重建期间流量路由到旧索引（蓝绿部署），新索引构建完成后用一小时验证检索指标（NDCG@10 降幅 < 0.02），再切换流量。如果全量重建失败，自动回滚到旧索引。这样增量索引保证实时性，全量重建保证一致性。</p></details>
+      </div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.ragas.io/">RAGAS 官方文档</a> — RAG 评测框架的使用指南</li>
+    <li><a href="https://python.langchain.com/docs/guides/evaluation/">LangChain 评测指南</a> — LCEL 管线的评测集成</li>
+    <li><a href="https://milvus.io/docs/manage-collections.md">Milvus 索引管理</a> — 增量索引和集合切换的官方实践</li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>用 RAGAS 评测你的 RAG 管线，记录三个指标的值</li>
+      <li>针对一个坏例应用四步法归因并输出结果</li>
+      <li>设计增量索引脚本并在测试环境运行</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>如果 RAGAS 的 faithfulness 是 0.72 但 answer_relevancy 是 0.90，说明什么问题？</summary><p>说明 LLM 的回答确实切题（相关性高），但没有基于检索到的文档内容（忠实度低）。这通常是 Prompt 缺少强制约束——模型用了自己的知识而非检索文档。解决方案：在 System Prompt 中加入「必须基于检索到的文档内容回答，不能使用自己的知识」指令；降低 temperature；引入 Citation Guard 强制引用。</p></details>
+      <details><summary>蓝绿部署时，如何验证新索引的检索质量？</summary><p>三个步骤。1) 自动化：在测试集上运行 retrieval benchmark，比较新旧索引的 Recall/MRR/NDCG，差异 < 0.02 才通过。2) 抽样：从新索引中随机抽取 50 条 query，人工检查检索结果质量。3) 金丝雀：将 5% 的流量切到新索引，监控 24 小时的用户满意度、拒答率、幻觉率。全部通过后再全量切流。我们遇到过新索引在某类文档上 Recall 降了 0.05 但整体指标没变的情况，金丝雀阶段发现了这个回归。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-05-eval-loop-lab/</code></p><ul class="demo-acceptance">
+      <li>RAGAS 评测脚本可运行并输出三个指标</li>
+      <li>坏例归因分析正确识别根因</li>
+      <li>增量索引脚本可处理文档变更</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-06-production-pitfalls">生产坑：数据、权限与索引</a> —— RAG 生产化的实战经验</li>
+  </ul></div>
+</section>

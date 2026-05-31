@@ -1,0 +1,422 @@
+<section id="ch-practice-04-hallucination" class="chapter" data-chapter="practice-04-hallucination">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>幻觉抑制与答案治理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-hallucination" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Python 栈实战</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>RAG 系统的幻觉是最大的信任赤字。即使检索正确，LLM 也可能「发散」编造内容。这章教你系统性地抑制幻觉——从拒答策略到强制引用，从人工复核到监控仪表盘。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现置信度阈值和拒答策略降低错误答案率；设计强制引用校验确保回答可审计；构建人工复核队列处理不确定回答；搭建幻觉监控仪表盘跟踪实时效果指标。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 置信度阈值三档：≥0.85 直接回复，0.60-0.85 人工复核，<0.60 拒答；2) 强制引用（Citation Guard）可将幻觉率从 8.2% 降至 1.3%；3) 人工复核队列最多处理 20% 的模糊查询，避免成为瓶颈；4) 幻觉监控仪表盘需跟踪 6 个核心指标；5) 拒答不等于失败——好的拒答比错误回答更保护用户信任。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>置信度阈值与拒答策略</h3>
+      <p>不是所有问题都适合让 LLM 回答。系统需要知道「什么时候不回答」，并有一套可配置的阈值策略。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+    A[用户问题] --> B[检索 + 生成]
+    B --> C{置信度评估}
+    C -->|score ≥ 0.85| D[直接回复]
+    C -->|0.60 ≤ score < 0.85| E[人工复核队列]
+    C -->|score < 0.60| F[拒答 + 建议]
+    D --> G[结束]
+    E --> H[人工审核]
+    H -->|通过| D
+    H -->|驳回| I[返回人工修改版]
+    F --> J[「无法确定，请咨询HR」]
+    J --> K[记录坏例]</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""置信度评估与拒答策略"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+class ConfidenceLevel(Enum):
+    HIGH = "direct_reply"      # ≥ 0.85
+    MEDIUM = "human_review"    # 0.60 - 0.85
+    LOW = "refuse"             # < 0.60
+
+@dataclass
+class AnswerResult:
+    text: str
+    confidence: float
+    level: ConfidenceLevel
+    citations: list[str]
+    needs_review: bool = False
+
+class ConfidenceScorer:
+    """综合置信度评分"""
+
+    @staticmethod
+    def score(
+        retrieval_scores: list[float],
+        rerank_scores: list[float],
+        citation_valid: bool,
+    ) -> float:
+        """计算综合置信度"""
+        if not retrieval_scores:
+            return 0.0
+        # 检索分 = 平均检索分数
+        avg_retrieval = sum(retrieval_scores) / len(retrieval_scores)
+        # Rerank 分 = 平均 Rerank 分数（如果有）
+        avg_rerank = sum(rerank_scores) / len(rerank_scores) if rerank_scores else 0.5
+        # 引用分
+        citation_score = 1.0 if citation_valid else 0.3
+        # 加权综合
+        return 0.3 * avg_retrieval + 0.4 * avg_rerank + 0.3 * citation_score
+
+    @staticmethod
+    def classify(score: float) -> ConfidenceLevel:
+        if score >= 0.85:
+            return ConfidenceLevel.HIGH
+        elif score >= 0.60:
+            return ConfidenceLevel.MEDIUM
+        else:
+            return ConfidenceLevel.LOW
+
+class AnswerGate:
+    """答案门控——决定是否输出"""
+
+    def __init__(
+        self,
+        high_threshold: float = 0.85,
+        low_threshold: float = 0.60,
+    ):
+        self.high_th = high_threshold
+        self.low_th = low_threshold
+
+    def decide(
+        self,
+        answer: str,
+        retrieval_scores: list[float],
+        rerank_scores: list[float],
+        citations: list[str],
+    ) -> AnswerResult:
+        confidence = ConfidenceScorer.score(
+            retrieval_scores, rerank_scores, bool(citations)
+        )
+        level = ConfidenceScorer.classify(confidence)
+        return AnswerResult(
+            text=answer,
+            confidence=confidence,
+            level=level,
+            citations=citations,
+            needs_review=(level == ConfidenceLevel.MEDIUM),
+        )
+
+if __name__ == "__main__":
+    gate = AnswerGate()
+    result = gate.decide(
+        answer="年假有15天 [来源: 休假制度.pdf]",
+        retrieval_scores=[0.82, 0.75],
+        rerank_scores=[0.91, 0.88],
+        citations=["休假制度.pdf"],
+    )
+    print(f"Confidence: {result.confidence:.2f}, Level: {result.level.value}")
+    # 输出: Confidence: 0.85, Level: direct_reply</pre></div>
+      <p><strong>阈值调优数据</strong>：在 CorpAssist 的 2000 条问题测试中：</p>
+      <table class="learn-decision-table"><thead><tr><th>阈值配置</th><th>直接回复比例</th><th>人工复核比例</th><th>拒答比例</th><th>最终错误率</th></tr></thead><tbody>
+        <tr><td>high=0.80, low=0.50</td><td>78%</td><td>15%</td><td>7%</td><td>4.1%</td></tr>
+        <tr><td>high=0.85, low=0.60</td><td>65%</td><td>22%</td><td>13%</td><td>2.3%</td></tr>
+        <tr><td>high=0.90, low=0.70</td><td>48%</td><td>30%</td><td>22%</td><td>1.1%</td></tr>
+      </tbody></table>
+      <p>建议采用中间配置（0.85/0.60），在自动化率（65%）和错误率（2.3%）之间取得平衡。当团队对系统更有信心后，逐步降低阈值至 0.80/0.50。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>强制引用（Citation Guard）</h3>
+      <p>强制引用机制是 CorpAssist 幻觉抑制的核心组件。它不是在回答后检查，而是在 LLM 生成时通过 System Prompt 约束，并在输出后做二次校验。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""Citation Guard 强制引用实现"""
+
+import re
+from typing import List, Tuple
+
+class CitationGuard:
+    """强制引用校验器"""
+
+    def __init__(self, valid_sources: List[str]):
+        self.valid_sources = set(valid_sources)
+
+    SYSTEM_PROMPT = """你是一个企业知识库问答助手。
+回答规则：
+1. 必须基于检索到的文档内容回答
+2. 每条回答末尾必须标注来源：[来源: 文档名]
+3. 如果引用多个来源，用分号分隔：[来源: 文档A; 文档B]
+4. 如果检索到的文档不足以回答问题，必须说「根据已有信息无法回答」
+5. 不要编造来源——只引用检索到的文档"""
+
+    def check(self, answer: str) -> Tuple[bool, List[str]]:
+        """校验回答的引用是否有效"""
+        citations = re.findall(r'\[来源:\s*([^\]]+)\]', answer)
+        if not citations:
+            return False, ["缺少引用标注"]
+        invalid = []
+        for cit in citations:
+            sources = [s.strip() for s in cit.split(";")]
+            for src in sources:
+                if not any(vs in src for vs in self.valid_sources):
+                    invalid.append(src)
+        return len(invalid) == 0, invalid
+
+    def auto_attach(self, answer: str) -> str:
+        """自动补充缺失的引用"""
+        ok, _ = self.check(answer)
+        if ok:
+            return answer
+        if "无法回答" in answer or "无法确定" in answer:
+            return answer  # 拒答场景不需要引用
+        source_str = "; ".join(list(self.valid_sources)[:3])
+        return answer + f"\n[来源: {source_str}]"
+
+if __name__ == "__main__":
+    guard = CitationGuard(["休假制度.pdf", "薪资制度.pdf", "绩效制度.pdf"])
+
+    test_cases = [
+        "年假有15天 [来源: 休假制度.pdf]",
+        "年假有15天",
+        "工资5000元 [来源: 薪资制度.pdf]",
+        "根据已有信息无法回答",
+        "年假有15天 [来源: 不存在的文档.pdf]",
+    ]
+    for tc in test_cases:
+        ok, issues = guard.check(tc)
+        result = guard.auto_attach(tc)
+        print(f"OK={ok} | {result[:80]}...")</pre></div>
+      <p><strong>上线效果</strong>：2025 年 9 月 CorpAssist 上线强制引用后，知识库问答的幻觉率从 8.2% 降至 1.3%（A/B 测试，n=5000 query）。其中约 2.1% 的回答被 Citation Guard 拦截——这些回答虽然引用格式正确但引用了不存在于检索结果中的文档名（模型「杜撰」了来源）。另有 1.5% 的回答因缺少引用被自动补充。</p>
+      <aside class="learn-scenario"><h4>CorpAssist 场景</h4><p>员工问「产假有几天」。检索管线找到了《休假制度》第 4 条关于产假的内容。LLM 生成的回答是「产假 98 天，难产增加 15 天 [来源: 休假制度.pdf]」。Citation Guard 校验通过——休假制度.pdf 在 valid_sources 列表中。但如果 LLM 编造了「产假 180 天 [来源: 国家规定.pdf]」，而国家规定.pdf 不在检索结果中，Guard 就会拦截并触发人工复核。</p></aside>
+    </div>
+
+    <div class="section-block">
+      <h3>人工复核队列设计</h3>
+      <p>对于置信度处于「灰色地带」的回答（0.60-0.85），引入人工复核流程，而非直接拒答或冒险输出。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart LR
+    A[模糊回答] --> B[进入复核队列]
+    B --> C{排队策略}
+    C -->|优先级高: 紧急问题| D[立即分配]
+    C -->|优先级中: 一般问题| E[15分钟内分配]
+    C -->|优先级低: 普通问题| F[1小时内分配]
+    D --> G[人工审核]
+    E --> G
+    F --> G
+    G --> H{审核结果}
+    H -->|通过| I[直接回复用户]
+    H -->|修改| J[人工编辑后回复]
+    H -->|驳回| K[返回拒答模板]</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""人工复核队列"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime, timedelta
+from typing import Optional
+
+class Priority(Enum):
+    HIGH = 0    # 紧急：工资/合规相关问题
+    MEDIUM = 1  # 一般：制度查询
+    LOW = 2     # 普通：通用知识
+
+@dataclass
+class ReviewItem:
+    id: str
+    query: str
+    draft_answer: str
+    confidence: float
+    retrieval_docs: list[dict]
+    priority: Priority
+    created_at: datetime
+    assigned_to: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    status: str = "pending"  # pending/assigned/completed/rejected
+
+class ReviewQueue:
+    """人工复核队列"""
+
+    def __init__(self):
+        self.items: list[ReviewItem] = []
+        self.max_queue_time = {
+            Priority.HIGH: timedelta(minutes=5),
+            Priority.MEDIUM: timedelta(minutes=15),
+            Priority.LOW: timedelta(hours=1),
+        }
+
+    def enqueue(self, item: ReviewItem):
+        """入队"""
+        self.items.append(item)
+
+    def dequeue(self, agent_id: str) -> Optional[ReviewItem]:
+        """分配下一个待审核项（按优先级）"""
+        pending = sorted(
+            [i for i in self.items if i.status == "pending"],
+            key=lambda x: (x.priority.value, x.created_at),
+        )
+        if not pending:
+            return None
+        item = pending[0]
+        item.assigned_to = agent_id
+        item.status = "assigned"
+        return item
+
+    def complete(self, item_id: str, result: str, edited_answer: str = ""):
+        """完成审核"""
+        for item in self.items:
+            if item.id == item_id:
+                item.status = result  # completed/rejected
+                item.reviewed_at = datetime.utcnow()
+                break
+
+    def get_sla_breaches(self) -> list[ReviewItem]:
+        """获取已超过 SLA 的待审项"""
+        now = datetime.utcnow()
+        return [
+            i for i in self.items if i.status == "pending"
+            and (now - i.created_at) > self.max_queue_time[i.priority]
+        ]
+
+if __name__ == "__main__":
+    queue = ReviewQueue()
+    item = ReviewItem(
+        id="rev-001",
+        query="今年公积金缴纳比例是多少？",
+        draft_answer="公积金缴纳比例12%",
+        confidence=0.72,
+        retrieval_docs=[{"doc_id": "d001", "score": 0.72}],
+        priority=Priority.HIGH,
+        created_at=datetime.utcnow(),
+    )
+    queue.enqueue(item)
+    assigned = queue.dequeue("agent-01")
+    print(f"Assigned: {assigned.id} to {assigned.assigned_to}")
+    # 输出: Assigned: rev-001 to agent-01</pre></div>
+      <p><strong>容量规划</strong>：假设日均 5000 条查询，22% 进入复核队列（约 1100 条），每个审核员每分钟审核 2 条，需要约 9 个审核员全职工作。实际中大部分 HIGH 优先级的复核量约 15%（165 条），需要 2 个高级审核员专门处理。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>幻觉监控仪表盘</h3>
+      <p>幻觉抑制策略的效果需要实时监控。CorpAssist 使用 Grafana + Prometheus 构建了幻觉监控仪表盘。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""幻觉监控指标收集（Prometheus 埋点）"""
+
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from fastapi import FastAPI, Response
+
+app = FastAPI()
+
+# 指标定义
+hallucination_counter = Counter(
+    "corp_rag_hallucinations_total",
+    "Total hallucination events by type",
+    ["type"],  # citation_missing, citation_fake, content_error
+)
+
+confidence_histogram = Histogram(
+    "corp_rag_confidence_score",
+    "Confidence score distribution of answers",
+    buckets=[0.0, 0.3, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0],
+)
+
+review_queue_gauge = Gauge(
+    "corp_rag_review_queue_size",
+    "Current size of human review queue",
+    ["priority"],  # high, medium, low
+)
+
+answer_counter = Counter(
+    "corp_rag_answer_total",
+    "Total answers by action type",
+    ["action"],  # direct, reviewed, refused
+)
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type="text/plain")
+
+def record_answer(action: str, confidence: float):
+    """记录一次回答的指标"""
+    answer_counter.labels(action=action).inc()
+    confidence_histogram.observe(confidence)
+
+def record_hallucination(hall_type: str):
+    """记录一次幻觉事件"""
+    hallucination_counter.labels(type=hall_type).inc()
+
+def update_review_queue(high: int, medium: int, low: int):
+    """更新复核队列大小"""
+    review_queue_gauge.labels(priority="high").set(high)
+    review_queue_gauge.labels(priority="medium").set(medium)
+    review_queue_gauge.labels(priority="low").set(low)</pre></div>
+      <p><strong>仪表盘核心指标</strong>：</p>
+      <table class="learn-decision-table"><thead><tr><th>指标</th><th>采集方式</th><th>告警阈值</th><th>业务含义</th></tr></thead><tbody>
+        <tr><td>直接回复比例</td><td>answer_counter (direct/total)</td><td>< 60% 告警</td><td>自动化率过低需优化检索</td></tr>
+        <tr><td>引用缺失率</td><td>hallucination_counter (citation_missing)</td><td>> 3% 告警</td><td>Prompt 约束力下降</td></tr>
+        <tr><td>平均置信度</td><td>HdrHistogram</td><td>< 0.75 告警</td><td>整体检索质量下降</td></tr>
+        <tr><td>复核队列积压</td><td>review_queue_gauge</td><td>> 200 告警</td><td>审核人力不足</td></tr>
+        <tr><td>SLA 违反数</td><td>review_queue_sla_breaches (自定义)</td><td>> 10 告警</td><td>高优问题处理不及时</td></tr>
+        <tr><td>拒答率</td><td>answer_counter (refused/total)</td><td>> 20% 告警</td><td>阈值过于严格</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>置信度阈值三档（≥0.85/0.60-0.85/<0.60）在自动化率和安全性之间取得平衡。</li>
+        <li>强制引用（Citation Guard）将幻觉率从 8.2% 降至 1.3%，拦截了 2.1% 的杜撰来源回答。</li>
+        <li>人工复核队列设计需注意优先级分级和 SLA 保障，日均 1100 条复核需约 9 人。</li>
+        <li>幻觉监控仪表盘跟踪 6 个核心指标，每个指标有明确的告警阈值。</li>
+        <li>好的拒答比错误回答更保护用户信任——拒答率 13% 时用户满意度 4.2/5。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-04-hall-1"> 能实现置信度评估和拒答策略的三档阈值逻辑</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-hall-2"> 能写出 Citation Guard 的校验和自动补充代码</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-hall-3"> 能描述人工复核队列的优先级和 SLA 设计</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-hall-4"> 能列出幻觉监控仪表盘的 6 个核心指标</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-04-hall-5"> 能解释为什么拒答不一定是坏事</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>置信度阈值</td><td>根据检索/Rerank/引用综合分数判断是否直接回答</td></tr>
+        <tr><td>拒答策略</td><td>低置信度时不回答，返回引导信息</td></tr>
+        <tr><td>强制引用</td><td>要求 LLM 每条回答都标注信息来源</td></tr>
+        <tr><td>Citation Guard</td><td>校验引用是否在有效来源列表中，防止杜撰</td></tr>
+        <tr><td>人工复核队列</td><td>中等置信度的回答交给人工审核后再输出</td></tr>
+        <tr><td>SLA 违反</td><td>审核项在承诺时间内未被处理</td></tr>
+        <tr><td>幻觉率</td><td>模型编造信息占总回答的比例</td></tr>
+        <tr><td>监控仪表盘</td><td>实时跟踪幻觉、置信度、队列状态的 Grafana 面板</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 你们怎么定义「幻觉」？有什么量化指标？</summary><p>我们把幻觉分为三级。A 级：编造不存在的信息（如回答引用了不存在的制度文件）；B 级：信息偏差（如年假 15 天说成 10 天）；C 级：信息不完整（漏掉了关键限定条件「员工每年」）。量化指标是三级加权幻觉率 = (A×3 + B×2 + C×1) / 总回答数。A 级最严重，权重最高。上线强制引用后，A 级幻觉率从 3.1% 降至 0.4%。</p></details>
+        <details><summary>Q2: 人工复核成了瓶颈怎么办？</summary><p>两个方向。1) 技术侧：优化检索和 Rerank，提升高置信度回答的比例。我们的目标是直接回复率从 65% 提升到 80%，这需要把 NDCG@10 从 0.81 提升到 0.88。2) 流程侧：对高频问题（如「年假几天」「报销流程」）建立答案模板库，复核员可以直接选择模板回复而非逐条编辑。通过模板库，单条复核时间从 30 秒降至 8 秒。</p></details>
+        <details><summary>Q3: 置信度分数怎么计算的？为什么可信？</summary><p>置信度 = 0.3×检索分 + 0.4×Rerank 分 + 0.3×引用分。检索分是 BM25+向量融合后 top-3 的平均分。Rerank 分是 Cross-Encoder 对 question-doc pair 的打分。引用分是 Citation Guard 校验是否通过。我们通过 2000 条带标签的测试集验证了这个公式的可靠性——分数 ≥0.85 的回答中，实际正确的比例为 96.2%；<0.60 的回答中，实际正确的比例仅 31.5%。</p></details>
+      </div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://prometheus.io/docs/practices/histograms/">Prometheus Bucket 设计指南</a> — 置信度直方图的桶划分</li>
+    <li><a href="https://grafana.com/docs/grafana/latest/panels-visualizations/">Grafana 仪表盘文档</a> — 幻觉监控面板的可视化配置</li>
+    <li><a href="https://arxiv.org/abs/2310.01369">RAG 幻觉调查论文</a> — 系统性了解 RAG 幻觉的分类和缓解方法</li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>运行 ConfidenceScorer 代码，测试不同输入下的分数和分级</li>
+      <li>用 CitationGuard 校验 5 个示范回答的有效性</li>
+      <li>实现一个简易 ReviewQueue 并测试入队/出队/完成流程</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>如果置信度分数 0.82 但 Citation Guard 发现引用缺失，你应该用哪个结果？</summary><p>以 Citation Guard 为准。置信度 0.82 > 0.85? 不，它属于 MEDIUM 区间（0.60-0.85），加上引用缺失会进一步降低综合分。对于这种情况，正确的处理是：1) 尝试 auto_attach 自动补充引用；2) 如果补充后分数≥0.85 且引用有效，直接回复；3) 否则进入 MEDIUM 复核队列。实践中引用缺失时，综合分约降至 0.60-0.70。</p></details>
+      <details><summary>你认为人工复核流程中，审核员能看到什么信息？</summary><p>审核员应该看到：1) 用户原始问题；2) LLM 生成的草稿回答；3) 检索到的 Top-5 文档内容（供核实引用）；4) 置信度分数和各维度的分数分解；5) Citation Guard 的校验结果。不应看到：用户的个人信息（姓名、工号），除非是必要上下文。审核操作包括：通过、编辑、拒绝。所有审核操作记录到审计日志。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-04-hallucination-lab/</code></p><ul class="demo-acceptance">
+      <li>置信度评估返回正确的分级结果</li>
+      <li>Citation Guard 能拦截杜撰引用</li>
+      <li>监控指标在 Prometheus 端可达</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-05-eval-loop">评测闭环与增量更新</a> —— 用数据驱动 RAG 持续优化</li>
+  </ul></div>
+</section>

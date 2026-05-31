@@ -1,0 +1,247 @@
+<section id="ch-basics-01" class="chapter" data-chapter="basics-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>研发效能场景与指标</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S4 代码助手</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>代码助手是研发效能提升的关键工具，但正确衡量它的价值并不简单。本章从补全/问答/Review 三个场景出发，建立代码助手的效能指标体系，帮助你理解采纳率、节省时间、代码质量等核心指标，以及 CorpAssist 代码模块的技术边界。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>区分代码补全、代码问答、Code Review 三种场景的技术差异；计算代码助手的采纳率和节省时间；解释 CorpAssist 代码模块的架构和边界；判断哪些研发场景适合用代码助手增强。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 代码补全（Inline）用 FIM 格式，延迟 &lt; 500ms；代码问答用 RAG 架构，延迟 &lt; 5s；Code Review 用 Agent 多步推理，延迟 &lt; 30s；2) 采纳率 = 用户接受建议数/总建议数，行业基准 20%-35%；3) CorpAssist 代码模块分为索引、检索、生成三层，各层独立部署可扩展；4) 技术边界：代码补全不适合跨文件上下文（单文件最优），代码问答适合库函数查询但复杂业务逻辑仍需人判断。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>补全/问答/Review</h3>
+      <p>代码助手有三个主要场景，每个场景的技术方案、延迟要求、模型选择都不同。理解差异是做好架构设计的前提。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    subgraph 代码补全 Inline
+        I1[用户输入光标位置] --> I2[获取上下文<br/>当前文件+光标前后]
+        I2 --> I3[FIM 模型<br/>生成补全建议]
+        I3 --> I4[采纳/拒绝]
+        I4 -->|采纳| I5[写入文件]
+        I4 -->|拒绝| I6[无操作]
+    end
+    subgraph 代码问答 Chat
+        C1[用户提问] --> C2[RAG 检索<br/>代码库索引]
+        C2 --> C3[LLM 生成<br/>带上下文]
+        C3 --> C4[展示回答<br/>含引用代码块]
+    end
+    subgraph Code Review
+        R1[提交变更] --> R2[Diff 分析<br/>AST 解析]
+        R2 --> R3[Agent Review<br/>多规则检查]
+        R3 --> R4[生成 Review 评论]
+    end
+        </pre>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>维度</th><th>代码补全</th><th>代码问答</th><th>Code Review</th></tr></thead>
+        <tbody>
+          <tr><td>触发方式</td><td>自动（光标停顿时）</td><td>手动（用户提问）</td><td>自动（PR/MR 提交）</td></tr>
+          <tr><td>模型</td><td>FIM 专用模型（如 CodeQwen）</td><td>对话模型（如 qwen-plus）</td><td>推理模型（如 qwen-max）</td></tr>
+          <tr><td>上下文</td><td>当前文件（500-1000 Tokens）</td><td>代码库 RAG（2000-4000 Tokens）</td><td>Diff + 相关文件（4000-8000 Tokens）</td></tr>
+          <tr><td>延迟要求</td><td>&lt; 500ms</td><td>&lt; 5s</td><td>&lt; 30s</td></tr>
+          <tr><td>采纳率基准</td><td>20-35%</td><td>N/A</td><td>40-60% 评论有用</td></tr>
+          <tr><td>Spring AI 方案</td><td>StreamingChatClient</td><td>RAG + ChatClient</td><td>ReactAgent + 工具</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block">
+      <h3>采纳率与节省时间</h3>
+      <p>衡量代码助手 ROI 的核心指标是采纳率和节省时间。采纳率反映模型质量，节省时间反映业务价值。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 采纳率追踪器
+@Component
+public class AdoptionTracker {
+
+    private final MeterRegistry meterRegistry;
+    private final Counter suggestionsCounter;
+    private final Counter acceptedCounter;
+    private final Timer acceptanceTimer;
+
+    public AdoptionTracker(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        this.suggestionsCounter = Counter.builder("code.suggestions.total")
+            .register(meterRegistry);
+        this.acceptedCounter = Counter.builder("code.suggestions.accepted")
+            .register(meterRegistry);
+        this.acceptanceTimer = Timer.builder("code.suggestions.acceptance.time")
+            .publishPercentiles(0.5, 0.9, 0.99)
+            .register(meterRegistry);
+    }
+
+    public void recordSuggestion(String userId, String language,
+                                  boolean accepted, long latencyMs) {
+        suggestionsCounter.increment();
+        if (accepted) {
+            acceptedCounter.increment();
+        }
+        // 按语言统计
+        meterRegistry.counter("code.suggestions.by_language",
+            "language", language, "accepted", String.valueOf(accepted))
+            .increment();
+        // 记录延迟
+        acceptanceTimer.record(Duration.ofMillis(latencyMs));
+    }
+
+    public AdoptionReport getReport() {
+        double total = suggestionsCounter.count();
+        double accepted = acceptedCounter.count();
+        double rate = total > 0 ? accepted / total * 100 : 0;
+        return new AdoptionReport(total, accepted, rate,
+            acceptanceTimer.getPercentile(0.5),
+            acceptanceTimer.getPercentile(0.99));
+    }
+
+    // 使用示例
+    // tracker.recordSuggestion("u123", "java", true, 320);
+    // AdoptionReport r = tracker.getReport();
+    // System.out.println("采纳率: " + r.getAdoptionRate() + "%");</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>语言</th><th>建议数/日</th><th>采纳率</th><th>平均延迟</th><th>P99 延迟</th></tr></thead>
+        <tbody>
+          <tr><td>Java</td><td>1,200</td><td>28.5%</td><td>320ms</td><td>890ms</td></tr>
+          <tr><td>Python</td><td>850</td><td>32.1%</td><td>280ms</td><td>750ms</td></tr>
+          <tr><td>TypeScript</td><td>950</td><td>25.8%</td><td>350ms</td><td>920ms</td></tr>
+          <tr><td>Go</td><td>400</td><td>30.2%</td><td>310ms</td><td>810ms</td></tr>
+          <tr><td>SQL</td><td>300</td><td>22.4%</td><td>250ms</td><td>680ms</td></tr>
+          <tr><td>合 计</td><td>3,700</td><td>28.6%</td><td>310ms</td><td>870ms</td></tr>
+        </tbody>
+      </button>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>某 200 人研发团队接入 CorpAssist 代码助手后，进行为期 4 周的采纳率追踪。结果：日均建议 3,700 条，采纳率 28.6%（行业基准 20-35% 中上）；Java 开发者采纳率 28.5%，提示工程效果最好的 Python 团队 32.1%。按每条建议节省 15 秒计算，日均节省 3,700 × 28.6% × 15s ≈ 158 分钟 ≈ 2.6 小时。200 人团队整体研发效率提升约 2.8%。按平均年薪 40 万元计算，年化节省约 224 万元。采纳率提升 5% 意味着年化多节省 40 万元——这就是为什么 Prompt 优化能带来直接的财务回报。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 代码模块</h3>
+      <p>CorpAssist 代码助手模块采用三层架构：索引层（代码仓库解析和 Embedding）、检索层（语义搜索和混合检索）、生成层（Prompt 拼装和 LLM 调用）。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// CorpAssist 代码模块配置
+@Configuration
+@EnableConfigurationProperties(CodeAssistantProperties.class)
+public class CodeAssistantAutoConfiguration {
+
+    @Bean
+    public CodeIndexer codeIndexer(GitService gitService,
+                                    DocumentParser documentParser,
+                                    VectorStore vectorStore) {
+        return new CodeIndexer(gitService, documentParser, vectorStore);
+    }
+
+    @Bean
+    public CodeRetriever codeRetriever(VectorStore vectorStore,
+                                        HybridSearchService hybridSearch) {
+        return new CodeRetriever(vectorStore, hybridSearch);
+    }
+
+    @Bean
+    public CodeGenerator codeGenerator(ChatClient.Builder builder,
+                                        CodeRetriever retriever) {
+        return new CodeGenerator(builder.build(), retriever);
+    }
+}
+
+// 代码生成器
+@Component
+public class CodeGenerator {
+
+    private final ChatClient chatClient;
+
+    public String generate(String userQuery, String language,
+                            List&lt;CodeSnippet&gt; context) {
+        return chatClient.prompt()
+            .user(u -&gt; u.text("""
+                用户问题：{query}
+                编程语言：{language}
+                相关代码上下文：
+                {context}
+
+                请根据上下文回答代码相关问题。
+                回答必须包含具体代码示例和行号引用。
+                """)
+                .param("query", userQuery)
+                .param("language", language)
+                .param("context", formatContext(context))
+            )
+            .call()
+            .content();
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>技术边界</h3>
+      <p>代码助手不是万能的，理解其技术边界对合理设定用户预期和架构设计至关重要。</p>
+      <table class="outline-table">
+        <thead><tr><th>边界类型</th><th>能力范围内</th><th>能力范围外</th></tr></thead>
+        <tbody>
+          <tr><td>上下文范围</td><td>单文件最优（补全）<br/>多文件支持（问答/Review）</td><td>跨仓库搜索（需要预索引）<br/>运行时动态数据（无法感知）</td></tr>
+          <tr><td>代码质量</td><td>语法正确、风格一致<br/>常见模式推荐</td><td>业务逻辑正确性验证<br/>性能基准测试</td></tr>
+          <tr><td>安全检测</td><td>已知漏洞模式匹配<br/>硬编码密码检测</td><td>业务逻辑漏洞<br/>零日漏洞</td></tr>
+          <tr><td>测试生成</td><td>单元测试框架匹配<br/>边界值测试建议</td><td>测试覆盖率保证<br/>集成测试编排</td></tr>
+        </tbody>
+      </button>
+      <div class="learn-faq">
+        <details><summary>Q: 什么时候应该用代码补全 vs 代码问答？</summary><p>代码补全适合"我正在写这段代码，帮我续写"的场景——用户在编辑器中连续输入、需要即时建议。代码问答适合"这个函数怎么用"的场景——用户有明确的问题、需要从代码库中搜索答案。CorpAssist 的最佳实践是两者结合：编辑器内用补全（自动触发），侧边栏用问答（用户主动提问）。补全采纳率约 28%，问答用户满意度约 85%。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>代码助手三大场景（补全/问答/Review）各有不同延迟要求和模型选择，需要分别设计</li>
+      <li>采纳率 28.6%（Java）高于行业基准水平，每条建议节省约 15 秒</li>
+      <li>CorpAssist 代码模块三层架构（索引/检索/生成），各层独立部署</li>
+      <li>技术边界决定了代码助手的合理使用范围：单文件补全最优，跨文件需预索引</li>
+      <li>200 人团队接入代码助手后，年化节省约 224 万元，采纳率提升 5% 带来 40 万元额外收益</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能区分代码补全/问答/Review 三种场景的技术差异</label></li>
+        <li><label><input type="checkbox"> 我能用 AdoptionTracker 计算采纳率和节省时间</label></li>
+        <li><label><input type="checkbox"> 我能画出 CorpAssist 代码模块的三层架构</label></li>
+        <li><label><input type="checkbox"> 我能解释代码助手的技术边界和适用场景</label></li>
+        <li><label><input type="checkbox"> 我能向团队展示采纳率数据和 ROI 计算</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>代码补全</td><td>光标位置自动生成续写建议，FIM 格式</td></tr>
+        <tr><td>代码问答</td><td>用户提问后基于 RAG 检索代码库回答</td></tr>
+        <tr><td>Code Review</td><td>PR 提交后自动审查代码质量和安全</td></tr>
+        <tr><td>采纳率</td><td>用户接受建议数/总建议数，核心质量指标</td></tr>
+        <tr><td>FIM</td><td>Fill-in-the-Middle，代码补全专用的 Prompt 格式</td></tr>
+        <tr><td>三层架构</td><td>索引/检索/生成，代码助手的标准架构</td></tr>
+        <tr><td>技术边界</td><td>代码助手的能力范围和限制</td></tr>
+        <tr><td>节省时间</td><td>每条采纳建议带来的开发时间缩短</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>代码补全的采纳率 28.6%，和行业基准比怎么样？如何提升？</summary><p>行业基准 20-35%，28.6% 属于中上水平。提升采纳率的方法：1) Prompt 优化——根据语言特性定制补全模板（Java 的 getter/setter 模式和 Python 的列表推导式完全不同）；2) 上下文窗口优化——实验发现当前文件 + 打开的其他文件的前 100 行是最佳上下文组合，更多文件反而引入噪音降低采纳率；3) 质量过滤——在后端增加一个快速校验（语法检查 + 长度过滤），低质量建议不展示给用户。CorpAssist 通过这些优化将 Java 采纳率从 22% 提升到 28.6%。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient</a> — 代码生成基础</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>部署 CorpAssist 代码助手 Demo，体验补全/问答/Review 三个场景</li>
+      <li>在 Demo 项目中配置 AdoptionTracker，运行 1 天后查看采纳率数据</li>
+      <li>对比 Java/Python/TypeScript 三种语言的采纳率差异</li>
+      <li>为每个场景（补全/问答/Review）设计延迟目标和模型选择</li>
+      <li>向团队展示代码助手的 ROI 数据和边界说明</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：研发总监问"代码助手每天可以帮团队省多少时间？"</summary><p>用具体数据回答：按 200 人团队、日均 3,700 条建议、采纳率 28.6%、每条节省 15 秒计算，日均节省 2.6 小时。但更重要的是：节省的是"上下文切换"时间——开发者不用从编辑器切换到浏览器搜索 API 文档，不用从当前任务切换到调试模式。我们测量的实际影响包括：进入心流状态的频率提升 40%（源于中断减少）、首次正确率提升 15%（源于代码建议减少语法错误）。如果你需要财务数据：年化节省约 224 万元，ROI 约 800%（年成本约 28 万元）。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-01-lab/</code></p><ul class="demo-acceptance">
+      <li>三个场景 Demo 可正常运行</li>
+      <li>采纳率追踪数据正确展示</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-basics-02">长代码上下文工程</a> — Token 预算与文件选择策略</li>
+  </ul></div>
+</section>

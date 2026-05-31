@@ -1,0 +1,189 @@
+<section id="ch-basics-04" class="chapter" data-chapter="basics-04">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>多模态与素材 RAG</h2><button type="button" class="btn-mark-done" data-chapter="basics-04" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>企业内容创作需要素材支撑——产品图片、往期文章、竞品资料、品牌规范。多模态素材 RAG 将这些非结构化素材统一管理，在生成内容时自动检索相关素材作为参考。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现图文素材的统一索引和检索；配置版权合规检查（图片引用/文字引用）；调用多模态 API（文生图/图生文）；实现素材使用的版权追溯。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 素材索引：图片 Clip Embedding + 文字 Embedding 统一存储；2) 版权合规：图片来源标记（自摄/素材库/AI生成），使用前检查权限；3) 多模态 API：DashScope 的文生图（qwen-vl-max）和图生文（qwen-vl-plus）；4) 版权追溯：每次素材使用记录素材 ID + 内容 ID + 使用时间。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>图文素材库</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 素材索引
+@Component
+public class AssetIndexer {
+
+    private final VectorStore vectorStore;
+    private final ImageEmbeddingService imageEmbedding;
+
+    public void indexImage(Asset asset) {
+        // 图片 Embedding（Clip 模型）
+        float[] imageVector = imageEmbedding.embed(asset.getFile());
+
+        Document doc = new Document(
+            asset.getDescription(),
+            Map.of(
+                "assetId", asset.getId(),
+                "type", "image",
+                "url", asset.getUrl(),
+                "source", asset.getSource(),   // ORIGINAL / AI_GENERATED / STOCK
+                "license", asset.getLicense(),
+                "tags", String.join(",", asset.getTags()),
+                "createdAt", asset.getCreatedAt().toString()
+            )
+        );
+        doc.setEmbedding(imageVector);
+        vectorStore.add(List.of(doc));
+    }
+
+    public void indexText(Asset asset) {
+        Document doc = new Document(
+            asset.getContent(),
+            Map.of(
+                "assetId", asset.getId(),
+                "type", "text",
+                "source", asset.getSource(),
+                "url", asset.getUrl(),
+                "tags", String.join(",", asset.getTags())
+            )
+        );
+        vectorStore.add(List.of(doc));
+    }
+
+    public List&lt;Asset&gt; searchAssets(String query, String type, int topK) {
+        SearchRequest request = SearchRequest.builder()
+            .query(query)
+            .topK(topK)
+            .filterExpression("type == '" + type + "'")
+            .build();
+        return vectorStore.similaritySearch(request).stream()
+            .map(this::toAsset)
+            .toList();
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>版权合规与多模态 API</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 版权检查器
+@Component
+public class CopyrightChecker {
+
+    public CheckResult checkUsage(Asset asset, String contentId) {
+        // 检查素材来源权限
+        switch (asset.getSource()) {
+            case "STOCK":
+                // 素材库图片：检查授权是否过期
+                if (asset.getLicenseExpiry().isBefore(Instant.now())) {
+                    return CheckResult.deny("素材库授权已过期: " + asset.getId());
+                }
+                break;
+            case "AI_GENERATED":
+                // AI 生成图片：可自由使用
+                break;
+            case "ORIGINAL":
+                // 自摄图片：检查是否有原始授权
+                if (!asset.hasPermission()) {
+                    return CheckResult.deny("自摄图片缺少使用授权");
+                }
+                break;
+        }
+        return CheckResult.allow();
+    }
+
+    // 记录使用
+    public void recordUsage(Asset asset, String contentId, String userId) {
+        UsageRecord record = new UsageRecord(
+            UUID.randomUUID().toString(),
+            asset.getId(), contentId, userId, Instant.now()
+        );
+        usageRepository.save(record);
+    }
+}
+
+// 多模态 API 调用
+@Component
+public class MultiModalService {
+
+    private final ChatClient vlClient;
+
+    // 文生图：生成配图
+    public String generateImage(String prompt, String style) {
+        return vlClient.prompt()
+            .user(u -&gt; u.text("""
+                生成一张配图。要求：
+                描述: {prompt}
+                风格: {style}
+                比例: 16:9
+                输出: 返回图片 Markdown 格式
+                """)
+                .param("prompt", prompt)
+                .param("style", style)
+            )
+            .call()
+            .content();
+    }
+
+    // 图生文：描述图片内容
+    public String describeImage(String imageUrl) {
+        return vlClient.prompt()
+            .user(u -&gt; u.text("请详细描述这张图片的内容、风格和适用场景")
+                .media(Media.of(imageUrl, MediaType.IMAGE))
+            )
+            .call()
+            .content();
+    }
+}</pre></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>生成一篇产品发布文章时，素材 RAG 自动检索到：1) 产品实拍图（自摄，有授权）→ 插入配图；2) 往期发布文案 3 篇（参考风格）→ 注入 Few-shot；3) 品牌规范文档（色调/字体）→ 注入 System Prompt。如果有图片来自素材库且授权即将过期（7 天内），自动标记并在文章底部添加"本图片使用 Shutterstock 授权"的版权声明。整个素材检索+版权检查+图文生成流程约 5 秒。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>版权追溯</h3>
+      <table class="outline-table">
+        <thead><tr><th>素材类型</th><th>来源</th><th>授权方式</th><th>追溯字段</th></tr></thead>
+        <tbody>
+          <tr><td>图片</td><td>自摄</td><td>内部授权</td><td>摄影师 + 拍摄日期 + 使用范围</td></tr>
+          <tr><td>图片</td><td>素材库</td><td>商业授权</td><td>授权编号 + 有效期</td></tr>
+          <tr><td>图片</td><td>AI 生成</td><td>完全授权</td><td>生成模型 + Prompt</td></tr>
+          <tr><td>文字</td><td>原创</td><td>自有版权</td><td>作者 + 创建日期</td></tr>
+          <tr><td>文字</td><td>引用</td><td>注明来源</td><td>原文链接 + 引用日期</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>素材索引通过 Clip Embedding（图片）+ 文本 Embedding 统一管理</li>
+      <li>版权合规按来源类型（自摄/素材库/AI生成）检查授权状态</li>
+      <li>多模态 API 支持文生图和图生文</li>
+      <li>每次素材使用记录到追溯表，素材 ID + 内容 ID + 时间</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能实现图文素材索引</label></li>
+        <li><label><input type="checkbox"> 我能配置版权合规检查</label></li>
+        <li><label><input type="checkbox"> 我能调用多模态 API</label></li>
+        <li><label><input type="checkbox"> 我能实现版权追溯</label></li>
+      </ul></div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">DashScope 多模态</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现图片素材索引和检索</li>
+      <li>配置版权检查器</li>
+      <li>调用多模态 API 生成配图</li>
+      <li>查询素材使用追溯记录</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-04-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-01">模板引擎与批量生成</a></li></ul></div>
+</section>

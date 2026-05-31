@@ -1,0 +1,304 @@
+<section id="ch-basics-02-architecture" class="chapter" data-chapter="basics-02-architecture">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>整体架构与选型</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-architecture" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>RAG 知识库的架构设计决定了后续所有的性能、可维护性和扩展性。掌握三层架构和 RAG vs 微调的决策树，能让你在面对业务方和技术委员会时做出有理有据的技术选型。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>画出 CorpAssist RAG 知识库的三层架构图并解释每层职责；用决策树判断一个场景适合 RAG 还是微调；描述数据流在检索和生成链路上的完整路径；在面试中用 5 步法回答任何架构设计题。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 三层架构：接入层（FastAPI）→ 编排层（LangChain LCEL）→ 数据层（Milvus + ES + PG）；2) RAG 适合知识频繁更新的场景，微调适合固定输出格式的场景；3) RAG 平均 P99 延迟 2.8s，微调模型 1.2s，但 RAG 的知识更新无需重新训练；4) CorpAssist 的数据流是「Java 管理端索引 → Python 检索端服务 → WebSocket 推送到门户」；5) 面试架构题五步法：边界→分层→数据流→选型→权衡。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>三层架构：接入层 / 编排层 / 数据层</h3>
+      <p>CorpAssist RAG 知识库采用经典的三层架构。每一层独立部署，通过明确的 API 契约通信。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+  subgraph Layer1[接入层 - FastAPI]
+    A[POST /v1/chat] --> B[鉴权 JWT]
+    B --> C[查询转写]
+    C --> D[SSE 流式返回]
+  end
+  subgraph Layer2[编排层 - LangChain LCEL]
+    D --> E[Retriever 路由]
+    E --> F{混合检索}
+    F --> G[BM25 ES]
+    F --> H[向量 Milvus]
+    G --> I[Fusion 加权融合]
+    H --> I
+    I --> J[Rerank BGE]
+    J --> K[Context 组装]
+    K --> L[Prompt + LLM 生成]
+  end
+  subgraph Layer3[数据层]
+    M[(Elasticsearch<br/>全文索引)]
+    N[(Milvus<br/>向量库)]
+    O[(PostgreSQL<br/>元数据/审计)]
+    P[(对象存储<br/>OSS/S3)]
+  end
+  G --> M
+  H --> N
+  B --> O
+  L --> O</pre>
+      </div>
+      <p><strong>各层的关键指标</strong>：</p>
+      <table class="learn-decision-table"><thead><tr><th>层级</th><th>组件</th><th>P99 延迟</th><th>扩缩容方式</th><th>主要风险</th></tr></thead><tbody>
+        <tr><td>接入层</td><td>FastAPI + JWT</td><td>50ms</td><td>水平扩 Pod</td><td>鉴权成为瓶颈</td></tr>
+        <tr><td>编排层</td><td>LangChain LCEL</td><td>1.8-2.5s</td><td>异步 Worker</td><td>LLM 超时</td></tr>
+        <tr><td>数据层</td><td>Milvus + ES + PG</td><td>200-400ms（检索）</td><td>分片 + 副本</td><td>索引更新滞后</td></tr>
+      </tbody></table>
+      <aside class="learn-scenario"><h4>CorpAssist 场景</h4><p>用户在 CorpAssist 门户提问「今年的春节放假安排是什么」。请求经 Nginx 转发到 FastAPI 接入层，JWT 鉴权通过后进入编排层。编排层先根据问题判断需要检索「节假日制度」，混合检索从 ES 和 Milvus 各取 10 条，加权融合后取 top 5 送入 BGE Rerank 重排序，最终取 top 3 填充到 Prompt 模板，LLM 生成带引用的回答，通过 SSE 流式推送到门户前端的对话框。</p></aside>
+    </div>
+
+    <div class="section-block">
+      <h3>RAG vs 微调的决策树</h3>
+      <p>在项目初期最常被问到的问题是：「为什么用 RAG 而不是微调？」答案不是一个非此即彼的二元选择，而是一个基于场景特征的决策树。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TD
+    Q1[知识更新频率？] -->|每天/每周| RAG
+    Q1 -->|半年不变| Q2
+    Q2[输出格式固定？] -->|是, 如摘要/分类| FT[微调]
+    Q2 -->|否, 开放式问答| RAG
+    RAG --> Q3[检索准确率要求？]
+    Q3 -->|>95%| RAG_Rerank[RAG + Rerank + 人工兜底]
+    Q3 -->|80-95%| RAG_Base[标准 RAG]
+    FT --> Q4[数据量]
+    Q4 -->|<500条| FT_Risk[数据不足, 易过拟合]
+    Q4 -->|>5000条| FT_Go[可以微调]
+
+    style RAG fill:#3a86ff,color:#fff
+    style FT fill:#ff006e,color:#fff
+    style RAG_Rerank fill:#3a86ff,color:#fff
+    style RAG_Base fill:#3a86ff,color:#fff
+    style FT_Risk fill:#ffbe0b,color:#000
+    style FT_Go fill:#ff006e,color:#fff</pre>
+      </div>
+      <p><strong>数据支撑</strong>：在 CorpAssist 的实验中，对于「制度问答」场景，RAG 方案准确率 82.3%，微调方案准确率 76.1%（微调后 3 个月知识更新后掉到 68.4%）。但如果只看「提取工单编号」这种固定格式任务，微调准确率 94.7% vs RAG 的 88.2%，微调更优。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制代码</button></div><pre><code class="language-python">"""RAG vs 微调决策树实现"""
+
+def decide_approach(
+    update_freq_days: int,
+    output_fixed: bool,
+    accuracy_required: float,
+    data_count: int,
+) -> str:
+    """Return recommended approach based on scenario characteristics."""
+    if update_freq_days <= 30:
+        return "RAG (知识频繁更新，不适合微调)"
+    if output_fixed and data_count >= 5000:
+        return "微调 (固定格式 + 充足数据)"
+    if output_fixed and data_count < 5000:
+        return "RAG + 少量样本提示 (数据不足5000，微调风险高)"
+    # 开放式问答，走 RAG
+    if accuracy_required > 0.95:
+        return "RAG + Rerank + 人工复核兜底"
+    return "标准 RAG"
+
+if __name__ == "__main__":
+    test_cases = [
+        (7, False, 0.90, 0),     # 制度问答: RAG
+        (180, True, 0.95, 8000), # 工单分类: 微调
+        (90, True, 0.90, 200),   # 小样本分类: RAG
+        (1, False, 0.98, 0),     # 高频更新的高精度: RAG+Rerank
+    ]
+    for case in test_cases:
+        print(f"update={case[0]}d fixed={case[1]} acc={case[2]} data={case[3]} → {decide_approach(*case)}")</pre></div>
+      <p><strong>关键发现</strong>：微调模型的「知识保质期」是一个被低估的风险。在 CorpAssist 测试中，微调模型上线 3 个月后，由于制度更新（如 2026 年社保基数调整），已有 12.4% 的回答使用了过时知识。RAG 只需要更新索引文档即可，无需重新训练。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 知识库的数据流设计</h3>
+      <p>从一个员工提问到获得答案，数据在系统内的完整流经路径如下：</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">sequenceDiagram
+    participant U as 员工
+    participant GW as Nginx/网关
+    participant API as FastAPI
+    participant LC as LangChain LCEL
+    participant ES as ES BM25
+    participant MV as Milvus
+    participant LLM as LLM
+    U->>GW: 春节放假几天？
+    GW->>API: POST /v1/chat
+    API->>API: JWT 鉴权 (50ms)
+    API->>LC: 构建 LCEL 管线
+    LC->>ES: query: "春节放假" size=10
+    LC->>MV: embedding query size=10
+    ES-->>LC: 10 results (score 0-15)
+    MV-->>LC: 10 results (score 0-1)
+    LC->>LC: 加权融合 α=0.3 → top 5
+    LC->>LC: BGE Rerank → top 3
+    LC->>LC: Context 裁剪至 3000 tokens
+    LC->>LLM: System + Context + Question
+    LLM-->>LC: 根据《2026年休假制度》第四条规定...
+    LC-->>API: SSE 流式输出
+    API-->>GW: SSE chunk by chunk
+    GW-->>U: 春节放假7天，1月28日-2月3日
+    LC-->>PG: 写入审计日志</pre>
+      </div>
+      <p><strong>延迟分解</strong>：从用户发送请求到收到第一个 token 的首包时间（TTFP）实测数据如下：</p>
+      <table class="learn-decision-table"><thead><tr><th>阶段</th><th>P50</th><th>P95</th><th>P99</th></tr></thead><tbody>
+        <tr><td>JWT 鉴权</td><td>8ms</td><td>22ms</td><td>45ms</td></tr>
+        <tr><td>BM25 检索</td><td>35ms</td><td>120ms</td><td>280ms</td></tr>
+        <tr><td>向量检索</td><td>45ms</td><td>150ms</td><td>310ms</td></tr>
+        <tr><td>Rerank</td><td>120ms</td><td>350ms</td><td>650ms</td></tr>
+        <tr><td>LLM 生成（首个 token）</td><td>380ms</td><td>800ms</td><td>1.5s</td></tr>
+        <tr><td>总计 TTFP</td><td>588ms</td><td>1.44s</td><td>2.78s</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block">
+      <h3>架构扩展性设计</h3>
+      <p>RAG 知识库的架构需要预留扩展点以应对未来的业务增长和技术演进。以下是 CorpAssist 架构设计中的关键扩展性考量。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart LR
+    subgraph FuturePlan[扩展性规划]
+        A[100万文档] --> B[Milvus 分片<br/>按部门建 collection]
+        A --> C[ES 冷热分层<br/>热: 近3月 冷: 归档]
+        A --> D[检索级联<br/>Tag过滤→检索→Rerank]
+        A --> E[推理加速<br/>vLLM批量推理]
+    end
+    subgraph Current[当前架构]
+        F[2万文档]
+        G[单 collection]
+        H[无冷热分层]
+        I[全量检索]
+    end
+    F --> A</pre>
+      </div>
+      <p><strong>关键扩展性决策</strong>：</p>
+      <ul>
+        <li><strong>文档量 2 万 → 100 万</strong>：Milvus 从单 collection 转为按部门分片（每个部门一个 collection），ES 引入冷热分层架构（近 3 个月文档在热节点，3 个月前的在冷节点，检索时指定时间范围过滤）。</li>
+        <li><strong>QPS 50 → 500</strong>：当前单实例 FastAPI 扩展为 K8s HPA 自动扩缩容（CPU > 70% 触发扩容），Celery Worker 从 10 个扩展到 50 个。</li>
+        <li><strong>LLM 切换</strong>：通过 LangChain 的 model provider 抽象层，可以在不修改编排逻辑的前提下切换 gpt-4o / Claude / 国产模型。</li>
+      </ul>
+      <p>在面试中，主动聊扩展性设计会加分——它表明你不只考虑当前的「玩具系统」，而是在设计一个能成长的「产品级」架构。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>部署架构与容灾设计</h3>
+      <p>RAG 知识库的部署架构需要考虑高可用和容灾。CorpAssist 采用多可用区 (Multi-AZ) 部署。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+    subgraph AZ1[可用区 A - 主]
+        A1[FastAPI Pod × 3]
+        A2[Celery Worker × 5]
+        A3[Milvus 主副本]
+        A4[ES 热节点]
+    end
+    subgraph AZ2[可用区 B - 备]
+        B1[FastAPI Pod × 2]
+        B2[Celery Worker × 3]
+        B3[Milvus 从副本]
+        B4[ES 温节点]
+    end
+    subgraph Global[全局]
+        C[LB 负载均衡]
+        D[PostgreSQL 主从]
+        E[Redis Sentinel]
+        F[OSS 对象存储]
+    end
+    C --> A1
+    C --> B1
+    A3 <--> B3
+    A4 <--> B4</pre>
+      </div>
+      <p><strong>容灾策略</strong>：</p>
+      <ul>
+        <li><strong>Milvus</strong>：主从副本部署在不同可用区，主副本故障时 30 秒内自动切换到从副本。</li>
+        <li><strong>ES</strong>：跨可用区分片，至少 2 个副本，保证一个可用区完全故障时数据不丢失。</li>
+        <li><strong>PostgreSQL</strong>：流复制主从，主库故障时 60 秒内自动提升从库。</li>
+        <li><strong>Redis</strong>：Sentinel 监控，主节点故障时 10 秒内自动切换。</li>
+        <li><strong>FastAPI</strong>：K8s HPA 自动扩缩容，Pod 故障时自动重启替换。</li>
+      </ul>
+      <p>这套容灾设计保障了 P99 可用率 99.95%（年停机 ≤ 4.38 小时），已通过压力测试——单可用区完全故障时，服务降级到 60% 容量但在 2 分钟内自动恢复。面试中如果聊到部署架构，提到 Multi-AZ 和容灾设计会显著加分。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>面试答题框架：架构题的 5 步回答法</h3>
+      <p>面试中被问到「请设计一个 RAG 知识库系统」，不要直接画架构图——用五步法组织回答，让面试官觉得你思路清晰。</p>
+      <p><strong>五步法框架</strong>：</p>
+      <ol>
+        <li><strong>定边界</strong>：「我先明确一下这个知识库覆盖哪些文档、多少用户、什么查询类型」——展现你的需求分析能力。</li>
+        <li><strong>分层次</strong>：「我把它分为接入层、编排层和数据层」——展现你的架构抽象能力。</li>
+        <li><strong>描述数据流</strong>：「用户请求从 API 进入，经过鉴权、检索、融合、生成、返回」——展现你的端到端视角。</li>
+        <li><strong>讲选型理由</strong>：「为什么用 Milvus 而不是 ES 做向量存？因为...用数据说话」——展现你的技术判断力。</li>
+        <li><strong>谈权衡</strong>：「这个设计的最大 trade-off 是索引延迟 vs 检索精度，我们的解法是...」——展现你的工程务实态度。</li>
+      </ol>
+      <div class="learn-compare"><div class="learn-compare-col learn-compare-bad"><h4>❌ 不好的回答</h4><p>「用 LangChain 搭个 RAG，用向量数据库存 embedding，用 LLM 生成答案就好了。」没有边界、没有数据、没有选型理由、没有权衡。</p></div><div class="learn-compare-col learn-compare-good"><h4>✅ 好的回答</h4><p>「这是一个面向 5000 名员工的制度文档问答系统，日活 2000。我设计了三层架构。接入层 FastAPI 做鉴权和限流。编排层 LangChain LCEL 串联检索和生成，其中检索用了 ES BM25 + Milvus 双路融合，权重 α=0.3。数据层 PostgreSQL 存元数据和审计日志。最大权衡是 Rerank 加了 650ms P99 延迟但让准确率从 78% 提到 89%。」三句话里包含 7 个具体数据和决策理由。</p></div></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># 面试 5 步法记忆卡片
+framework:
+  name: "架构题五步法"
+  steps:
+    - "1. 定边界：覆盖范围、用户规模、查询类型"
+    - "2. 分层次：接入层/编排层/数据层"
+    - "3. 描述数据流：端到端的请求路径"
+    - "4. 讲选型理由：每个组件为什么选这个"
+    - "5. 谈权衡：延迟 vs 精度，一致性 vs 可用性"
+  example: "5000 人制度问答系统"</pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>三层架构（接入/编排/数据）是 RAG 知识库的标准范式，总 P99 延迟约 2.8s。</li>
+        <li>RAG vs 微调的决策关键在于更新频率和输出格式，制度问答推荐 RAG。</li>
+        <li>数据流涉及 7 个组件串行协作，检索阶段是主要的延迟瓶颈（Rerank 占 650ms P99）。</li>
+        <li>面试架构题的五步法（边界→分层→数据流→选型→权衡）能系统化展示架构能力。</li>
+        <li>微调模型存在「知识保质期」问题，3 个月后 12.4% 的回答使用了过时知识。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="basics-02-arch-1"> 能画出 CorpAssist 三层架构图并标注各层组件</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-arch-2"> 能解释 RAG vs 微调的决策树，并给出 2 个具体案例</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-arch-3"> 能说出检索链路上每个阶段的 P50/P95/P99 延迟</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-arch-4"> 能用五步法模拟回答一道架构面试题</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-02-arch-5"> 能解释「知识保质期」问题及 RAG 如何解决它</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>三层架构</td><td>接入层（API）→ 编排层（业务逻辑）→ 数据层（存储），每层独立部署</td></tr>
+        <tr><td>LCEL</td><td>LangChain Expression Language，声明式管线串联检索→Prompt→LLM</td></tr>
+        <tr><td>BM25</td><td>传统关键词检索算法，适合精确匹配，ES 实现</td></tr>
+        <tr><td>向量检索</td><td>用 Embedding 语义相似度检索，Milvus/Qdrant 实现</td></tr>
+        <tr><td>Rerank</td><td>重排序模型，对首轮检索结果做更精确的打分排序</td></tr>
+        <tr><td>TTFP</td><td>Time to First Payload，从发请求到收到首包的时间</td></tr>
+        <tr><td>知识保质期</td><td>微调模型的知识会随时间过时，RAG 通过更新文档避免</td></tr>
+        <tr><td>Fusion 加权</td><td>多路检索结果的分数加权求和，常用 α*BM25 + (1-α)*Vector</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 如果知识库有 100 万份文档，你的架构需要做什么调整？</summary><p>三点调整。1) 数据层：Milvus 需要按业务域分 collection，ES 需要按月份或部门建 index，避免单索引过大导致检索退化。2) 编排层：引入级联检索策略——先用粗粒度 Tag 过滤缩小范围，再在缩小后的集合上做语义检索。3) 接入层：引入异步模式，对复杂查询先返回「任务 ID」，用户轮询或 WebSocket 获取结果。</p></details>
+        <details><summary>Q2: 为什么用了 RAG 还要 Rerank？不止一次检索够吗？</summary><p>不够。首次检索（BM25/向量）的 top-K 结果里通常有 30-40% 是不相关的。Rerank 用交叉编码器（Cross-Encoder）对问题-文档对逐条打精确分，能把 top-5 准确率从 65% 提到 89%。P99 延迟增加 650ms，但效果提升显著。对 P99 要求低于 2s 的场景可以省略或使用小模型（如 BGE-Reranker-v2-mini）。</p></details>
+        <details><summary>Q3: 如果你们的知识库既要服务中文又要服务英文，架构上有什么不同？</summary><p>核心差异在 Embedding 模型。需要选择多语言模型如 BGE-M3 或 intfloat/multilingual-e5-large，确保中英文语义空间对齐。中文分词的 ES 分析器需要用 ik_smart 或 jieba，英文用 standard。Rerank 模型同样需要多语言版本。在我们的测试中，BGE-M3 的中英文混合检索 NDCG@10 是 0.812，而纯中文模型在英文查询上只有 0.423。</p></details>
+      </div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://python.langchain.com/docs/expression_language/">LangChain LCEL 文档</a> — 声明式管线的完整指南</li>
+    <li><a href="https://milvus.io/docs/">Milvus 向量数据库文档</a> — 高性能向量检索的部署和调优</li>
+    <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html">Elasticsearch 官方指南</a> — BM25 全文检索的配置与优化</li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>根据课程物料中的模板，画出 CorpAssist 三层架构图（可用 draw.io 或 Mermaid）</li>
+      <li>用一个你熟悉的业务场景，走一遍 RAG vs 微调的决策树，记录每一步的选择理由</li>
+      <li>打开 <code>courses/scenario-py-rag-kb/course.json</code>，确认每个 chapter 的 id 与 filename 一一对应</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>技术团队提议把所有文档直接放到 LLM 的 128K 上下文窗口中，不做 RAG。你同意吗？</summary><p>在大规模场景下不可行。128K 上下文看起来能塞下很多文档，但实际「大海捞针」测试中，当上下文超过 64K tokens，LLM 对中间部分的召回率低于 60%。且每次请求都把所有文档拼进去，Token 成本是 RAG 的 20-50 倍（例如 100 份文档每次消耗 128K tokens，RAG 仅消耗 3K tokens 的上下文）。RAG 的核心价值是「精确召回相关文档，减少无效输入」。</p></details>
+      <details><summary>如果你的 P99 延迟要求小于 1.5s，你会怎么调整架构？</summary><p>首先去掉 Rerank 阶段（省 650ms），只做 BM25 + 向量融合检索。其次使用 2-bit 量化的小 Embedding 模型（如 BGE-small-v1.5）减少向量检索时间。如果 LLM 首包时间超过 500ms，考虑用 vLLM 或 TensorRT-LLM 加速推理。最后，对常见问题（如「年假几天」）做缓存，命中率约 25%，可绕过完整链路。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-02-architecture-lab/</code></p><ul class="demo-acceptance">
+      <li>完成三层架构图绘制并标注延迟数据</li>
+      <li>运行决策树代码验证 4 个测试用例的输出</li>
+      <li>用 5 步法录制一段 3 分钟的模拟面试回答</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-basics-03-chunking">分块策略设计</a> —— 从文档到检索单元的核心技术</li>
+  </ul></div>
+</section>

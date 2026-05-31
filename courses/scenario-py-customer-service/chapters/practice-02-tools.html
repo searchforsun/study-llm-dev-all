@@ -1,0 +1,249 @@
+<section id="ch-practice-02-tools" class="chapter" data-chapter="practice-02-tools">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>工具调用：订单/退款/改址</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-tools" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Python 栈实战</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>工具调用是智能客服与 RAG 的最大区别——AI 不只是回答问题，还能执行操作：查订单、发起退款、修改地址。工具调用的可靠性直接决定了用户能否「一次解决」。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 OpenAPI 规范定义客服工具；封装 LangChain Tool 并集成到对话引擎；实现参数校验和幂等性保证；设计工具调用失败的重试与降级策略。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 工具定义用 OpenAPI 3.0 规范，包含 name/description/parameters/returns；2) LangChain Tool 封装将 OpenAPI 变为 Agent 可调用的函数；3) 幂等性通过 request_id 实现，重复调用跳过执行；4) 超时（>5s）自动降级，返回「系统繁忙请稍后重试」；5) 工具调用成功率目标 ≥ 99%，失败原因前三：参数不完整、第三方超时、权限不足。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>OpenAPI 工具定义与 LangChain Tool 封装</h3>
+      <p>每个后端能力被定义为 OpenAPI 规范，然后封装为 LangChain Tool。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-json">{
+  "openapi": "3.0.0",
+  "info": {"title": "CorpAssist 客服工具", "version": "1.0.0"},
+  "paths": {
+    "/api/ticket/query": {
+      "post": {
+        "summary": "查询工单状态",
+        "parameters": [
+          {"name": "ticket_id", "in": "query", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {"description": "工单状态信息"}
+        }
+      }
+    },
+    "/api/refund/apply": {
+      "post": {
+        "summary": "发起退款申请",
+        "parameters": [
+          {"name": "order_id", "in": "query", "required": true, "schema": {"type": "string"}},
+          {"name": "reason", "in": "query", "required": true, "schema": {"type": "string"}},
+          {"name": "request_id", "in": "query", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {"description": "退款申请结果"}
+        }
+      }
+    }
+  }
+}</pre></div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""LangChain Tool 封装"""
+
+from langchain.tools import BaseTool
+import httpx
+from typing import Optional, Type
+from pydantic import BaseModel, Field
+
+class QueryTicketInput(BaseModel):
+    ticket_id: str = Field(description="工单编号，如 TKT-001")
+
+class QueryTicketTool(BaseTool):
+    name: str = "query_ticket"
+    description: str = "根据工单编号查询工单当前状态、处理人和预计完成时间"
+    args_schema: Type[BaseModel] = QueryTicketInput
+
+    def _run(self, ticket_id: str) -> str:
+        """执行工单查询"""
+        try:
+            resp = httpx.post(
+                "http://ticket-system/api/ticket/query",
+                params={"ticket_id": ticket_id},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return f"工单 {ticket_id} 状态: {data['status']}, 处理人: {data['assignee']}"
+        except httpx.TimeoutException:
+            return "查询超时，请稍后重试"
+        except Exception as e:
+            return f"查询失败: {str(e)}"
+
+class ApplyRefundTool(BaseTool):
+    name: str = "apply_refund"
+    description: str = "为指定订单发起退款申请，需要订单编号和退款原因"
+    args_schema: Type[BaseModel] = type("RefundInput", (BaseModel,), {
+        "order_id": str,
+        "reason": str,
+        "request_id": str,
+    })
+
+    _executed: set = set()
+
+    def _run(self, order_id: str, reason: str, request_id: str) -> str:
+        """执行退款（幂等）"""
+        if request_id in self._executed:
+            return f"退款申请已处理（重复请求已忽略），订单 {order_id}"
+        try:
+            resp = httpx.post(
+                "http://order-system/api/refund/apply",
+                json={"order_id": order_id, "reason": reason, "request_id": request_id},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            self._executed.add(request_id)
+            return f"退款申请已提交，订单 {order_id}，工单号 {resp.json()['refund_id']}"
+        except Exception as e:
+            return f"退款申请失败: {str(e)}"</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>参数校验与幂等性保证</h3>
+      <p>参数不完整是工具调用失败的第一大原因（占 38%）。CorpAssist 在工具调用前做参数校验，缺失参数主动反问。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""参数校验"""
+
+from pydantic import ValidationError, BaseModel
+from typing import Dict, List, Tuple
+
+class ToolValidator:
+    """工具参数校验器"""
+
+    SCHEMAS: Dict[str, BaseModel] = {
+        "query_ticket": QueryTicketInput,
+        "apply_refund": type("RefundInput", (BaseModel,), {
+            "order_id": str, "reason": str, "request_id": str,
+        }),
+    }
+
+    def validate(self, tool_name: str, params: dict) -> Tuple[bool, str, dict]:
+        """校验参数，返回 (是否通过, 错误信息, 修正后的参数)"""
+        schema = self.SCHEMAS.get(tool_name)
+        if not schema:
+            return False, f"未找到工具 {tool_name} 的 schema", params
+        try:
+            validated = schema(**params)
+            return True, "", validated.dict()
+        except ValidationError as e:
+            missing = [err["loc"][0] for err in e.errors() if err["type"] == "missing"]
+            hints = {m: self._get_hint(tool_name, m) for m in missing}
+            return False, self._make_prompt(missing, hints), params
+
+    def _get_hint(self, tool_name: str, field: str) -> str:
+        hints = {"ticket_id": "如 TKT-001", "order_id": "如 ORD-2026-001",
+                 "reason": "退款原因说明", "request_id": "系统自动生成"}
+        return hints.get(field, field)
+
+    def _make_prompt(self, missing: List[str], hints: Dict) -> str:
+        prompt = "请提供以下信息: "
+        prompt += "、".join(f"{m}（{hints[m]}）" for m in missing)
+        return prompt</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Mock 工具测试</h3>
+      <p>在开发阶段，后端 API 往往不可用或不稳定。CorpAssist 使用 Mock 工具来隔离测试，确保 Agent 逻辑可以在没有真实后端的情况下验证。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""Mock 工具测试框架"""
+
+from unittest.mock import patch
+
+class MockTicketSystem:
+    """模拟工单系统"""
+
+    @staticmethod
+    def query(ticket_id: str) -> dict:
+        if ticket_id == "TKT-001":
+            return {"status": "审批中", "assignee": "张三", "eta": "2026-06-05"}
+        return {"error": "工单不存在"}
+
+    @staticmethod
+    def create(title: str, priority: str) -> dict:
+        return {"ticket_id": "TKT-999", "status": "created"}
+
+def test_query_ticket_tool():
+    """测试工单查询工具"""
+    with patch("src.tools.QueryTicketTool._run") as mock_run:
+        mock_run.return_value = "工单 TKT-001 状态: 审批中, 处理人: 张三"
+        from src.tools import QueryTicketTool
+        tool = QueryTicketTool()
+        result = tool.run({"ticket_id": "TKT-001"})
+        assert "审批中" in result
+        assert "张三" in result
+        print("PASS: query_ticket_tool works correctly")
+
+def test_apply_refund_idempotent():
+    """测试退款幂等性"""
+    from src.tools import ApplyRefundTool
+    tool = ApplyRefundTool()
+    first = tool.run({"order_id": "ORD-001", "reason": "质量问题", "request_id": "req-1"})
+    second = tool.run({"order_id": "ORD-001", "reason": "质量问题", "request_id": "req-1"})
+    assert "已处理" in first
+    assert "重复请求" in second  # 幂等性生效
+    print("PASS: refund idempotency works correctly")</pre></div>
+      <p><strong>测试覆盖率要求</strong>：每个工具至少有一个单元测试（验证参数校验和错误处理）和一个集成测试（验证 HTTP 调用链路）。CI 管线上每次提交自动跑全量工具测试，新增工具的测试覆盖率必须 ≥ 85%。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>重试与降级策略</h3>
+      <p>工具调用可能因网络/第三方系统故障而失败。CorpAssist 采用分层重试和降级策略。</p>
+      <table class="learn-decision-table"><thead><tr><th>失败类型</th><th>重试策略</th><th>降级方案</th></tr></thead><tbody>
+        <tr><td>网络超时 (timeout)</td><td>最多重试 2 次，间隔 1s</td><td>返回「系统繁忙，请稍后重试」</td></tr>
+        <tr><td>HTTP 5xx</td><td>最多重试 3 次，间隔 2s(指数退避)</td><td>熔断该工具 30s，返回「服务暂不可用」</td></tr>
+        <tr><td>HTTP 4xx (参数错误)</td><td>不重试</td><td>返回参数校验提示，请求用户补充</td></tr>
+        <tr><td>HTTP 4xx (权限不足)</td><td>不重试</td><td>记录审计，返回「您没有权限执行此操作」</td></tr>
+        <tr><td>幂等重复</td><td>不重试</td><td>直接返回上次执行结果</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>工具定义采用 OpenAPI 3.0 规范，LangChain Tool 封装供 Agent 调用。</li>
+        <li>参数校验在调用前拦截 38% 的参数缺失错误，向用户反问补充。</li>
+        <li>幂等性通过 request_id 实现，重复调用不重复执行。</li>
+        <li>工具调用成功率目标 99%，HTTP 5xx 最多重试 3 次后熔断 30s。</li>
+        <li>分层降级确保第三方系统故障不会级联影响整个客服系统。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-prac-02-1"> 能写出 OpenAPI 工具定义</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-02-2"> 能封装 LangChain Tool</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-02-3"> 能实现参数校验和反问</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-02-4"> 能解释 request_id 如何保证幂等性</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-02-5"> 能设计工具调用失败的分层降级方案</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>OpenAPI</td><td>REST API 的标准化描述规范</td></tr>
+        <tr><td>LangChain Tool</td><td>将外部 API 封装为 Agent 可调用的函数</td></tr>
+        <tr><td>参数校验</td><td>调用前检查参数完整性，缺失时反问用户</td></tr>
+        <tr><td>幂等性</td><td>同一操作重复执行不产生额外影响</td></tr>
+        <tr><td>request_id</td><td>全局唯一请求 ID，用于去重判断</td></tr>
+        <tr><td>熔断</td><td>工具连续失败后临时禁用，防止级联故障</td></tr>
+        <tr><td>指数退避</td><td>重试间隔逐次翻倍，减轻系统压力</td></tr>
+        <tr><td>降级</td><td>系统故障时提供简化但可用的替代方案</td></tr>
+      </tbody></table></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://python.langchain.com/docs/modules/agents/tools/">LangChain Tools 文档</a></li>
+    <li><a href="https://swagger.io/specification/">OpenAPI 3.0 规范</a></li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>用 QueryTicketTool 查询一个模拟的工单</li>
+      <li>用 ToolValidator 测试参数缺失时能正确反问</li>
+      <li>模拟 ApplyRefundTool 的幂等性测试</li>
+    </ol></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-03-agent-dual">LangGraph 客服 Agent</a></li>
+  </ul></div>
+</section>

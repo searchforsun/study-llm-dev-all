@@ -1,0 +1,218 @@
+<section id="ch-practice-02" class="chapter" data-chapter="practice-02">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>生成 + 审核流水线</h2><button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>AI 生成的内容不能直接发布——需要安全检测和人工复核。本章实现完整的内容安全检测（Advisor 链）、人工复核（Flowable 工作流）、驳回重写的闭环流程。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>配置 Spring AI Advisor 链实现内容安全检测；基于 Flowable 实现人工复核工作流；实现驳回重写和重新提交；设计审核状态机。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) Advisor 链依次执行：敏感词过滤→有害内容检测→品牌合规检查→版权检查；2) Flowable 工作流管理"提交→审核→通过/驳回→发布"生命周期；3) 驳回重写时保留审核意见和原始版本，Agent 根据意见修改；4) 审核状态机：DRAFT → SUBMITTED → REVIEWING → APPROVED/REJECTED → PUBLISHED。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>内容安全检测（Advisor 链）</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 内容安全 Advisor 链
+@Component
+public class ContentSafetyAdvisorChain {
+
+    @Bean
+    public ChatClient safeChatClient(ChatClient.Builder builder,
+                                      List&lt;Advisor&gt; advisors) {
+        return builder
+            .defaultAdvisors(advisors)
+            .build();
+    }
+
+    @Bean
+    public List&lt;Advisor&gt; contentSafetyAdvisors() {
+        return List.of(
+            new SensitiveWordFilter(),      // 1. 敏感词过滤
+            new HarmfulContentDetector(),    // 2. 有害内容检测
+            new BrandComplianceChecker(),    // 3. 品牌合规检查
+            new CopyrightChecker()           // 4. 版权来源检查
+        );
+    }
+}
+
+// 敏感词过滤器
+@Component
+public class SensitiveWordFilter implements Advisor {
+
+    private final Set&lt;String&gt; sensitiveWords = Set.of(
+        "敏感词A", "敏感词B", "敏感词C");
+
+    @Override
+    public AdviceResponse before(AdviceRequest request) {
+        String content = request.getContent();
+        for (String word : sensitiveWords) {
+            if (content.contains(word)) {
+                return new AdviceResponse(false,
+                    "内容包含敏感词: " + word);
+            }
+        }
+        return new AdviceResponse(true);
+    }
+}
+
+// 有害内容检测器（基于 LLM）
+@Component
+public class HarmfulContentDetector implements Advisor {
+
+    private final ChatClient detectorClient;
+
+    @Override
+    public AdviceResponse before(AdviceRequest request) {
+        String result = detectorClient.prompt()
+            .user(u -&gt; u.text("""
+                检查以下内容是否包含：暴力、色情、歧视、虚假宣传。
+                内容：{content}
+                输出 JSON：{"safe":true/false,"reason":"","riskLevel":"NONE/LOW/MEDIUM/HIGH"}
+                """)
+                .param("content", request.getContent())
+            )
+            .call()
+            .content();
+
+        DetectionResult dr = parseResult(result);
+        if (!dr.isSafe()) {
+            return new AdviceResponse(false,
+                "有害内容检测未通过: " + dr.getReason());
+        }
+        return new AdviceResponse(true);
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>人工复核（Flowable/Activity）</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Flowable 审核工作流
+@Component
+public class ReviewWorkflowService {
+
+    private final RuntimeService runtimeService;
+    private final TaskService taskService;
+
+    public String startReview(String contentId, String reviewerId) {
+        Map&lt;String, Object&gt; variables = new HashMap&lt;&gt;();
+        variables.put("contentId", contentId);
+        variables.put("reviewerId", reviewerId);
+        variables.put("status", "SUBMITTED");
+        variables.put("reviewCount", 0);
+
+        ProcessInstance instance = runtimeService
+            .startProcessInstanceByKey("contentReview", variables);
+        return instance.getId();
+    }
+
+    public void approve(String taskId, String comment) {
+        Map&lt;String, Object&gt; variables = new HashMap&lt;&gt;();
+        variables.put("status", "APPROVED");
+        variables.put("comment", comment);
+        taskService.complete(taskId, variables);
+    }
+
+    public void reject(String taskId, String comment) {
+        Map&lt;String, Object&gt; variables = new HashMap&lt;&gt;();
+        variables.put("status", "REJECTED");
+        variables.put("comment", comment);
+        taskService.complete(taskId, variables);
+    }
+}
+
+// 审核状态机
+// DRAFT --> SUBMITTED --> REVIEWING --> APPROVED --> PUBLISHED
+//                          REVIEWING --> REJECTED --> DRAFT (修改后重新提交)
+// REJECTED --> SUBMITTED (修改后重新提交)
+
+// Flowable BPMN 定义 (content-review.bpmn20.xml)
+// &lt;process id="contentReview"&gt;
+//   &lt;startEvent id="start" /&gt;
+//   &lt;userTask id="reviewTask" name="内容审核" /&gt;
+//   &lt;exclusiveGateway id="gateway" /&gt;
+//   &lt;endEvent id="approved"&gt;
+//     &lt;extensionElements&gt;
+//       &lt;activiti:executionListener event="end"
+//         class="com.corpassist.PublishListener"/&gt;
+//     &lt;/extensionElements&gt;
+//   &lt;/endEvent&gt;
+//   &lt;endEvent id="rejected" /&gt;
+// &lt;/process&gt;</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>驳回重写</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 驳回重写服务
+@Component
+public class RewriteService {
+
+    private final ChatClient rewriteClient;
+
+    public String rewrite(String original, String reviewComment) {
+        return rewriteClient.prompt()
+            .user(u -&gt; u.text("""
+                请根据审核意见修改以下内容。
+
+                原始内容：
+                {original}
+
+                审核意见：
+                {comment}
+
+                要求：
+                - 保留原始内容的核心信息
+                - 针对审核意见逐条修改
+                - 保持品牌语调一致
+                - 输出修改后的完整内容
+                """)
+                .param("original", original)
+                .param("comment", reviewComment)
+            )
+            .call()
+            .content();
+    }
+
+    // 版本管理：保留每次修改的版本
+    public ContentVersion saveVersion(String contentId, String content,
+                                       String reviewComment) {
+        ContentVersion version = new ContentVersion();
+        version.setContentId(contentId);
+        version.setContent(content);
+        version.setReviewComment(reviewComment);
+        version.setVersionNumber(getNextVersion(contentId));
+        version.setCreatedAt(Instant.now());
+        return versionRepository.save(version);
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>Advisor 链依次执行 4 道安全检测（敏感词/有害/品牌/版权）</li>
+      <li>Flowable 工作流管理审核生命周期</li>
+      <li>驳回重写保留审核意见和版本历史</li>
+      <li>审核状态机 6 个状态闭环流转</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能配置 Advisor 安全检测链</label></li>
+        <li><label><input type="checkbox"> 我能用 Flowable 实现审核工作流</label></li>
+        <li><label><input type="checkbox"> 我能实现驳回重写</label></li>
+        <li><label><input type="checkbox"> 我能设计审核状态机</label></li>
+      </ul></div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://www.flowable.com/" target="_blank" rel="noopener">Flowable 官方</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>配置 Advisor 安全检测链</li>
+      <li>部署 Flowable 审核流程</li>
+      <li>测试驳回重写功能</li>
+      <li>验证审核状态机流转</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-02-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-03">千人千面个性化</a></li></ul></div>
+</section>

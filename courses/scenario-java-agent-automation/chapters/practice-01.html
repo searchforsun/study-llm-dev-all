@@ -1,0 +1,299 @@
+<section id="ch-practice-01" class="chapter" data-chapter="practice-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Spring AI Alibaba Graph 工作流</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>当 Agent 流程复杂到需要条件分支、并行执行、显式状态管理时，ReAct 的简单循环就不够用了。Spring AI Alibaba 的 Graph 模块提供了类似 LangGraph 的有向图工作流引擎，支持节点（@Bean 定义）、边（条件/无条件）和状态持久化。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 Spring AI Alibaba Graph 的 @Bean 节点定义工作流；实现条件边根据状态路由到不同分支；使用 Admin Studio 可视化调试；实现状态序列化和反序列化支持断点恢复。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) Graph 工作流三个核心概念：State（共享状态）、Node（处理单元）、Edge（连接关系）；2) 节点用 @Bean 标注方法，接收 State 返回 State；3) 条件边通过 router-function 根据 State 中的字段值决定下一个节点；4) Admin Studio 实时显示 Graph 执行状态、节点耗时、State 变化；5) State 序列化使用 Jackson，支持 JSON 持久化到 Redis。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Graph 节点定义（@Bean）</h3>
+      <p>Spring AI Alibaba Graph 使用 <code>@Bean</code> 注解定义工作流节点。每个节点是一个接收 State 对象并返回更新后 State 的函数。框架自动管理节点的执行顺序和数据传递。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    START([开始]) --> N1[getUserInfo<br/>查用户信息]
+    N1 --> N2{isManager?<br/>条件判断}
+    N2 -->|yes, 是经理| N3[queryTeamTickets<br/>查团队工单]
+    N2 -->|no, 是员工| N4[queryMyTickets<br/>查个人工单]
+    N3 --> N5[generateReport<br/>生成周报]
+    N4 --> N5
+    N5 --> N6{needApproval?}
+    N6 -->|yes| N7[submitApproval<br/>提交审批]
+    N6 -->|no| N8[sendEmail<br/>发送邮件]
+    N7 --> N9[waitApproval<br/>等待审批]
+    N9 -->|审批通过| N8
+    N9 -->|审批拒绝| N10[notifyUser<br/>通知用户]
+    N8 --> END([结束])
+    N10 --> END
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Graph 状态定义
+@Data
+@Builder
+public class WorkflowState {
+    private String sessionId;
+    private String userId;
+    private String userName;
+    private boolean manager;
+    private List&lt;Ticket&gt; tickets;
+    private String reportContent;
+    private boolean needApproval;
+    private String approvalResult;
+    private String emailResult;
+    private List&lt;String&gt; errors;
+}
+
+// Graph 节点定义
+@Configuration
+public class WorkflowNodes {
+
+    @Bean
+    public Function&lt;WorkflowState, WorkflowState&gt; getUserInfo() {
+        return state -&gt; {
+            // 查询用户信息（模拟）
+            UserInfo user = userService.getUser(state.getUserId());
+            state.setUserName(user.getName());
+            state.setManager("MANAGER".equals(user.getRole()));
+            return state;
+        };
+    }
+
+    @Bean
+    public Function&lt;WorkflowState, WorkflowState&gt; queryTeamTickets() {
+        return state -&gt; {
+            List&lt;Ticket&gt; tickets = ticketService
+                .queryByTeam(state.getUserId());
+            state.setTickets(tickets);
+            state.setNeedApproval(tickets.size() &gt; 5);
+            return state;
+        };
+    }
+
+    @Bean
+    public Function&lt;WorkflowState, WorkflowState&gt; queryMyTickets() {
+        return state -&gt; {
+            List&lt;Ticket&gt; tickets = ticketService
+                .queryByUser(state.getUserId());
+            state.setTickets(tickets);
+            state.setNeedApproval(false);
+            return state;
+        };
+    }
+}</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>条件边：根据状态路由</h3>
+      <p>条件边是 Graph 工作流的核心灵活性——不同状态数据可以路由到不同的处理节点。Spring AI Alibaba Graph 通过 router-function 实现条件路由。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Graph 工作流配置（条件路由）
+@Configuration
+public class WorkflowConfig {
+
+    @Bean
+    public Graph&lt;WorkflowState&gt; reportWorkflow() {
+        return Graph.builder()
+            .stateClass(WorkflowState.class)
+            // 注册节点
+            .node("getUserInfo", "getUserInfo()")  // @Bean 方法名
+            .node("queryTeamTickets", "queryTeamTickets()")
+            .node("queryMyTickets", "queryMyTickets()")
+            .node("generateReport", "generateReport()")
+            .node("submitApproval", "submitApproval()")
+            .node("sendEmail", "sendEmail()")
+            .node("notifyUser", "notifyUser()")
+            // 定义边
+            .edge("START", "getUserInfo")
+            // 条件边：根据 isManager 路由
+            .condition("getUserInfo", state -&gt;
+                state.isManager() ? "queryTeamTickets" : "queryMyTickets")
+            .edge("queryTeamTickets", "generateReport")
+            .edge("queryMyTickets", "generateReport")
+            // 条件边：根据 needApproval 路由
+            .condition("generateReport", state -&gt;
+                state.isNeedApproval() ? "submitApproval" : "sendEmail")
+            .edge("submitApproval", "sendEmail")
+            .edge("notifyUser", "END")
+            .build();
+    }
+}
+
+// 多条件分支查询示例
+// condition() 方法支持复杂逻辑表达式
+.condition("reviewNode", state -&gt; {
+    if (state.getErrors().size() &gt; 3) return "rejectNode";
+    if (state.getErrors().size() &gt; 0) return "fixNode";
+    return "approveNode";
+})</pre></code></div>
+      <table class="outline-table">
+        <thead><tr><th>边类型</th><th>方法</th><th>说明</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td>无条件边</td><td>.edge(from, to)</td><td>执行完 from 节点后直接进入 to 节点</td><td>.edge("A", "B")</td></tr>
+          <tr><td>条件边</td><td>.condition(from, router)</td><td>根据 router 函数返回的目标节点名路由</td><td>.condition("A", s -&gt; s.isX()?"B":"C")</td></tr>
+          <tr><td>并行边</td><td>.parallelFork/join</td><td>同时执行多个节点并等待全部完成</td><td>.parallelFork("A", "B", "C")</td></tr>
+          <tr><td>回退边</td><td>.edge(from, to, type=LOOP)</td><td>允许从后向前回退循环</td><td>.edge("C", "A", LOOP)</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block">
+      <h3>可视化调试（Admin Studio）</h3>
+      <p>Spring AI Alibaba Admin Studio 提供了实时的 Graph 工作流可视化界面。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant Admin as Admin Studio
+    participant Graph as Graph Engine
+    participant State as State Store
+    participant Log as 日志
+
+    Admin->>Graph: 开始执行 worklow_001
+    Graph->>State: 初始化 State
+    Graph->>Graph: 执行 node: getUserInfo
+    Graph->>Log: [INFO] node=getUserInfo, duration=320ms
+    Graph->>Admin: 推送事件: node_completed
+    Admin->>Admin: 高亮 getUserInfo 节点<br/>显示 duration=320ms
+
+    Graph->>Graph: 评估条件边: isManager=true
+    Graph->>Graph: 执行 node: queryTeamTickets
+    Graph->>Log: [INFO] node=queryTeamTickets, duration=1.2s
+    Graph->>Admin: 推送事件: node_completed
+    Admin->>Admin: 更新执行路径
+
+    Graph->>Graph: 执行 node: generateReport
+    Graph->>Graph: 完成工作流
+    Graph->>Admin: 推送事件: workflow_completed
+    Admin->>Admin: 显示完整执行路径<br/>和节点耗时时间线
+        </pre>
+      </div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>运维人员在 Admin Studio 中看到：一个"生成部门周报"的工作流有 7 个节点，其中 queryTeamTickets 耗时最高（1.2 秒），因为工单系统返回慢。通过可视化界面，运维发现条件路由 isManager=true 的路径走了 80% 的执行，说明经理用户是主要使用者。基于这个数据，运维优化了 queryTeamTickets 节点的缓存策略，将平均耗时从 1.2 秒降至 200 毫秒。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>状态序列化与恢复</h3>
+      <p>工作流的持久化和恢复依赖于 State 对象的序列化。Spring AI Alibaba Graph 使用 Jackson 序列化 State，支持存储到 Redis 或数据库。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 状态序列化与持久化
+@Component
+public class GraphStatePersistence {
+
+    private final RedisTemplate&lt;String, String&gt; redisTemplate;
+    private final ObjectMapper objectMapper;
+    private static final String PREFIX = "graph:state:";
+
+    public void saveState(String workflowId, WorkflowState state) {
+        try {
+            String json = objectMapper.writeValueAsString(state);
+            redisTemplate.opsForValue().set(
+                PREFIX + workflowId, json,
+                Duration.ofHours(24)  // TTL 24 小时
+            );
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("State 序列化失败", e);
+        }
+    }
+
+    public WorkflowState loadState(String workflowId) {
+        String json = redisTemplate.opsForValue().get(PREFIX + workflowId);
+        if (json == null) return null;
+        try {
+            return objectMapper.readValue(json, WorkflowState.class);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("State 反序列化失败", e);
+        }
+    }
+
+    public void deleteState(String workflowId) {
+        redisTemplate.delete(PREFIX + workflowId);
+    }
+}
+
+// Graph 执行器（支持恢复）
+@Service
+public class GraphExecutor {
+
+    public void executeWithRecovery(String workflowId, String userId) {
+        // 尝试从上次中断处恢复
+        WorkflowState state = persistence.loadState(workflowId);
+        if (state == null) {
+            state = WorkflowState.builder()
+                .sessionId(workflowId).userId(userId).build();
+        }
+        // 继续执行未完成的节点
+        graph.execute(state, workflowId);
+    }
+}</pre></code></div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>无持久化恢复</h4><p>工作流执行到一半系统崩溃，所有进度丢失。用户需要重新发起请求，Agent 重新执行所有节点（包括已完成的），浪费 Token 和时间。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>有持久化恢复</h4><p>工作流每完成一个节点就持久化 State。系统崩溃恢复后，从 Redis 加载 State，直接从中断的节点继续执行。State 包含已完成节点列表和中间结果，不重复执行已完成的节点。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>Spring AI Alibaba Graph 用 @Bean 函数定义节点，接收和返回 State 对象</li>
+      <li>条件边通过 router-function 根据 State 字段值路由到不同分支，支持复杂的多条件逻辑</li>
+      <li>Admin Studio 提供实时可视化调试，显示节点耗时和执行路径</li>
+      <li>State 使用 Jackson 序列化，持久化到 Redis 支持断点恢复</li>
+      <li>CorpAssist 使用 Graph 工作流编排 IT 运维流程、审批流和多步骤报告生成</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-01-1"> 我能用 @Bean 定义 Graph 节点函数并理解 State 传递机制</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-2"> 我能实现条件边根据 State 路由到不同节点</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-3"> 我能启动 Admin Studio 并解读 Graph 可视化信息</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-4"> 我能实现 State 的序列化持久化和断点恢复</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-01-5"> 我能对比 Graph 和 ReAct 的适用场景并做技术选型</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>Graph</td><td>Spring AI Alibaba 的有向图工作流引擎</td></tr>
+        <tr><td>State</td><td>工作流的共享状态对象，在节点间传递和更新</td></tr>
+        <tr><td>Node</td><td>工作流中的处理单元，用 @Bean 函数定义</td></tr>
+        <tr><td>条件边</td><td>根据 State 值决定下一个节点的路由边</td></tr>
+        <tr><td>无条件边</td><td>直接从一个节点到另一个的固定路由</td></tr>
+        <tr><td>Admin Studio</td><td>Spring AI Alibaba 的管理控制台，支持 Graph 可视化</td></tr>
+        <tr><td>状态序列化</td><td>将 State 对象转为 JSON 以便持久化存储</td></tr>
+        <tr><td>断点恢复</td><td>从持久化的 State 恢复中断的工作流执行</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Graph 和 ReAct 在状态管理上的核心区别是什么？</summary><p>ReAct 的状态管理是隐式的——状态存在于对话历史（Message 列表）中，Agent 通过 ChatMemory 获得上下文。Graph 的状态管理是显式的——开发者定义 WorkflowState 类，明确所有状态字段，节点函数显式读写这些字段。核心区别：1) 可预测性——Graph 的 State 结构固定，执行路径确定；2) 可持久化——Graph 的 State 可序列化为 JSON 存储；3) 可测试——Graph 的每个节点可以独立单元测试；4) 调试难度——Graph 的 State 变化可追踪，ReAct 的中间推理过程不透明。CorpAssist 实践中：需要审计追溯的流程（如财务审批）用 Graph，快速问答用 ReAct。</p></details>
+        <details><summary>Graph 工作流的 State 太大导致序列化慢怎么办？</summary><p>优化策略：1) 状态裁剪——State 只保存必需的字段，大型数据（如完整的工单列表）只保存 ID 和摘要；2) 增量序列化——State 保存"增量"而非"全量"，每次只保存相比上一次 checkpoint 的变化部分；3) 分片存储——将 State 分为元数据（userInfo, status）和业务数据（tickets, report）两部分，元数据用 Redis Hash，业务数据用单独的 Key；4) 异步序列化——序列化操作异步执行，不影响主流程。CorpAssist 使用方案 1+3，典型 State 大小控制在 10KB 以内，序列化时间 &lt;5ms。</p></details>
+        <details><summary>Graph 工作流出现循环（loop）如何防止死循环？</summary><p>三种防护：1) maxLoops 配置——每条 LOOP 类型的边配置最大循环次数（如 maxLoops=5）；2) State 中维护 loopCount——每次经过循环节点时 loopCount+1，到达阈值后自动退出循环；3) 循环检测——Graph 引擎内置检测器，如果同一节点连续执行超过 3 次且 State 无有效变化，判定为死循环并终止。CorpAssist 使用方案 1+2，在"审批驳回重新提交"循环中，最多允许 3 次驳回重提，超过后转人工处理。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://github.com/alibaba/spring-ai-alibaba/tree/main/graph" target="_blank" rel="noopener">Spring AI Alibaba Graph</a> — Graph 模块源码和文档</li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/functions.html" target="_blank" rel="noopener">Spring AI Function Calling</a> — @Tool 和 ToolCallback 文档</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>定义 WorkflowState 类，包含 userId、userName、manager、tickets、reportContent 字段</li>
+      <li>用 @Bean 定义 4 个节点函数（getUserInfo、queryTickets、generateReport、sendReport）</li>
+      <li>配置条件边：isManager=true 走团队工单路径，false 走个人工单路径</li>
+      <li>启动 Admin Studio，执行工作流并观察可视化界面</li>
+      <li>保存 State 到 Redis，模拟系统重启后从断点恢复</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：queryTeamTickets 节点耗时 3 秒，导致整体工作流超时，如何优化？</summary><p>优化方案：1) 加入 Redis 缓存——工单数据缓存 1 分钟，大多数用户看到的是 1 分钟内创建的数据；2) 异步执行——将 queryTeamTickets 改为异步节点（返回 CompletableFuture），与 generateReport 的初始化步骤并行执行；3) 超时降级——如果 queryTeamTickets 超过 2 秒，改为查询缓存数据（即使稍旧）+ 标记"数据可能不是最新"；4) 预加载——Graph 在 getUserInfo 节点完成后立即预加载工单数据。CorpAssist 使用方案 1+3，缓存命中时 queryTeamTickets 耗时从 3 秒降至 50 毫秒。</p></details>
+      <details><summary>场景：submitApproval 节点的审批流程需要 2 小时，Graph 应该等吗？</summary><p>不应该同步等待。解决方案：1) 在 submitApproval 节点完成后，Graph 将状态持久化并标记为 WAITING_APPROVAL；2) Graph 工作流暂停执行，释放资源；3) 审批系统通过回调接口（如 POST /workflow/{id}/resume?result=approve）通知 Graph 引擎审批完成；4) Graph 引擎从持久化存储恢复 State，继续执行后续节点。这个过程通过 Webhook 或 MQ 消息实现异步解耦。CorpAssist 使用 RocketMQ 消息队列监听审批结果，典型的审批等待时间从 5 分钟到 24 小时不等。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-01-lab/</code></p><ul class="demo-acceptance">
+      <li>Graph 工作流包含至少 5 个节点和 2 个条件边</li>
+      <li>Admin Studio 正确显示执行路径和节点耗时</li>
+      <li>State 持久化后恢复成功，不重复执行已完成节点</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-02">多工具协作与编排</a> — @Tool 注解与并行/串行工具执行</li>
+  </ul></div>
+</section>

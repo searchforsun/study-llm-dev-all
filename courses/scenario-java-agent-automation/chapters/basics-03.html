@@ -1,0 +1,304 @@
+<section id="ch-basics-03" class="chapter" data-chapter="basics-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>任务规划与分解</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Agent 基础</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>复杂办公任务（如"生成季度总结报告并发送给各部门负责人"）需要拆分成多个子任务逐步执行。Plan-and-Execute 模式将任务规划与执行分离，Spring AI 通过 ChatClient 的链式调用支持这种模式。了解任务分解和编排，是构建可靠 Agent 系统的关键。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 Spring AI 实现 Plan-and-Execute 模式；设计子任务拆分与编排策略；使用 Redis 持久化检查点支持断点恢复；实现失败补偿和重试逻辑。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) Plan-and-Execute 分两步：Planner 生成执行计划，Executor 按计划逐步执行；2) 子任务拆分粒度以"一个工具调用"为单位，避免子任务内部再需要多步推理；3) 检查点持久化使用 Redis Hash 存储每个子任务的执行状态和结果；4) 失败恢复策略：子任务级重试（最多 3 次）+ 任务级跳过 + 整体补偿回滚；5) CorpAssist 的 Planner 使用 System Prompt 约束输出 JSON 格式的计划数组。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Plan-and-Execute 在 Java 侧</h3>
+      <p>Plan-and-Execute 模式的核心思想是将 Agent 分为两个阶段：<strong>Planner</strong> 分析用户请求生成执行计划，<strong>Executor</strong> 按计划逐步骤执行。Spring AI 的 ChatClient 通过两次独立的 prompt 调用实现这种分离。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant P as Planner
+    participant E as Executor
+    participant T1 as 工具1: getUserInfo
+    participant T2 as 工具2: queryTicket
+    participant T3 as 工具3: sendEmail
+
+    U->>P: "查张三的工单，有未处理的发邮件提醒"
+    P->>P: 分析请求，生成计划
+    P-->>E: Plan: [1.getUserInfo, 2.queryTicket, 3.sendEmail]
+
+    E->>T1: Step 1: getUserInfo("张三")
+    T1-->>E: {userId: "u123"}
+    E->>E: 保存 checkpoint 1
+
+    E->>T2: Step 2: queryTicket("u123")
+    T2-->>E: [{id: "TKT-001", status: "处理中"}]
+    E->>E: 保存 checkpoint 2
+
+    E->>E: 条件判断: 有未处理工单,继续
+    E->>T3: Step 3: sendEmail("u123", "提醒")
+    T3-->>E: {sent: true}
+    E->>E: 保存 checkpoint 3
+
+    E-->>U: "已处理: 查到一个未处理工单，已发送提醒"
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Plan-and-Execute 实现
+@Component
+public class PlanAndExecuteAgent {
+
+    private final ChatClient planner;
+    private final ChatClient executor;
+
+    public PlanAndExecuteAgent(ChatClient.Builder builder) {
+        // Planner: 生成执行计划
+        this.planner = builder
+            .defaultSystem("""
+                你是任务规划器。分析用户请求，输出 JSON 格式的执行计划。
+                计划格式：[{"step": 1, "action": "getUserInfo", "params": {"name": "张三"}}]
+                约束：
+                - 每个 step 只能调用一个工具
+                - 步骤不超过 10 个
+                - 步骤间有数据依赖时标注 dependsOn
+                """)
+            .build();
+
+        // Executor: 按计划执行
+        this.executor = builder
+            .defaultSystem("你是任务执行器，严格按照计划执行每一步。")
+            .build();
+    }
+
+    public String execute(String userRequest, List&lt;ToolCallback&gt; tools) {
+        // Phase 1: 规划
+        String planJson = planner.prompt()
+            .user(userRequest)
+            .call()
+            .content();
+
+        List&lt;PlanStep&gt; plan = parsePlan(planJson);
+
+        // Phase 2: 执行
+        StringBuilder result = new StringBuilder();
+        Map&lt;String, Object&gt; context = new HashMap&lt;&gt;();
+
+        for (PlanStep step : plan) {
+            try {
+                String stepResult = executor.prompt()
+                    .user("执行步骤 " + step.step + ": " + step.action
+                        + "，参数: " + step.params
+                        + "，当前上下文: " + context)
+                    .tools(tools)
+                    .call()
+                    .content();
+                context.put("step_" + step.step, stepResult);
+                result.append("步骤").append(step.step).append("完成\n");
+            } catch (Exception e) {
+                result.append("步骤").append(step.step).append("失败: ")
+                    .append(e.getMessage()).append("\n");
+                // 检查是否需要补偿
+                if (step.critical) {
+                    throw new RuntimeException("关键步骤失败，任务终止");
+                }
+            }
+        }
+        return result.toString();
+    }
+
+    record PlanStep(int step, String action,
+                    Map&lt;String, Object&gt; params,
+                    List&lt;Integer&gt; dependsOn,
+                    boolean critical) {}
+}</pre></code></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>用户请求"生成本月部门周报，汇总项目进度，发给部门总监"。Planner 生成 5 步计划：1) getDepartmentMembers→获取部门成员列表；2) getProjectStatus(members)→获取各项目进度；3) generateWeeklyReport(数据)→LLM 汇总生成周报；4) getDirectorInfo→获取总监邮箱；5) sendEmail(报告, 总监)→发送。Executor 逐步执行，每步完成后保存检查点到 Redis。如果第 2 步获取项目进度超时，重试 2 次后跳过（标记为"部分数据缺失"）继续执行第 3 步。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>子任务拆分与编排</h3>
+      <p>子任务的拆分粒度直接影响 Agent 的可靠性和执行效率。拆得太细导致循环次数过多（Token 浪费），拆得太粗导致单个子任务内部逻辑复杂（容易出错）。</p>
+      <table class="outline-table">
+        <thead><tr><th>拆细（反模式）</th><th>适中（推荐）</th><th>太粗（反模式）</th></tr></thead>
+        <tbody>
+          <tr><td>step1: 获取用户名<br/>step2: 获取用户ID<br/>step3: 获取用户邮箱</td><td>step1: getUserInfo<br/>返回完整用户信息</td><td>step1: 处理用户请求<br/>包含所有逻辑</td></tr>
+          <tr><td>6 步 → maxIterations=15<br/>Token 消耗高</td><td>1 步 → 高效</td><td>1 步 → LLM 容易遗漏</td></tr>
+          <tr><td>每步 1 个字段</td><td>每步 1 个工具</td><td>每步多个工具</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 带有依赖关系的任务编排器
+@Component
+public class TaskOrchestrator {
+
+    public void executeDag(List&lt;PlanStep&gt; steps) {
+        // 构建 DAG：key=stepId, value=依赖的 stepId 列表
+        Map&lt;Integer, List&lt;Integer&gt;&gt; dag = new HashMap&lt;&gt;();
+        for (PlanStep step : steps) {
+            dag.put(step.step, step.dependsOn);
+        }
+
+        // 拓扑排序：先执行无依赖的步骤
+        Set&lt;Integer&gt; completed = new HashSet&lt;&gt;();
+        while (completed.size() &lt; steps.size()) {
+            for (PlanStep step : steps) {
+                if (completed.contains(step.step)) continue;
+                // 检查依赖是否全部完成
+                boolean depsMet = step.dependsOn.stream()
+                    .allMatch(completed::contains);
+                if (depsMet) {
+                    // 执行当前步骤
+                    executeStep(step);
+                    completed.add(step.step);
+                }
+            }
+        }
+    }
+
+    private void executeStep(PlanStep step) {
+        // 注入依赖步骤的结果作为上下文
+        String prompt = "执行: " + step.action;
+        if (!step.dependsOn.isEmpty()) {
+            prompt += ", 依赖数据: step_" +
+                String.join(", step_",
+                    step.dependsOn.stream().map(String::valueOf).toList());
+        }
+        // 调用 Executor 执行
+    }
+}</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>检查点持久化（Redis）</h3>
+      <p>检查点持久化是实现断点恢复的基础。CorpAssist 使用 Redis Hash 存储每个 session 的执行状态，包括已完成的步骤、中间结果、当前步骤索引。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Redis 检查点持久化
+@Component
+public class CheckpointStore {
+
+    private final RedisTemplate&lt;String, Object&gt; redisTemplate;
+    private static final String KEY_PREFIX = "agent:checkpoint:";
+
+    public CheckpointStore(RedisTemplate&lt;String, Object&gt; redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    public void saveCheckpoint(String sessionId, int stepIndex,
+                                String stepResult, List&lt;Message&gt; history) {
+        String key = KEY_PREFIX + sessionId;
+        Map&lt;String, Object&gt; checkpoint = new HashMap&lt;&gt;();
+        checkpoint.put("stepIndex", stepIndex);
+        checkpoint.put("stepResult", stepResult);
+        checkpoint.put("history", serializeHistory(history));
+        checkpoint.put("updatedAt", Instant.now().toString());
+        checkpoint.put("status", "IN_PROGRESS");
+
+        redisTemplate.opsForHash().putAll(key, checkpoint);
+        redisTemplate.expire(key, 24, TimeUnit.HOURS); // 24小时过期
+    }
+
+    public Checkpoint loadCheckpoint(String sessionId) {
+        String key = KEY_PREFIX + sessionId;
+        Map&lt;Object, Object&gt; entries = redisTemplate.opsForHash().entries(key);
+        if (entries.isEmpty()) {
+            return null;
+        }
+        return new Checkpoint(
+            (int) entries.get("stepIndex"),
+            (String) entries.get("stepResult"),
+            deserializeHistory((String) entries.get("history")),
+            (String) entries.get("status")
+        );
+    }
+
+    public void markCompleted(String sessionId) {
+        String key = KEY_PREFIX + sessionId;
+        redisTemplate.opsForHash().put(key, "status", "COMPLETED");
+    }
+
+    record Checkpoint(int stepIndex, String stepResult,
+                      List&lt;Message&gt; history, String status) {}
+}</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>失败恢复与补偿</h3>
+      <p>Agent 执行过程中可能遇到的失败类型：工具调用超时、工具返回异常数据、LLM 返回格式错误。对于不同类型的失败，CorpAssist 采用不同的恢复策略。</p>
+      <table class="outline-table">
+        <thead><tr><th>失败类型</th><th>检测方式</th><th>恢复策略</th><th>补偿动作</th></tr></thead>
+        <tbody>
+          <tr><td>工具超时</td><td>toolTimeoutException</td><td>重试 2 次（间隔 5s）</td><td>记录超时日志，标记降级</td></tr>
+          <tr><td>工具异常数据</td><td>返回异常值</td><td>重试 1 次，使用默认值</td><td>通知管理员检查数据源</td></tr>
+          <tr><td>LLM 格式错误</td><td>JSON 解析失败</td><td>重新生成（最多 3 次）</td><td>调整 Prompt 约束</td></tr>
+          <tr><td>依赖步骤失败</td><td>dependsOn 步骤状态=FAILED</td><td>跳过（如果是非关键步骤）</td><td>在最终结果中说明"部分数据缺失"</td></tr>
+          <tr><td>关键步骤失败</td><td>critical=true + 失败</td><td>整体回滚</td><td>执行补偿操作（如撤销已发送的邮件）</td></tr>
+        </tbody>
+      </button>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>Agent 在执行"批量创建工单"过程中，第 5 个工单创建失败（工单系统返回 500）。由于该步骤 non-critical，Agent 跳过该工单并在最终结果中说明"已成功创建 4/5 个工单，第 5 个工单（ID: PRJ-005）创建失败，已记录异常，请手动处理"。如果该步骤是"创建付款审批"（critical=true）且失败，Agent 需要执行补偿操作——撤销已创建的关联工单，防止出现"已发付款但审批未创建"的不一致状态。</p>
+      </aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>Plan-and-Execute 将 Agent 分为 Planner 和 Executor 两个阶段，Planner 输出 JSON 格式的执行计划</li>
+      <li>子任务拆分以"一个工具调用"为单位，步骤数控制在 10 步以内，减少 Token 消耗</li>
+      <li>Redis Hash 存储检查点包含 stepIndex、stepResult、history、status，24 小时过期</li>
+      <li>失败恢复使用分层策略：工具超时重试 2 次→非关键步骤跳过→关键步骤整体回滚并补偿</li>
+      <li>CorpAssist 的 Planner 通过严格 System Prompt 约束输出格式，Executor 通过上下文注入管理步骤间数据依赖</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="basics-03-1"> 我能用 Spring AI 实现 Planner + Executor 分离的架构</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-2"> 我能判断一个任务应该如何拆分子任务并编排顺序</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-3"> 我能使用 Redis 存储和恢复 Agent 执行检查点</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-4"> 我能设计失败恢复和补偿策略处理不同类型的异常</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-03-5"> 我能实现 DAG 依赖编排支持步骤间数据传递</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>Plan-and-Execute</td><td>先规划后执行的 Agent 模式，Planner 生成计划，Executor 逐步执行</td></tr>
+        <tr><td>Planner</td><td>分析用户请求生成结构化执行计划的 LLM 调用</td></tr>
+        <tr><td>Executor</td><td>按计划步骤逐一调用工具并收集结果的执行器</td></tr>
+        <tr><td>检查点</td><td>Agent 执行进度的快照，包含步骤索引、中间结果、对话历史</td></tr>
+        <tr><td>DAG 编排</td><td>有向无环图的任务依赖关系管理，确保前置步骤完成后才执行后续步骤</td></tr>
+        <tr><td>关键步骤</td><td>标记为 critical=true 的步骤，失败后需整体回滚和补偿</td></tr>
+        <tr><td>补偿操作</td><td>关键步骤失败后执行的撤销或修复操作，保持系统状态一致</td></tr>
+        <tr><td>Redis Hash</td><td>Redis 的 Hash 数据结构，用于存储检查点的多个字段</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Plan-and-Execute 和 ReAct 的区别和适用场景？</summary><p>ReAct 是"边想边做"：LLM 在每次循环中决定下一步做什么，适合不确定步骤顺序的任务（如"查一个信息后决定下一步"）。Plan-and-Execute 是"先想好再做"：Planner 先生成完整计划，Executor 按计划执行，适合步骤明确的流程化任务（如"周报生成→审批→发送"三步固定流程）。CorpAssist 实践中：Plan-and-Execute 用于 80% 的办公自动化任务（流程固定），ReAct 用于 20% 需要灵活决策的任务（如客服对话）。性能上，Plan-and-Execute 的 Token 消耗比 ReAct 少约 30%，因为 Planner 只需要一次 LLM 调用，后续 Executor 不需要重复思考。</p></details>
+        <details><summary>检查点存储应该包含哪些信息？序列化怎么做？</summary><p>检查点包含：1) 元数据——sessionId、userId、任务描述、创建时间；2) 执行状态——当前步骤索引、已完成步骤列表、失败步骤列表；3) 中间结果——每个已完成步驟的输出（用于后续步骤的上下文）；4) 对话历史——最近 N 条 Message（用于 LLM 理解上下文）；5) 环境状态——已加载的工具列表、当前配置参数。序列化策略：对话历史使用 Spring AI 的 MessageSerializer（JSON 格式），中间结果使用 Jackson ObjectMapper。存储量控制：单个检查点不超过 100KB，历史消息压缩到最近 20 条。</p></details>
+        <details><summary>Planner 输出了错误的计划（如步骤顺序错误），如何检测和纠正？</summary><p>三种检测手段：1) 静态校验——Planner 输出 JSON 后，校验每个步骤的 dependsOn 是否有效（引用的步骤 ID 是否存在）、步骤数是否在范围内；2) 执行时验证——Executor 执行前检查依赖步骤是否已完成，如果发现循环依赖（step1 依赖 step2，step2 也依赖 step1），自动修正为顺序执行；3) LLM 自检——将计划打印给 LLM 让它自我检查，"请审核以下执行计划是否有逻辑错误"。如果发现错误，CorpAssist 的策略是：将计划返回给 Planner 并要求重新生成（最多 2 次），如果仍错误则使用默认的固定流程模板。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI ChatClient</a> — 用于 Planner 和 Executor 的 ChatClient 配置</li>
+    <li><a href="https://redis.io/docs/data-types/hashes/" target="_blank" rel="noopener">Redis Hash 文档</a> — 检查点存储的数据结构</li>
+    <li><a href="https://github.com/alibaba/spring-ai-alibaba" target="_blank" rel="noopener">Spring AI Alibaba</a> — Plan-and-Execute 示例代码</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现 Planner：用 ChatClient 生成 JSON 格式的执行计划，包含 dependsOn 字段</li>
+      <li>实现 Executor：按计划执行步骤，支持步骤间数据传递（Map&lt;String, Object&gt; context）</li>
+      <li>集成 Redis：在 Executor 每步完成后保存检查点，支持从断点恢复</li>
+      <li>设计补偿逻辑：模拟一个关键步骤失败，执行撤销操作（如删除已创建的工单）</li>
+      <li>将 Planner 输出格式改为错误的 JSON，观察校验逻辑是否触发重生成</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：Agent 执行到第 3 步时系统崩溃重启，如何从检查点恢复？</summary><p>1) Agent 启动时从 Redis 加载 session 的检查点；2) 检查 status 是否为 IN_PROGRESS（如果是 COMPLETED 或 FAILED 则不需要恢复）；3) 从检查点获取 history、已完成步骤结果、当前步骤索引；4) 恢复 ChatClient 的历史消息（使用 Spring AI 的 ChatHistory.withMessages）；5) 从断点步骤重新执行（不是重试已完成的步骤）。关键设计思路：不要重试已完成的步骤（可能产生副作用，如重复发邮件），而是直接从断点处继续。CorpAssist 使用幂等性设计——每个步骤的执行结果包含幂等键，系统恢复时检查幂等键避免重复执行。</p></details>
+      <details><summary>场景：Planner 输出了 15 个步骤，但 maxIterations 只允许 10 步，怎么办？</summary><p>解决方案：1) Planner 的 System Prompt 中加入"最多输出 8 步"的约束；2) 如果 Planner 仍然输出了超过限制的计划，触发计划压缩——将连续的 2-3 个步骤合并为一个"批量步骤"（如将 getUserInfo、getDepartmentInfo、getProjectList 合并为 gatherContextInfo 步骤）；3) 如果无法压缩，则分阶段执行——先执行前 8 步，完成后重新调用 Planner 生成剩余步骤的计划。CorpAssist 使用方案 3，因为方案 2 的合并步骤内部逻辑可能过于复杂。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-03-lab/</code></p><ul class="demo-acceptance">
+      <li>Planner 正确生成 JSON 格式的 4 步执行计划</li>
+      <li>Executor 按依赖顺序执行并传递上下文</li>
+      <li>Redis 检查点持久化支持系统重启后恢复</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-basics-04">记忆与工具生态（Spring AI）</a> — 短期/长期记忆与 MCP 工具注册</li>
+  </ul></div>
+</section>

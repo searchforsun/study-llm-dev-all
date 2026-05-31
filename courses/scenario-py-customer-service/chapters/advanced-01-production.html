@@ -1,0 +1,203 @@
+<section id="ch-advanced-01-production" class="chapter" data-chapter="advanced-01-production">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>生产化：网关、限流与 SSO</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-production" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>客服系统上生产环境比 RAG 知识库要复杂得多——SSE 长连接的网关配置、QPS 限流与削峰、JWT 与 SSO 的用户鉴权、7x24 值班告警。这些基础设施决定客服系统能否在生产环境稳定运行。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>配置 SSE 端到端链路（Nginx→FastAPI→SSE）；实现令牌桶限流和队列削峰；集成 JWT + SSO 用户鉴权；搭建 7x24 值班告警规则。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) SSE 需要 Nginx 禁用缓冲（X-Accel-Buffering: no），否则流式失效；2) 令牌桶限流 50 QPS，超出排队到 Redis 队列削峰；3) JWT Token 有效期 15min，刷新 Token 7天；4) P0 告警：P99>5s / 错误率>5% / 转接率>40%，1分钟内通知；5) 7x24 值班方案：P0 15分钟响应，P1 30分钟，P2 4小时。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>SSE 端到端链路</h3>
+      <p>SSE（Server-Sent Events）流式输出客服回答，需要从前端到 Nginx 到 FastAPI 全链路支持。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">sequenceDiagram
+    participant F as 前端
+    participant NGX as Nginx
+    participant API as FastAPI
+    participant AG as Agent
+    participant LLM as LLM
+    F->>NGX: POST /v1/chat (SSE)
+    NGX->>API: 转发
+    API->>AG: 处理对话
+    AG->>LLM: 流式生成
+    LLM-->>AG: token1, token2...
+    AG-->>API: SSE events
+    API-->>NGX: 逐chunk返回
+    NGX-->>F: 流式接收
+    Note over NGX: X-Accel-Buffering: no<br/>proxy_buffering off</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">nginx</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-nginx"># Nginx SSE 配置
+upstream fastapi_backend {
+    server fastapi:8002;
+    keepalive 64;
+}
+server {
+    listen 443 ssl;
+    location /v1/chat {
+        proxy_pass http://fastapi_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+        add_header X-Accel-Buffering no;
+        proxy_read_timeout 120s;
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>QPS 限流与削峰</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""限流与削峰"""
+
+from fastapi import FastAPI, HTTPException
+import asyncio
+from collections import deque
+import time
+
+app = FastAPI()
+
+class RateLimiter:
+    def __init__(self, max_qps: int = 50):
+        self.max_qps = max_qps
+        self.requests = deque()
+
+    async def acquire(self):
+        now = time.monotonic()
+        # 清除 1 秒前的记录
+        while self.requests and self.requests[0] < now - 1:
+            self.requests.popleft()
+        if len(self.requests) >= self.max_qps:
+            raise HTTPException(status_code=429, detail="Too Many Requests")
+        self.requests.append(now)
+
+class PeakShavingQueue:
+    """削峰队列"""
+    def __init__(self, max_queue: int = 200):
+        self.queue = asyncio.Queue(maxsize=max_queue)
+
+    async def enqueue(self, request):
+        try:
+            await asyncio.wait_for(self.queue.put(request), timeout=5)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=503, detail="Service Busy")</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>用户鉴权（JWT + SSO）</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""JWT 鉴权中间件"""
+
+from fastapi import Request, HTTPException
+from jose import jwt, JWTError
+from datetime import datetime, timedelta
+from typing import Optional
+
+SECRET_KEY = "corp-assist-secret-key-2026"
+ALGORITHM = "HS256"
+
+def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes=15)) -> str:
+    to_encode = data.copy()
+    to_encode.update({"exp": datetime.utcnow() + expires_delta})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(token: str) -> Optional[dict]:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+async def auth_middleware(request: Request, call_next):
+    if request.url.path not in ["/health", "/metrics"]:
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = verify_token(auth[7:])
+        if not payload:
+            raise HTTPException(status_code=401, detail="Token expired")
+        request.state.user = payload
+    return await call_next(request)</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>7x24 告警规则</h3>
+      <table class="learn-decision-table"><thead><tr><th>级别</th><th>触发条件</th><th>通知方式</th><th>响应时间</th></tr></thead><tbody>
+        <tr><td>P0</td><td>P99 > 5s / 错误率 > 5% / 转接率 > 40%</td><td>电话 + 短信 + 钉钉</td><td>15 分钟</td></tr>
+        <tr><td>P1</td><td>P99 > 3s / 错误率 > 2% / CSAT < 3.5</td><td>钉钉 + 邮件</td><td>30 分钟</td></tr>
+        <tr><td>P2</td><td>任意指标连续 3 天下降 > 5%</td><td>邮件</td><td>4 小时</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block">
+      <h3>SSO 集成与企业 LDAP</h3>
+      <p>企业客户通常使用 SSO（单点登录）和 LDAP（轻量级目录访问协议）管理员工身份。CorpAssist 的智能客服需要与企业现有的身份系统集成。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""SSO 集成（OIDC 协议）"""
+
+from fastapi import Request, HTTPException
+from authlib.integrations.starlette_client import OAuth
+from starlette.config import Config
+
+config = Config(".env")  # OIDC 配置
+oauth = OAuth(config)
+oauth.register(
+    name="corp_sso",
+    server_metadata_url="https://sso.corp.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid profile email"},
+)
+
+async def sso_login(request: Request):
+    """SSO 登录重定向"""
+    redirect_uri = request.url_for("sso_callback")
+    return await oauth.corp_sso.authorize_redirect(request, redirect_uri)
+
+async def sso_callback(request: Request):
+    """SSO 回调处理"""
+    token = await oauth.corp_sso.authorize_access_token(request)
+    user_info = token.get("userinfo", {})
+    # 生成内部 JWT Token
+    internal_token = create_access_token({
+        "sub": user_info.get("sub"),
+        "name": user_info.get("name"),
+        "roles": user_info.get("roles", ["全员可见"]),
+    })
+    return {"access_token": internal_token, "token_type": "bearer"}</pre></div>
+      <p><strong>集成要点</strong>：</p>
+      <ul>
+        <li>企业 SSO 支持 OIDC（推荐）和 SAML 2.0（兼容）两种协议。</li>
+        <li>LDAP 同步员工组织架构和角色信息，每日增量同步一次。</li>
+        <li>用户角色（如「HR_可见」「经理_可见」）从 SSO 的 group/role 声明中提取。</li>
+        <li>统一登录入口：CorpAssist 门户 → SSO 登录 → 重定向回门户 → 携带 JWT Token。</li>
+      </ul>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>SSE 需要 Nginx+FastAPI 全链路配置，关键在 X-Accel-Buffering: no。</li>
+        <li>令牌桶限流 50 QPS + 队列削峰，超出队列返回 503。</li>
+        <li>JWT Token 15 分钟 + Refresh Token 7 天，SSO 集成企业 LDAP。</li>
+        <li>P0 告警 15 分钟响应，覆盖 P99/错误率/转接率三个关键指标。</li>
+        <li>7x24 值班方案分 P0/P1/P2 三级，确保严重故障及时响应。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-adv-01-1"> 能配置 Nginx SSE</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-adv-01-2"> 能实现令牌桶限流</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-adv-01-3"> 能编写 JWT 鉴权中间件</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-adv-01-4"> 能定义 P0/P1/P2 告警规则</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-adv-01-5"> 能解释 SSO 集成方式</label></li>
+      </ul></div>
+    </div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>上一篇：<a href="#ch-practice-06-production-pitfalls">生产坑：DST、确定性与高并发</a></li>
+    <li>下一篇：<a href="#ch-advanced-02-metrics">业务数据叙事</a></li>
+  </ul></div>
+</section>

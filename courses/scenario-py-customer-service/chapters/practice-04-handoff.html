@@ -1,0 +1,271 @@
+<section id="ch-practice-04-handoff" class="chapter" data-chapter="practice-04-handoff">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>降级与人工转接</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-handoff" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Python 栈实战</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>没有 AI 客服能做到 100% 的自动化率。当 AI 无法处理、用户情绪负面、或者问题超出边界时，优雅地转接人工是保障用户体验的最后一道防线。糟糕的转接体验会让用户对系统整体的评分直接腰斩。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现置信度阈值触发的自动转接；设计上下文移交机制（转人工时携带对话历史和用户信息）；实现排队与坐席分配策略；搭建转接率监控看板并做优化分析。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 转接触发条件：置信度<0.50、用户要求、意图识别失败3次、情感分数<0.3；2) 上下文移交包含：对话历史+已收集参数+用户信息+转接原因；3) 排队策略：优先级队列（投诉>金额>一般），坐席分配用最少占用优先；4) 目标转接率 25-30%，转接后 CSAT ≥ 3.8/5；5) 转接优化最重要的是「少转且转得准」——错误转接比不转接更伤用户体验。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>置信度低于阈值 → 转人工</h3>
+      <p>转接触发条件需要多个维度的综合判断，而非单一阈值。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TD
+    A[对话进行中] --> B{转接条件检查}
+    B --> C[意图置信度 < 0.50]
+    B --> D[用户明确要求转人工]
+    B --> E[意图识别失败 ≥ 3 次]
+    B --> F[情感分数 < 0.3 负面]
+    C --> G[触发转接]
+    D --> G
+    E --> G
+    F --> G
+    G --> H[打包上下文]
+    H --> I[排队]
+    I --> J[分配坐席]
+    J --> K[上下文注入到人工工作台]</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""转接触发与上下文移交"""
+
+from dataclasses import dataclass, field
+from typing import Optional, List
+from datetime import datetime
+
+@dataclass
+class TransferContext:
+    """转接上下文"""
+    session_id: str
+    user_id: str
+    user_name: str
+    dialog_history: str  # 格式化的对话历史
+    collected_params: dict
+    current_intent: str
+    transfer_reason: str  # low_confidence / user_request / sentiment_negative / max_retries
+    priority: str  # high / normal / low
+    sentiment_score: Optional[float] = None
+    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+class TransferDecision:
+    """转接决策器"""
+
+    def __init__(self):
+        self.max_intent_failures = 3
+        self.confidence_threshold = 0.50
+        self.sentiment_threshold = 0.3
+
+    def should_transfer(
+        self,
+        confidence: float,
+        intent_failures: int,
+        user_requested: bool,
+        sentiment: Optional[float],
+    ) -> tuple[bool, str]:
+        """判断是否转接"""
+
+        if user_requested:
+            return True, "user_request"
+
+        if intent_failures >= self.max_intent_failures:
+            return True, "max_retries"
+
+        if confidence < self.confidence_threshold:
+            return True, "low_confidence"
+
+        if sentiment is not None and sentiment < self.sentiment_threshold:
+            return True, "sentiment_negative"
+
+        return False, ""
+
+    def determine_priority(self, intent: str, sentiment: float) -> str:
+        """确定优先级"""
+        if intent == "complaint" or sentiment < 0.2:
+            return "high"
+        elif sentiment < 0.4 or intent in ["apply_refund", "modify_info"]:
+            return "normal"
+        return "low"
+
+    def build_transfer_context(
+        self, session_id: str, user_info: dict,
+        history: list, params: dict, intent: str,
+        reason: str, sentiment: float,
+    ) -> TransferContext:
+        """构建转接上下文"""
+        history_text = "\n".join(
+            f"{'用户' if h['role']=='user' else 'AI'}: {h['content']}"
+            for h in history[-20:]
+        )
+        priority = self.determine_priority(intent, sentiment)
+        return TransferContext(
+            session_id=session_id,
+            user_id=user_info.get("user_id", ""),
+            user_name=user_info.get("name", ""),
+            dialog_history=history_text,
+            collected_params=params,
+            current_intent=intent,
+            transfer_reason=reason,
+            priority=priority,
+            sentiment_score=sentiment,
+        )</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>排队与坐席分配策略</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""排队与坐席分配"""
+
+from dataclasses import dataclass
+from typing import List, Optional
+from datetime import datetime
+import heapq
+
+@dataclass
+class Agent:
+    """坐席"""
+    agent_id: str
+    name: str
+    skills: List[str]  # ["ticket", "refund", "complaint"]
+    status: str  # "idle" / "busy"
+    current_load: int = 0
+    max_concurrent: int = 3
+
+class QueueManager:
+    """排队管理器"""
+
+    def __init__(self):
+        self.queue: List[tuple] = []  # (priority, time, context)
+        self.agents: List[Agent] = []
+
+    def enqueue(self, context: TransferContext):
+        priority_map = {"high": 0, "normal": 1, "low": 2}
+        heapq.heappush(self.queue, (
+            priority_map[context.priority],
+            datetime.utcnow().timestamp(),
+            context,
+        ))
+
+    def assign(self) -> Optional[tuple[TransferContext, Agent]]:
+        """分配坐席"""
+        if not self.queue:
+            return None
+        # 找到最空闲且有对应技能的坐席
+        available = [
+            a for a in self.agents
+            if a.status == "idle" and a.current_load < a.max_concurrent
+        ]
+        if not available:
+            return None
+        _, _, context = heapq.heappop(self.queue)
+        agent = min(available, key=lambda a: a.current_load)
+        agent.current_load += 1
+        if agent.current_load >= agent.max_concurrent:
+            agent.status = "busy"
+        return context, agent
+
+    def complete(self, agent_id: str):
+        """完成服务"""
+        for agent in self.agents:
+            if agent.agent_id == agent_id:
+                agent.current_load = max(0, agent.current_load - 1)
+                agent.status = "idle"
+                break</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文移交的端到端测试</h3>
+      <p>转接时的上下文移交是最容易出现细节 bug 的环节。CorpAssist 团队维护了一个端到端测试场景来验证上下文移交的完整性。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""上下文移交的端到端测试"""
+
+from src.transfer import TransferDecision, TransferContext
+
+def test_transfer_context_integrity():
+    """验证上下文移交完整性"""
+    decision = TransferDecision()
+    history = [
+        {"role": "user", "content": "我要投诉"},
+        {"role": "ai", "content": "请问您遇到了什么问题"},
+        {"role": "user", "content": "我的订单 ORD-123 还没到货"},
+        {"role": "ai", "content": "好的，我查一下。订单显示已发货"},
+        {"role": "user", "content": "但是已经过了预计时间了"},
+    ]
+    ctx = decision.build_transfer_context(
+        session_id="test-001",
+        user_info={"user_id": "u001", "name": "张三"},
+        history=history,
+        params={"order_id": "ORD-123"},
+        intent="complaint",
+        reason="user_request",
+        sentiment=0.15,
+    )
+    # 验证上下文完整性
+    assert ctx.session_id == "test-001"
+    assert ctx.current_intent == "complaint"
+    assert ctx.priority == "high"  # sentiment < 0.2 → high
+    assert "投诉" in ctx.dialog_history
+    assert "ORD-123" in ctx.dialog_history
+    print(f"Context length: {len(ctx.dialog_history)} chars")
+    print(f"Transfer reason: {ctx.transfer_reason}")
+    print(f"Priority: {ctx.priority}")
+
+def test_queue_and_assign():
+    """测试排队和分配"""
+    from src.transfer import QueueManager, TransferContext, Agent
+    mgr = QueueManager()
+    mgr.agents = [Agent(agent_id="a1", name="客服A", skills=["complaint"], status="idle")]
+    ctx = TransferContext(
+        session_id="s1", user_id="u1", user_name="李四",
+        dialog_history="测试历史", collected_params={},
+        current_intent="complaint", transfer_reason="user_request",
+        priority="high",
+    )
+    mgr.enqueue(ctx)
+    result = mgr.assign()
+    assert result is not None
+    assigned_ctx, agent = result
+    assert agent.agent_id == "a1"
+    print(f"Assigned {assigned_ctx.session_id} to {agent.name}")
+    print("ALL TESTS PASSED")</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>转接率监控与优化</h3>
+      <table class="learn-decision-table"><thead><tr><th>指标</th><th>目标</th><th>当前值</th><th>优化方向</th></tr></thead><tbody>
+        <tr><td>整体转接率</td><td>25-30%</td><td>28%</td><td>增加 FAQ 模板覆盖率</td></tr>
+        <tr><td>投诉场景转接率</td><td>100%</td><td>100%</td><td>保持</td></tr>
+        <tr><td>意图失败转接率</td><td>≤ 15%</td><td>18%</td><td>优化意图分类器 + 增加反问话术</td></tr>
+        <tr><td>平均排队等待时长</td><td>< 30s</td><td>25s</td><td>繁忙时段增加机动坐席</td></tr>
+        <tr><td>转接后 CSAT</td><td>≥ 3.8/5</td><td>3.9/5</td><td>减少上下文丢失</td></tr>
+      </tbody></table>
+      <p><strong>转接率优化深度分析</strong>：转接率优化不能只看整体数字，需要按维度拆解。CorpAssist 的转接率按意图维度拆解后发现，「查询工单」的转接率仅 8%，「密码重置」为 12%，但「修改个人信息」的转接率高达 45%。深入分析发现，45% 中有一半是因为 AI 无法完成身份验证（需要用户提供更多身份信息），另一半是因为权限不足。针对身份验证问题，我们上线了「多渠道身份验证」——用户可以通过企业微信扫码验证身份，减少对话中的身份确认轮次。该优化将「修改个人信息」的转接率从 45% 降到 28%。</p>
+      <aside class="learn-scenario"><h4>CorpAssist 场景</h4><p>终端用户在企业门户上让 AI 客服「帮我改手机号」。AI 客服发起身份验证流程：通过企业微信 push 一条验证通知到用户的已注册手机，用户点击确认后身份验证自动完成。整个过程不需要用户在对话框中输入任何敏感信息，既安全又高效。这个方案上线后，「修改个人信息」场景的用户满意度从 3.2/5 提升到 4.3/5。</p></aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>转接触发有 4 个维度：置信度/用户要求/失败次数/情感评分。</li>
+        <li>上下文移交包含完整对话历史 + 参数 + 用户信息 + 转接原因。</li>
+        <li>优先级队列用最小堆实现，坐席分配用最少占用优先策略。</li>
+        <li>目标转接率 25-30%, 转接后 CSAT ≥ 3.8/5。</li>
+        <li>优化转接的核心是减少「错误转接」——本可 AI 处理的问题被转到人工。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-prac-04-1"> 能列出 4 种转接触发条件</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-04-2"> 能实现上下文移交的打包逻辑</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-04-3"> 能设计优先级队列和坐席分配算法</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-04-4"> 能设定转接率监控目标</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-prac-04-5"> 能解释什么是「错误转接」及其危害</label></li>
+      </ul></div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3></div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-05-eval">客服效果评测</a></li>
+  </ul></div>
+</section>

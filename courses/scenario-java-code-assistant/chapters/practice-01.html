@@ -1,0 +1,242 @@
+<section id="ch-practice-01" class="chapter" data-chapter="practice-01">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>代码索引流水线</h2><button type="button" class="btn-mark-done" data-chapter="practice-01" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S4 代码助手</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>代码索引是代码助手的"知识库"——代码切片的存储和检索效率直接决定用户体验。本章实现完整的索引流水线：Git 增量检测、Spring Scheduling 定时索引、Milvus 向量集合管理、权限控制。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 JGit 实现 Git 增量索引；配置 Spring Scheduling 定时任务；管理 Milvus 集合和索引；实现基于项目的权限控制。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) JGit 获取最近提交差异，5 分钟的增量窗口检测变更文件；2) Spring @Scheduled 控制全量索引（每天 2AM）和增量索引（每 5 分钟）；3) Milvus 集合每个项目一个 collection，使用 IVF_FLAT 索引加速检索；4) 权限控制基于项目级别的 Token 认证。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Git 增量索引</h3>
+      <p>使用 JGit 库获取仓库的提交历史，分析变更文件，只重新索引修改过的文件。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    A[定时器触发: 每5分钟] --> B[获取上次索引的 commitId]
+    B --> C[JGit: 获取 recent commits]
+    C --> D[对比 files changed]
+    D --> E{文件类型?}
+    E -->|Java/Python/TS等| F[重新索引]
+    E -->|非代码文件| G[跳过]
+    F --> H[删除 Milvus 中旧数据]
+    H --> I[写入新切片到 Milvus]
+    I --> J[更新 lastIndexedCommit]
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Git 增量索引实现
+@Component
+public class GitIncrementalIndexer {
+
+    @Value("${code-index.repo.path}")
+    private String repoPath;
+
+    private final Map&lt;String, String&gt; lastIndexedCommits = new ConcurrentHashMap&lt;&gt;();
+
+    public List&lt;GitChange&gt; detectChanges(String projectId) {
+        try (Git git = Git.open(new File(repoPath + "/" + projectId))) {
+            // 获取上次索引的 commit
+            String lastCommit = lastIndexedCommits
+                .getOrDefault(projectId, getInitialCommit(git));
+
+            // 获取从上次索引后的所有新提交
+            Iterable&lt;RevCommit&gt; commits = git.log()
+                .addRange(
+                    git.resolve(lastCommit + "^"),
+                    git.resolve("HEAD"))
+                .call();
+
+            // 汇总所有变更文件
+            Set&lt;String&gt; changedFiles = new LinkedHashSet&lt;&gt;();
+            for (RevCommit commit : commits) {
+                try (RevWalk walk = new RevWalk(git.getRepository())) {
+                    RevCommit revCommit = walk.parseCommit(commit.getId());
+                    if (revCommit.getParentCount() &gt; 0) {
+                        RevTree parentTree = revCommit.getParent(0).getTree();
+                        RevTree thisTree = revCommit.getTree();
+                        // 对比两棵树的差异
+                        diffTrees(git, parentTree, thisTree, changedFiles);
+                    }
+                }
+            }
+
+            // 记录最新的 commitId
+            RevCommit latest = git.log().setMaxCount(1).call().iterator().next();
+            lastIndexedCommits.put(projectId, latest.getName());
+
+            return changedFiles.stream()
+                .filter(this::isCodeFile)
+                .map(f -&gt; new GitChange(projectId, f, GitChange.Type.MODIFY))
+                .toList();
+        } catch (Exception e) {
+            throw new RuntimeException("Git diff failed", e);
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring Scheduling 调度</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 索引调度配置
+@Configuration
+@EnableScheduling
+public class IndexSchedulerConfig {
+
+    @Bean
+    public TaskScheduler indexTaskScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(3);          // 支持 3 个仓库并行索引
+        scheduler.setThreadNamePrefix("code-index-");
+        scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        return scheduler;
+    }
+}
+
+@Component
+public class IndexScheduler {
+
+    private final GitIncrementalIndexer gitIndexer;
+    private final CodeIndexBuilder indexBuilder;
+
+    @Scheduled(cron = "0 0 2 * * ?")  // 每天凌晨 2 点全量
+    public void fullIndexAll() {
+        log.info("开始全量索引所有项目");
+        List&lt;String&gt; projects = gitIndexer.listProjects();
+        for (String project : projects) {
+            try {
+                indexBuilder.fullIndex(project);
+                log.info("全量索引完成: {}", project);
+            } catch (Exception e) {
+                log.error("全量索引失败: {}", project, e);
+                alertService.sendAlert("索引失败: " + project);
+            }
+        }
+    }
+
+    @Scheduled(fixedRate = 300000)  // 每 5 分钟增量
+    public void incrementalIndex() {
+        List&lt;String&gt; projects = gitIndexer.listProjects();
+        for (String project : projects) {
+            List&lt;GitChange&gt; changes = gitIndexer.detectChanges(project);
+            if (!changes.isEmpty()) {
+                log.info("检测到 {} 个文件变更: {}", changes.size(), project);
+                indexBuilder.incrementalIndex(changes);
+            }
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Milvus Schema 管理</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Milvus 集合管理
+@Component
+public class MilvusCollectionManager {
+
+    private final MilvusClient milvusClient;
+
+    public void createCollection(String projectId) {
+        String collectionName = "code_" + projectId.replace("-", "_");
+
+        // 检查集合是否存在
+        if (milvusClient.hasCollection(collectionName)) {
+            return;
+        }
+
+        // 创建集合 Schema
+        FieldType idField = FieldType.builder()
+            .name("id").dataType(DataType.Int64).primaryKey(true)
+            .autoID(true).build();
+
+        FieldType embeddingField = FieldType.builder()
+            .name("embedding").dataType(DataType.FloatVector)
+            .dimension(1024).build();
+
+        FieldType filePathField = FieldType.builder()
+            .name("filePath").dataType(DataType.VarChar)
+            .maxLength(500).build();
+
+        FieldType languageField = FieldType.builder()
+            .name("language").dataType(DataType.VarChar)
+            .maxLength(20).build();
+
+        FieldType symbolNameField = FieldType.builder()
+            .name("symbolName").dataType(DataType.VarChar)
+            .maxLength(200).build();
+
+        CollectionSchema schema = CollectionSchema.builder()
+            .addField(idField).addField(embeddingField)
+            .addField(filePathField).addField(languageField)
+            .addField(symbolNameField)
+            .build();
+
+        milvusClient.createCollection(
+            CreateCollectionReq.builder()
+                .collectionName(collectionName)
+                .collectionSchema(schema)
+                .build()
+        );
+
+        // 创建索引
+        milvusClient.createIndex(
+            CreateIndexReq.builder()
+                .collectionName(collectionName)
+                .fieldName("embedding")
+                .indexType(IndexType.IVF_FLAT)
+                .metricType(MetricType.IP)
+                .extraParam("{\"nlist\":1024}")
+                .build()
+        );
+
+        log.info("Milvus 集合创建完成: {}", collectionName);
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>权限控制</h3>
+      <table class="outline-table">
+        <thead><tr><th>角色</th><th>可索引的项目</th><th>可查询的项目</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr><td>开发者</td><td>分配的 1-3 个项目</td><td>分配的项目</td><td>代码问答</td></tr>
+          <tr><td>技术主管</td><td>所在部门的所有项目</td><td>部门项目</td><td>问答 + Review</td></tr>
+          <tr><td>管理员</td><td>全部项目</td><td>全部项目</td><td>管理索引</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>JGit 增量索引检测 5 分钟内变更的文件，只重新索引代码文件</li>
+      <li>Spring Scheduling 支持每天 2AM 全量索引 + 每 5 分钟增量索引</li>
+      <li>Milvus 每个项目独立 collection，IVF_FLAT 索引加速检索</li>
+      <li>权限控制按项目级别管理索引和查询权限</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能用 JGit 实现增量索引</label></li>
+        <li><label><input type="checkbox"> 我能配置 Spring Scheduling 调度</label></li>
+        <li><label><input type="checkbox"> 我能管理 Milvus 集合和索引</label></li>
+        <li><label><input type="checkbox"> 我能实现项目级别的权限控制</label></li>
+      </ul></div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://milvus.io/docs" target="_blank" rel="noopener">Milvus 文档</a></li>
+    <li><a href="https://www.eclipse.org/jgit/" target="_blank" rel="noopener">JGit 官方</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>用 JGit 打开仓库，获取最近 5 分钟的变更文件</li>
+      <li>配置 Spring @Scheduled 全量+增量索引</li>
+      <li>创建 Milvus collection 并插入切片</li>
+      <li>实现基于项目的 Token 权限校验</li>
+      <li>测试全量索引 1000+ 文件的仓库耗时</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-01-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-02">仓库问答 API（Spring Boot）</a></li></ul></div>
+</section>

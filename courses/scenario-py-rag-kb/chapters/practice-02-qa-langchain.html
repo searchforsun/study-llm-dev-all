@@ -1,0 +1,387 @@
+<section id="ch-practice-02-qa-langchain" class="chapter" data-chapter="practice-02-qa-langchain">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>LangChain 问答编排</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-qa-langchain" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>Python 栈实战</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>从检索到生成不是简单的「找到文档→丢给 LLM」——需要设计结构化的 LCEL 管线、确保引用可溯源、输出支持流式。这章是 RAG 服务端到端实现的核心。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 LangChain LCEL 构建完整的 RAG 问答管线；实现带来源引用的答案输出；通过 SSE 协议实现流式推送；对比 LangChain 和 LlamaIndex 的实现差异并做选型判断。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) LCEL 管线的核心链：Retriever → Context 组装 → Prompt 模板 → LLM 生成 → OutputParser；2) 引用溯源要求每个检索出的 chunk 携带 doc_id/page_num，LLM 输出时强制标注；3) SSE 流式输出将首词延迟从 2.8s 降到 0.6s（TTFP），用户体验显著提升；4) LlamaIndex 更适合复杂索引场景，LangChain 更适合灵活的管线编排；5) CorpAssist 选择 LangChain 因为它与 Python 双栈其他组件（Celery 索引、FastAPI 服务）集成更自然。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>LCEL 管线：Retriever → Context → Prompt → LLM</h3>
+      <p>LangChain Expression Language (LCEL) 是 LangChain 的声明式管线语法，用 <code>|</code> 操作符串联各阶段的处理逻辑。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart LR
+    A[用户查询] --> B[Retriever<br/>混合检索+融合]
+    B --> C[Context 合成器<br/>去重+剪裁+格式化]
+    C --> D[Prompt 模板<br/>System + Context + Q]
+    D --> E[LLM 生成<br/>带索引约束]
+    E --> F[OutputParser<br/>引用提取+后处理]
+    F --> G[SSE 流式输出]</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""LangChain LCEL RAG 问答管线"""
+
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI
+from operator import itemgetter
+
+# 1. 自定义检索器
+class CorpHybridRetriever:
+    """CorpAssist 混合检索器封装"""
+
+    def __init__(self, alpha: float = 0.3, top_k: int = 5):
+        self.alpha = alpha
+        self.top_k = top_k
+
+    def invoke(self, query: str) -> list:
+        """执行混合检索并返回文档列表"""
+        from src.retrieval import HybridSearch
+        searcher = HybridSearch(alpha=self.alpha)
+        results = searcher.search(query, top_k=self.top_k)
+        return [
+            {"page_content": r["text"],
+             "metadata": {"doc_id": r["doc_id"],
+                          "source": r.get("source", ""),
+                          "page": r.get("page_num", 1)}}
+            for r in results
+        ]
+
+# 2. Context 合成器
+def format_docs(docs: list) -> str:
+    """将文档列表格式化为含引用的上下文"""
+    formatted = []
+    for i, doc in enumerate(docs):
+        meta = doc["metadata"]
+        ref = f"[{i+1}] 来源: {meta.get('source', '未知')} 第{meta.get('page', '?')}页"
+        formatted.append(f"{ref}\n{doc['page_content']}")
+    return "\n\n".join(formatted)
+
+# 3. Prompt 模板
+PROMPT_TEMPLATE = """你是一个企业知识库问答助手。请根据以下检索到的文档内容回答问题。
+如果文档内容不足以回答问题，请明确说「根据已有信息无法回答」。
+
+检索到的文档：
+{context}
+
+用户问题：{question}
+
+要求：
+1. 请基于检索文档的内容作答
+2. 在每个答案的末尾用 [来源: 文档名, 页码] 标注信息来源
+3. 如果多个文档提供不同信息，请综合并注明各来源
+"""
+
+prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+
+# 4. 完整 LCEL 管线
+def build_rag_chain():
+    """构建 LCEL RAG 链"""
+    retriever = CorpHybridRetriever()
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.1,
+        streaming=True,
+    )
+
+    chain = (
+        RunnableParallel(
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        )
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return chain
+
+if __name__ == "__main__":
+    chain = build_rag_chain()
+    answer = chain.invoke("今年的年假有几天？")
+    print(answer)
+    # 输出: 根据《2026年休假制度》第二条，员工每年享有 15 天带薪年假。
+    #       [来源: 2026-休假制度.pdf, 第2页]</pre></div>
+      <p><strong>管线设计要点</strong>：</p>
+      <ul>
+        <li><strong>RunnableParallel</strong>：将上下文格式化与原始查询并行传递到 Prompt 模板</li>
+        <li><strong>temperature=0.1</strong>：知识库问答需要确定性高，低温度防止模型「发挥」</li>
+        <li><strong>format_docs</strong>：加入来源标注，使 LLM 能看到每个 chunk 的出处</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>引用溯源：让回答可审计</h3>
+      <p>企业环境中，LLM 回答必须有据可查。CorpAssist 实现了「强制引用」机制——如果 LLM 回答不包含来源引用，系统在输出后自动补充。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+    subgraph Pipeline[引用溯源流程]
+        A[检索结果] --> B[注入元数据到上下文]
+        B --> C[LLM 生成含引用回答]
+        C --> D[引用校验器]
+        D -->|引用有效| E[直接输出]
+        D -->|缺少引用| F[自动补充引用]
+        D -->|引用不存在于上下文中| G[拒绝输出+记录坏例]
+    end
+    style E fill:#38b000,color:#fff
+    style G fill:#d00000,color:#fff</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""引用溯源校验器"""
+
+import re
+from typing import List, Dict, Tuple
+
+class CitationGuard:
+    """强制引用校验器"""
+
+    def __init__(self, docs: List[Dict]):
+        self.docs = docs
+        # 从文档中提取所有可引用来源
+        self.valid_sources = set()
+        for d in docs:
+            meta = d.get("metadata", {})
+            source = f"{meta.get('source', '未知')}"
+            self.valid_sources.add(source)
+
+    def check_citations(self, answer: str) -> Tuple[bool, List[str]]:
+        """检查回答是否包含有效引用，返回 (是否通过, 缺失列表)"""
+        citations = re.findall(r'\[来源:\s*([^\]]+)\]', answer)
+        if not citations:
+            return False, ["无任何引用"]
+
+        invalid = []
+        for cit in citations:
+            found = any(vs in cit for vs in self.valid_sources)
+            if not found:
+                invalid.append(cit)
+        return len(invalid) == 0, invalid
+
+    def auto_attach_citations(self, answer: str) -> str:
+        """如果答案没有引用，自动附加"""
+        valid, _ = self.check_citations(answer)
+        if valid:
+            return answer
+        source_list = "; ".join(list(self.valid_sources)[:3])
+        return answer + f"\n[来源: {source_list}]"
+
+if __name__ == "__main__":
+    docs = [
+        {"metadata": {"source": "2026-休假制度.pdf", "page": 2}},
+        {"metadata": {"source": "薪资制度.pdf", "page": 5}},
+    ]
+    guard = CitationGuard(docs)
+
+    answer_ok = "年假有15天 [来源: 2026-休假制度.pdf]"
+    print(guard.check_citations(answer_ok))  # (True, [])
+
+    answer_bad = "年假有15天"
+    print(guard.check_citations(answer_bad))  # (False, ['无任何引用'])
+    print(guard.auto_attach_citations(answer_bad))
+    # 年假有15天 [来源: 2026-休假制度.pdf; 薪资制度.pdf]</pre></div>
+      <p><strong>审计数据</strong>：上线引用溯源后，CorpAssist 知识库的答案可信度评分从 3.2/5 提升到 4.5/5。用户投诉「答案不可信」的比例从 22% 降至 4%。同时审计部门可以根据引用来源快速定位原始文档，满足等保三级的审计追溯要求。</p>
+      <aside class="learn-scenario"><h4>CorpAssist 场景</h4><p>员工问「今年生育津贴怎么算」。检索管线返回了《社保制度-第8章-生育保险.pdf》第 3 页的 2 个 chunk。LLM 生成回答后通过引用校验——答案引用了「社保制度-第8章-生育保险.pdf」，在 valid_sources 列表中，校验通过。审计日志中记录了该次问答的完整信息：用户 u001 在 2026-03-15 14:22:30 的提问、生成的答案、以及引用的具体文档。</p></aside>
+    </div>
+
+    <div class="section-block">
+      <h3>流式输出（SSE）</h3>
+      <p>用户等待 LLM 生成完整答案后再看到结果是不合理的——首包时间（TTFP）应尽可能短。SSE（Server-Sent Events）流式方案将 TTFP 从 2.8s 降到 0.6s。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""FastAPI SSE 流式 RAG 问答"""
+
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import AsyncGenerator
+
+app = FastAPI()
+
+class ChatRequest(BaseModel):
+    query: str
+    user_id: str
+
+async def rag_stream(query: str, user_id: str) -> AsyncGenerator[str, None]:
+    """SSE 流式 RAG 问答生成器"""
+    from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_openai import ChatOpenAI
+
+    # 构建流式管线
+    retriever = CorpHybridRetriever()
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, streaming=True)
+
+    def format_docs(docs):
+        formatted = []
+        for i, d in enumerate(docs):
+            formatted.append(f"[{i+1}] {d['page_content'][:200]}")
+        return "\n\n".join(formatted)
+
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+
+    chain = (
+        RunnableParallel(
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        )
+        | prompt
+        | llm
+    )
+
+    async for event in chain.astream_events(query, version="v2"):
+        kind = event.get("event")
+        if kind == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            content = chunk.content
+            if content:
+                yield f"data: {content}\n\n"
+        elif kind == "on_chain_end" and "output" in event.get("data", {}):
+            # 写入审计日志
+            from src.audit import log_query
+            log_query(user_id, query, event["data"]["output"])
+
+    yield "data: [DONE]\n\n"
+
+@app.post("/v1/chat")
+async def chat_endpoint(req: ChatRequest):
+    return StreamingResponse(
+        rag_stream(req.query, req.user_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Nginx 禁用缓冲
+        },
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)</pre></div>
+      <p><strong>流式与非流式的对比</strong>：</p>
+      <table class="learn-decision-table"><thead><tr><th>指标</th><th>非流式（完整返回）</th><th>流式 SSE</th><th>差异</th></tr></thead><tbody>
+        <tr><td>TTFP（首包时间）</td><td>2.8s (P99)</td><td>0.6s (P99)</td><td>-78%</td></tr>
+        <tr><td>用户体验评分</td><td>3.1/5</td><td>4.6/5</td><td>+48%</td></tr>
+        <tr><td>总传输时间</td><td>2.8s</td><td>3.5s</td><td>+25%（但感知更快）</td></tr>
+        <tr><td>服务端内存</td><td>较高（需缓存完整输出）</td><td>低（逐 token 发送）</td><td>~60% 降低</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block">
+      <h3>与 LlamaIndex 的对照实现</h3>
+      <p>LlamaIndex 是 LangChain 之外最流行的 RAG 框架，它有更强大的索引管理和更丰富的检索策略。以下是 LlamaIndex 实现同样 RAG 管线的代码对比。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""LlamaIndex RAG 对照实现"""
+
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.postprocessor import SentenceTransformerRerank
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+def build_llama_index_pipeline(docs_text: List[str]):
+    """LlamaIndex 版 RAG 管线"""
+    # 文档解析与索引
+    documents = [Document(text=t) for t in docs_text]
+    splitter = SentenceSplitter(chunk_size=256, chunk_overlap=50)
+    nodes = splitter.get_nodes_from_documents(documents)
+
+    # Embedding 模型
+    embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-m3")
+    index = VectorStoreIndex(nodes, embed_model=embed_model)
+
+    # 检索器
+    retriever = VectorIndexRetriever(index=index, similarity_top_k=5)
+
+    # Rerank 后处理器
+    reranker = SentenceTransformerRerank(
+        model="BAAI/bge-reranker-v2-m3", top_n=3
+    )
+
+    # 查询引擎
+    query_engine = RetrieverQueryEngine.from_args(
+        retriever=retriever,
+        node_postprocessors=[reranker],
+        response_mode="compact",
+    )
+    return query_engine
+
+if __name__ == "__main__":
+    docs = [
+        "员工每年享有 15 天带薪年假。",
+        "病假需提供医院证明。",
+    ]
+    engine = build_llama_index_pipeline(docs)
+    resp = engine.query("今年年假有几天？")
+    print(resp)
+    # 输出: 员工每年享有 15 天带薪年假。</pre></div>
+      <p><strong>选型对比</strong>：</p>
+      <table class="learn-decision-table"><thead><tr><th>维度</th><th>LangChain</th><th>LlamaIndex</th><th>CorpAssist 选择及理由</th></tr></thead><tbody>
+        <tr><td>管线灵活性</td><td>★★★★★ 中</td><td>★★★</td><td>LangChain: 需要自由组合检索+工具+Agent</td></tr>
+        <tr><td>索引管理</td><td>★★★</td><td>★★★★★</td><td>LlamaIndex: 索引管理更成熟</td></tr>
+        <tr><td>流式支持</td><td>★★★★★</td><td>★★★</td><td>LangChain: LCEL astream_events 更完善</td></tr>
+        <tr><td>社区生态</td><td>★★★★★</td><td>★★★★</td><td>LangChain: 工具/文档/集成更丰富</td></tr>
+        <tr><td>学习曲线</td><td>中等</td><td>较陡</td><td>LangChain: 团队上手更快</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>LCEL 管线通过 RunnableParallel 串联 Retriever → Context → Prompt → LLM，是 RAG 的标准实现范式。</li>
+        <li>引用溯源机制强制 LLM 输出标注来源，将答案可信度从 3.2/5 提升到 4.5/5。</li>
+        <li>SSE 流式输出将 TTFP 从 2.8s 降至 0.6s，用户体验评分提升 48%。</li>
+        <li>LangChain vs LlamaIndex 各有优劣，CorpAssist 选 LangChain 因其灵活性和流式支持。</li>
+        <li>审计日志记录每次问答的完整链路，满足等保三级追溯要求。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-02-lcel-1"> 能写出 LCEL 管线的完整代码</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-lcel-2"> 能解释引用溯源机制及其校验逻辑</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-lcel-3"> 能实现 FastAPI SSE 流式问答端点</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-lcel-4"> 能对比 LangChain 和 LlamaIndex 的选型优劣势</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-lcel-5"> 能说出流式和非流式的 TTFP 差异数据</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>LCEL</td><td>LangChain 的声明式管线语法，用 | 串联组件</td></tr>
+        <tr><td>RunnableParallel</td><td>LCEL 中并行执行多个任务并合并输出的组件</td></tr>
+        <tr><td>引用溯源</td><td>强制 LLM 在回答中标注信息来源的机制</td></tr>
+        <tr><td>SSE</td><td>Server-Sent Events，服务端逐 token 推送流式数据</td></tr>
+        <tr><td>TTFP</td><td>Time to First Payload，首包延迟</td></tr>
+        <tr><td>StrOutputParser</td><td>LangChain 输出解析器，将 LLM 响应转为字符串</td></tr>
+        <tr><td>ChatPromptTemplate</td><td>结构化提示词模板，含 system/user 消息</td></tr>
+        <tr><td>OutputParser</td><td>解析 LLM 输出为结构化数据（JSON/引用等）</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 你们怎么确保 RAG 回答不是模型瞎编的？</summary><p>三层保障。第一层检索：只有检索到的文档才进入 LLM 上下文。第二层 Prompt：system prompt 明确要求「仅基于检索内容回答，无法回答时说明」。第三层引用校验：输出的回答必须包含有效的来源引用，引用必须在检索到的文档列表中。如果引用校验不通过，系统拒绝输出并记录坏例。三层结合，上线后幻觉率从 8.2% 降至 1.3%。</p></details>
+        <details><summary>Q2: SSE 流式推送时，如果客户端掉线了怎么办？</summary><p>客户端断开 TCP 连接后，FastAPI 会自动抛出 <code>RuntimeError</code>，SSE 生成器会捕获并终止。服务端不会持续生成浪费资源。对于已生成但未推送完的内容，由于 LLM 调用是 stream 模式，断开后 LLM 的生成也会随着迭代器终止而停止。审计日志记录所有成功推送的完整问答，掉线的问答记录为 incomplete 状态。</p></details>
+        <details><summary>Q3: LangChain 和 LlamaIndex 你怎么选？</summary><p>看场景。如果你要做复杂的 Agent + Tool 编排，LangChain 更灵活。如果你需要强大的索引管理（多种索引策略、图状索引），LlamaIndex 更合适。CorpAssist 选择了 LangChain 因为我们需要和 FastAPI/Celery 深度集成，并且后续会上 Agent 功能（工具调用、多步推理），LangChain 的生态更匹配。</p></details>
+      </div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://python.langchain.com/docs/expression_language/">LCEL 官方文档</a> — 声明式管线的完整指南</li>
+    <li><a href="https://python.langchain.com/docs/how_to/streaming/">LangChain 流式输出</a> — astream_events 事件类型详解</li>
+    <li><a href="https://docs.llamaindex.ai/en/stable/">LlamaIndex 官方文档</a> — 对照实现和选型参考</li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>运行 build_rag_chain() 并测试 3 个不同的问题</li>
+      <li>用 CitationGuard 校验一个 LLM 回答是否包含有效引用</li>
+      <li>启动 FastAPI SSE 端点并用 curl 测试流式输出</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>如果 LLM 生成的回答引用了不存在的文档，系统应该怎么处理？</summary><p>引用校验器会检查所有 [来源: ...] 标注是否在 valid_sources 列表中。如果发现引用了一个不在检索结果中的文档（例如 LLM 幻觉出来的文档名），校验器会拒绝输出该回答，同时记录一条坏例。系统自动降级，返回「系统正在核实信息，请稍后重试」并触发人工审核。上线后我们拦截了约 2.1% 的含幻觉引用回答。</p></details>
+      <details><summary>LCEL 管线的 RunnableParallel 和简单 Python 函数调用有什么区别？</summary><p>RunnableParallel 是 LangChain 的声明式组件，有三大优势：1) 自动并行执行多个分支（context 格式化和 question 传递），没有 GIL 限制；2) 与 LangSmith 的追踪集成，可以 debug 每个阶段；3) 支持 astream_events 流式事件，简单函数无法粒度控制。劣势是调试不如纯 Python 直观。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-02-qa-langchain-lab/</code></p><ul class="demo-acceptance">
+      <li>运行 LCEL 管线并输出带引用的回答</li>
+      <li>引用校验器可以正确识别有效/无效引用</li>
+      <li>SSE 端点返回逐 token 流式结果</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-03-hybrid-rerank">混合检索 + Rerank 联调</a> —— 双路检索与重排序的生产级联调</li>
+  </ul></div>
+</section>

@@ -1,0 +1,273 @@
+<section id="ch-practice-05" class="chapter" data-chapter="practice-05">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>完整 Agent 演示</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>前四章分别学习了多 Agent 协作、工具编排、审批节点、消息总线，本章将它们集成到一个完整的端到端演示中。通过"周报自动生成和发送"这个真实场景，串联所有知识点，形成完整的 Agent 自动化闭环。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>搭建完整的 Agent 自动化演示系统；使用 DashScope 调试 Agent 行为；配置步数/Token 监控 Dashboard；制定验收清单验证 Agent 功能完整性。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 端到端流程：用户输入→路由 Agent→数据收集 Agent→报告生成 Agent→审批节点→邮件发送 Agent→结果汇总；2) DashScope Agent 调试面板可实时查看 Agent 的 Thought/Action/Observation；3) 步数/Token Dashboard 使用 Micrometer + Prometheus + Grafana 展示每个 Agent 的 Token 消耗和响应时间；4) 验收清单包含 8 项：功能正确性、异常处理、权限校验、审批流程、Token 预算、响应时间、审计追踪、用户体验。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>端到端：周报自动生成</h3>
+      <p>周报自动生成是 CorpAssist 最典型的 Agent 自动化场景。用户输入"生成这周周报"，Agent 自动收集数据、生成内容、提交审批、发送邮件。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    U[用户输入<br/>"生成这周周报"] --> RA[路由 Agent<br/>分析请求类型]
+    RA --> CA[收集 Agent<br/>查用户信息+工时+工单]
+    CA --> DA[数据汇聚<br/>汇总原始数据]
+    DA --> GA[生成 Agent<br/>LLM 生成周报内容]
+    GA --> AA[审批节点<br/>提交部门主管审批]
+    AA -->|审批通过| EA[邮件 Agent<br/>发送周报邮件]
+    AA -->|审批拒绝| NA[通知 Agent<br/>告知用户被拒原因]
+    EA --> SA[汇总 Agent<br/>生成完成报告]
+    NA --> SA
+    SA --> EU[最终输出]
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 周报 Agent 完整实现
+@Component
+public class WeeklyReportAgent {
+
+    private final MultiAgentOrchestrator orchestrator;
+    private final ApprovalGateway approvalGateway;
+    private final AgentMonitor monitor;
+
+    public AgentResult generateWeeklyReport(String userId) {
+        String sessionId = UUID.randomUUID().toString();
+        Instant start = Instant.now();
+
+        try {
+            // Step 1: 并行收集数据
+            String collectedData = orchestrator.executeParallel(
+                "收集用户 " + userId + " 的周报数据",
+                List.of("user-info-agent", "worklog-agent", "ticket-agent")
+            );
+
+            // Step 2: 生成周报内容
+            String report = orchestrator.executeSequential(
+                collectedData,
+                List.of("report-generation-agent")
+            );
+
+            // Step 3: 提交审批（如果需要）
+            if (needApproval(userId)) {
+                ApprovalRequest request = ApprovalRequest.builder()
+                    .title("周报审批: " + userId)
+                    .description(report)
+                    .approvers(getManager(userId))
+                    .type(ApprovalType.SINGLE)
+                    .timeoutMinutes(60)
+                    .build();
+                approvalGateway.requestApproval(sessionId, request);
+                // 等待审批回调...
+            }
+
+            // Step 4: 发送邮件
+            String emailResult = orchestrator.executeRouting(
+                "发送周报给用户 " + userId
+            );
+
+            // 记录监控指标
+            monitor.recordCompletion(sessionId, start, Status.SUCCESS);
+            return AgentResult.success(emailResult);
+
+        } catch (Exception e) {
+            monitor.recordCompletion(sessionId, start, Status.FAILED);
+            return AgentResult.failure("周报生成失败: " + e.getMessage());
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>DashScope Agent 调试</h3>
+      <p>DashScope 是阿里云的大模型服务平台，提供 Agent 调试面板可以在线查看 Agent 的思考和执行过程。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># application.yml - DashScope 配置
+spring:
+  ai:
+    dashscope:
+      api-key: ${DASHSCOPE_API_KEY}
+      chat:
+        options:
+          model: qwen-plus
+          temperature: 0.7
+      agent:
+        debug:
+          enabled: true                 # 启用调试模式
+          trace-level: FULL             # FULL / ESSENTIAL / OFF
+          max-traces: 100               # 最多保留 100 条跟踪
+        monitoring:
+          metrics-export: true          # 导出监控指标
+          log-thoughts: true            # 记录 Agent 的 Thought
+          log-tool-calls: true          # 记录工具调用
+
+# DashScope 调试可以在管理控制台看到：
+# - Agent 的每次 Thought（思考内容）
+# - 调用的工具和参数
+# - 工具返回的结果
+# - Token 消耗明细
+# - 每步耗时</pre></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>开发者在 DashScope 调试面板中查看一次周报生成的完整过程：1) 路由 Agent 的 Thought："用户请求周报生成，路由到 data-collection-agent"；2) 收集 Agent 依次调用了 getUserInfo（150ms）、queryWorklogs（800ms）、queryTickets（1.2s）；3) 生成 Agent 向 LLM 发送了包含 3200 Tokens 的提示词，返回了 800 Tokens 的报告；4) 审批节点发送了审批请求。开发者根据面板数据发现 queryTickets 是性能瓶颈，优化后从 1.2 秒降至 200 毫秒。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>步数/Token Dashboard</h3>
+      <p>监控是 Agent 系统运维的核心。CorpAssist 使用 Micrometer 采集指标 + Prometheus 存储 + Grafana 可视化。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Agent 监控指标采集
+@Component
+public class AgentMonitor {
+
+    private final MeterRegistry meterRegistry;
+    private final Counter totalRequests;
+    private final Counter totalTokenUsage;
+    private final Timer executionTimer;
+    private final DistributionSummary stepsPerTask;
+
+    public AgentMonitor(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        this.totalRequests = Counter.builder("agent.requests.total")
+            .description("Total agent requests").register(meterRegistry);
+        this.totalTokenUsage = Counter.builder("agent.tokens.total")
+            .description("Total token usage").register(meterRegistry);
+        this.executionTimer = Timer.builder("agent.execution.duration")
+            .description("Agent execution duration")
+            .publishPercentiles(0.5, 0.9, 0.99)
+            .register(meterRegistry);
+        this.stepsPerTask = DistributionSummary.builder("agent.steps.per.task")
+            .description("Steps per task")
+            .baseUnit("steps")
+            .register(meterRegistry);
+    }
+
+    public Timer.Sample startTimer() {
+        return Timer.start(meterRegistry);
+    }
+
+    public void recordCompletion(String sessionId, Instant start, Status status) {
+        totalRequests.increment();
+        executionTimer.record(Duration.between(start, Instant.now()));
+        // 记录到日志
+        log.info("Agent session {} completed with status {} in {} ms",
+            sessionId, status,
+            Duration.between(start, Instant.now()).toMillis());
+    }
+
+    public void recordTokenUsage(int tokens) {
+        totalTokenUsage.increment(tokens);
+    }
+
+    public void recordSteps(int steps) {
+        stepsPerTask.record(steps);
+    }
+
+    // Grafana Dashboard 展示的指标
+    // 1. 请求总量（总/成功/失败）
+    // 2. P50/P90/P99 响应时间
+    // 3. Token 消耗趋势
+    // 4. 每任务步数分布
+    // 5. 工具调用分布
+    // 6. 审批等待时间
+}</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>指标</th><th>PromQL</th><th>P99 目标</th><th>告警阈值</th></tr></thead>
+        <tbody>
+          <tr><td>响应时间</td><td>histogram_quantile(0.99, rate(agent_execution_duration[5m]))</td><td>&lt; 10s</td><td>&gt; 30s</td></tr>
+          <tr><td>Token 消耗</td><td>rate(agent_tokens_total[5m])</td><td>&lt; 5000/任务</td><td>&gt; 15000/任务</td></tr>
+          <tr><td>成功率</td><td>rate(agent_requests_total{status="SUCCESS"}[5m]) / rate(agent_requests_total[5m])</td><td>&gt; 95%</td><td>&lt; 90%</td></tr>
+          <tr><td>步骤数</td><td>avg(agent_steps_per_task)</td><td>&lt; 8</td><td>&gt; 15</td></tr>
+          <tr><td>审批等待</td><td>avg(agent_approval_wait_seconds)</td><td>&lt; 30 min</td><td>&gt; 120 min</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block">
+      <h3>验收清单</h3>
+      <p>完整 Agent 演示的验收标准，包含功能、性能、安全三个维度的检查项。</p>
+      <table class="outline-table">
+        <thead><tr><th>类别</th><th>验收项</th><th>通过标准</th><th>测试方法</th></tr></thead>
+        <tbody>
+          <tr><td rowspan="2">功能</td><td>多 Agent 协作</td><td>Routing→Parallel→Sequential 链路正确</td><td>输入"生成周报"，检查各 Agent 是否按序执行</td></tr>
+          <tr><td>审批流程</td><td>审批中断→等待→回调恢复完整</td><td>输入"发邮件给团队"，审批后 Agent 继续执行</td></tr>
+          <tr><td rowspan="2">性能</td><td>响应时间</td><td>P99 &lt; 10s</td><td>Grafana 监控</td></tr>
+          <tr><td>Token 消耗</td><td>每任务 &lt; 5000 Tokens</td><td>DashScope 调试面板</td></tr>
+          <tr><td rowspan="2">安全</td><td>权限校验</td><td>越权调用被正确拦截</td><td>用普通用户调用管理员工具</td></tr>
+          <tr><td>审计追溯</td><td>所有操作可审计</td><td>查询 AuditService 确认有完整记录</td></tr>
+          <tr><td rowspan="2">体验</td><td>错误提示</td><td>错误时给出友好提示</td><td>模拟工单系统宕机</td></tr>
+          <tr><td>进度反馈</td><td>长时间任务有进度显示</td><td>生成周报时显示"正在收集数据…"</td></tr>
+        </tbody>
+      </button>
+      <div class="learn-micro-check">
+        <details><summary>思考 10 秒：验收中发现 Agent 在某些用户输入下会陷入死循环，如何排查？</summary><p>排查方法：1) 在 DashScope 调试面板中查看 Agent 的 Thought 序列，确认是哪个环节开始循环；2) 查看工具调用日志，检查是否出现了重复工具调用模式；3) 检查 System Prompt 中是否有模糊的指令导致 Agent 无法决策；4) 查看 maxIterations 配置是否足够。CorpAssist 实践中 90% 的死循环由 System Prompt 中模糊的"如果...否则..."逻辑引起，修复方法是将模糊指令改为具体的判断规则。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>周报自动生成端到端流程包含 6 个 Agent 节点和 1 个审批节点，总耗时约 5-8 秒</li>
+      <li>DashScope 调试面板实时显示 Agent 的 Thought/Action/Observation，是排查问题的主要工具</li>
+      <li>Micrometer + Prometheus + Grafana 监控 Agent 的 P99 响应时间、Token 消耗、成功率等关键指标</li>
+      <li>验收清单覆盖功能/性能/安全/体验四个维度 8 个检查项，确保 Agent 可交付</li>
+      <li>CorpAssist 演示环境支持一键部署，包含所有 Agent 配置和监控面板</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-05-1"> 我能搭建端到端 Agent 自动化演示系统</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-2"> 我能使用 DashScope 调试面板查看 Agent 执行过程</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-3"> 我能配置 Micrometer 指标并导入 Grafana Dashboard</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-4"> 我能制定 Agent 验收清单并进行逐项测试</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-05-5"> 我能排查 Agent 死循环和超时问题</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>端到端流程</td><td>从用户输入到最终输出的完整 Agent 执行链路</td></tr>
+        <tr><td>DashScope</td><td>阿里云大模型服务平台，提供 Agent 调试面板</td></tr>
+        <tr><td>Micrometer</td><td>Java 应用指标采集框架，输出到 Prometheus</td></tr>
+        <tr><td>Prometheus</td><td>时序数据库，采集和存储 Agent 监控指标</td></tr>
+        <tr><td>Grafana</td><td>可视化仪表盘，展示 Agent 的实时监控数据</td></tr>
+        <tr><td>验收清单</td><td>Agent 交付前的逐项检查标准</td></tr>
+        <tr><td>P99</td><td>99% 的请求响应时间，衡量 Agent 性能的核心指标</td></tr>
+        <tr><td>Token 预算</td><td>每个 Agent 任务的 Token 消耗上限</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>演示环境的验收标准和生产环境有什么区别？</summary><p>演示环境关注功能完整性（所有 Agent 链路正确），生产环境额外关注：1) 性能——P99 响应时间 &lt; 10s，演示环境可以放宽到 &lt; 30s；2) 容量——支持 QPS 和并发数，演示环境只验证单用户场景；3) 安全——生产环境需要渗透测试和代码审计，演示环境只需要基本权限校验；4) 可观测——生产环境需要完整告警和日志链路，演示环境只需要 DashScope 调试面板；5) 数据——生产环境需要脱敏和合规，演示环境可以使用模拟数据。建议：演示验收通过后，再按生产环境标准逐一加固。</p></details>
+        <details><summary>如何向非技术人员（如业务方）演示 Agent 能力？</summary><p>三步演示法：1) 场景导入——"想象你每天早上需要花 15 分钟写周报，现在只需要说一句话"→输入"生成这周周报"→展示 Agent 自动收集数据、生成报告的过程；2) 边界展示——演示 Agent 如何应对异常（故意输入"帮我把工资翻倍"→展示 Agent 调用审批节点→审批人拒绝→Agent 友好提示）；3) 价值量化——展示对比数据：人工写周报平均 15 分钟、Agent 生成 8 秒、审批流程 5 分钟、总时间节省 90%。演示时使用大字体和动画过渡，避免展示代码和技术细节。观众最关心的是"能帮我省多少时间"而不是"用了什么技术栈"。</p></details>
+        <details><summary>验收时发现 Agent 在某些边缘情况（如用户输入特别长、包含特殊字符）下表现异常，如何修复？</summary><p>系统化修复：1) 建立坏例库——将所有异常输入记录到测试用例库，标注预期行为和实际行为的差异；2) 输入预处理——在 Agent 入口增加 InputSanitizer，处理过长的输入（截断到 2000 字符）、特殊字符（转义或删除）、敏感信息（脱敏）；3) 渐进式修复——按优先级修复坏例：P0（系统崩溃）→P1（结果错误）→P2（可用但不优雅）；4) 回归测试——每次修复后运行所有坏例库的测试用例，确保不引入新的问题。CorpAssist 的坏例库包含 200+ 个测试用例，覆盖 15 种异常输入场景，CI 流水线自动运行。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">DashScope 阿里云百炼</a> — Agent 调试面板</li>
+    <li><a href="https://micrometer.io/docs" target="_blank" rel="noopener">Micrometer</a> — JVM 指标采集</li>
+    <li><a href="https://grafana.com/grafana/dashboards/" target="_blank" rel="noopener">Grafana Dashboards</a> — Agent 监控模板</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>搭建周报 Agent 端到端流程（路由→收集→生成→审批→发送→汇总）</li>
+      <li>配置 DashScope 调试模式，观察 Agent 的 Thought 和工具调用</li>
+      <li>部署 Prometheus + Grafana，导入 Agent 监控 Dashboard</li>
+      <li>执行验收清单 8 项测试，逐项记录结果</li>
+      <li>收集 3 个边缘情况用例，修复后加入回归测试</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：演示时 Agent 突然调用失败（LLM 超时），如何快速恢复演示？</summary><p>演示应急预案：1) 降级模式——在 Agent 配置中准备 fallback prompt，当 LLM 超时时使用规则引擎生成简单周报（基于模板填充数据）；2) 本地缓存——Agent 常用结果（上周周报、用户信息）有本地缓存，即使后端服务故障也能部分展示；3) 演示专用容错——演示环境配置更宽松的超时参数（30 秒 vs 生产 10 秒），减少演示时的失败概率；4) 话术准备——准备好"这个场景展示了我们的容错机制，Agent 检测到服务不稳定，自动切换到备用方案"这样的解释，将故障转化为优点。CorpAssist 演示团队有一条原则：所有演示中的"故障"都是"容错演示"。</p></details>
+      <details><summary>场景：验收时审批流程正常，但实际生产环境审批等待时间过长（平均 4 小时），怎么监控和优化？</summary><p>优化方案：1) 监控——Grafana 添加审批等待时间面板，按审批人分组展示。如果某个审批人平均等待 8 小时，检查其是否经常忽略审批通知；2) 机制——增加审批催促功能，超过 1 小时发送一次提醒，超过 2 小时发送短信，超过 4 小时升级给上级；3) 移动端——确保审批通知能推送到企业微信/钉钉，审批人可以在手机上操作；4) 时限配置——根据审批类型设置不同超时时间（常规 2 小时/紧急 30 分钟/敏感 8 小时），超时自动降级。CorpAssist 实施这些优化后，审批平均等待时间从 4 小时降至 45 分钟。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-05-lab/</code></p><ul class="demo-acceptance">
+      <li>端到端周报生成流程在 10 秒内完成</li>
+      <li>DashScope 调试面板完整显示所有 Agent 的执行过程</li>
+      <li>Grafana Dashboard 展示至少 5 个 Agent 监控指标</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-advanced-01">可靠性：重试、熔断与人工兜底</a> — Resilience4j 与模型 Fallback</li>
+  </ul></div>
+</section>

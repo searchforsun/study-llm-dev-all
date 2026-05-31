@@ -1,0 +1,289 @@
+<section id="ch-basics-02-architecture" class="chapter" data-chapter="basics-02-architecture">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>整体架构与选型</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-architecture" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S2</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>智能客服系统比 RAG 知识库复杂得多——需要意图识别、对话管理、工具调用、人工转接等模块协同工作。理解整体架构和模块间的关系，是设计可靠智能客服的第一步。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>画出智能客服的五大模块架构图；描述模块间的数据流和接口；将 CorpAssist 客服架构对应到微服务架构模式；在面试中系统化回答客服架构设计题。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 五大模块：意图路由、对话引擎、工具层、人工坐席、质检；2) 数据流：用户→意图路由→对话引擎→工具层→响应；3) CorpAssist 采用双栈架构——Python 对话引擎 + Java 管理端；4) 与微服务对应：意图路由=API Gateway，对话引擎=编排服务，工具层=后端服务；5) P99 延迟目标 < 3s，其中工具调用占 60%。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>五大模块</h3>
+      <p>智能客服系统由五个核心模块构成，每个模块职责清晰可独立部署。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+    subgraph Modules[智能客服五大模块]
+        A[意图路由<br/>Intent Router] --> B[对话引擎<br/>Dialog Engine]
+        B --> C[工具层<br/>Tool Layer]
+        B --> D[人工坐席<br/>Human Agent]
+        A --> E[质检模块<br/>Quality Check]
+        B --> E
+        C --> E
+        D --> E
+    end
+    subgraph Tech[技术选型]
+        A -->|FastAPI + 分类器| F
+        B -->|LangGraph StateGraph| F
+        C -->|LangChain Tool + OpenAPI| F
+        D -->|WebSocket + Agent Desktop| F
+        E -->|监控 + 抽检 + 评分| F
+    end
+    F[Python 双栈]</pre>
+      </div>
+      <table class="learn-decision-table"><thead><tr><th>模块</th><th>职责</th><th>技术选型</th><th>部署方式</th></tr></thead><tbody>
+        <tr><td>意图路由</td><td>识别用户意图并路由到处理节点</td><td>FastAPI + 规则+模型双引擎</td><td>独立微服务</td></tr>
+        <tr><td>对话引擎</td><td>维护多轮对话上下文，决定下一步动作</td><td>LangGraph StateGraph</td><td>独立微服务（有状态）</td></tr>
+        <tr><td>工具层</td><td>封装后端 API 为 Agent 可调用的工具</td><td>LangChain Tool + OpenAPI</td><td>内部 SDK + API</td></tr>
+        <tr><td>人工坐席</td><td>接收转接的对话，提供人工服务</td><td>WebSocket + React 管理端</td><td>Java 管理端</td></tr>
+        <tr><td>质检模块</td><td>自动+人工抽检对话质量</td><td>RAGAS + Rubric 评分标尺</td><td>独立服务</td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="section-block">
+      <h3>模块间的数据流与接口</h3>
+      <p>一次客服对话在模块间的完整数据流如下：</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant IR as 意图路由
+    participant DE as 对话引擎
+    participant TL as 工具层
+    participant HA as 人工坐席
+    participant DB as PostgreSQL
+    U->>IR: "帮我查工单状态"
+    IR->>IR: 意图分类: query_ticket
+    IR->>DE: 意图 + 用户信息
+    DE->>DE: 更新对话状态
+    DE->>TL: call(query_ticket, ticket_id="TKT-001")
+    TL->>TL: 调用工单系统 API
+    TL-->>DE: 结果: 工单审核中
+    DE->>DE: 生成回答
+    DE-->>U: 您的工单 TKT-001 正在财务审批
+    alt 用户不满意
+        U->>IR: "转人工"
+        IR->>DE: transfer_to_human
+        DE->>HA: 移交对话上下文
+        HA-->>U: 您好，我是人工客服...
+    end
+    DE->>DB: 写对话日志</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""模块间接口定义"""
+
+from pydantic import BaseModel
+from typing import Optional, List
+
+class IntentResult(BaseModel):
+    """意图路由模块输出"""
+    intent: str  # query_ticket, reset_password, etc.
+    confidence: float
+    entities: dict  # {ticket_id: "TKT-001"}
+    raw_text: str
+
+class DialogState(BaseModel):
+    """对话引擎状态"""
+    session_id: str
+    user_id: str
+    current_intent: Optional[str] = None
+    collected_params: dict = {}
+    history: List[dict] = []
+    turn_count: int = 0
+
+class ToolCall(BaseModel):
+    """工具调用请求"""
+    tool_name: str
+    params: dict
+    timeout_ms: int = 5000
+
+class ToolResult(BaseModel):
+    """工具调用结果"""
+    success: bool
+    data: dict
+    error: Optional[str] = None
+
+class TransferRequest(BaseModel):
+    """转人工请求"""
+    session_id: str
+    user_info: dict
+    dialog_history: str  # 格式化后的对话历史
+    reason: str  # 转接原因
+    priority: str = "normal"  # high / normal / low</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 客服架构总图</h3>
+      <p>CorpAssist 的智能客服采用 Python 对话引擎 + Java 管理端的双栈架构，与 RAG 知识库共享基础设施。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># CorpAssist 智能客服架构
+architecture:
+  python_services:  # 对话服务层
+    - name: "intent-router"
+      framework: "FastAPI + ONNX 意图分类器"
+      description: "实时意图识别与路由"
+      port: 8001
+    - name: "dialog-engine"
+      framework: "LangGraph StateGraph + FastAPI SSE"
+      description: "多轮对话管理、状态维护"
+      port: 8002
+    - name: "tool-executor"
+      framework: "LangChain Tool + HTTP"
+      description: "工具调用和幂等性控制"
+      port: 8003
+    - name: "policy-rag"
+      framework: "LangChain LCEL"
+      description: "政策库 RAG 查询（复用知识库模块）"
+      port: 8004
+
+  java_services:  # 管理服务层
+    - name: "agent-dashboard"
+      framework: "Spring Boot + React"
+      description: "人工坐席工作台"
+    - name: "admin-console"
+      framework: "Spring Boot"
+      description: "客服管理端（话术配置/质检/报表）"
+
+  shared_infra:
+    - "PostgreSQL：对话日志/用户信息/坐席状态"
+    - "Redis：会话状态/排队队列"
+    - "Milvus：政策文档向量库"
+    - "Elasticsearch：政策文档全文索引"
+
+  communication:
+    - "Python ↔ Python：gRPC 内部调用"
+    - "Python → Java：HTTP 回调（转人工/审计日志）"</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>与微服务架构的对应关系</h3>
+      <p>智能客服的五模块设计天然对应微服务架构的经典模式。</p>
+      <table class="learn-decision-table"><thead><tr><th>客服模块</th><th>对应微服务模式</th><th>说明</th></tr></thead><tbody>
+        <tr><td>意图路由</td><td>API Gateway + 内容路由</td><td>统一入口，按意图分发给不同处理流</td></tr>
+        <tr><td>对话引擎</td><td>有状态编排服务 + Saga</td><td>维护对话状态，长事务管理</td></tr>
+        <tr><td>工具层</td><td>后端服务 + 防腐层</td><td>封装异构后端的 API，提供统一接口</td></tr>
+        <tr><td>人工坐席</td><td>事件驱动 + WebSocket</td><td>双向实时通信</td></tr>
+        <tr><td>质检模块</td><td>监控 + 异步分析</td><td>离线分析对话质量</td></tr>
+      </tbody></table>
+      <p>理解这种对应关系的价值在于：微服务的成熟模式（限流/熔断/重试/幂等）可以直接套用到客服模块中。例如，工具层实现了重试和熔断——当第三方工单系统响应时间超过 3s，工具层自动熔断并返回「系统繁忙，请稍后重试」，避免级联故障。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>部署拓扑与运维监控</h3>
+      <p>CorpAssist 智能客服的部署拓扑涉及 5 个 Python 微服务和 2 个 Java 服务，通过 K8s 统一编排。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># K8s 部署配置（摘要）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intent-router
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: intent-router
+  template:
+    metadata:
+      labels:
+        app: intent-router
+    spec:
+      containers:
+      - name: intent-router
+        image: corp-assist/intent-router:latest
+        ports:
+        - containerPort: 8001
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 10
+        env:
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: url
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: intent-router-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: intent-router
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70</pre></div>
+      <p><strong>运维监控</strong>：每个服务暴露 /health（存活检查）和 /metrics（Prometheus 埋点）端点。Grafana 仪表盘跟踪每个服务的 CPU/内存/QPS/P99 延迟。当意图路由的 P99 > 200ms 时自动告警，表明可能需要扩容或优化 ONNX 推理。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>智能客服五大模块（意图路由/对话引擎/工具层/人工坐席/质检）可独立部署。</li>
+        <li>模块间通过标准化的 Pydantic 模型通信，接口契约清晰。</li>
+        <li>CorpAssist 采用 Python 对话引擎 + Java 管理端双栈架构。</li>
+        <li>五模块对应微服务经典模式（API Gateway/Saga/防腐层等）。</li>
+        <li>工具层的熔断机制防止第三方系统故障级联到整个客服系统。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-1"> 能画出智能客服五大模块架构图</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-2"> 能描述一次对话在模块间的完整数据流</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-3"> 能列出 CorpAssist 客服的 5 个 Python 服务和 2 个 Java 服务</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-4"> 能将 5 大模块对应到微服务架构模式</label></li>
+        <li><label><input type="checkbox" data-check-id="cs-basics-02-5"> 能解释工具层的熔断机制为什么重要</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>意图路由</td><td>判断用户输入属于哪种意图并分发</td></tr>
+        <tr><td>对话引擎</td><td>维护对话状态、决定下一步动作的编排器</td></tr>
+        <tr><td>工具层</td><td>封装后端 API 供 Agent 调用的适配层</td></tr>
+        <tr><td>人工坐席</td><td>接收转接，提供人工客服服务的工作台</td></tr>
+        <tr><td>质检模块</td><td>评估对话质量，确保服务标准</td></tr>
+        <tr><td>Saga 模式</td><td>分布式事务的补偿机制，客服中用于多步工具调用的回滚</td></tr>
+        <tr><td>防腐层</td><td>隔离外部系统变化对核心系统的影响</td></tr>
+        <tr><td>SSE</td><td>Server-Sent Events，服务端流式推送对话响应</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 对话引擎为什么用 LangGraph 而不是单纯的 LCEL？</summary><p>因为客服对话不是线性管线——它有分支和条件边。LangGraph 的 StateGraph 可以定义状态节点和条件边，根据意图不同路由到不同处理节点。比如用户说「查工单」和「重置密码」走不同的工具调用链路。LCEL 适合「检索→生成」的线性流程，无法表达这种分支逻辑。LangGraph 的有状态图模型天然匹配客服的多轮场景。</p></details>
+        <details><summary>Q2: 工具层怎么保证调用第三方系统时的幂等性？</summary><p>每个工具调用生成全局唯一的 request_id，第三方系统在收到重复 request_id 时跳过执行返回上次结果。如果第三方不支持幂等，工具层在本地维护「已执行记录」缓存（TTL=24h），同一 request_id 的重复请求直接返回缓存结果。对于查询类操作，天然幂等；对于修改类操作（如重置密码），幂等性至关重要。</p></details>
+      </div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://langchain-ai.github.io/langgraph/">LangGraph 官方文档</a> — StateGraph 有状态图详解</li>
+    <li><a href="https://microservices.io/patterns/">微服务模式目录</a> — API Gateway/Saga/防腐层等模式参考</li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>画出 CorpAssist 智能客服的架构图并用文字标注每个模块</li>
+      <li>写一段 IntentResult/DialogState/ToolCall 的 Pydantic 定义</li>
+      <li>将 5 大模块对应到微服务模式并说明原因</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>如果意图路由和对话引擎合并为一个服务，有什么好处和坏处？</summary><p>好处：减少一次服务间调用（省 20-50ms），部署运维简化。坏处：内部耦合，无法独立扩缩容——意图路由是轻计算（分类器），对话引擎是重计算（LLM 生成），合并后资源浪费。高流量场景下，意图路由需要较多的 CPU 实例，对话引擎需要 GPU 实例，分开部署更能精准分配资源。</p></details>
+      <details><summary>如果用户连续 3 次意图识别失败，系统应该怎么做？</summary><p>策略是「降级：反问 → 转人工」。第 1 次失败：反问澄清「请问您是想查工单、重置密码还是咨询制度？」第 2 次再失败：给出示例提示「您可以试试说：查工单 TKT-001」。第 3 次还失败：自动转人工，附带对话历史让客服了解上下文。这个策略将意图识别失败场景的转人工率从 60% 降到 15%。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-02-architecture-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-basics-03-chunking">多轮上下文与指代</a> —— 让 AI 客服记住上文内容</li>
+  </ul></div>
+</section>

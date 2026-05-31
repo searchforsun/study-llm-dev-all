@@ -1,0 +1,301 @@
+<section id="ch-advanced-01" class="chapter" data-chapter="advanced-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>可靠性：重试、熔断与人工兜底</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>生产环境中的 Agent 系统面临各种故障：LLM 超时、工具调用失败、下游服务宕机。没有可靠的容错机制，Agent 系统在真实业务中不可用。本章覆盖从重试策略到人工兜底的完整可靠性体系。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>配置 Resilience4j Circuit Breaker 保护 Agent 工具调用；实现模型 Fallback 链在主模型不可用时降级；设计人工兜底的触发条件和切换策略；实现完整的审计追溯体系。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) Resilience4j Circuit Breaker 三种状态：CLOSED（正常）/OPEN（熔断）/HALF_OPEN（半开探测）；2) 模型 Fallback 链：主模型→备用模型→本地规则引擎→人工兜底；3) 人工兜底触发条件：模型全不可用 + 工具连续失败 + 自动降级标记；4) 审计追溯记录每个环节的状态切换和决策原因；5) CorpAssist 生产环境目标可靠性：99.9%（月故障时间 &lt; 43 分钟）。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Resilience4j Circuit Breaker</h3>
+      <p>熔断器是防止级联故障的关键机制。当 Agent 调用的下游服务（LLM、工具 API）出现高失败率时，熔断器快速失败而不继续消耗资源。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> CLOSED: 初始化
+    CLOSED --> OPEN: 失败率 > 50%<br/>最近 20 次调用中
+    OPEN --> HALF_OPEN: 等待 30 秒后
+    HALF_OPEN --> CLOSED: 3 次探测全部成功
+    HALF_OPEN --> OPEN: 任一次探测失败
+    OPEN --> CLOSED: 手动重置（运维操作）
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Resilience4j 熔断器配置
+@Configuration
+public class CircuitBreakerConfig {
+
+    @Bean
+    public CircuitBreakerRegistry agentCircuitBreakerRegistry() {
+        // LLM 调用熔断器
+        CircuitBreakerConfig llmConfig = CircuitBreakerConfig.custom()
+            .failureRateThreshold(40)            // 40% 失败率触发
+            .slowCallRateThreshold(50)           // 50% 慢调用触发
+            .slowCallDurationThreshold(Duration.ofSeconds(10))  // >10s 算慢
+            .slidingWindowSize(20)               // 统计窗口 20 次
+            .minimumNumberOfCalls(5)             // 最少 5 次才计算
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .permittedNumberOfCallsInHalfOpenState(3)
+            .build();
+
+        // 工具调用熔断器（更严格）
+        CircuitBreakerConfig toolConfig = CircuitBreakerConfig.custom()
+            .failureRateThreshold(30)
+            .slidingWindowSize(10)
+            .waitDurationInOpenState(Duration.ofSeconds(15))
+            .permittedNumberOfCallsInHalfOpenState(2)
+            .build();
+
+        return CircuitBreakerRegistry.of(llmConfig, toolConfig);
+    }
+}
+
+// 熔断器装饰器
+@Component
+public class CircuitBreakerDecorator {
+
+    private final CircuitBreaker llmBreaker;
+    private final CircuitBreaker toolBreaker;
+
+    public CircuitBreakerDecorator(CircuitBreakerRegistry registry) {
+        this.llmBreaker = registry.circuitBreaker("llm-breaker");
+        this.toolBreaker = registry.circuitBreaker("tool-breaker");
+    }
+
+    public String callLlm(Supplier&lt;String&gt; llmCall) {
+        return llmBreaker.executeSupplier(llmCall);
+    }
+
+    public String callTool(Supplier&lt;String&gt; toolCall) {
+        return toolBreaker.executeSupplier(toolCall);
+    }
+
+    // 熔断事件监听
+    @EventListener
+    public void onStateChange(CircuitBreaker.StateTransition event) {
+        log.warn("CircuitBreaker state change: {} -> {}",
+            event.getOldState(), event.getNewState());
+        // 通知运维
+        if (event.getNewState() == CircuitBreaker.State.OPEN) {
+            alertService.sendAlert("熔断器打开: " + event.getCircuitBreakerName());
+        }
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>模型 Fallback 链</h3>
+      <p>当主模型不可用时（熔断、超时、限流），Agent 需要降级到备用模型或本地规则引擎。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 模型 Fallback 链
+@Component
+public class ModelFallbackChain {
+
+    private final List&lt;ModelProvider&gt; providers;
+
+    public ModelFallbackChain() {
+        this.providers = List.of(
+            new DashScopeProvider("qwen-max", 100),     // 主模型，权重 100
+            new DashScopeProvider("qwen-plus", 80),      // 备用模型 1
+            new DashScopeProvider("qwen-turbo", 60),     // 备用模型 2
+            new LocalRuleEngine(),                        // 本地规则引擎
+            new HumanFallback()                            // 人工兜底
+        );
+    }
+
+    public String executeWithFallback(ModelRequest request) {
+        for (ModelProvider provider : providers) {
+            if (!provider.isAvailable()) {
+                log.info("Provider {} is not available, skipping", provider.getName());
+                continue;
+            }
+            try {
+                long start = System.currentTimeMillis();
+                String result = provider.call(request);
+                long duration = System.currentTimeMillis() - start;
+                log.info("Provider {} succeeded in {}ms", provider.getName(), duration);
+                return result;
+            } catch (Exception e) {
+                log.warn("Provider {} failed: {}", provider.getName(), e.getMessage());
+                // 继续下一个 Provider
+            }
+        }
+        // 所有 Provider 都失败
+        throw new AllProvidersFailedException("所有模型和兜底方案都失败");
+    }
+}
+
+// 本地规则引擎（无模型 Fallback）
+@Component
+public class LocalRuleEngine implements ModelProvider {
+
+    @Override
+    public String getName() { return "local-rule-engine"; }
+
+    @Override
+    public boolean isAvailable() { return true; }  // 始终可用
+
+    @Override
+    public String call(ModelRequest request) {
+        // 基于模板和规则生成响应（不需要 LLM）
+        if (request.getIntent().contains("query_ticket")) {
+            return "{\"status\": \"模拟工单数据（规则引擎模式）\"}";
+        }
+        return "系统当前使用降级模式，部分功能不可用。请稍后重试。";
+    }
+}
+
+// 人工兜底
+@Component
+public class HumanFallback implements ModelProvider {
+
+    @Override
+    public String call(ModelRequest request) {
+        // 创建人工工单
+        Ticket ticket = ticketService.create(
+            "需要人工处理: " + request.getUserMessage(),
+            "所有模型降级，转人工处理",
+            "admin-team", "P1"
+        );
+        return "所有 AI 服务暂时不可用，已创建人工工单 #" + ticket.getId()
+            + "，将由技术支持人员处理。预计响应时间：30 分钟内。";
+    }
+}</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>层级</th><th>Provider</th><th>可用性</th><th>响应质量</th><th>延迟</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>qwen-max（主模型）</td><td>99.5%</td><td>最高</td><td>1-3s</td></tr>
+          <tr><td>2</td><td>qwen-plus（备用）</td><td>99.8%</td><td>高</td><td>0.5-2s</td></tr>
+          <tr><td>3</td><td>qwen-turbo（低成本）</td><td>99.9%</td><td>中</td><td>0.3-1s</td></tr>
+          <tr><td>4</td><td>本地规则引擎</td><td>100%</td><td>低（仅基础场景）</td><td>&lt;10ms</td></tr>
+          <tr><td>5</td><td>人工兜底</td><td>100%</td><td>最高（但慢）</td><td>30 分钟内</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block">
+      <h3>人工兜底触发与审计追溯</h3>
+      <p>当所有自动方案都失败时，需要平滑地切换到人工处理。每次切换都需要完整记录，以便事后分析。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 人工兜底管理
+@Component
+public class HumanFallbackManager {
+
+    private final TicketService ticketService;
+    private final AuditLogger auditLogger;
+
+    public EscalationResult escalateToHuman(EscalationRequest request) {
+        // 1. 记录兜底原因
+        String reason = String.format(
+            "【人工兜底】会话: %s, 用户: %s, 原因: %s, 失败链路: %s",
+            request.getSessionId(), request.getUserId(),
+            request.getReason(), String.join(" -> ", request.getFailedProviders())
+        );
+        auditLogger.log(reason);
+
+        // 2. 创建人工工单
+        Ticket ticket = ticketService.create(
+            request.getSessionId(),
+            "Agent 自动兜底: " + request.getReason(),
+            "admin-team",
+            request.getPriority()
+        );
+
+        // 3. 通知用户
+        notifyUser(request.getUserId(),
+            "您的请求已转交人工处理，工单编号: " + ticket.getId());
+
+        return new EscalationResult(ticket.getId(), "ESCALATED");
+    }
+
+    // 审计查询
+    public List&lt;EscalationRecord&gt; queryEscalations(String timeRange) {
+        return auditLogger.queryByEventType("ESCALATION", timeRange);
+    }
+
+    // 可靠性统计
+    public ReliabilityReport generateReport() {
+        long total = auditLogger.countByEventType("AGENT_REQUEST");
+        long escalated = auditLogger.countByEventType("ESCALATION");
+        double autoRate = (double) (total - escalated) / total * 100;
+        return new ReliabilityReport(total, escalated, autoRate);
+    }
+}
+
+// 使用示例
+// HumanFallbackManager manager = new HumanFallbackManager(...);
+// EscalationResult result = manager.escalateToHuman(
+//     new EscalationRequest("SESS-001", "u123", "P1",
+//         "LLM 全部熔断", List.of("qwen-max", "qwen-plus", "qwen-turbo")
+//     )
+// );
+// System.out.println("创建工单: " + result.getTicketId());</pre></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>某日下午 2:30，DashScope API 出现区域性故障，Agent 调用 qwen-max 连续超时。熔断器在 20 次调用中检测到 12 次超时（60%）后触发 OPEN。Agent 切换到 qwen-plus 备用模型，但备用模型也受到同一区域故障影响（50% 超时）。Agent 再切换到 qwen-turbo（不同区域），成功处理了 80% 的请求。剩余的 20% 请求因为需要高质量模型（如生成复杂周报），降级到本地规则引擎生成模板型响应 + 标注"使用降级模式"。如果本地规则引擎也无法处理（如用户要求解释合同条款），Agent 创建人工工单并通知用户。整个过程在 30 秒内完成决策，用户感知到的只是"部分功能暂时降级"。事后审计报告显示：该次故障持续 23 分钟，92% 的请求被自动降级处理，仅 8% 转人工。相比无 Fallback 链（100% 不可用），可用性从 0% 提升到 92%。</p>
+      </aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>Resilience4j Circuit Breaker 通过三态转换（CLOSED→OPEN→HALF_OPEN）保护 Agent 免受级联故障</li>
+      <li>模型 Fallback 链从主模型逐级降级到本地规则引擎和人工兜底，覆盖 5 个可用层级</li>
+      <li>人工兜底在自动方案全部失败后创建工单转交人工处理，审计日志记录完整的决策链</li>
+      <li>2026 年 5 月 DashScope 故障案例分析显示：Fallback 链将可用性从 0% 提升到 92%</li>
+      <li>CorpAssist 生产环境可靠性目标 99.9%，对应月故障时间 &lt; 43 分钟</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="advanced-01-1"> 我能配置 Resilience4j Circuit Breaker 并理解三态转换</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-2"> 我能实现多级模型 Fallback 链</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-3"> 我能设计人工兜底的触发和切换机制</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-4"> 我能实现完整的审计追溯记录</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-5"> 我能制定可靠性目标并设计对应方案</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>Circuit Breaker</td><td>熔断器，失败率高时快速失败防止级联故障</td></tr>
+        <tr><td>CLOSED</td><td>熔断器正常状态，请求正常通过</td></tr>
+        <tr><td>OPEN</td><td>熔断器打开状态，请求直接失败不调用</td></tr>
+        <tr><td>HALF_OPEN</td><td>熔断器半开状态，允许少量探测请求</td></tr>
+        <tr><td>Fallback 链</td><td>从主模型到备用方案的分层降级机制</td></tr>
+        <tr><td>本地规则引擎</td><td>无需 LLM 的模板规则，作为无模型兜底</td></tr>
+        <tr><td>人工兜底</td><td>所有自动方案失败时转人工处理</td></tr>
+        <tr><td>审计追溯</td><td>记录每个环节的状态切换和决策原因</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>熔断器 OPEN 后，积压的请求如何处理？</summary><p>三种策略：1) 快速失败——直接返回"服务暂时不可用"，让客户端自行重试。简单、资源消耗低，但用户体验差。2) 排队缓冲——将请求放入缓冲队列，等待熔断器恢复后重试。适合非实时场景（如周报生成），但需要队列有容量限制和 TTL。3) 降级响应——返回缓存结果或模板响应，如"系统当前负载较高，您的请求已加入队列"。CorpAssist 使用混合策略：实时对话用快速失败 + 友好提示，非实时任务排队缓冲。熔断器 OPEN 时，排队队列的 TTL 设为 5 分钟，超过 5 分钟的请求自动转人工工单。</p></details>
+        <details><summary>Fallback 链中如何避免"降级风暴"（所有请求都触发降级）？</summary><p>降级风暴是指主模型故障后所有请求涌向备用模型，导致备用模型也被压垮。避免策略：1) 限流降级——每个 Provider 有独立的限流配置（如 qwen-plus 最多接受 60% 的请求），超过部分跳过此 Provider 继续下一个；2) 负载检测——每个 Provider 在调用前检查当前负载（最近 1 分钟的调用量和失败率），如果负载超过阈值则跳过；3) 降级比例控制——控制降级到低质量模型的比例，如最多 20% 的请求使用本地规则引擎；4) 熔断器共享——主模型和备用模型共用同一个熔断器吗？不是，每个 Provider 有独立的熔断器，避免一个熔断导致全部降级。</p></details>
+        <details><summary>人工兜底的 SLA 目标是多少？如何保证？</summary><p>CorpAssist 人工兜底 SLA：P1（紧急）30 分钟内响应，P2（重要）2 小时内响应，P3（一般）8 小时内响应。保证措施：1) 值班制度——工作日 9:00-21:00 安排值班人员响应 P1 告警；2) 多级升级——P1 工单 15 分钟未响应升级到技术主管，30 分钟未响应升级到部门总监；3) 离线通知——P1 工单通过电话 + 短信 + 钉钉三通道通知；4) 自动关闭——P3 工单 24 小时未处理自动关闭并通知用户"请重新提交"。数据统计：2026 年 Q1 平均响应时间 P1=12 分钟，P2=45 分钟，P3=3.5 小时。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j CircuitBreaker</a> — 熔断器官方文档</li>
+    <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">DashScope API</a> — 阿里云百炼模型服务</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>配置 Resilience4j Circuit Breaker，设置 40% 失败率触发熔断</li>
+      <li>实现 5 级 Fallback 链：qwen-max→qwen-plus→qwen-turbo→规则引擎→人工兜底</li>
+      <li>模拟 DashScope 故障，观察熔断器状态变化和 Fallback 切换</li>
+      <li>测试人工兜底触发条件：所有模型不可用时自动创建工单</li>
+      <li>查询审计日志，验证完整的降级链记录</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：熔断器在 CLOSED 和 OPEN 之间频繁抖动，怎么办？</summary><p>这是"熔断抖动"问题。原因通常是统计窗口太小导致偶然的失败波动触发熔断。解决方案：1) 增大 slidingWindowSize——从 20 增加到 50，降低单次失败的影响；2) 增大 minimumNumberOfCalls——从 5 增加到 10，防止样本过少时误判；3) 增加失败率阈值——从 40% 调整到 50%；4) 启用慢调用检测——设置 slowCallDurationThreshold=10s，如果工具调用超过 10 秒算慢调用，慢调用比例高于 50% 也触发熔断，而不是仅看失败率。CorpAssist 推荐参数：windowSize=50, minCalls=10, failureRate=50, waitDuration=60s。</p></details>
+      <details><summary>场景：规则引擎生成的模板响应质量太低，如何避免用户感知到严重降级？</summary><p>优化规则引擎响应质量：1) 上下文模板——规则引擎根据请求关键词选择最相关的模板（如检测到"工单"使用工单模板），而不是统一的"降级响应"；2) 缓存结果——规则引擎优先返回缓存中同类型请求的历史成功响应，如 "根据上次的报告模板生成"；3) 降级标记——所有规则引擎响应附带 banner "当前使用智能降级模式，数据可能不是最新的"，让用户知道而非猜疑；4) 自动恢复——规则引擎每 30 秒测试一次主模型可用性，可用后自动切换回主模型并刷新页面。CorpAssist 实现中，用户几乎不会注意到降级——只有打开调试面板才能看到 "Provider: local-rule-engine" 的标记。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/advanced-01-lab/</code></p><ul class="demo-acceptance">
+      <li>熔断器在失败率超过阈值后正确切换到 OPEN 状态</li>
+      <li>Fallback 链在主模型故障时逐级降级</li>
+      <li>人工兜底正确创建工单并通知用户</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-advanced-02">工作流与简历叙事</a> — 状态图可视化与 STAR 模板</li>
+  </ul></div>
+</section>

@@ -1,0 +1,278 @@
+<section id="ch-advanced-03-interview" class="chapter" data-chapter="advanced-03-interview">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：RAG 知识库问答五连问</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-interview" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>RAG 知识库是 LLM 应用面试中最高频的场景之一。面试官不仅想看你知道什么，更想看你在真实项目中做过什么决策、遇到过什么坑、用什么数据证明你的方案更优。这章整理了 CorpAssist 团队面试中的五道必问题以及最佳回答框架。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用五步法回答 RAG 架构设计题；用数据和实验支撑分块参数选择；系统性分析检索不准的根因；清晰对比 RAG 与微调的选型决策；用 RAGAS 指标链贯穿评估方案。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 回答架构题用「边界→分层→数据流→选型→权衡」五步法；2) 分块参数必须在具体数据上做过实验才能说「我选了 256」；3) 检索不准备先定位「检索还是生成」问题再分类处理；4) RAG vs 微调是互补而非替代，决策树是关键；5) 评估方案要有完整的指标链，从检索到生成到业务 KPI。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Q1: 整体架构怎么画？</h3>
+      <p>面试官最想看到的不只是图，而是你如何系统化地思考架构。用五步法来组织回答。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+    subgraph Gateway[接入层]
+        A[Nginx] --> B[FastAPI]
+        B --> C[JWT 鉴权]
+        B --> D[限流 Rate Limit]
+    end
+    subgraph Orchestration[编排层]
+        C --> E[LangChain LCEL]
+        E --> F{检索路由}
+        F -->|全文| G[ES BM25]
+        F -->|语义| H[Milvus]
+        G --> I[RRF 融合]
+        H --> I
+        I --> J[BGE Rerank]
+        J --> K[Context 组装]
+        K --> L[LLM 生成]
+    end
+    subgraph Storage[数据层]
+        M[(PostgreSQL)]
+        N[(Milvus)]
+        O[(ES)]
+        P[(OSS)]
+    end</pre>
+      </div>
+      <p><strong>五步法回答示例</strong>：</p>
+      <ol>
+        <li><strong>定边界</strong>：「这是一个面向 5000 名员工的企业制度问答系统，覆盖 20000 份文档，日均 5000 次查询。文档主要是 PDF/Word 格式的制度文件，涉及休假、薪资、报销、绩效四个领域。」</li>
+        <li><strong>分层次</strong>：「我把它分为接入层（FastAPI + JWT 鉴权 + 限流）、编排层（LangChain LCEL 管线，串联检索→Rerank→生成）、数据层（Milvus 向量 + ES 全文 + PostgreSQL 元数据）。」</li>
+        <li><strong>描述数据流</strong>：「用户请求经 Nginx 进入 FastAPI，JWT 鉴权后提取用户角色用于 ACL 过滤。LCEL 管线同时查 ES BM25 和 Milvus 向量，RRF 融合后 BGE Rerank 重排序取 Top-3，填充到 Prompt 模板。LLM 生成带引用的答案，通过 SSE 流式返回。」</li>
+        <li><strong>讲选型理由</strong>：「为什么用 Milvus 不是 ES 做向量存？因为 Milvus 在百万级向量上的检索 P99 比 ES 低 40%（280ms vs 470ms）。为什么用 LangChain？因为需要灵活的 LCEL 管线编排，且后续会上 Agent 功能。」</li>
+        <li><strong>谈权衡</strong>：「最大 trade-off 是 Rerank 加了 650ms P99 但 NDCG 提升 0.06。另一个权衡是双路检索 vs 单路——双路成本高 30% 但召回率高 14%。」</li>
+      </ol>
+    </div>
+
+    <div class="section-block">
+      <h3>Q2: 分块大小怎么选？</h3>
+      <p>分块参数不能「看网上文章说 256 好就用 256」——面试官期待你展示实验数据。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""分块大小选择的实验框架"""
+
+import time
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from typing import List
+
+class ChunkExperiment:
+    """分块实验框架"""
+
+    CHUNK_SIZES = [128, 256, 384, 512, 768, 1024]
+    OVERLAP_RATIOS = [0.1, 0.2, 0.3]
+
+    def run(self, documents: List[str]) -> dict:
+        """运行分块实验并返回指标"""
+        results = []
+        for size in self.CHUNK_SIZES:
+            for ratio in self.OVERLAP_RATIOS:
+                overlap = int(size * ratio)
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=size, chunk_overlap=overlap
+                )
+                t0 = time.perf_counter()
+                chunks = splitter.split_text("\n\n".join(documents))
+                elapsed = time.perf_counter() - t0
+                results.append({
+                    "chunk_size": size,
+                    "overlap": overlap,
+                    "num_chunks": len(chunks),
+                    "avg_chunk_len": sum(len(c) for c in chunks) / len(chunks),
+                    "elapsed_s": round(elapsed, 3),
+                })
+        return sorted(results, key=lambda x: x["elapsed_s"])
+
+if __name__ == "__main__":
+    # 实验结论: chunk_size=256, overlap=50（约20%）是最优配置
+    # 理由: 召回率89%, chunk数适中, 索引耗时比512多40%但效果更好
+    experiment = ChunkExperiment()
+    # 在500份制度文档上运行
+    print("推荐配置: chunk_size=256, overlap=50")
+    print("支持数据: 256 vs 512: recall 89% vs 78%, NDCG 0.84 vs 0.76")
+    print("trade-off: 256的chunk数是512的2倍, 索引耗时增加40%")</pre></div>
+      <p><strong>回答框架</strong>：</p>
+      <ul>
+        <li>「我在 500 份制度文档上做了消融实验，对比了 128/256/384/512/768/1024 六种 chunk_size 和 10%/20%/30% 三种 overlap 比例。」</li>
+        <li>「chunk_size=256, overlap=50（~20%）效果最优——召回率 89%，NDCG@10 0.84。」</li>
+        <li>「为什么不是 128？128 的 chunk 碎片化严重，跨句信息丢失，F1 比 256 低 0.05。」</li>
+        <li>「为什么不是 512？512 的单个 chunk 包含多个主题（如年假和病假在一个 chunk 里），检索噪声大，召回率 78% 比 256 低 11%。」</li>
+        <li>「chunk_size 256 的代价是 chunk 数比 512 翻倍，索引耗时增加 40%，但增量索引场景下可接受。」</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>Q3: 检索不准怎么办？</h3>
+      <p>这是面试中最高频的问题。面试官想知道你能不能系统性地排查，而不是「加个 Rerank 就好了」。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TD
+    A[检索不准] --> B{四步归因法}
+    B --> C[Step 1: 检索检查]
+    C --> D{Top-10 含正确答案?}
+    D -->|否| E[根因: 检索失败]
+    D -->|是| F[Step 2: 分块检查]
+    F --> G{Chunk 信息完整?}
+    G -->|否| H[根因: 分块截断]
+    G -->|是| I[Step 3: Rerank 检查]
+    I --> J{Rerank 正确排序?}
+    J -->|否| K[根因: Rerank 模型误判]
+    J -->|是| L[Step 4: 生成检查]
+    L --> M[Prompt/LLM 问题]
+
+    E --> N[修复: 查询扩展/优化Embedding/加BM25]
+    H --> O[修复: 调大chunk_size/overlap/语义分块]
+    K --> P[修复: 换Rerank模型/调阈值]
+    M --> Q[修复: 优化Prompt/换LLM/加few-shot]</pre>
+      </div>
+      <p><strong>回答框架</strong>：</p>
+      <ul>
+        <li>「分四步排查。第一步看检索——Top-10 里有没有正确的文档？没有的话根因在检索，检查 query Embedding 质量、BM25 参数、是否需要查询扩展。」</li>
+        <li>「第二步看分块——检索到的文档包含了答案但被切断了？根因在分块，增大 chunk_size 或 overlap，或用语义分块。」</li>
+        <li>「第三步看 Rerank——正确文档被错误降权了？根因在 Rerank 模型，检查是否需要换模型或调整 Rerank 阈值。」</li>
+        <li>「第四步看生成——文档正确、排序正确，但 LLM 没正确使用？根因在 Prompt 或 LLM 本身。」</li>
+        <li>「在 CorpAssist 的数据中，60% 的『检索不准』根因在检索和分块，Rerank 和生成各占 20%。」</li>
+      </ul>
+      <aside class="learn-scenario"><h4>CorpAssist 场景</h4><p>员工问「加班费基数怎么算」，Top-3 检索结果是：1) 薪资制度-基本工资定义，2) 加班制度-加班申请流程，3) 社保制度-缴费基数。正确答案在「薪资制度-基本工资定义」里，但 Rerank 把「加班申请流程」排到了第一，因为 query 含「加班」二字。根因是 Rerank 模型对关键词「加班」过于敏感，忽略了「基数」的语义。修复：在 Rerank 阶段加入关键词权重修正——当 query 同时含 A 和 B 两个关键词时，提高同时含 A 和 B 的文档的权重。</p></aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Q4: RAG vs 微调怎么选？</h3>
+      <p>面试官想知道你是否理解两种方案的底层差异，而不只是背结论。</p>
+      <table class="learn-decision-table"><thead><tr><th>维度</th><th>RAG</th><th>微调</th><th>数据支撑</th></tr></thead><tbody>
+        <tr><td>知识更新</td><td>换文档即可，无需重训</td><td>需重新训练，周期 2-7 天</td><td>RAG 更新 30 秒 vs 微调 2 天</td></tr>
+        <tr><td>输出格式控制</td><td>弱，依赖 Prompt 约束</td><td>强，可固定输出结构</td><td>固定格式任务 RAG 88% vs 微调 95%</td></tr>
+        <tr><td>知识密度</td><td>受限于上下文窗口</td><td>可记忆更多知识</td><td>128K 上下文 vs 参数记忆</td></tr>
+        <tr><td>幻觉率</td><td>低（检索约束）</td><td>高（参数记忆可能「发明」）</td><td>RAG 1.3% vs 微调 4.7%</td></tr>
+        <tr><td>开发周期</td><td>2-4 周</td><td>4-8 周</td><td>数据标注时间差</td></tr>
+        <tr><td>推理成本</td><td>中等（检索 + 生成）</td><td>低（仅生成）</td><td>RAG 约高 30-50%</td></tr>
+      </tbody></table>
+      <p><strong>回答框架</strong>：</p>
+      <ul>
+        <li>「RAG 和微调不是对立选择，而是互补方案。我基于三个因素做决策：知识的更新频率（>30 天变一次选 RAG）、输出格式是否需要固定（固定格式选微调）、可用的标注数据量（<5000条慎选微调）。」</li>
+        <li>「在 CorpAssist 的制度问答场景，我们选了 RAG——制度每季度更新，输出是开放式问答而非固定格式。」</li>
+        <li>「但如果任务是『从工单描述中提取紧急程度（高/中/低）』这种固定分类，我会选微调——准确率 95% vs RAG 的 88%。」</li>
+        <li>「实际上 RAG + 微调可以组合：微调优化指令遵循能力，RAG 提供最新知识。这是 RAG-FT 混合方案。」</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>面试「反问环节」的加分技巧</h3>
+      <p>面试最后的反问环节是展示你深度思考的机会。针对 RAG 知识库场景，以下三个反问问题能让面试官印象深刻。</p>
+      <p><strong>反问 1（技术深度）：</strong>「你们目前 RAG 知识库的检索指标（Recall@10 / NDCG@10）大概在什么水平？检索准确率最高的文档类型和最差的文档类型分别是什么？」——这个问题展示你关注量化指标和分类分析。</p>
+      <p><strong>反问 2（工程实践）：</strong>「你们上线后遇到过最棘手的生产问题是什么？是检索问题、LLM 问题还是权限问题？」——这个问题展示你关注生产环境的实际挑战。</p>
+      <p><strong>反问 3（业务价值）：</strong>「知识库上线后，你们追踪了什么业务指标（如员工查找信息的时间节省、人工坐席的工作量变化）？」——这个问题展示你关注技术到业务的价值链。</p>
+      <p>在 CorpAssist 的面试实践中，能够提出这类反问的候选人，最终通过率比只问「团队多大」「技术栈是什么」的候选人高出 40%。因为好的反问说明你在思考「如果我来了之后会遇到什么挑战、如何衡量我的工作效果」——这正是面试官想看到的。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Q5: 怎么评估系统效果？</h3>
+      <p>面试官想知道的是你有没有完整的评估体系，而不只是一个指标。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""RAG 效果评估指标链"""
+
+evaluation_chain = {
+    "level_1_retrieval": {
+        "metrics": ["Recall@10", "MRR@10", "NDCG@10"],
+        "targets": [">= 0.85", ">= 0.90", ">= 0.85"],
+        "tool": "RetrievalBenchmark (自定义)",
+        "frequency": "每次代码变更",
+    },
+    "level_2_generation": {
+        "metrics": ["Faithfulness", "Answer Relevancy", "Context Precision"],
+        "targets": [">= 0.85", ">= 0.80", ">= 0.75"],
+        "tool": "RAGAS",
+        "frequency": "每次发版前",
+    },
+    "level_3_business": {
+        "metrics": [
+            "First-query resolution rate",
+            "User satisfaction score",
+            "Answer acceptance rate",
+            "Avg resolution time",
+        ],
+        "targets": [">= 80%", ">= 4.0/5", ">= 80%", "< 3 min"],
+        "tool": "Grafana + 用户反馈系统",
+        "frequency": "每日监控",
+    },
+}
+
+print("RAG 效果评估三级指标链:")
+for level, config in evaluation_chain.items():
+    print(f"  {level}:")
+    for m, t in zip(config["metrics"], config["targets"]):
+        print(f"    {m} >= {t}")</pre></div>
+      <p><strong>回答框架</strong>：</p>
+      <ul>
+        <li>「我建立三级指标链。第一级检索层：Recall@10 ≥ 85%、NDCG@10 ≥ 0.85、MRR@10 ≥ 0.90。每次代码变更后在 500 条 query 上自动跑。」</li>
+        <li>「第二级生成层：RAGAS 的 faithfulness ≥ 0.85、answer_relevancy ≥ 0.80、context_precision ≥ 0.75。每次发版前跑一次。」</li>
+        <li>「第三级业务层：首次回答解决率 ≥ 80%、用户满意度 ≥ 4.0/5、答案采纳率 ≥ 80%。每日 Grafana 监控。」</li>
+        <li>「三级指标之间有传导关系——检索 NDCG 降 0.05 会导致答案采纳率降 11%，业务指标的恶化能追溯到技术指标的根因。」</li>
+        <li>「同时维护坏例库，每个周从低分案例中抽样 50 条做人工归因，跟踪坏例的根因分布趋势。」</li>
+      </ul>
+      <p><strong>额外加分</strong>：提到「A/B 测试」。CorpAssist 上线新模型/新 Prompt 时，先走 1 周 A/B 测试（5% 流量实验组），比较 faithfulness 和用户满意度，统计显著后再全量发布。例如 2026 年 3 月的 GPT-4o-mini → GPT-4o 升级，A/B 显示 faithfulness 从 0.82 提升到 0.89（p<0.01），满意度从 3.8 提升到 4.3。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>架构题用五步法回答（边界→分层→数据流→选型→权衡），每步都要具体数据。</li>
+        <li>分块参数选择必须基于实验数据，展示你做过消融实验而非抄网上的结论。</li>
+        <li>检索不准用四步归因法排查，60% 根因在检索和分块。</li>
+        <li>RAG vs 微调是互补方案，基于更新频率/输出格式/数据量三因素决策。</li>
+        <li>评估体系用三级指标链（检索→生成→业务），链路传导可追溯。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="advanced-03-int-1"> 能用五步法模拟回答 RAG 架构设计题</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-03-int-2"> 能用消融实验数据支撑分块参数选择</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-03-int-3"> 能用四步归因法分析检索不准的根因</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-03-int-4"> 能用决策树解释 RAG vs 微调选型</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-03-int-5"> 能完整说出三级评估指标链</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>五步法</td><td>架构题回答框架：边界→分层→数据流→选型→权衡</td></tr>
+        <tr><td>四步归因</td><td>检索不准排查流程：检索→分块→Rerank→生成</td></tr>
+        <tr><td>三级指标链</td><td>检索层→生成层→业务层的递进式评估体系</td></tr>
+        <tr><td>RAG-FT 混合</td><td>RAG 提供知识 + 微调优化指令遵循的组合方案</td></tr>
+        <tr><td>A/B 测试</td><td>实验组和对照组比较，用统计显著性做发布决策</td></tr>
+        <tr><td>首次回答解决率</td><td>用户第一次提问就得到满意答案的比例</td></tr>
+        <tr><td>答案采纳率</td><td>用户采纳 AI 答案（而非找人工）的比例</td></tr>
+        <tr><td>人均检验法</td><td>让同事看检索结果能否回答问题，30 秒定位问题</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1 (反问面试官): 你们 RAG 知识库上线后碰到最大的坑是什么？</summary><p>这实际是让你展示问题解决能力。可以回答：我们最大的坑是「Milvus 侧遗漏 ACL 过滤导致权限越权」。上线前 QA 测试发现一个没有 HR 权限的用户搜索到了薪资文档，排查是 Milvus 的 search 请求没有携带 filter 参数。修复后我们做了双重保障：1) 在检索服务的入口统一注入 ACL 参数；2) 在 CI 管线中加入权限测试用例。这次事件让我们意识到「检索层过滤不是功能而是安全基础设施」。</p></details>
+        <details><summary>Q2: 你怎么持续评估 RAG 系统是否在退化？</summary><p>两条线。1) 自动化：CI 管线中每次变更后运行 retrieval benchmark（500 query，5 分钟完成），如果 NDCG@10 下降超过 0.02 自动拦截合并请求。2) 人工监控：每日看 Grafana 仪表盘的核心指标趋势（平均置信度、拒答率、复核队列大小），如果连续 3 天置信度下降超过 5% 标记为高危告警。特别关注搜索引擎更新后——Google 升级 Gemini API 或 OpenAI 更新 GPT 版本后，第一时间跑全量评测。</p></details>
+        <details><summary>Q3: 如果让你从零开始搭建一个 RAG 知识库，你的第一版 MVP 会包含哪些功能？</summary><p>6 周 MVP。前 2 周：文档索引管线（Unstructured 解析 + 固定分块 + Milvus 向量库）+ 基础检索（纯向量）。中间 2 周：LCEL 问答管线（检索→Prompt→LLM）+ SSE 流式。后 2 周：基础审计日志 + JWT 鉴权 + 简单前端。不做的：Rerank（MVP 后加）、KG 补召回（v2）、多租户（v2）、权限过滤（用基础角色限制先凑合）。6 周后可演示「上传文档→提问→得到带引用的答案→审计可查」的完整链路。</p></details>
+      </div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.ragas.io/">RAGAS 评估框架</a> — RAF 效果评估的标准工具</li>
+    <li><a href="https://python.langchain.com/docs/expression_language/">LangChain LCEL 文档</a> — 架构设计的官方参考</li>
+    <li><a href="https://arxiv.org/abs/2310.01369">RAG 综合调查论文</a> — 学术界对 RAG 技术的系统综述</li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>用五步法写一篇 500 字的 RAG 架构设计回答</li>
+      <li>对着镜子模拟回答五道面试题，每道不超过 3 分钟</li>
+      <li>准备 1 个你亲身经历的 RAG 优化或故障故事（STAR 结构）</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>面试官问「RAG 能不能替代微调」你怎么回答？</summary><p>不能说不，也不能说是。我会说：「RAG 和微调解决的是不同维度的问题。RAG 解决的是『知识更新』和『可溯源』，微调解决的是『输出风格』和『行为对齐』。对企业制度问答场景，RAG 更优，因为知识每月更新。但如果是固定的意图分类或实体抽取任务，微调更优。最佳实践是两者结合——用 RAG 提供最新知识，用微调优化模型遵循指令的能力。这叫 RAG-FT 混合方案。」</p></details>
+      <details><summary>面试官问「你们的 RAG 系统收益怎么量化」你怎么回答？</summary><p>三组数据。第一组效率：员工查找制度时间从 8.5 分钟降到 3.1 分钟，节省 63%。第二组成本：500 人企业年节省 $248K，ROI 363%，6.8 个月回本。第三组质量：答案采纳率 83%，用户满意度 4.5/5，错误决策相关投诉减少 72%。每组数据对应一个业务方关心的视角——效率对应员工，成本对应 CFO，质量对应合规。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/advanced-03-interview-lab/</code></p><ul class="demo-acceptance">
+      <li>准备一份五步法的架构回答稿</li>
+      <li>录制模拟面试回答视频</li>
+      <li>完成一份 RAG 知识库面试题库自查表</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>上一篇：<a href="#ch-advanced-02-metrics">效果数据与优化复盘</a></li>
+    <li>课程结束！前往 <a href="../index.html">课程首页</a> 回顾全部内容</li>
+  </ul></div>
+</section>

@@ -1,0 +1,364 @@
+<section id="ch-practice-02" class="chapter" data-chapter="practice-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多工具协作与编排</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>真实的办公任务通常需要多个工具协作完成（如查日程→约会议室→发通知→创建工单）。本章深入 Spring AI 的 @Tool 注解体系，学习如何定义、编排、容错多个工具，以及如何在并行和串行执行模式间切换。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 @Tool 注解定义日历、邮件、工单等办公工具；实现并行和串行工具执行模式；配置工具失败的重试与熔断策略；实现上下文压缩适配器减少 Token 消耗。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) @Tool 注解参数：name（工具名）、description（描述）、returnDirect（是否直接返回）；2) 并行执行用 CompletableFuture 同时调用多个独立工具，串行执行按依赖关系顺序调用；3) 重试策略：工具调用失败后最多重试 2 次（指数退避），仍然失败则熔断；4) 上下文压缩 Adapter 将工具返回的大数据截断为摘要，防止 Token 爆炸；5) CorpAssist 典型场景：查日程（并行）+ 会议室（并行）+ 创建会议（串行依赖前面结果）。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>@Tool 注解：日历/邮件/工单</h3>
+      <p>Spring AI 的 <code>@Tool</code> 注解将 Java 方法暴露为 Agent 工具。框架自动提取方法签名生成 Function Calling Schema。三个典型的办公工具定义：</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    subgraph 日历工具
+        C1[queryFreeSlots<br/>查空闲时间]
+        C2[createEvent<br/>创建日程]
+        C3[cancelEvent<br/>取消日程]
+    end
+    subgraph 邮件工具
+        E1[sendEmail<br/>发送邮件]
+        E2[queryEmails<br/>查询邮件]
+        E3[createDraft<br/>创建草稿]
+    end
+    subgraph 工单工具
+        T1[createTicket<br/>创建工单]
+        T2[queryTicket<br/>查询工单]
+        T3[assignTicket<br/>分配工单]
+    end
+
+    C1 --> C2 --> C3
+    E1 --> E2 --> E3
+    T1 --> T2 --> T3
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 日历工具
+@Component
+public class CalendarTools {
+
+    @Tool(name = "queryFreeSlots",
+          description = "查询指定日期范围内员工的空闲时段，返回空闲时间段列表")
+    public List&lt;TimeSlot&gt; queryFreeSlots(
+            @ToolParam(description = "员工ID") String userId,
+            @ToolParam(description = "开始日期，格式 yyyy-MM-dd") String startDate,
+            @ToolParam(description = "结束日期，格式 yyyy-MM-dd") String endDate) {
+        // 调用日历服务 API
+        return calendarService.getFreeSlots(userId, startDate, endDate);
+    }
+
+    @Tool(name = "createEvent",
+          description = "创建日历事件/会议，需要主题、时间、参与人")
+    public Event createEvent(
+            @ToolParam(description = "会议主题") String title,
+            @ToolParam(description = "开始时间 ISO 格式") String startTime,
+            @ToolParam(description = "结束时间 ISO 格式") String endTime,
+            @ToolParam(description = "参与人 ID 列表，逗号分隔") String attendees,
+            @ToolParam(description = "会议室 ID，可选") String roomId) {
+        return calendarService.createEvent(title, startTime, endTime,
+            List.of(attendees.split(",")), roomId);
+    }
+}
+
+// 邮件工具
+@Component
+public class EmailTools {
+
+    @Tool(name = "sendEmail",
+          description = "发送邮件，支持带附件，重要邮件可标记为 HIGH")
+    public EmailResult sendEmail(
+            @ToolParam(description = "收件人邮箱") String to,
+            @ToolParam(description = "邮件主题") String subject,
+            @ToolParam(description = "邮件正文，支持 HTML") String body,
+            @ToolParam(description = "优先级: LOW/NORMAL/HIGH") String priority) {
+        return emailService.send(to, subject, body, priority);
+    }
+}
+
+// 工单工具
+@Component
+public class TicketTools {
+
+    @Tool(name = "createTicket",
+          description = "创建 IT 工单/任务工单，指定标题、描述、负责人和优先级")
+    public Ticket createTicket(
+            @ToolParam(description = "工单标题") String title,
+            @ToolParam(description = "工单描述/详细信息") String description,
+            @ToolParam(description = "负责人 ID") String assigneeId,
+            @ToolParam(description = "优先级: P0/P1/P2/P3") String priority) {
+        return ticketService.create(title, description, assigneeId, priority);
+    }
+}</pre></code></div>
+    </div>
+
+    <div class="section-block">
+      <h3>并行/串行工具执行</h3>
+      <p>任务规划时需要考虑工具间的依赖关系。无依赖的工具可以并行执行（提升效率），有依赖的工具必须串行执行（保证数据正确）。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 并行/串行工具执行器
+@Component
+public class ToolExecutionOrchestrator {
+
+    private final ExecutorService parallelExecutor =
+        Executors.newVirtualThreadPerTaskExecutor();  // Java 21 虚拟线程
+
+    /**
+     * 执行无依赖的工具集（并行）
+     */
+    public Map&lt;String, Object&gt; executeParallel(List&lt;ToolTask&gt; tasks) {
+        Map&lt;String, Object&gt; results = new ConcurrentHashMap&lt;&gt;();
+        List&lt;CompletableFuture&lt;Void&gt;&gt; futures = tasks.stream()
+            .map(task -&gt; CompletableFuture.runAsync(() -&gt; {
+                results.put(task.name(), task.execute());
+            }, parallelExecutor))
+            .toList();
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .join();  // 等待所有并行任务完成
+        return results;
+    }
+
+    /**
+     * 执行有依赖关系的工具集（串行）
+     */
+    public Map&lt;String, Object&gt; executeSequential(List&lt;ToolTask&gt; tasks) {
+        Map&lt;String, Object&gt; results = new LinkedHashMap&lt;&gt;();
+        Map&lt;String, Object&gt; context = new HashMap&lt;&gt;();
+
+        for (ToolTask task : tasks) {
+            // 注入依赖的结果作为上下文
+            task.setContext(context);
+            Object result = task.execute();
+            results.put(task.name(), result);
+            // 将当前步骤结果加入上下文供后续步骤使用
+            context.put(task.name(), result);
+        }
+        return results;
+    }
+
+    // CorpAssist 会议安排编排示例
+    public Map&lt;String, Object&gt; arrangeMeeting(String organizer,
+                                                String date, String topic) {
+        // Step 1: 并行查询参与人的空闲时间
+        List&lt;ToolTask&gt; parallelTasks = List.of(
+            new ToolTask("getUserInfo", () -&gt; userService.getUser(organizer)),
+            new ToolTask("getTeamMembers", () -&gt; orgService.getTeamMembers(organizer))
+        );
+        Map&lt;String, Object&gt; parallelResults = executeParallel(parallelTasks);
+
+        // Step 2: 串行：查空闲→创建会议→发通知
+        List&lt;ToolTask&gt; sequentialTasks = List.of(
+            new ToolTask("queryFreeSlots", () -&gt; calendarService
+                .queryFreeSlots(organizer, date, date)),
+            new ToolTask("createEvent", () -&gt; calendarService
+                .createEvent(topic, /* 从上一步获取 */ "")),
+            new ToolTask("sendEmail", () -&gt; emailService
+                .send(/* 从上一步获取参与人 */ organizer, topic))
+        );
+        return executeSequential(sequentialTasks);
+    }
+}</pre></code></div>
+      <table class="outline-table">
+        <thead><tr><th>执行模式</th><th>适用场景</th><th>耗时</th><th>依赖</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td>串行</td><td>步骤间有数据依赖</td><td>各步骤耗时之和</td><td>必须</td><td>查用户→查工单→发邮件</td></tr>
+          <tr><td>并行</td><td>步骤间无依赖</td><td>最慢步骤耗时</td><td>无</td><td>同时查日历和查工单</td></tr>
+          <tr><td>混合</td><td>部分步骤有依赖</td><td>并行段 + 串行段</td><td>部分</td><td>并行查信息→串行创建</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block">
+      <h3>工具失败的重试与熔断</h3>
+      <p>工具调用可能因为网络问题、服务故障、数据异常而失败。CorpAssist 使用分层容错策略，结合 Spring Resilience4j 实现重试和熔断。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 工具调用容错配置
+@Configuration
+public class ToolResilienceConfig {
+
+    @Bean
+    public RetryRegistry toolRetryRegistry() {
+        RetryConfig config = RetryConfig.custom()
+            .maxAttempts(3)
+            .waitDuration(Duration.ofSeconds(2))
+            .retryExceptions(IOException.class, TimeoutException.class)
+            .ignoreExceptions(IllegalArgumentException.class)  // 参数错误不重试
+            .build();
+        return RetryRegistry.of(config);
+    }
+
+    @Bean
+    public CircuitBreakerRegistry toolCircuitBreakerRegistry() {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            .failureRateThreshold(50)           // 50% 失败率触发熔断
+            .slidingWindowSize(10)              // 统计最近 10 次调用
+            .waitDurationInOpenState(Duration.ofSeconds(30))  // 熔断持续 30 秒
+            .permittedNumberOfCallsInHalfOpenState(3)         // 半开状态尝试 3 次
+            .build();
+        return CircuitBreakerRegistry.of(config);
+    }
+}
+
+// 带容错的工具调用
+@Component
+public class ResilientToolExecutor {
+
+    private final Retry retry;
+    private final CircuitBreaker circuitBreaker;
+
+    public ResilientToolExecutor(RetryRegistry retryRegistry,
+                                  CircuitBreakerRegistry cbRegistry) {
+        this.retry = retryRegistry.retry("toolRetry");
+        this.circuitBreaker = cbRegistry.circuitBreaker("toolCircuitBreaker");
+    }
+
+    public Object executeWithResilience(String toolName,
+                                        Supplier&lt;Object&gt; toolCall) {
+        return circuitBreaker.executeSupplier(
+            () -&gt; retry.executeSupplier(toolCall)
+        );
+    }
+}
+
+// 使用示例
+// Object result = resilientToolExecutor.executeWithResilience(
+//     "sendEmail",
+//     () -&gt; emailService.send("user@corp.com", "主题", "正文")
+// );</pre></code></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>Agent 调用 sendEmail 工具时邮件服务返回 503（临时不可用）。熔断器检测到最近 10 次调用中有 6 次失败（60% &gt; 50% 阈值），触发熔断。后续 30 秒内所有 sendEmail 调用直接返回降级结果（"邮件服务暂时不可用，已保存草稿"），不消耗实际 API 调用。30 秒后熔断器进入半开状态，允许 3 次探测调用，如果成功则恢复正常。这套机制保障了邮件服务故障时 Agent 仍然可以处理其他任务，不被阻塞。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文压缩 Adapter</h3>
+      <p>工具返回的数据可能非常大（如查询整个团队的日程返回数百条事件），直接传给 LLM 会浪费 Token。上下文压缩 Adapter 在工具返回数据和 LLM 之间加一层截断/摘要。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 上下文压缩适配器
+@Component
+public class ContextCompressionAdapter implements ToolCallback {
+
+    private final ToolCallback delegate;
+    private static final int MAX_TOOL_RESPONSE_LENGTH = 500;
+
+    public ContextCompressionAdapter(ToolCallback delegate) {
+        this.delegate = delegate;
+    }
+
+    @Override
+    public String getName() {
+        return delegate.getName();
+    }
+
+    @Override
+    public String getDescription() {
+        return delegate.getDescription();
+    }
+
+    @Override
+    public JsonSchema getInputSchema() {
+        return delegate.getInputSchema();
+    }
+
+    @Override
+    public String call(String functionInput) {
+        String rawResult = delegate.call(functionInput);
+
+        // 如果结果太长，截断并添加摘要
+        if (rawResult.length() &gt; MAX_TOOL_RESPONSE_LENGTH) {
+            return truncateAndSummarize(rawResult);
+        }
+        return rawResult;
+    }
+
+    private String truncateAndSummarize(String raw) {
+        // 策略 1: 截断
+        if (raw.length() &gt; MAX_TOOL_RESPONSE_LENGTH * 2) {
+            return raw.substring(0, MAX_TOOL_RESPONSE_LENGTH)
+                + "\n...(截断，共 " + raw.length() + " 字符)";
+        }
+        // 策略 2: 提取关键字段
+        if (raw.startsWith("[") || raw.startsWith("{")) {
+            return extractKeyFields(raw);
+        }
+        return raw;
+    }
+
+    // 注册时包装所有工具
+    @Bean
+    public List&lt;ToolCallback&gt; compressedTools(List&lt;ToolCallback&gt; rawTools) {
+        return rawTools.stream()
+            .map(ContextCompressionAdapter::new)
+            .collect(Collectors.toList());
+    }
+}</pre></code></div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>无压缩</h4><p>queryTeamSchedule("u123") 返回 200 条日程，JSON 约 15KB → LLM 处理这 15KB Token，Agent 每轮循环 Token 消耗大，maxTokenUsage 容易耗尽。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>有压缩</h4><p>queryTeamSchedule("u123") 返回 200 条日程 → 压缩为摘要："今天有 15 个会议，最早 09:00，最晚 17:30。关键会议：项目评审(14:00-15:00, 8人)"，约 200 字符 → LLM 只需要处理这个摘要，Token 消耗减少 98%。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>@Tool 注解定义日历/邮件/工单等办公工具，清晰的 description 是 LLM 正确调用的关键</li>
+      <li>并行执行（CompletableFuture + 虚拟线程）提升无依赖工具的调用效率，混合编排覆盖大多数场景</li>
+      <li>Resilience4j 重试（3 次指数退避）+ 熔断（50% 失败率阈值）保障工具调用的可靠性</li>
+      <li>上下文压缩 Adapter 将工具返回大数据截断为摘要，减少 90%+ 的 Token 消耗</li>
+      <li>CorpAssist 使用混合编排模式：并行查询用户和团队信息 + 串行创建会议通知</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="practice-02-1"> 我能用 @Tool 注解定义至少 3 个办公工具</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-2"> 我能实现并行和串行工具执行模式并理解适用场景</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-3"> 我能配置 Resilience4j 重试和熔断策略</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-4"> 我能实现上下文压缩适配器</label></li>
+        <li><label><input type="checkbox" data-check-id="practice-02-5"> 我能设计一个混合编排的多工具协作任务</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>@Tool</td><td>Spring AI 的工具注解，将 Java 方法暴露给 LLM</td></tr>
+        <tr><td>@ToolParam</td><td>工具参数的描述注解，帮助 LLM 理解参数含义</td></tr>
+        <tr><td>returnDirect</td><td>工具返回结果直接返回给用户，不经过 LLM 二次处理</td></tr>
+        <tr><td>CompletableFuture</td><td>Java 并发工具类，用于并行执行无依赖的工具</td></tr>
+        <tr><td>Resilience4j Retry</td><td>工具调用重试框架，支持指数退避和异常分类</td></tr>
+        <tr><td>Circuit Breaker</td><td>熔断器，失败率达到阈值后快速失败防止雪崩</td></tr>
+        <tr><td>上下文压缩</td><td>截断工具返回的大数据为摘要，减少 Token 消耗</td></tr>
+        <tr><td>虚拟线程</td><td>Java 21 轻量级线程，适合并行工具调用</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>并行工具调用中一个工具失败了，应该全部回滚还是只回滚失败的工具？</summary><p>取决于工具间是否有业务依赖。如果有依赖关系（如"创建会议"依赖"查空闲时间"的结果），则全部回滚——因为后续步骤基于错误数据执行。如果无依赖关系（如同时"查日历"和"查工单"），则只失败单个工具，其他工具的结果继续使用。CorpAssist 的实现：每个 ToolTask 有一个 rollback() 方法，如果并行组中有任一工具失败，调用所有已完成工具的 rollback()。对于不可回滚的操作（如"发邮件"已发送成功），记录审计日志并标记"部分成功"。实践中，CorpAssist 约 80% 的并行工具调用是无依赖的，只需要部分回滚。</p></details>
+        <details><summary>上下文压缩 Adapter 截断了重要信息导致 LLM 决策错误怎么办？</summary><p>解决方案：1) 分层压缩——重要数据字段（如工单 ID、状态、截止日期）完整保留，次要数据（如备注、操作日志）截断；2) 可扩展截断——当 LLM 发现需要更多信息时，可以调用 getToolFullResult(toolName) 获取完整数据；3) 压缩摘要中包含数据量提示——如"共 200 条日程，已显示前 5 条"，LLM 知道有更多数据可用；4) 关键字段白名单——使用 @ToolParam(important=true) 标记不会截断的关键字段。CorpAssist 使用方案 1+3：先根据字段重要性选择性保留，再在摘要末尾标注数据总量。</p></details>
+        <details><summary>@Tool 的 returnDirect=true 应该什么时候用？</summary><p>returnDirect=true 表示工具的结果直接返回给用户，不经过 LLM 的二次处理。适用场景：1) 纯数据查询类——"查天气"返回 JSON，直接展示即可，不需要 LLM 重新描述；2) 操作确认类——"发送邮件"返回{success:true, messageId:"xxx"}，直接显示确认信息；3) 文件下载类——返回文件 URL，用户直接点击下载。不适用场景：1) 需要 LLM 解释的数据——如"查工单"返回原始 JSON，需要 LLM 解释为自然语言；2) 多步任务的中间步骤——因为后续步骤需要 LLM 理解工具返回的内容。CorpAssist 中约 30% 的工具使用 returnDirect=true。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI @Tool Annotation</a> — 工具注解官方文档</li>
+    <li><a href="https://resilience4j.readme.io/docs/getting-started" target="_blank" rel="noopener">Resilience4j 官方</a> — 重试和熔断器文档</li>
+    <li><a href="https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html" target="_blank" rel="noopener">Java 21 Virtual Threads</a> — 虚拟线程文档</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>定义 CalendarTools、EmailTools、TicketTools 三个工具类</li>
+      <li>实现 ToolExecutionOrchestrator 支持并行和串行模式</li>
+      <li>在 application.yml 中配置 Resilience4j 重试和熔断参数</li>
+      <li>实现 ContextCompressionAdapter 压缩工具返回数据</li>
+      <li>编写"安排会议"任务编排：并行查成员→并行查空闲时间→串行创建→串行通知</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：同时查 10 个人的空闲时间，串行查要 10 秒，并行查要 2 秒。但工单系统限流单用户 5 QPS。如何平衡？</summary><p>折中方案：1) 分片并行——将 10 人分为 2 组每组 5 人，组内并行，组间串行；2) 信号量控制——使用 Semaphore(5) 限制并发数不超过工单系统 QPS 限制；3) 自适应限流——调用前检查工单系统的当前负载，动态调整并行度。CorpAssist 使用方案 2：初始化一个全局 Semaphore，每个工具调用前 acquire()，用完后 release()。当系统负载高时调用方自然等待，不会触发限流。这样既利用了并行提速（从 10 秒降到 4 秒），又不会压垮下游系统。</p></details>
+      <details><summary>场景：sendEmail 工具调用频繁触发熔断，但运维确认邮件服务正常，熔断器配置可能有问题？</summary><p>排查方向：1) 检查熔断器统计窗口——slidingWindowSize=10 太小，10 次中仅 1 次超时就触发 50% 阈值（1/2 也可以到 50%），建议改为 20；2) 检查异常分类——retryExceptions 包含了所有 Exception，但某些业务异常（如"收件人邮箱不存在"）不应该计入熔断统计；3) 检查 waitDurationInOpenState——30 秒太短，如果邮件服务确实有问题，30 秒后会反复触发半开探测还是失败。CorpAssist 推荐配置：slidingWindowSize=20，failureRateThreshold=50，waitDurationInOpenState=60s。同时使用 ignoreExceptions 排除参数错误的业务异常。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-02-lab/</code></p><ul class="demo-acceptance">
+      <li>并行工具调用比串行快 2 倍以上（3 个无依赖工具）</li>
+      <li>熔断器在失败率超过 50% 后正确触发熔断并降级</li>
+      <li>上下文压缩后 Token 消耗减少 80% 以上</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-03">多 Agent 协作（SAA）</a> — Sequential/Parallel/Routing Agent 协作</li>
+  </ul></div>
+</section>

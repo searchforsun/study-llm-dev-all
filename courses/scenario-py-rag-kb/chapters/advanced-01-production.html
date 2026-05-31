@@ -1,0 +1,379 @@
+<section id="ch-advanced-01-production" class="chapter" data-chapter="advanced-01-production">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>权限、审计与多租户</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-production" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>25</strong> 分钟 · 阶段：<strong>生产化与答辩</strong> · 场景：<strong>S1</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>企业级 RAG 知识库不能只「问得出答案」，还必须「管得住权限」「查得到痕迹」「隔得开租户」。这章是 CorpAssist 知识库上生产环境前必须完成的安全与合规基础设施。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>设计行级权限的检索层过滤方案；实现完整的 RAG 审计日志系统；设计多租户索引隔离策略；准备等保三级合规的交付清单。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 行级权限通过 ACL Tag + 检索层过滤实现，非应用层二次校验；2) 审计日志需记录 user_id/query/retrieved_docs/answer/confidence/timestamp；3) 多租户隔离三种级别：索引级/集合级/文档级；4) 等保三级对 RAG 系统的要求覆盖身份认证/访问控制/审计/数据安全；5) 权限相关 P0 故障的平均恢复时间（MTTR）约 42 分钟，审计日志能帮助定位。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>行级权限的检索层过滤</h3>
+      <p>行级权限指不同的用户角色可以看到不同的文档集合。CorpAssist 不在应用层做权限校验，而是在检索层直接过滤——「检索不到 = 不可见」。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">flowchart TB
+    subgraph Config[权限配置 - Java 管理端]
+        A[文档上传] --> B[管理员设定 ACL Tag]
+        B --> C{ACL 标签}
+        C -->|全员可见| D[tag: public]
+        C -->|HR 仅见| E[tag: hr_only]
+        C -->|经理仅见| F[tag: manager_only]
+    end
+    subgraph Filter[检索层过滤 - Python]
+        G[用户请求 + JWT] --> H[提取用户角色]
+        H --> I[构建过滤条件]
+        I --> J{检索引擎}
+        J -->|Milvus| K[filter: acl_tags_contains(role)]
+        J -->|ES| L[bool filter: terms acl_tags]
+    end
+    subgraph Result[结果]
+        K --> M[仅返回角色匹配的 chunk]
+        L --> M
+    end</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""行级权限的检索层过滤"""
+
+from typing import List, Optional
+from pydantic import BaseModel
+
+class UserContext(BaseModel):
+    """用户上下文（从 JWT 解析）"""
+    user_id: str
+    roles: List[str]  # ["全员可见", "HR_可见", "经理_可见"]
+
+class RowLevelACL:
+    """行级权限过滤器"""
+
+    def __init__(self, user: UserContext):
+        self.user = user
+        self.is_admin = "admin" in user.roles
+
+    def milvus_expr(self) -> Optional[str]:
+        """生成 Milvus 表达式"""
+        if self.is_admin:
+            return None  # 管理员免过滤
+        conditions = [
+            f"acl_tags contains '{role}'"
+            for role in self.user.roles
+        ]
+        return " or ".join(conditions) if conditions else "acl_tags contains 'public'"
+
+    def es_filter(self) -> dict:
+        """生成 ES 过滤 DSL"""
+        if self.is_admin:
+            return {"match_all": {}}
+        return {
+            "bool": {
+                "should": [
+                    {"terms": {"acl_tags": self.user.roles}}
+                ],
+                "minimum_should_match": 1,
+            }
+        }
+
+    def apply_to_search(self, query: str, top_k: int = 10) -> List[dict]:
+        """执行带权限过滤的检索"""
+        from src.retrieval import DualHybridRetriever
+        retriever = DualHybridRetriever()
+
+        # 混合检索内置了 ES + Milvus 双路
+        results = retriever.search(
+            query,
+            top_k=top_k,
+            es_filter=self.es_filter(),
+            milvus_filter=self.milvus_expr(),
+        )
+        return results
+
+if __name__ == "__main__":
+    user = UserContext(user_id="u001", roles=["HR_可见"])
+    acl = RowLevelACL(user)
+    print("Milvus expr:", acl.milvus_expr())
+    # 输出: acl_tags contains 'HR_可见'
+    print("ES filter:", acl.es_filter())
+    # 输出: {"bool": {"should": [{"terms": {"acl_tags": ["HR_可见"]}}], "minimum_should_match": 1}}</pre></div>
+      <p><strong>性能影响</strong>：带 ACL 过滤的检索相比无过滤检索，P99 延迟增加约 15-25ms（主要在 Milvus 标量索引查询和 ES 过滤执行）。这远低于应用层二次校验（额外 50-100ms 的请求开销）。行级权限带来的安全收益远大于微小的延迟代价。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>审计日志设计</h3>
+      <p>审计日志是等保三级的硬性要求，也是排查问题的第一手资料。CorpAssist 的审计日志记录 RAG 流程的每个关键环节。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant API as FastAPI
+    participant AUD as Audit Service
+    participant DB as PostgreSQL
+    U->>API: "年假几天？"
+    API->>AUD: log_start(user_id, query)
+    API->>API: 检索 + 生成
+    API->>AUD: log_retrieval(docs)
+    API-->>U: 年假15天 [来源: 休假制度.pdf]
+    API->>AUD: log_complete(answer, confidence, tokens)
+    AUD->>DB: INSERT INTO audit_logs</pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""RAG 审计日志系统"""
+
+from datetime import datetime
+from typing import List, Optional
+from pydantic import BaseModel
+
+class AuditRecord(BaseModel):
+    """审计日志记录"""
+    id: str
+    user_id: str
+    user_roles: List[str]
+    query: str
+    query_timestamp: datetime
+    retrieved_docs: List[dict]  # [{doc_id, score, source}]
+    answer_text: str
+    answer_confidence: float
+    action: str  # "direct_reply" / "human_review" / "refused"
+    token_usage: dict  # {input_tokens, output_tokens, model}
+    latency_ms: int
+    citation_check_passed: bool
+    version: str  # RAG 管线版本号
+
+class AuditLogger:
+    """审计日志记录器"""
+
+    def __init__(self, db_pool):
+        self.db = db_pool
+
+    async def log_query_start(self, user_id: str, query: str) -> str:
+        """记录查询开始"""
+        record_id = f"audit-{datetime.utcnow().strftime('%Y%m%d%H%M%S-%f')}"
+        # 插入一条初始记录
+        await self.db.execute("""
+            INSERT INTO audit_logs (id, user_id, query, created_at, status)
+            VALUES ($1, $2, $3, $4, 'in_progress')
+        """, record_id, user_id, query, datetime.utcnow())
+        return record_id
+
+    async def log_query_complete(self, record_id: str, record: AuditRecord):
+        """更新查询完成记录"""
+        await self.db.execute("""
+            UPDATE audit_logs SET
+                status = 'completed',
+                answer_text = $2,
+                answer_confidence = $3,
+                action = $4,
+                token_usage = $5,
+                latency_ms = $6,
+                citation_check_passed = $7,
+                retrieved_docs = $8
+            WHERE id = $1
+        """, record_id, record.answer_text, record.answer_confidence,
+            record.action, record.token_usage, record.latency_ms,
+            record.citation_check_passed,
+            [json.dumps(d) for d in record.retrieved_docs])
+
+    async def query_audit(
+        self, user_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[AuditRecord]:
+        """查询审计日志（管理端使用）"""
+        conditions = []
+        params = []
+        if user_id:
+            conditions.append(f"user_id = ${len(params)+1}")
+            params.append(user_id)
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        rows = await self.db.fetch(
+            f"SELECT * FROM audit_logs WHERE {where} ORDER BY created_at DESC LIMIT ${len(params)+1}",
+            *params, limit,
+        )
+        return [AuditRecord(**row) for row in rows]
+
+if __name__ == "__main__":
+    # 模拟审计日志使用
+    logger = AuditLogger(None)
+    rid = "audit-20260531-142530-001"
+    print(f"Audit record: {rid}")
+    # DDL: CREATE TABLE audit_logs (id TEXT PRIMARY KEY, user_id TEXT, ...);</pre></div>
+      <p><strong>审计数据量</strong>：假设日均 5000 条查询，每条审计记录约 2KB（含检索文档信息），日均存储约 10MB，年化约 3.6GB。加上索引，使用 PostgreSQL 即可满足。为满足等保三级「日志保留 180 天以上」的要求，配置 TTL 分区自动清理旧数据。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户索引隔离</h3>
+      <p>CorpAssist 需要服务多个企业客户（租户），每个租户的知识库相互隔离。隔离方案有三种级别，各有取舍。</p>
+      <table class="learn-decision-table"><thead><tr><th>隔离级别</th><th>实现方式</th><th>安全性</th><th>运维成本</th><th>适用场景</th></tr></thead><tbody>
+        <tr><td>索引级隔离</td><td>每个租户独立 Milvus collection + ES index</td><td>★★★★★</td><td>高（需管理 N 套索引）</td><td>金融/医疗等高合规要求</td></tr>
+        <tr><td>集合级隔离</td><td>同一个 collection/index，用 tenant_id 字段过滤</td><td>★★★★</td><td>中</td><td>中型企业（推荐）</td></tr>
+        <tr><td>文档级隔离</td><td>同一个索引，每个文档带 tenant_id tag 过滤</td><td>★★★</td><td>低</td><td>低合规但多租户场景</td></tr>
+      </tbody></table>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-python">"""多租户隔离方案（集合级）"""
+
+from typing import List, Optional
+
+class MultiTenantIndex:
+    """多租户索引管理器 - 集合级隔离"""
+
+    def __init__(self, milvus_client, es_client):
+        self.milvus = milvus_client
+        self.es = es_client
+
+    def search(
+        self, tenant_id: str, query: str,
+        user_roles: List[str], top_k: int = 10,
+    ) -> List[dict]:
+        """带租户隔离的检索"""
+        acl_filter = self._build_acl_expr(user_roles)
+        tenant_filter = f"tenant_id == '{tenant_id}'"
+        combined = f"{acl_filter} and {tenant_filter}" if acl_filter else tenant_filter
+
+        # Milvus 检索
+        from src.embeddings import get_embedding_model
+        embedder = get_embedding_model()
+        query_vec = embedder.embed_query(query)
+        mv_results = self.milvus.search(
+            collection_name="corp_chunks",
+            data=[query_vec],
+            filter=combined,
+            limit=top_k,
+            output_fields=["doc_id", "text", "tenant_id", "acl_tags"],
+        )
+        return [{"doc_id": r["id"], "text": r["entity"].get("text", "")}
+                for r in mv_results[0]]
+
+    def _build_acl_expr(self, roles: List[str]) -> Optional[str]:
+        """构建权限过滤表达式"""
+        if "admin" in roles:
+            return None
+        conditions = [f"acl_tags contains '{r}'" for r in roles]
+        return " or ".join(conditions) if conditions else "acl_tags contains 'public'"
+
+    def index_document(
+        self, tenant_id: str, doc_id: str,
+        chunks: List[dict], acl_tags: List[str],
+    ):
+        """索引文档到指定租户"""
+        for chunk in chunks:
+            chunk["tenant_id"] = tenant_id
+            chunk["acl_tags"] = acl_tags
+        # 写入 Milvus（带 tenant_id 和 acl_tags 字段）
+        # 写入 ES（带 tenant_id 和 acl_tags 字段）
+
+if __name__ == "__main__":
+    index = MultiTenantIndex(None, None)
+    results = index.search(
+        tenant_id="tenant_abc",
+        query="年假几天",
+        user_roles=["全员可见"],
+    )
+    print(f"Found {len(results)} results for tenant_abc")</pre></div>
+      <p><strong>推荐方案</strong>：对于 CorpAssist 服务的大多数企业客户，推荐集合级隔离（同一套索引基础设施，tenant_id 字段过滤）。该方案在安全性和运维成本之间取得平衡。金融/医疗等高合规场景升级为索引级隔离（独立 Milvus collection）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>等保合规清单</h3>
+      <p>基于 GB/T 22239-2019 等保三级标准，以下是 CorpAssist RAG 知识库必须通过的合规检查项。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-yaml"># 等保三级合规检查清单 - RAG 知识库
+compliance:
+  authentication:
+    - item: "用户身份鉴别"
+      requirement: "所有API调用必须携带JWT Token，过期时间不超过24小时"
+      status: "已实现"
+    - item: "双因子认证"
+      requirement: "管理端登录需要密码+短信验证码"
+      status: "已实现"
+  access_control:
+    - item: "最小权限原则"
+      requirement: "文档级ACL Tag控制访问范围"
+      status: "已实现"
+    - item: "权限回收"
+      requirement: "用户角色变更后，下次请求生效（JWT TTL内可能有缓存）"
+      status: "已实现，TTL=15min"
+  audit:
+    - item: "安全审计"
+      requirement: "记录所有RAG问答的完整链路"
+      status: "已实现，audit_logs表"
+    - item: "日志保留"
+      requirement: "审计日志保留≥180天"
+      status: "已实现，分区自动管理"
+  data_security:
+    - item: "数据加密"
+      requirement: "传输层TLS 1.2+，存储层AES-256"
+      status: "已实现"
+    - item: "数据脱敏"
+      requirement: "审计日志中用户手机号/身份证等敏感信息需脱敏"
+      status: "开发中"
+  backup:
+    - item: "数据备份"
+      requirement: "每日全量、每30分钟增量备份"
+      status: "已实现"
+    - item: "容灾恢复"
+      requirement: "RPO ≤ 1小时，RTO ≤ 4小时"
+      status: "已实现"</pre></div>
+      <p><strong>常见不合规项</strong>：在 CorpAssist 的等保测评预审中，最容易出现的不合规项是「数据脱敏不完整」。审计日志虽然记录了完整问答链路，但部分用户的姓名、手机号在 query 字段中以明文形式存在。修复方案：在写入审计日志前用脱敏正则处理敏感信息模式（手机号/身份证号/银行卡号）。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>行级权限通过 ACL Tag + 检索层过滤实现，P99 延迟仅增加 15-25ms。</li>
+        <li>审计日志记录 RAG 问答全链路，日均 10MB，年化 3.6GB，适合 PostgreSQL 存储。</li>
+        <li>多租户隔离推荐集合级（tenant_id 过滤），高合规场景升级索引级（独立 collection）。</li>
+        <li>等保三级合规清单覆盖身份认证/访问控制/审计/数据安全/备份五大领域。</li>
+        <li>数据脱敏是等保测评中最容易被忽视的不合规项，需在审计写入前处理。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="advanced-01-pr-1"> 能实现行级权限的检索层过滤（ES + Milvus 双端）</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-pr-2"> 能设计完整的 RAG 审计日志表和查询接口</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-pr-3"> 能比较三种多租户隔离方案的优劣</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-pr-4"> 能列出等保三级对 RAG 系统的 10 个要求</label></li>
+        <li><label><input type="checkbox" data-check-id="advanced-01-pr-5"> 能解释为什么 ACL 过滤不在应用层做</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>行级权限</td><td>不是用户能访问哪些表，而是用户能访问哪些行（文档）</td></tr>
+        <tr><td>ACL Tag</td><td>文档级权限标签列表，如 ["HR_可见", "经理_可见"]</td></tr>
+        <tr><td>检索层过滤</td><td>在检索引擎层直接过滤无权限结果，而非应用层</td></tr>
+        <tr><td>审计日志</td><td>记录 user_id/query/retrieved_docs/answer/confidence 等字段</td></tr>
+        <tr><td>多租户隔离</td><td>不同企业的数据在逻辑或物理上互相隔离</td></tr>
+        <tr><td>等保三级</td><td>中国信息安全等级保护三级标准，企业级系统适用</td></tr>
+        <tr><td>数据脱敏</td><td>对敏感信息（手机号/身份证）做替换或屏蔽处理</td></tr>
+        <tr><td>TTL 分区</td><td>按时间分区的表，过期自动清理</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Q1: 多个企业客户共用一套知识库系统时，怎么防止数据泄露？</summary><p>采用集合级多租户隔离。所有文档在索引时携带 tenant_id 字段，检索时强制附加 tenant_id 过滤。同时文档级 ACL Tag 提供第二层权限控制。架构上保障：1) 检索 API 的 tenant_id 从 JWT Token 中提取而非客户端参数传递；2) 即使恶意构造 API 请求也无法跨租户检索；3) 审计日志记录每次检索的 tenant_id，方便事后审计。金融等高合规客户可以升级为索引级隔离（独立 Milvus collection）。</p></details>
+        <details><summary>Q2: 审计日志存这么多数据有什么用？举一个实际案例。</summary><p>有一次用户反馈「我搜'工资'出来的结果不对」。通过审计日志我们还原了他的完整查询链路：query='工资' → 检索到薪资制度.pdf → Rerank 后 Top-1 是绩效制度.pdf（因为 BGE-Reranker 对「工资」和「绩效」的语义关联度打高分 0.81）→ LLM 基于绩效制度生成了「工资根据绩效评级确定」，但用户想问的是「基本工资标准」。根因是 Rerank 对「工资-绩效」的关联度误判。修复：在 Rerank 阶段加入业务规则约束——如果 query 含「工资」，降低绩效相关文档的 Rerank 权重。</p></details>
+        <details><summary>Q3: 等保三级测评中最难通过的项是哪个？</summary><p>根据 CorpAssist 的测评经验，最难的是「数据脱敏」。RAG 系统的审计日志天然包含用户的完整提问和模型回答，用户的 query 中可能包含姓名、手机号、身份证号等敏感信息。简单的尾部打码（138****1234）模式不够——有些 query 是「帮我查一下张三的银行卡号是多少」，脱敏需要在原文中定位并替换。我们上线了基于正则的敏感信息扫描器，在审计写入前扫描并替换所有已知模式的敏感信息，准确率约 97%。</p></details>
+      </div>
+    </div>
+  </div>
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://milvus.io/docs/filter.md">Milvus 标量索引过滤</a> — ACL 权限过滤的官方语法</li>
+    <li><a href="https://www.gov.cn/zhengce/2020/content_5512258.htm">GB/T 22239-2019 等保三级标准</a> — 安全合规的依据原文</li>
+    <li><a href="https://jwt.io/introduction">JWT 认证标准</a> — 跨语言 Token 鉴权的标准协议</li>
+  </ul></div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <div class="steps-operate"><h4>操作步骤</h4><ol>
+      <li>实现 RowLevelACL 并测试不同角色的检索差异</li>
+      <li>设计 audit_logs 表的 DDL，包含所有必需的审计字段</li>
+      <li>写一个等保三级合规自查脚本，检查 10 个核心要求的实现状态</li>
+    </ol></div>
+    <div class="steps-judgment-list"><h4>判断练习</h4>
+      <details><summary>如果租户 A 的文档被租户 B 的用户检索到了，最可能的原因是什么？</summary><p>最可能的原因是检索时没有强制带 tenant_id 过滤。在我们的架构中，如果 API 从 JWT 提取 tenant_id 的逻辑有 bug（如默认值设为空字符串），导致 filter 条件无效，搜到的就是所有租户的文档。第二个可能的原因是 Milvus 和 ES 的某一边缺少 tenant_id 过滤。双重过滤的设计就是为了防止这种情况——即使 ES 侧漏了，Milvus 侧也应该拦住。</p></details>
+      <details><summary>审计日志的保留期限应该设多久？超过保留期的数据应该删除还是归档？</summary><p>等保三级要求 ≥180 天，CorpAssist 设置为 365 天。超过保留期的数据不直接删除——先压缩归档到廉价存储（OSS/S3），保留 3 年后自动删除。如果出现法律调查需求，可以从归档中恢复指定时间范围内的审计日志。审计日志的删除策略需要走审批流程，不能自动化执行定时删除。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/advanced-01-production-lab/</code></p><ul class="demo-acceptance">
+      <li>行级 ACL 过滤正确限制不同角色的访问范围</li>
+      <li>审计日志记录完整的 RAG 问答链路</li>
+      <li>多租户隔离测试验证租户 A 看不到租户 B 的数据</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>上一篇：<a href="#ch-practice-06-production-pitfalls">生产坑：数据、权限与索引</a></li>
+    <li>下一篇：<a href="#ch-advanced-02-metrics">效果数据与优化复盘</a> —— 从 60% 到 85% 的优化叙事</li>
+  </ul></div>
+</section>

@@ -1,0 +1,221 @@
+<section id="ch-basics-03" class="chapter" data-chapter="basics-03">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>长文结构规划</h2><button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>长文（白皮书/产品手册/行业报告）直接让 LLM 一次生成往往会逻辑松散、前后矛盾。正确做法：先规划大纲→分段生成→拼接合并→连贯性检测。本章实现长文生成的完整流程。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>用 Outline→Segment→Assemble 三步生成长文；实现连贯性检测（主题漂移/人称不一致）；配置去重策略（段落级/句子级）；建立长文质量评估标准。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 三步法：LLM 先生成大纲（Outline）→分段生成（Segment）→拼接并检测（Assemble）；2) 连贯性检测通过向量相似度计算相邻段落的主题漂移；3) 去重策略：段落级 Jaccard 相似度 > 0.7 则合并；4) 长文评估：结构完整性 + 逻辑连贯性 + 事实一致性 + 风格统一性。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>大纲→分段→拼接</h3>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant O as Outline LLM
+    participant S as Segment LLM
+    participant A as Assembler
+
+    U->>O: "写一篇5000字关于Agent自动化的白皮书"
+    O->>O: 生成大纲
+    O-->>U: Outline: [引言, 场景, 架构, 实践, 总结]
+    U->>S: 生成[引言]段<br/>基于大纲+语调
+    S-->>U: Segment1: 300字
+    U->>S: 生成[场景]段<br/>基于大纲+语调+前一段摘要
+    S-->>U: Segment2: 1200字
+    U->>S: 生成[架构]段<br/>基于大纲+语调+前一段摘要
+    S-->>U: Segment3: 1500字
+    U->>S: 生成[实践]段<br/>基于大纲+语调+前一段摘要
+    S-->>U: Segment4: 1500字
+    U->>S: 生成[总结]段<br/>基于大纲+语调+前一段摘要
+    S-->>U: Segment5: 500字
+    U->>A: 拼接+连贯性检测
+    A-->>U: 完整白皮书
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 长文生成器
+@Component
+public class LongFormWriter {
+
+    private final ChatClient outlineClient;
+    private final ChatClient segmentClient;
+
+    public String write(String topic, BrandTone tone, int targetWords) {
+        // 1. 生成大纲
+        String outline = outlineClient.prompt()
+            .user(u -&gt; u.text("""
+                为「{topic}」生成写作大纲，输出 JSON 格式。
+                总字数约 {words} 字。
+                大纲包含 5-8 个章节，每个章节标注重点内容和字数分配。
+                JSON: [{"title":"引言","keyPoints":["背景","意义"],"words":300}]
+                """)
+                .param("topic", topic)
+                .param("words", String.valueOf(targetWords))
+            )
+            .call()
+            .content();
+
+        // 2. 分段生成
+        List&lt;OutlineItem&gt; items = parseOutline(outline);
+        StringBuilder fullText = new StringBuilder();
+        String previousSummary = "";
+
+        for (int i = 0; i &lt; items.size(); i++) {
+            OutlineItem item = items.get(i);
+            String segment = segmentClient.prompt()
+                .user(u -&gt; u.text("""
+                    写作主题：{topic}
+                    当前章节：{title}
+                    章节重点：{keyPoints}
+                    目标字数：{words}字
+                    前章摘要：{prevSummary}
+                    这是第 {idx}/{total} 章。
+
+                    请生成该章节内容，保持与前章的连贯性。
+                    """)
+                    .param("topic", topic)
+                    .param("title", item.title())
+                    .param("keyPoints", String.join(",", item.keyPoints()))
+                    .param("words", String.valueOf(item.words()))
+                    .param("prevSummary", previousSummary)
+                    .param("idx", String.valueOf(i + 1))
+                    .param("total", String.valueOf(items.size()))
+                )
+                .call()
+                .content();
+
+            fullText.append("\n\n## ").append(item.title()).append("\n\n")
+                .append(segment);
+            previousSummary = summarize(segment, 100);
+        }
+
+        // 3. 拼接+检测
+        return assembleAndCheck(fullText.toString());
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>连贯性检测与去重</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 连贯性检测器
+@Component
+public class CoherenceChecker {
+
+    public List&lt;CoherenceIssue&gt; check(String fullText) {
+        List&lt;CoherenceIssue&gt; issues = new ArrayList&lt;&gt;();
+        String[] paragraphs = fullText.split("\n\n");
+
+        // 1. 相邻段落主题漂移检测
+        for (int i = 1; i &lt; paragraphs.length; i++) {
+            double similarity = cosineSimilarity(
+                embed(paragraphs[i-1]), embed(paragraphs[i]));
+            if (similarity &lt; 0.3) {
+                issues.add(new CoherenceIssue(i-1, i,
+                    "主题漂移", similarity));
+            }
+        }
+
+        // 2. 人称一致性检测
+        Set&lt;String&gt; persons = Set.of("我们", "我", "您", "你", "他们");
+        for (String p : persons) {
+            boolean found = false;
+            for (String para : paragraphs) {
+                if (para.contains(p)) {
+                    if (found) continue;
+                    found = true;
+                }
+                if (found &amp;&amp; !para.contains(p)) {
+                    issues.add(new CoherenceIssue(
+                        "人称不一致: '" + p + "' 在段落中突然消失"));
+                    break;
+                }
+            }
+        }
+
+        return issues;
+    }
+}
+
+// 段落去重器
+@Component
+public class Deduplicator {
+
+    public String deduplicate(String text) {
+        String[] paragraphs = text.split("\n\n");
+        List&lt;String&gt; unique = new ArrayList&lt;&gt;();
+
+        for (String para : paragraphs) {
+            boolean duplicate = false;
+            for (String existing : unique) {
+                double sim = jaccardSimilarity(para, existing);
+                if (sim &gt; 0.7) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                unique.add(para);
+            }
+        }
+        return String.join("\n\n", unique);
+    }
+
+    private double jaccardSimilarity(String a, String b) {
+        Set&lt;String&gt; setA = new HashSet&lt;&gt;(List.of(a.split("\\s+")));
+        Set&lt;String&gt; setB = new HashSet&lt;&gt;(List.of(b.split("\\s+")));
+        Set&lt;String&gt; intersection = new HashSet&lt;&gt;(setA);
+        intersection.retainAll(setB);
+        Set&lt;String&gt; union = new HashSet&lt;&gt;(setA);
+        union.addAll(setB);
+        return (double) intersection.size() / union.size();
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>长文评估</h3>
+      <table class="outline-table">
+        <thead><tr><th>评估维度</th><th>方法</th><th>权重</th><th>阈值</th></tr></thead>
+        <tbody>
+          <tr><td>结构完整性</td><td>检查大纲章节是否全部生成</td><td>25%</td><td>100%</td></tr>
+          <tr><td>逻辑连贯性</td><td>相邻段落向量相似度</td><td>30%</td><td>&gt; 0.3</td></tr>
+          <tr><td>事实一致性</td><td>跨段落实体引用一致性</td><td>25%</td><td>无矛盾</td></tr>
+          <tr><td>风格统一</td><td>语调参数偏差检测</td><td>20%</td><td>&lt; 20% 偏差</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>Outline→Segment→Assemble 三步法：大纲 1 次 + 分段 N 次 + 拼接检测</li>
+      <li>连贯性检测通过向量余弦相似度判断相邻段落主题漂移，阈值 0.3</li>
+      <li>Jaccard 相似度 &gt; 0.7 的段落合并去重</li>
+      <li>四维评估体系：结构/连贯/事实/风格，综合评分</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能实现三步法生成长文</label></li>
+        <li><label><input type="checkbox"> 我能实现连贯性检测</label></li>
+        <li><label><input type="checkbox"> 我能实现段落去重</label></li>
+        <li><label><input type="checkbox"> 我能建立长文评估标准</label></li>
+      </ul></div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现 Outline→Segment→Assemble</li>
+      <li>实现连贯性检测器</li>
+      <li>实现去重器</li>
+      <li>用 4 维标准评估长文</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-03-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-basics-04">多模态与素材 RAG</a></li></ul></div>
+</section>

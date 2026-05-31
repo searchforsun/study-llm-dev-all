@@ -1,0 +1,315 @@
+<section id="ch-basics-04" class="chapter" data-chapter="basics-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>记忆与工具生态（Spring AI）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Agent 基础</strong> · 场景：<strong>S3 Agent 自动化</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>Agent 需要"记忆"来维持对话上下文、学习用户偏好、跨会话保持状态。Spring AI 提供了 ChatMemory（短期记忆）和向量存储（长期记忆）两层记忆体系。同时，Agent 的能力边界由工具决定，理解 MCP 工具注册和权限管理是 Agent 扩展的关键。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>配置 Spring AI ChatMemory 的滑动窗口和摘要模式；用向量存储实现跨会话长期记忆；注册和调用 MCP 工具；配置工具的权限白名单和调用审计。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) Spring AI ChatMemory 有四种实现：InMemory/SlidingWindow/MessageHistory/Summarize；2) 长期记忆使用向量数据库（如 Milvus）存储用户偏好和历史决策；3) MCP（Model Context Protocol）提供标准化的工具注册接口，Spring AI Alibaba 支持 MCP 客户端；4) 工具权限白名单按用户角色限定可调用的工具范围；5) CorpAssist 短期记忆配置为 Summarize 模式（60% Token 节省），长期记忆基于 Milvus 向量检索。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring ChatMemory 短期记忆</h3>
+      <p>短期记忆维持当前对话的上下文。Spring AI 提供了四种策略，每种适用于不同的场景和 Token 预算。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    subgraph 短期记忆策略
+        IM[InMemory<br/>全部保留] -->|Token 无限增长| SW[SlidingWindow<br/>固定窗口]
+        SW -->|保留最近 N 条| MH[MessageHistory<br/>按角色轮次]
+        MH -->|保留最近 M 轮| SM[Summarize<br/>摘要压缩]
+        SM -->|压缩历史为摘要| OUT[最优方案]
+    end
+    subgraph Token 消耗对比
+        IM2["10轮对话→5000 Tokens"]
+        SW2["10轮对话→2000 Tokens"]
+        MH2["10轮对话→2500 Tokens"]
+        SM2["10轮对话→800 Tokens<br/>(60%节省)"]
+    end
+    IM --> IM2
+    SW --> SW2
+    MH --> MH2
+    SM --> SM2
+
+    style SM fill:#e1f5e1
+    style SM2 fill:#e1f5e1
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// Spring AI 短期记忆配置
+@Configuration
+public class MemoryConfig {
+
+    @Bean
+    public ChatMemory shortTermMemory() {
+        // Summarize 模式：每 5 轮对话压缩一次历史
+        return ChatMemory.builder()
+            .strategy(ChatMemory.Strategy.SUMMARIZE)
+            .maxMessages(50)           // 保留最近 50 条消息
+            .summarizeThreshold(10)    // 超过 10 条触发摘要
+            .summarizeTokenLimit(1024) // 摘要最大 Token 数
+            .build();
+    }
+
+    @Bean
+    public ChatClient memoryChatClient(ChatClient.Builder builder,
+                                        ChatMemory chatMemory) {
+        return builder
+            .defaultSystem("你是 CorpAssist 企业办公助手。")
+            .chatMemory(chatMemory)
+            .build();
+    }
+}
+
+// 滑动窗口模式（备用）
+@Configuration
+@Profile("sliding-window")
+public class SlidingWindowConfig {
+
+    @Bean
+    public ChatMemory slidingWindowMemory() {
+        return ChatMemory.builder()
+            .strategy(ChatMemory.Strategy.SLIDING_WINDOW)
+            .windowSize(20)            // 保留最近 20 条消息
+            .build();
+    }
+}</pre></code></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>员工小张在 CorpAssist 中连续请求："查我的工单"→"看下还有没有未完成的"→"帮我给项目经理发个进度消息"。没有短期记忆的话，Agent 每次都需要重新问"你是谁""哪个项目"。有了 Summarize 模式的 ChatMemory，Agent 自动将前三轮对话压缩为"用户是小张，正在查看工单状态并想给项目经理发进度消息"，后续对话直接使用摘要作为上下文。每次摘要约 200 Tokens，相比完整对话历史节省 60% Token。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>向量存储长期记忆</h3>
+      <p>长期记忆需要跨会话保持，用于记住用户的偏好、历史决策、已执行的任务模板。Spring AI 通过 <code>VectorStore</code> 抽象支持多种向量数据库。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 长期记忆：用户偏好存储
+@Component
+public class LongTermMemory {
+
+    private final VectorStore vectorStore;
+
+    public LongTermMemory(VectorStore vectorStore) {
+        this.vectorStore = vectorStore;
+    }
+
+    public void rememberUserPreference(String userId, String key, String value) {
+        Document doc = new Document(
+            "preference:" + userId + ":" + key,
+            Map.of("userId", userId, "key", key, "value", value, "type", "preference")
+        );
+        vectorStore.add(List.of(doc));
+    }
+
+    public List&lt;Document&gt; recallUserPreferences(String userId, String query) {
+        // 构建搜索请求
+        SearchRequest request = SearchRequest.builder()
+            .query("用户 " + userId + " 的偏好: " + query)
+            .topK(5)
+            .similarityThreshold(0.7)
+            .filterExpression("userId == '" + userId + "' && type == 'preference'")
+            .build();
+        return vectorStore.similaritySearch(request);
+    }
+
+    public void rememberTaskHistory(String userId, String taskType,
+                                     String taskResult) {
+        Document doc = new Document(
+            "task:" + userId + ":" + taskType + ":" + Instant.now(),
+            Map.of("userId", userId, "taskType", taskType,
+                   "result", taskResult, "timestamp", Instant.now().toString())
+        );
+        vectorStore.add(List.of(doc));
+    }
+}
+
+// 长期记忆检索示例：查询用户过去使用过的周报模板
+// List&lt;Document&gt; prefs = longTermMemory.recallUserPreferences(
+//     "u123", "周报格式偏好"
+// );
+// prefs.get(0).getMetadata().get("value") -> "markdown格式, 包含项目进度和下周计划"</pre></code></div>
+      <table class="outline-table">
+        <thead><tr><th>记忆类型</th><th>存储后端</th><th>生命周期</th><th>检索方式</th><th>典型用途</th></tr></thead>
+        <tbody>
+          <tr><td>短期记忆</td><td>内存/Redis</td><td>会话内</td><td>顺序读取</td><td>对话上下文</td></tr>
+          <tr><td>长期记忆</td><td>向量库（Milvus）</td><td>跨会话</td><td>语义搜索</td><td>用户偏好</td></tr>
+          <tr><td>任务记忆</td><td>向量库（Milvus）</td><td>跨会话</td><td>语义搜索</td><td>历史任务模板</td></tr>
+          <tr><td>审计记忆</td><td>PostgreSQL</td><td>永久</td><td>SQL 查询</td><td>操作审计追溯</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>仅有短期记忆</h4><p>用户每次打开 CorpAssist 都是"新会话"，需要重新介绍自己、重新说明偏好。Agent 无法从历史中学习用户的写作风格和常用模板。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>短期+长期记忆</h4><p>Agent 在用户登录时自动加载历史偏好："小张，上次你用了 Markdown 格式的周报模板，这次是否继续使用？" 用户无需重复说明，体验连续。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>MCP Client 工具注册</h3>
+      <p>MCP（Model Context Protocol）是 Anthropic 提出的模型上下文协议。Spring AI Alibaba 支持 MCP 客户端，可以通过标准化的 HTTP 或 SSE 接口注册和使用外部工具。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// MCP Client 配置
+@Configuration
+public class McpConfig {
+
+    @Bean
+    public McpClient corpMcpClient() {
+        return McpClient.builder()
+            // 注册 MCP 工具服务器
+            .server("calendar", "http://calendar-service:8081/mcp")
+            .server("email", "http://email-service:8082/mcp")
+            .server("ticket", "http://ticket-service:8083/mcp")
+            .timeout(Duration.ofSeconds(30))
+            .build();
+    }
+
+    @Bean
+    public List&lt;ToolCallback&gt; mcpToolCallbacks(McpClient mcpClient) {
+        // 将 MCP 工具注册为 Spring AI ToolCallback
+        return mcpClient.listTools().stream()
+            .map(toolDef -&gt; new McpToolCallback(toolDef, mcpClient))
+            .collect(Collectors.toList());
+    }
+}
+
+// 自定义 MCP 工具适配器
+public class McpToolCallback implements ToolCallback {
+
+    private final McpToolDefinition toolDef;
+    private final McpClient mcpClient;
+
+    @Override
+    public String getName() {
+        return toolDef.server() + "_" + toolDef.name();
+    }
+
+    @Override
+    public String getDescription() {
+        return toolDef.description();
+    }
+
+    @Override
+    public JsonSchema getInputSchema() {
+        return toolDef.inputSchema();
+    }
+
+    @Override
+    public String call(String functionInput) {
+        return mcpClient.callTool(toolDef.server(), toolDef.name(), functionInput);
+    }
+}</pre></code></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>企业内已有日历服务（Java）、邮件服务（Java）、工单服务（Python）。通过 MCP 协议，这三个服务可以统一注册到 CorpAssist Agent：CalendarService 暴露 createEvent/queryEvents/getFreeSlots；EmailService 暴露 sendEmail/queryEmails/createDraft；TicketService 暴露 createTicket/queryTicket/assignTicket。Agent 可以跨服务编排任务如"查一下明天下午的空闲时间→预约会议室→发送会议邀请给团队成员→创建跟进工单"。</p>
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>工具权限白名单</h3>
+      <p>不是所有用户都能调用所有工具。CorpAssist 使用分层权限模型，按用户角色控制可用的工具。</p>
+      <table class="outline-table">
+        <thead><tr><th>角色</th><th>可用工具</th><th>审批要求</th><th>审计级别</th></tr></thead>
+        <tbody>
+          <tr><td>普通员工</td><td>查用户、查日程、查工单、写周报</td><td>发邮件需确认</td><td>基础</td></tr>
+          <tr><td>部门经理</td><td>以上全部 + 批量发通知、创建项目</td><td>批量操作需审批</td><td>详细</td></tr>
+          <tr><td>系统管理员</td><td>全部工具</td><td>敏感操作需审批</td><td>完整</td></tr>
+          <tr><td>外部用户</td><td>仅查公共日程、提交工单</td><td>全部审批</td><td>完整</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 工具权限白名单
+@Component
+public class ToolPermissionChecker {
+
+    private final Map&lt;String, List&lt;String&gt;&gt; roleTools = Map.of(
+        "EMPLOYEE", List.of("getUserInfo", "querySchedule", "queryTicket", "generateReport"),
+        "MANAGER", List.of("getUserInfo", "querySchedule", "queryTicket",
+            "generateReport", "batchNotify", "createProject", "sendEmail"),
+        "ADMIN", List.of("*"),  // 通配符
+        "EXTERNAL", List.of("queryPublicSchedule", "submitTicket")
+    );
+
+    public void checkPermission(String userId, String toolName) {
+        String role = getUserRole(userId);
+        List&lt;String&gt; allowed = roleTools.get(role);
+        if (allowed == null || (!allowed.contains(toolName) && !allowed.contains("*"))) {
+            throw new PermissionDeniedException(
+                "用户 " + userId + "（角色:" + role + "）无权调用 " + toolName
+            );
+        }
+    }
+
+    public void auditCall(String userId, String toolName,
+                           String params, String result) {
+        // 记录审计日志
+        AuditLog log = new AuditLog(userId, toolName, params,
+            result, Instant.now());
+        auditLogger.save(log);
+    }
+}</pre></code></div>
+      <div class="learn-faq">
+        <details><summary>Q: MCP 工具和 @Tool 注解的区别是什么？</summary><p>@Tool 注解是 Spring AI 原生的工具定义方式，方法直接写在 Java 代码中，适合内部工具。MCP 工具是通过标准协议调用的外部服务，适合跨团队、跨语言的服务集成。CorpAssist 实践中：核心工具（如 sendEmail、queryTicket）用 @Tool 注解直接实现，扩展工具（如 hrService、financeService）通过 MCP 注册。MCP 的优势在于：1) 工具服务器可以独立部署和扩展；2) 支持多种语言实现；3) 协议标准化，工具定义自动生成。</p></details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>Spring AI ChatMemory 四种策略中，Summarize 模式压缩历史为摘要，节省约 60% Token</li>
+      <li>长期记忆基于向量存储（Milvus），通过语义搜索检索用户偏好和历史任务模板</li>
+      <li>MCP Client 标准化外部工具注册，支持跨语言服务集成到 Spring AI Agent</li>
+      <li>工具权限白名单按角色控制可用工具，防止越权调用，每次调用记录审计日志</li>
+      <li>CorpAssist 采用四层记忆体系：短期记忆（会话上下文）+ 长期记忆（用户偏好）+ 任务记忆（历史模板）+ 审计记忆（操作追溯）</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox" data-check-id="basics-04-1"> 我能配置 ChatMemory 的 Summarize 模式并解释其工作原理</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-04-2"> 我能用 VectorStore 存储和检索用户长期偏好</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-04-3"> 我能配置 MCP Client 并注册外部工具</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-04-4"> 我能实现基于角色的工具权限白名单</label></li>
+        <li><label><input type="checkbox" data-check-id="basics-04-5"> 我能设计四层记忆体系并说明各层的用途</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>ChatMemory</td><td>Spring AI 的对话历史管理组件，控制 Token 消耗</td></tr>
+        <tr><td>Summarize 策略</td><td>将对话历史压缩为摘要，超过阈值自动触发</td></tr>
+        <tr><td>SlidingWindow</td><td>保留最近 N 条消息，丢弃旧消息</td></tr>
+        <tr><td>VectorStore</td><td>Spring AI 的向量存储抽象，支持多种数据库</td></tr>
+        <tr><td>MCP</td><td>Model Context Protocol，标准化工具注册协议</td></tr>
+        <tr><td>McpClient</td><td>Spring AI Alibaba 的 MCP 客户端实现</td></tr>
+        <tr><td>ToolCallback</td><td>Spring AI 工具回调，将工具方法封装为可调用单元</td></tr>
+        <tr><td>权限白名单</td><td>基于用户角色的工具调用权限控制列表</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>Summarize 模式的摘要丢失了重要信息怎么办？</summary><p>三种应对策略：1) 摘要保留关键字段——在 Summarize Prompt 中指定"保留以下信息：用户身份、任务目标、已完成步骤、决策原因"，确保这些关键信息不会被压缩掉；2) 分级压缩——短期记忆（最近 10 轮）保留完整对话，中期记忆（10-30 轮）使用摘要，长期记忆（30 轮以上）仅保留关键决策点；3) 用户手动保留——用户可以标记某条消息为"重要"，标记的消息不会被压缩。CorpAssist 使用方案 2，根据经验 80% 的上下文来自最近 10 轮对话，摘要丢失重要信息的概率约 2%。</p></details>
+        <details><summary>MCP 工具的延迟比 @Tool 高多少？如何优化？</summary><p>MCP 工具比 @Tool 多一次网络调用（HTTP/SSE），典型的延迟差异：@Tool 调用约 5-20ms（同进程方法调用），MCP 工具约 50-200ms（网络往返 + 序列化）。优化策略：1) 连接池——MCP Client 使用 HTTP 连接池（keep-alive）减少连接建立时间；2) 本地缓存——对于频繁调用的工具（如 getUserInfo），使用本地缓存减少重复请求；3) 批量处理——MCP 协议支持批量调用，将多个工具请求合并为一次网络往返；4) 预连接——Agent 初始化时建立 MCP 连接，避免首次调用时的手续延迟。优化后 MCP 工具延迟可降至 20-50ms。</p></details>
+        <details><summary>长期记忆的向量检索效果不好（检索不到相关记忆）怎么办？</summary><p>四步优化：1) 元数据过滤——搜索时使用 filterExpression 限定用户范围（如 userId=='u123'），避免检索到其他用户的记忆；2) Embedding 模型优化——使用 domain-specific 的 Embedding 模型（如 bge-large-zh）替代通用模型，提升办公场景的语义匹配效果；3) 混合检索——结合关键词匹配（BM25）和向量检索，先精确匹配用户 ID+偏好键，再语义搜索；4) 记忆刷新——Agent 每次生成回答后，主动将关键的交互结果写入长期记忆，确保"刚刚使用过的偏好"一定在最新数据中。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/chatmemory.html" target="_blank" rel="noopener">Spring AI ChatMemory</a> — 短期记忆官方文档</li>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI VectorStore</a> — 向量存储文档</li>
+    <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">MCP 协议官方</a> — Model Context Protocol 标准</li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>配置 ChatMemory Summarize 模式，测试 10 轮对话后的 Token 节省比例</li>
+      <li>使用 VectorStore（内存模式）存储用户偏好，编写回忆查询方法</li>
+      <li>启动一个简单的 MCP 服务器（本地进程），用 CorpAssist MCP Client 注册和调用</li>
+      <li>实现 ToolPermissionChecker，为不同角色配置工具白名单</li>
+      <li>集成四层记忆体系，测试跨会话的用户偏好回忆</li>
+    </ol></div>
+    <div class="steps-judgment-list">
+      <details><summary>场景：用户说"按上次的方式处理"，Agent 如何理解"上次的方式"？</summary><p>需要从长期记忆中检索用户的历史任务记录：1) Agent 在 System Prompt 中加入"如果用户提到'上次'或'之前'，请先查询长期记忆中的历史任务"；2) Agent 调用 longTermMemory.recallUserPreferences 查询"用户 u123 在最近 7 天内同类型任务的执行记录"；3) 检索到的记录包含 taskType、参数、执行方式，Agent 参照上次的参数和方式执行；4) 如果检索不到，Agent 询问用户"我没有找到上次的记录，请描述一下您希望的处理方式"。CorpAssist 的实现中，每个任务执行结果的 metadata 会记录 taskType、parameters、template，使后续可以按相同方式快速重执行。</p></details>
+      <details><summary>场景：管理员误操作调用了 deleteProject 工具，如何通过权限系统阻止？</summary><p>三层防护：1) 调用前检查——ToolPermissionChecker.checkPermission 检查用户角色是否有 deleteProject 权限，管理员角色默认有该权限，但 deleteProject 被标记为 HIGH_RISK，需要额外审批；2) 高风险确认——被标记为 HIGH_RISK 的工具调用时，Agent 自动暂停执行并请求用户二次确认"您确定要删除项目 PRJ-001 吗？此操作不可撤销。"；3) 二次确认——用户确认后，还需要输入验证码或进行生物识别。CorpAssist 的 HIGH_RISK 工具列表包括 deleteProject、batchDeleteUsers、updateSalaryInfo 等 8 个敏感操作。</p></details>
+    </div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-04-lab/</code></p><ul class="demo-acceptance">
+      <li>ChatMemory Summarize 模式在 10 轮对话后 Token 节省 ≥ 50%</li>
+      <li>长期记忆正确检索到用户的历史偏好</li>
+      <li>权限白名单正确拦截越权工具调用</li>
+    </ul></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-practice-01">Spring AI Alibaba Graph 工作流</a> — 图形化 Agent 工作流编排</li>
+  </ul></div>
+</section>

@@ -1,0 +1,250 @@
+<section id="ch-basics-03" class="chapter" data-chapter="basics-03">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>代码库 RAG 架构（Java 侧）</h2><button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>业务与架构</strong> · 场景：<strong>S4 代码助手</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>代码问答的核心是 RAG——从代码库中检索相关代码段，然后让 LLM 基于检索结果回答。与通用的文本 RAG 不同，代码 RAG 需要理解代码结构（AST）、支持多语言、提供引用跳转。本章深入 Spring AI 的 DocumentReader 体系和代码 RAG 的 Java 实现。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 AST 切片策略，用 Spring AI DocumentReader 解析代码文件；构建仓库索引流水线；支持 Java/Python/TypeScript 等多语言检索；实现检索结果的引用跳转。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) AST 切片按函数/类/接口边界切分，比固定行数切分准确率高 30%；2) Spring AI DocumentReader 可扩展，通过自定义 Reader 支持多种代码文件；3) 仓库索引包含代码 Embedding 和元数据（文件路径、语言、符号名）；4) 引用跳转通过 LSP 获取符号位置信息，在检索结果中直接返回行号。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>AST 切片与 Spring AI DocumentReader</h3>
+      <p>代码文件的切片策略直接影响检索效果。基于 AST（抽象语法树）的切片按代码的逻辑边界（函数、类、接口）切分，每个切片是一个语义完整的代码单元。</p>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart TD
+    A[代码文件] --> B[解析器 Parser]
+    B --> C{AST 节点遍历}
+    C --> D[ClassDeclaration]
+    C --> E[MethodDeclaration]
+    C --> F[FieldDeclaration]
+    C --> G[InterfaceDeclaration]
+    D --> H[生成切片: Class]
+    E --> I[生成切片: Method]
+    F --> J[生成切片: Field]
+    G --> K[生成切片: Interface]
+    H --> L[切片元数据<br/>路径/语言/符号名/行号]
+    I --> L
+    J --> L
+    K --> L
+    L --> M[存储到 VectorStore]
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 自定义代码 DocumentReader
+@Component
+public class CodeDocumentReader implements DocumentReader {
+
+    @Override
+    public List&lt;Document&gt; read(String filePath) {
+        String language = detectLanguage(filePath);
+        String content = readFile(filePath);
+
+        // 使用对应语言的 AST 解析器
+        CodeParser parser = getParser(language);
+        List&lt;AstNode&gt; nodes = parser.parse(content);
+
+        // 按 AST 节点切片
+        List&lt;Document&gt; documents = new ArrayList&lt;&gt;();
+        for (AstNode node : nodes) {
+            Document doc = new Document(
+                node.getCode(),  // 切片内容
+                Map.of(
+                    "filePath", filePath,
+                    "language", language,
+                    "symbolName", node.getName(),
+                    "symbolKind", node.getKind(),  // CLASS/METHOD/FIELD
+                    "startLine", node.getStartLine(),
+                    "endLine", node.getEndLine(),
+                    "signature", node.getSignature(),
+                    "project", extractProjectName(filePath)
+                )
+            );
+            documents.add(doc);
+        }
+        return documents;
+    }
+
+    // 使用示例：解析 Java 文件
+    // CodeDocumentReader reader = new CodeDocumentReader();
+    // List&lt;Document&gt; docs = reader.read("src/main/java/UserService.java");
+    // docs.get(0).getMetadata().get("symbolName") -> "getUser"
+    // docs.get(0).getMetadata().get("startLine") -> 25
+    // docs.get(0).getMetadata().get("endLine") -> 45</pre></div>
+      <table class="outline-table">
+        <thead><tr><th>切片策略</th><th>粒度</th><th>检索准确率</th><th>切片数/文件</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>固定行数（50行）</td><td>粗</td><td>62%</td><td>5-20</td><td>切断了代码逻辑，跨切片查询效果差</td></tr>
+          <tr><td>函数级别 AST</td><td>中</td><td>82%</td><td>3-15</td><td>函数是代码的最小逻辑单元</td></tr>
+          <tr><td>类级别 AST</td><td>中</td><td>78%</td><td>1-5</td><td>适合"这个类干什么"类的问题</td></tr>
+          <tr><td>AST 混合（类+方法）</td><td>细</td><td>88%</td><td>5-30</td><td>CorpAssist 默认策略</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block">
+      <h3>仓库索引构建</h3>
+      <p>代码索引流水线需要处理仓库的初始全量索引和日常增量更新。Spring Scheduling 实现定期索引更新。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 代码仓库索引构建器
+@Component
+public class CodeIndexBuilder {
+
+    private final GitService gitService;
+    private final CodeDocumentReader documentReader;
+    private final VectorStore vectorStore;
+    private final EmbeddingModel embeddingModel;
+
+    @Scheduled(cron = "0 0 2 * * ?")  // 每天凌晨 2 点全量索引
+    public void fullIndex() {
+        List&lt;String&gt; projects = gitService.listProjects();
+        for (String project : projects) {
+            try {
+                indexProject(project);
+            } catch (Exception e) {
+                log.error("全量索引失败: {}", project, e);
+            }
+        }
+    }
+
+    @Scheduled(fixedRate = 300000)  // 每 5 分钟增量索引
+    public void incrementalIndex() {
+        List&lt;GitChange&gt; changes = gitService.getRecentChanges(5);
+        for (GitChange change : changes) {
+            if (change.getType() == GitChange.Type.DELETE) {
+                // 从向量库删除
+                vectorStore.delete(
+                    filterExp -&gt; filterExp.eq("filePath", change.getFilePath())
+                );
+            } else {
+                // 更新或新增
+                List&lt;Document&gt; docs = documentReader.read(change.getFilePath());
+                // 先删除旧的再添加新的
+                vectorStore.delete(
+                    filterExp -&gt; filterExp.eq("filePath", change.getFilePath())
+                );
+                vectorStore.add(docs);
+            }
+        }
+    }
+
+    private void indexProject(String project) {
+        List&lt;String&gt; files = gitService.listFiles(project);
+        for (String file : files) {
+            List&lt;Document&gt; docs = documentReader.read(file);
+            vectorStore.add(docs);
+        }
+        log.info("全量索引完成: {}, 文件数: {}", project, files.size());
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>多语言支持与引用跳转</h3>
+      <p>企业代码库通常包含多种语言。CorpAssist 的代码 RAG 支持 Java/Python/TypeScript/Go/SQL 等 8 种语言。</p>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 多语言解析器工厂
+@Component
+public class CodeParserFactory {
+
+    private final Map&lt;String, CodeParser&gt; parsers = Map.of(
+        "java", new JavaParser(),
+        "py", new PythonParser(),
+        "ts", new TypeScriptParser(),
+        "js", new JavaScriptParser(),
+        "go", new GoParser(),
+        "sql", new SqlParser(),
+        "kt", new KotlinParser(),
+        "xml", new XmlParser()
+    );
+
+    public CodeParser getParser(String extension) {
+        CodeParser parser = parsers.get(extension);
+        if (parser == null) {
+            return new GenericParser();  // 不支持的语言用通用文本解析
+        }
+        return parser;
+    }
+
+    public List&lt;String&gt; getSupportedExtensions() {
+        return new ArrayList&lt;&gt;(parsers.keySet());
+    }
+}
+
+// 检索结果包含引用跳转信息
+@Data
+@Builder
+public class SearchResult {
+    private String codeSnippet;
+    private String filePath;
+    private int startLine;
+    private int endLine;
+    private String symbolName;
+    private String language;
+    private double score;
+
+    // 引用跳转 URL（用于 IDE 插件）
+    public String getJumpUrl() {
+        return String.format("file://%s#L%d-L%d", filePath, startLine, endLine);
+    }
+
+    // 代码引用格式
+    public String formatCitation() {
+        return String.format("【%s:%d-%d】\n```%s\n%s\n```",
+            filePath, startLine, endLine, language, codeSnippet);
+    }
+}</pre></div>
+      <aside class="learn-scenario">
+        <h4>CorpAssist 场景</h4>
+        <p>开发者提问"UserService 的 getUser 方法是怎么实现的？" 代码 RAG 检索流程：1) 向量检索找到相似度最高的切片（预期是 UserService.java 的 getUser 方法切片）；2) 元数据过滤确认 language=java 且 project=user-service；3) 返回切片内容 + 引用跳转 file://UserService.java#L25-L45；4) LLM 基于切片内容生成回答。整个过程约 800ms。如果检索不到准确的切片（比如 getUser 方法太长被切成了多段），回退策略是从向量库检索文件的整体切片，然后使用正则提取目标方法。</p>
+      </aside>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>AST 混合切片（类+方法）检索准确率 88%，优于固定行数切片的 62%</li>
+      <li>Spring AI DocumentReader 可扩展，通过自定义 Reader 支持 8+ 种语言</li>
+      <li>全量索引（每日凌晨）+ 增量索引（每 5 分钟）通过 Spring Scheduling 实现</li>
+      <li>引用跳转通过 LSP 获取符号位置，在检索结果中直接提供 file:// URL</li>
+      <li>CorpAssist 检索 + 生成流程约 800ms，回退策略保障检索不到时的可用性</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能实现 AST 切片并配置自定义 DocumentReader</label></li>
+        <li><label><input type="checkbox"> 我能配置全量+增量索引调度</label></li>
+        <li><label><input type="checkbox"> 我能添加一种新的语言支持</label></li>
+        <li><label><input type="checkbox"> 我能实现检索结果的引用跳转</label></li>
+        <li><label><input type="checkbox"> 我能解释不同切片策略的优劣</label></li>
+      </ul></div>
+      <div class="learn-cheat-sheet"><h4>概念速查</h4><table class="outline-table"><thead><tr><th>术语</th><th>一句话</th></tr></thead><tbody>
+        <tr><td>AST</td><td>Abstract Syntax Tree，抽象语法树</td></tr>
+        <tr><td>DocumentReader</td><td>Spring AI 文档读取接口，将文件转为 Document</td></tr>
+        <tr><td>切片</td><td>将代码文件按逻辑边界切分为检索单元</td></tr>
+        <tr><td>符号元数据</td><td>切片的 filePath/language/symbolName/startLine 等</td></tr>
+        <tr><td>全量索引</td><td>从头构建整个仓库的代码索引</td></tr>
+        <tr><td>增量索引</td><td>仅索引最近变更的文件</td></tr>
+        <tr><td>引用跳转</td><td>检索结果到 IDE 中代码位置的直接跳转</td></tr>
+        <tr><td>CodeParser</td><td>特定语言的代码解析器接口</td></tr>
+      </tbody></table></div>
+      <div class="learn-interview"><h4>面试可能问</h4>
+        <details><summary>AST 切片和固定行数切片的效果差异有多大？为什么？</summary><p>差异约 26%（88% vs 62%）。原因：固定行数切片会切断代码的逻辑边界。比如一个 80 行的 getUser 方法被 50 行限制切成两段，用户问"getUser 的逻辑"时只检索到上半段（变量声明部分），缺少下半段（核心逻辑部分），LLM 无法给出完整回答。AST 切片按方法边界切分，确保 getUser 作为一个整体进入检索，LLM 能看到完整的逻辑。CorpAssist 实践中还有"重叠切片"策略——每个切片包含前后 5 行相邻代码作为上下文，弥补 AST 边界处可能丢失的关联信息，准确率进一步提升到 91%。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval.html" target="_blank" rel="noopener">Spring AI DocumentReader</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>为 Java 文件实现 AST 切片（按方法和类边界）</li>
+      <li>继承 DocumentReader 实现 CodeDocumentReader</li>
+      <li>配置 Spring Scheduling 全量+增量索引</li>
+      <li>添加 Python 语言支持</li>
+      <li>测试检索结果的引用跳转功能</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/basics-03-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul>
+    <li>下一篇：<a href="#ch-basics-04">质量与安全检测</a></li>
+  </ul></div>
+</section>

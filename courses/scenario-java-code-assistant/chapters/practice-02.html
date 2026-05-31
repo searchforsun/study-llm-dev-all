@@ -1,0 +1,213 @@
+<section id="ch-practice-02" class="chapter" data-chapter="practice-02">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>仓库问答 API（Spring Boot）</h2><button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S4 代码助手</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>代码索引建好后，需要 API 将索引能力暴露给用户。本章实现完整的仓库问答 API：Controller 设计、检索+生成 Pipeline、引用代码块展示、SSE 流式输出。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>设计 REST API 暴露代码检索和问答能力；实现检索+生成 RAG Pipeline；在回答中嵌入引用代码块；实现 SSE 流式传输减少首字节延迟。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) 两个核心 API：/api/code/search（检索）和 /api/code/ask（问答）；2) RAG Pipeline 三阶段：搜索→增强→生成；3) 引用代码块格式包含文件路径+行号+代码片段，支持 IDE 跳转；4) SSE 流式输出通过 Spring WebFlux 的 SseEmitter 或 Flux 实现。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Controller 设计</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 仓库问答 Controller
+@RestController
+@RequestMapping("/api/code")
+public class CodeQueryController {
+
+    private final CodeRetriever codeRetriever;
+    private final CodeGenerator codeGenerator;
+    private final TokenBudgetManager tokenBudget;
+
+    @PostMapping("/search")
+    public ResponseEntity&lt;List&lt;SearchResult&gt;&gt; search(
+            @RequestBody SearchRequest request) {
+        // 检索代码切片
+        List&lt;SearchResult&gt; results = codeRetriever.search(
+            request.getProjectId(),
+            request.getQuery(),
+            request.getTopK()
+        );
+        return ResponseEntity.ok(results);
+    }
+
+    @PostMapping("/ask")
+    public ResponseEntity&lt;AskResponse&gt; ask(
+            @RequestBody AskRequest request) {
+        // 1. 检索
+        List&lt;SearchResult&gt; contexts = codeRetriever.search(
+            request.getProjectId(), request.getQuery(), 5);
+
+        // 2. 拼装上下文（Token 预算管理）
+        String codeContext = tokenBudget.formatContext(contexts);
+
+        // 3. 生成回答
+        String answer = codeGenerator.generate(
+            request.getQuery(),
+            request.getLanguage(),
+            codeContext,
+            contexts  // 用于引用
+        );
+
+        return ResponseEntity.ok(new AskResponse(answer, contexts));
+    }
+
+    // SSE 流式问答
+    @PostMapping(value = "/ask/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter askStream(@RequestBody AskRequest request) {
+        SseEmitter emitter = new SseEmitter(30_000L);  // 30 秒超时
+
+        executor.execute(() -&gt; {
+            try {
+                // 先发送检索结果（快速）
+                List&lt;SearchResult&gt; contexts = codeRetriever
+                    .search(request.getProjectId(), request.getQuery(), 5);
+                emitter.send(SseEmitter.event()
+                    .name("context")
+                    .data(contexts));
+
+                // 再流式生成回答
+                Flux&lt;String&gt; stream = codeGenerator
+                    .generateStream(request.getQuery(), request.getLanguage(),
+                        tokenBudget.formatContext(contexts), contexts);
+                stream.subscribe(
+                    chunk -&gt; emitter.send(SseEmitter.event()
+                        .name("token").data(chunk)),
+                    emitter::completeWithError,
+                    emitter::complete
+                );
+            } catch (Exception e) {
+                emitter.completeWithError(e);
+            }
+        });
+
+        return emitter;
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>检索+生成 Pipeline</h3>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant API as Controller
+    participant R as Retriever
+    participant G as Generator
+    participant V as VectorStore
+
+    U->>API: "UserService.getUser 的实现?"
+    API->>R: search("getUser", topK=5)
+    R->>V: 向量检索
+    V-->>R: 5 个切片
+    R-->>API: SearchResults
+
+    API->>G: generate(question + context)
+    G->>G: 拼装 Prompt<br/>System+切片+问题
+    G->>G: LLM 生成回答
+    G-->>API: Answer + Citations
+    API-->>U: JSON {answer, citations}
+        </pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>引用代码块与 SSE 流式</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 引用代码块格式化
+@Component
+public class CitationFormatter {
+
+    public String formatCitations(List&lt;SearchResult&gt; results) {
+        StringBuilder sb = new StringBuilder("\n\n**引用代码：**\n");
+        int idx = 1;
+        for (SearchResult r : results) {
+            sb.append(String.format(
+                "\n[%d] %s:%d-%d\n```%s\n%s\n```\n",
+                idx++, r.getFilePath(), r.getStartLine(),
+                r.getEndLine(), r.getLanguage(), r.getCodeSnippet()
+            ));
+        }
+        return sb.toString();
+    }
+}
+
+// SSE 流式配置
+@Configuration
+public class SseConfig {
+
+    @Bean
+    public CodeGenerator codeGenerator(ChatClient.Builder builder) {
+        return new CodeGenerator(builder.build());
+    }
+}
+
+@Component
+public class CodeGenerator {
+
+    private final ChatClient chatClient;
+
+    public Flux&lt;String&gt; generateStream(String query, String language,
+                                        String context,
+                                        List&lt;SearchResult&gt; citations) {
+        return chatClient.prompt()
+            .user(u -&gt; u.text("""
+                请回答以下代码问题。
+
+                相关代码上下文：
+                {context}
+
+                问题：{query}
+                编程语言：{language}
+
+                回答要求：
+                - 引用具体代码行
+                - 给出代码示例
+                - 不确定时说明"不确定"
+                """)
+                .param("context", context)
+                .param("query", query)
+                .param("language", language)
+            )
+            .stream()
+            .content()
+            .concatWithValues( // 追加引用
+                Flux.just(formatCitations(citations)).toString()
+            );
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>Controller 提供 search/ask/ask-stream 三个 API 端点</li>
+      <li>RAG Pipeline 三阶段：向量检索(800ms) + 上下文拼装(200ms) + LLM 生成(2-5s)</li>
+      <li>引用代码块包含文件路径+行号+代码片段，SSE 流式减少首字节延迟</li>
+      <li>SseEmitter 30 秒超时 + Flux 流式输出</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能设计代码检索和问答 API</label></li>
+        <li><label><input type="checkbox"> 我能实现 RAG Pipeline</label></li>
+        <li><label><input type="checkbox"> 我能格式化引用代码块</label></li>
+        <li><label><input type="checkbox"> 我能实现 SSE 流式输出</label></li>
+      </ul></div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html" target="_blank" rel="noopener">Spring SSE</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现 search 和 ask 两个 REST API</li>
+      <li>实现 RAG Pipeline 三阶段</li>
+      <li>格式化引用代码块包含行号跳转信息</li>
+      <li>实现 SSE 流式问答</li>
+      <li>测试不同 query 的流式响应时间</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-02-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-03">补全与生成 Prompt</a></li></ul></div>
+</section>

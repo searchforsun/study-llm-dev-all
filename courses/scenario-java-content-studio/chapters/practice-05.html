@@ -1,0 +1,195 @@
+<section id="ch-practice-05" class="chapter" data-chapter="practice-05">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>Spring 编排创作 API</h2><button type="button" class="btn-mark-done" data-chapter="practice-05" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S5 内容生成工坊</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>内容工坊的 API 设计需要支持交互式生成（SSE 流式）和批量生成（回调通知）。本章实现完整的创作 API：Controller + SSE 流式输出、批量生成回调、与 Python 生成服务的契约对接。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>实现 Controller + SSE 流式内容生成；配置批量生成完成后回调通知；定义 Python 生成服务的 API 契约；执行验收测试。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) SSE 流式：/api/content/generate-stream 实时输出生成 Token；2) 批量生成回调：/api/content/batch/callback 接收完成通知；3) Python 生成服务契约：OpenAPI 3.0 规范生成接口；4) 验收清单 8 项覆盖功能/性能/安全。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>Controller + SSE 流式</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 内容生成 API
+@RestController
+@RequestMapping("/api/content")
+public class ContentController {
+
+    private final ContentGenerator generator;
+    private final BatchContentService batchService;
+
+    @PostMapping("/generate")
+    public ResponseEntity&lt;GenerateResponse&gt; generate(
+            @RequestBody GenerateRequest request) {
+        String content = generator.generate(request);
+        return ResponseEntity.ok(new GenerateResponse(content));
+    }
+
+    @PostMapping(value = "/generate-stream",
+                 produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter generateStream(@RequestBody GenerateRequest request) {
+        SseEmitter emitter = new SseEmitter(60_000L);
+
+        executor.execute(() -&gt; {
+            try {
+                // 流式生成 Token
+                Flux&lt;String&gt; stream = generator.generateStream(request);
+                stream.subscribe(
+                    token -&gt; emitter.send(SseEmitter.event()
+                        .name("token").data(token)),
+                    err -&gt; {
+                        emitter.send(SseEmitter.event()
+                            .name("error").data(err.getMessage()));
+                        emitter.complete();
+                    },
+                    () -&gt; {
+                        emitter.send(SseEmitter.event()
+                            .name("done").data(""));
+                        emitter.complete();
+                    }
+                );
+            } catch (Exception e) {
+                emitter.completeWithError(e);
+            }
+        });
+        return emitter;
+    }
+
+    @PostMapping("/batch")
+    public ResponseEntity&lt;BatchResponse&gt; batchGenerate(
+            @RequestBody BatchRequest request) {
+        String batchId = batchService.startBatch(
+            request.getTemplateId(),
+            request.getVariablesList(),
+            request.getCallbackUrl()  // 生成完成后的回调
+        );
+        return ResponseEntity.accepted()
+            .body(new BatchResponse(batchId, "IN_PROGRESS"));
+    }
+
+    @GetMapping("/batch/{batchId}/progress")
+    public ResponseEntity&lt;BatchProgress&gt; getProgress(
+            @PathVariable String batchId) {
+        return ResponseEntity.ok(progressTracker.getProgress(batchId));
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>批量生成回调与 Python 契约</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 批量生成回调处理
+@Component
+public class BatchCallbackHandler {
+
+    private final RestTemplate restTemplate;
+
+    @Async
+    public void notifyCompletion(String batchId, String callbackUrl) {
+        BatchResult result = batchService.getResult(batchId);
+        CallbackPayload payload = new CallbackPayload(
+            batchId, "COMPLETED",
+            result.getTotalCount(), result.getSuccessCount(),
+            result.getFailedCount(), result.getResults()
+        );
+
+        try {
+            restTemplate.postForEntity(callbackUrl, payload, String.class);
+            log.info("Batch {} callback sent to {}", batchId, callbackUrl);
+        } catch (Exception e) {
+            log.error("Batch {} callback failed: {}", batchId, e.getMessage());
+            // 重试 3 次
+            retryCallback(batchId, callbackUrl, 0);
+        }
+    }
+
+    private void retryCallback(String batchId, String url, int attempt) {
+        if (attempt &gt;= 3) return;
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.schedule(() -&gt; {
+            try {
+                notifyCompletion(batchId, url);
+            } catch (Exception e) {
+                retryCallback(batchId, url, attempt + 1);
+            }
+        }, 5 * (attempt + 1), TimeUnit.SECONDS);
+    }
+}
+
+// Python 生成服务契约（OpenAPI 3.0）
+// openapi: 3.0.0
+// info:
+//   title: CorpAssist Content Generation Service
+//   version: 1.0.0
+// paths:
+//   /api/generate:
+//     post:
+//       requestBody:
+//         content:
+//           application/json:
+//             schema:
+//               type: object
+//               properties:
+//                 template_id: { type: string }
+//                 variables: { type: object }
+//                 brand_tone: { type: object }
+//               required: [template_id, variables]
+//       responses:
+//         '200':
+//           description: 生成成功
+//           content:
+//             text/event-stream:
+//               schema:
+//                 type: string
+//   /api/health:
+//     get:
+//       responses:
+//         '200':
+//           description: 健康检查</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>验收</h3>
+      <table class="outline-table">
+        <thead><tr><th>验收项</th><th>标准</th><th>方法</th></tr></thead>
+        <tbody>
+          <tr><td>SSE 流式</td><td>首 Token &lt; 1s</td><td>curl 测试</td></tr>
+          <tr><td>批量生成</td><td>100 条 &lt; 5 分钟</td><td>Jmeter</td></tr>
+          <tr><td>回调通知</td><td>成功率 &gt; 99%</td><td>Mock 回调服务</td></tr>
+          <tr><td>Python 对接</td><td>契约测试通过</td><td>OpenAPI 验证</td></tr>
+          <tr><td>错误处理</td><td>错误时返回友好提示</td><td>模拟故障</td></tr>
+        </tbody>
+      </button>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>SSE 流式 API 首 Token &lt; 1s，支持实时内容生成</li>
+      <li>批量生成回调支持 3 次重试（间隔 5/10/15 秒）</li>
+      <li>Python 服务契约基于 OpenAPI 3.0</li>
+      <li>验收 5 项：SSE/批量/回调/契约/错误处理</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能实现 SSE 流式 API</label></li>
+        <li><label><input type="checkbox"> 我能配置回调通知</label></li>
+        <li><label><input type="checkbox"> 我能定义 Python 服务契约</label></li>
+        <li><label><input type="checkbox"> 我能执行验收测试</label></li>
+      </ul></div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://swagger.io/specification/" target="_blank" rel="noopener">OpenAPI 3.0</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现 SSE 流式生成</li>
+      <li>实现批量回调通知</li>
+      <li>定义 Python 服务契约</li>
+      <li>执行 5 项验收测试</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-05-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-advanced-01">合规与有害内容防护</a></li></ul></div>
+</section>

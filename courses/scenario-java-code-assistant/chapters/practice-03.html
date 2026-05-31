@@ -1,0 +1,220 @@
+<section id="ch-practice-03" class="chapter" data-chapter="practice-03">
+  <header class="chapter-header"><h2><span class="chapter-done-badge">已完成</span>补全与生成 Prompt</h2><button type="button" class="btn-mark-done" data-chapter="practice-03" aria-label="标记本章完成">标记完成</button></header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30</strong> 分钟 · 阶段：<strong>Java 栈实战</strong> · 场景：<strong>S4 代码助手</strong></p>
+      <div class="notice notice-why-learn"><h4>为什么学这章</h4><p>代码补全的 Prompt 与对话模型完全不同，FIM（Fill-in-the-Middle）格式要求模型根据前后文填充中间代码。本章深入 FIM 格式、上下文精确拼装、风格约束、多文件补全策略。</p></div>
+      <div class="notice notice-outcome"><h4>学完后能做什么</h4><p>构造 FIM 格式的补全 Prompt；精确选择光标前后的上下文；配置代码风格约束（缩进/命名/注释风格）；实现跨文件的多文件补全。</p></div>
+      <div class="notice"><h4>本章要点速记</h4><p>1) FIM 格式：prefix（光标前代码） + suffix（光标后代码） + middle（LLM 填充）；2) 上下文选择规则：光标前 300 Tokens + 光标后 200 Tokens 是最优组合；3) 风格约束通过 infile 示例（同一文件已有的代码风格）隐式传递；4) 多文件补全需要额外注入当前打开的其他文件中相关符号的定义。</p></div>
+    </div>
+
+    <div class="section-block">
+      <h3>FIM 格式</h3>
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+flowchart LR
+    A[源码文件] --> B[光标位置拆分]
+    B --> C[Prefix: 光标前]
+    B --> D[Suffix: 光标后]
+    C --> E[FIM Prompt<br/>prefix + suffix]
+    D --> E
+    E --> F[FIM 模型<br/>CodeQwen/StarCoder]
+    F --> G[Middle: 补全内容]
+    G --> H[prefix + middle + suffix<br/>= 完整代码]
+        </pre>
+      </div>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// FIM Prompt 构造器
+@Component
+public class FimPromptBuilder {
+
+    private static final int PREFIX_TOKENS = 300;
+    private static final int SUFFIX_TOKENS = 200;
+    private static final int MAX_LINE_LENGTH = 120;
+
+    public FimPrompt build(String fileContent, int cursorLine,
+                            int cursorColumn, String language) {
+        // 1. 按光标位置拆分 prefix 和 suffix
+        String[] lines = fileContent.split("\n", -1);
+
+        StringBuilder prefix = new StringBuilder();
+        int prefixChars = 0;
+        int targetChars = estimateChars(PREFIX_TOKENS);
+
+        // 从光标前开始，向前取目标 Tokens 的内容
+        for (int i = Math.max(0, cursorLine - 50); i &lt; cursorLine; i++) {
+            String line = lines[i] + "\n";
+            prefixChars += line.length();
+            if (prefixChars &gt; targetChars) {
+                prefix.append("// ... 上下文截断 ...\n");
+                break;
+            }
+            prefix.append(line);
+        }
+        // 光标位置的前半行
+        prefix.append(lines[cursorLine], 0, cursorColumn);
+
+        // 取光标后的内容
+        StringBuilder suffix = new StringBuilder();
+        int suffixChars = 0;
+        int targetSuffix = estimateChars(SUFFIX_TOKENS);
+
+        // 光标位置的后半行
+        if (cursorColumn &lt; lines[cursorLine].length()) {
+            suffix.append(lines[cursorLine].substring(cursorColumn)).append("\n");
+            suffixChars += suffix.length();
+        }
+        for (int i = cursorLine + 1; i &lt; Math.min(cursorLine + 30, lines.length); i++) {
+            String line = lines[i] + "\n";
+            suffixChars += line.length();
+            if (suffixChars &gt; targetSuffix) {
+                suffix.append("// ... 上下文截断 ...\n");
+                break;
+            }
+            suffix.append(line);
+        }
+
+        return new FimPrompt(prefix.toString(), suffix.toString());
+    }
+
+    public String formatForModel(FimPrompt fim) {
+        // CodeQwen FIM 格式
+        return "&lt;fim_prefix&gt;" + fim.prefix()
+            + "&lt;fim_suffix&gt;" + fim.suffix()
+            + "&lt;fim_middle&gt;";
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文拼装与风格约束</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 上下文拼装器（含风格约束）
+@Component
+public class ContextAssembler {
+
+    public String assembleCompletionContext(String currentFile,
+                                             int cursorLine,
+                                             List&lt;RelatedFile&gt; relatedFiles,
+                                             String language) {
+        StringBuilder ctx = new StringBuilder();
+
+        // 1. 风格参考（infile 示例）：当前文件的风格模式
+        ctx.append("// 当前代码风格参考:\n");
+        ctx.append(extractStylePattern(currentFile, language));
+        ctx.append("\n");
+
+        // 2. 相关符号定义（多文件支持）
+        if (!relatedFiles.isEmpty()) {
+            ctx.append("// 引用符号定义:\n");
+            for (RelatedFile rf : relatedFiles) {
+                ctx.append("//   ").append(rf.getFilePath())
+                    .append(": ").append(rf.getSymbol()).append("\n");
+            }
+            ctx.append("\n");
+        }
+
+        // 3. FIM Prompt
+        FimPrompt fim = new FimPromptBuilder()
+            .build(currentFile, cursorLine, 0, language);
+        ctx.append(fim.formatForModel(fim));
+
+        return ctx.toString();
+    }
+
+    private String extractStylePattern(String code, String language) {
+        // 检测代码的缩进风格（2空格/4空格/tab）
+        // 命名风格（camelCase/snake_case）
+        // 注释风格（// / /** / --）
+        // 返回检测结果作为隐式风格约束
+        int spaces = countLeadingSpaces(code);
+        boolean usesTab = code.contains("\t");
+        return String.format(
+            "缩进: %s %d, 命名: camelCase",
+            usesTab ? "tab" : "空格",
+            usesTab ? 1 : spaces
+        );
+    }
+}
+
+// FIM 格式 vs 对话格式效果对比
+// 对话格式: "请补全以下 Java 代码: ..."
+//   → 模型输出自然语言解释，不是纯代码
+//  FIM 格式: <fim_prefix>public String getUser<fim_suffix>{...}<fim_middle>
+//   → 模型输出纯代码补全，不需要解释</pre></div>
+    </div>
+
+    <div class="section-block">
+      <h3>多文件补全</h3>
+      <div class="code-block"><div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div><pre><code class="language-java">// 多文件补全管理器
+@Component
+public class MultiFileCompletion {
+
+    private final LspClient lspClient;
+
+    public CompletionResult complete(String projectPath,
+                                      String currentFile,
+                                      int cursorLine,
+                                      List&lt;String&gt; openFiles) {
+        // 1. 获取光标位置符号
+        Symbol cursorSymbol = lspClient
+            .getSymbolAt(projectPath, currentFile, cursorLine);
+
+        // 2. 从打开的文件中找到引用了该符号的文件
+        List&lt;RelatedFile&gt; relatedFiles = new ArrayList&lt;&gt;();
+        for (String openFile : openFiles) {
+            if (openFile.equals(currentFile)) continue;
+            List&lt;Symbol&gt; symbols = lspClient.getDocumentSymbols(projectPath, openFile);
+            for (Symbol s : symbols) {
+                if (s.getName().equals(cursorSymbol.getName())) {
+                    relatedFiles.add(new RelatedFile(openFile, s.getName(),
+                        s.getCode()));
+                    break;
+                }
+            }
+        }
+
+        // 3. 构建多文件上下文 + FIM Prompt
+        String context = new ContextAssembler()
+            .assembleCompletionContext(currentFile, cursorLine,
+                relatedFiles, detectLanguage(currentFile));
+
+        // 4. 调用模型
+        String completion = llmService.complete(context);
+
+        return new CompletionResult(completion, relatedFiles);
+    }
+}</pre></div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice"><h3>本章结论</h3><ul class="chapter-conclusions-list">
+      <li>FIM 格式（prefix+suffix+middle）是代码补全的标准 Prompt 格式，比对话格式产生纯代码而非自然语言</li>
+      <li>上下文选择：前缀 300 Tokens + 后缀 200 Tokens 是最优组合</li>
+      <li>风格约束通过 infile 示例隐式传递，比显式指令更准确</li>
+      <li>多文件补全通过 LSP 符号引用注入相关文件中光标位置符号的定义</li>
+    </ul></div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist"><h4>过关清单</h4><ul>
+        <li><label><input type="checkbox"> 我能构造 FIM 格式的补全 Prompt</label></li>
+        <li><label><input type="checkbox"> 我能精确选择光标前后上下文</label></li>
+        <li><label><input type="checkbox"> 我能通过 infile 示例传递风格约束</label></li>
+        <li><label><input type="checkbox"> 我能实现多文件补全上下文拼装</label></li>
+      </ul></div>
+    </div>
+  </div>
+
+  <div class="official-links content-section"><h3>官方参考</h3><ul>
+    <li><a href="https://huggingface.co/blog/codepal" target="_blank" rel="noopener">FIM 格式说明</a></li>
+  </ul></div>
+  <div class="chapter-practice"><h3>动手练习</h3>
+    <div class="steps-operate"><ol>
+      <li>实现 FIM Prompt 构造器，支持光标位置拆分</li>
+      <li>实现上下文选择：前缀 300 + 后缀 200 Tokens</li>
+      <li>实现风格约束：自动检测缩进/命名风格</li>
+      <li>实现多文件补全：通过 LSP 获取引用符号</li>
+      <li>对比 FIM 和对话格式的补全质量差异</li>
+    </ol></div>
+    <div class="demo-box"><h4>配套实验室</h4><p>见 <code>demos/practice-03-lab/</code></p></div>
+  </div>
+  <div class="resources content-section"><h3>延伸阅读</h3><ul><li>下一篇：<a href="#ch-practice-04">延迟优化</a></li></ul></div>
+</section>
