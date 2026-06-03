@@ -14,3 +14,11 @@
 - [ ] interview-answers.md 含 3 个完整回答
 - [ ] 使用 CORAL 或 STAR 框架
 - [ ] 回答包含实际踩坑和数字
+
+## 验收命令
+
+```bash
+# 文档型 lab：确认产物文件存在且非空
+ls -la *.md *.rego 2>/dev/null | wc -l
+# 期望：≥ 1；再按上方验收标准逐项勾选
+```

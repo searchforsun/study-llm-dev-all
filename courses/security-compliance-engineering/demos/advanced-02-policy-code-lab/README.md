@@ -14,3 +14,11 @@
 - [ ] security-policy.rego 含至少 3 条策略规则
 - [ ] OPA 集成到 Spring AI 中
 - [ ] 策略变更通过 CI/CD pipeline
+
+## 验收命令
+
+```bash
+# 文档型 lab：确认产物文件存在且非空
+ls -la *.md *.rego 2>/dev/null | wc -l
+# 期望：≥ 1；再按上方验收标准逐项勾选
+```

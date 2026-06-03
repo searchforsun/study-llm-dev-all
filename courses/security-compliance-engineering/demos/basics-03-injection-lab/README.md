@@ -14,3 +14,11 @@
 - [ ] defense-plan.md 含攻击手法列表和防护层
 - [ ] DelimiterGuard 正确转义标签字符
 - [ ] JailbreakDetector 识别 Base64 编码注入
+
+## 验收命令
+
+```bash
+# 文档型 lab：确认产物文件存在且非空
+ls -la *.md *.rego 2>/dev/null | wc -l
+# 期望：≥ 1；再按上方验收标准逐项勾选
+```

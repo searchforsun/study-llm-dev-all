@@ -14,3 +14,11 @@
 - [ ] privacy-plan.md 含 PII 规则、脱敏方式和保留策略
 - [ ] PIIDetector 正确脱敏手机号和身份证
 - [ ] 日志中不含原始 PII
+
+## 验收命令
+
+```bash
+# 文档型 lab：确认产物文件存在且非空
+ls -la *.md *.rego 2>/dev/null | wc -l
+# 期望：≥ 1；再按上方验收标准逐项勾选
+```

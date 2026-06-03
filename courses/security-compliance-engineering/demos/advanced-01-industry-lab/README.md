@@ -14,3 +14,11 @@
 - [ ] industry-compliance-plan.md 含对比表和配置
 - [ ] 审计日志签名方案完整
 - [ ] 行业配置可切换
+
+## 验收命令
+
+```bash
+# 文档型 lab：确认产物文件存在且非空
+ls -la *.md *.rego 2>/dev/null | wc -l
+# 期望：≥ 1；再按上方验收标准逐项勾选
+```

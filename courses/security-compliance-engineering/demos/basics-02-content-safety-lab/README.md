@@ -3,14 +3,22 @@
 [章节](../../index.html#ch-basics-02-content-safety)
 
 ## 目标
-实现输入输出双向审核与双栈 Advisor 配置。
+
+配置四层内容审核规则（文档型 lab）。
 
 ## 步骤
-1. 实现 Spring AI InputModerationAdvisor
-2. 实现 Python ContentSafetyMiddleware 的 check_input 方法
-3. 配置输出审核规则：识别身份证和手机号
+
+1. 阅读 `moderation-flow.md`，对照正文四层审核表补全 L1–L4 职责。
+2. 列出输入/输出 moderation 各 3 条规则（关键词或 API 策略）。
+
+## 验收命令
+
+```bash
+grep -c "L[1-4]" moderation-flow.md
+# 期望：≥ 4
+```
 
 ## 验收标准
-- [ ] moderation-rules.yaml 含 4 层审核规则
-- [ ] Input Advisor 拦截注入关键词
-- [ ] Output Advisor 拦截敏感信息
+
+- [ ] moderation-flow.md 覆盖四层审核
+- [ ] 输入与输出规则各 ≥ 3 条

@@ -14,3 +14,11 @@
 - [ ] audit-schema.json 含 who/what/citations/tool_calls
 - [ ] 审计日志含引用链（chunk_id、document_id）
 - [ ] 不可篡改：Kafka + Object Store 双存储
+
+## 验收命令
+
+```bash
+# 文档型 lab：确认产物文件存在且非空
+ls -la *.md *.rego 2>/dev/null | wc -l
+# 期望：≥ 1；再按上方验收标准逐项勾选
+```
