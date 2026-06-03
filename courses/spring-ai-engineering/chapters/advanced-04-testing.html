@@ -6,92 +6,318 @@
 
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产化与可移植</strong> · 能力：@MockBean ChatModel、Testcontainers 与快照测试</p>
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产化与可移植</strong> · 能力：用 @MockBean ChatModel、Testcontainers、快照测试与 CI 门禁保障 CorpAssist 可重复验证</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
-        <p>CI 不能依赖真实 LLM。Mock ChatModel 返回固定内容，Testcontainers 起 PGVector 做集成测。</p>
+        <p><a href="#ch-advanced-03-micrometer">上一章</a> 已为 NS2 客服链路埋点；若 CI 仍调用真实模型网关，MR 会因<strong>网络抖动、配额、随机性</strong>而红绿不定。CorpAssist 要求：业务逻辑、Advisor 顺序、RAG 引用格式必须在<strong>无 LLM 密钥</strong>的环境跑通。<span class="term" data-term-id="mock-chat-model" tabindex="0">mock chat model</span> 与 <span class="term" data-term-id="testcontainers" tabindex="0">testcontainers</span> 是 Java 轨与 Python 轨 pytest + httpx mock 的对等实践——Spring 侧用 <span class="term" data-term-id="mockbean" tabindex="0">mockbean</span> 替换 <code>ChatModel</code> Bean，向量层用 PGVector 容器，Prompt 渲染用 <span class="term" data-term-id="snapshot-test" tabindex="0">snapshot test</span> 锁结构。</p>
       </div>
       <div class="notice notice-outcome">
         <strong>学完你能</strong>
         <ul>
-          <li>在 CorpAssist-spring 模块实践本章核心能力</li>
-          <li>说明与 <a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 工程轨</span><code class="course-ref-slug">python-engineering-for-llm</code></a> 的分工与契约</li>
-          <li>完成 Demo 与章节测验</li>
+          <li>在 <code>@SpringBootTest</code> 中用 <span class="term" data-term-id="mockbean" tabindex="0">mockbean</span> 注入固定 <code>ChatResponse</code>，断言 RAG API 含 <code>sources[]</code> 与 Advisor 行为</li>
+          <li>用 Testcontainers 启动 PostgreSQL + pgvector，验证 <code>VectorStore</code> 相似度检索与 ACL filter</li>
+          <li>对 Prompt 模板与 OpenAPI 响应做 <span class="term" data-term-id="contract-snapshot" tabindex="0">contract snapshot</span>，MR 时人工审核 diff</li>
+          <li>设计 <span class="term" data-term-id="ci-pipeline" tabindex="0">ci pipeline</span>：单元 / 集成 / 契约三层，并配置 <span class="term" data-term-id="flaky-guard" tabindex="0">flaky guard</span> 禁止真实 LLM 调用</li>
         </ul>
       </div>
       <div class="notice">
         <strong>本章先记住 3 件事</strong>
         <ul>
-          <li><strong>抽象优先</strong>：业务依赖 ChatClient/VectorStore，而非具体厂商 SDK。</li>
-          <li><strong>可配置</strong>：模型名、密钥、路由策略来自环境，不写死在代码。</li>
-          <li><strong>可观测</strong>：关键路径有日志、指标与 request_id，便于双栈联调。</li>
+          <li><strong>测行为不测文采</strong>：断言结构（引用 docId、降级码、HTTP 状态），不断言模型「措辞是否优美」。</li>
+          <li><strong>分层替身</strong>：ChatModel → MockBean；VectorStore → Testcontainers；Python 检索 → <span class="term" data-term-id="wiremock-llm" tabindex="0">wiremock llm</span> / WireMock。</li>
+          <li><strong>CI 零密钥</strong>：<code>spring.ai.openai.api-key</code> 在 CI 留空时测试仍绿，靠 Mock 与 Testcontainers 覆盖。</li>
         </ul>
       </div>
     </div>
 
     <div class="section-block">
       <h3>@MockBean ChatModel</h3>
-      <p>单元测试注入固定 AssistantMessage；断言 Controller 与 Advisor 行为。 关联：<span class="term" data-term-id="mock-chat-model" tabindex="0">mock chat model</span>、<span class="term" data-term-id="testcontainers" tabindex="0">testcontainers</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · NS1 制度问答</span>
+        员工问「年假如何申请？」——Controller 应返回带 <code>pol-001</code> 引用的 JSON。测试只需验证：<strong>RAG Advisor 是否把检索片段拼进 Prompt</strong>、Mock 模型是否被调用一次、响应 DTO 字段完整；无需真实 GPT 生成段落。
+      </aside>
+      <p>Spring Boot 3.3 + Spring AI 1.0.x 中，自动配置会注册 <code>ChatModel</code> Bean。在测试类上用 <code>@MockBean ChatModel chatModel</code> 可<strong>替换容器内 Bean</strong>，配合 Mockito 返回固定 <code>ChatResponse</code>。</p>
+
+      <h4>MockChatModelTest（见 demo）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@AutoConfigureMockMvc
+class MockChatModelTest {
+
+  @Autowired MockMvc mockMvc;
+
+  @MockBean ChatModel chatModel;
+
+  @Test
+  void ragQueryReturnsCitation() throws Exception {
+    when(chatModel.call(any(Prompt.class))).thenReturn(
+        ChatResponse.builder()
+            .generations(List.of(new Generation(
+                new AssistantMessage("依据 [pol-001]，年假至少 5 天，需提前在 OA 提交。"))))
+            .metadata(Map.of("model", "mock"))
+            .build());
+
+    mockMvc.perform(post("/v1/rag/query")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""
+                {"query":"年假如何申请？","topK":5}
+                """))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.answer").value(containsString("pol-001")))
+        .andExpect(jsonPath("$.sources[0].docId").exists());
+
+    verify(chatModel, times(1)).call(any(Prompt.class));
+  }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">@Mock 局部 new ChatService</span>
+          <ul>
+            <li>绕开 Spring 容器，Advisor 链未装配</li>
+            <li>测不到 <code>@Order</code> 与 Filter 交互</li>
+            <li>与生产 Bean 图不一致</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">@MockBean + @SpringBootTest</span>
+          <ul>
+            <li>真实 ChatClient、Advisor 顺序生效</li>
+            <li>仅替换最外层 ChatModel</li>
+            <li>可叠加 MockMvc 测 REST 契约</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>流式 SSE 测试要点</h4>
+      <p>NS2 客服 SSE 路径应对 <code>StreamingChatModel</code> 或 <code>chatModel.stream()</code> 使用 <code>Flux&lt;ChatResponse&gt;</code> 的 stub。断言：首 event 含 <code>event: message</code>、结束 event 含 <code>[DONE]</code>；勿在 CI 等待真实 token 流。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 Mock ChatModel 而不是 Mock ChatClient？</summary>
+        <p><code>ChatClient</code> 是门面，内部仍走 Advisor 链与 Observation。Mock <code>ChatClient</code> 会跳过 RAG/护栏测试；Mock <code>ChatModel</code> 保留链路上游逻辑，只切断外部 LLM。</p>
+      </details>
     </div>
 
     <div class="section-block">
       <h3>Testcontainers</h3>
-      <p>PostgreSQL + pgvector 容器跑 VectorStore 集成测试。 关联：<span class="term" data-term-id="snapshot-test" tabindex="0">snapshot test</span>、<span class="term" data-term-id="mockbean" tabindex="0">mockbean</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
-    </div>
+      <p><code>VectorStore</code> 集成测需要真实 SQL 与 pgvector 运算符；H2 不支持 vector 类型。Testcontainers 在 CI 拉取 <code>pgvector/pgvector:pg16</code> 镜像，<code>@DynamicPropertySource</code> 注入 JDBC URL。</p>
 
-    <div class="section-block">
-      <h3>快照测试与 CI</h3>
-      <p>Prompt 渲染结果快照；MR 时人工审核变更。 关联：<span class="term" data-term-id="wiremock-llm" tabindex="0">wiremock llm</span>、<span class="term" data-term-id="ci-pipeline" tabindex="0">ci pipeline</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
-    </div>
-
-    <div class="section-block">
-      <h3>关键术语</h3>
-      <p><span class="term" data-term-id="mock-chat-model" tabindex="0">mock chat model</span> · <span class="term" data-term-id="testcontainers" tabindex="0">testcontainers</span> · <span class="term" data-term-id="snapshot-test" tabindex="0">snapshot test</span> · <span class="term" data-term-id="mockbean" tabindex="0">mockbean</span> · <span class="term" data-term-id="wiremock-llm" tabindex="0">wiremock llm</span> · <span class="term" data-term-id="ci-pipeline" tabindex="0">ci pipeline</span> · <span class="term" data-term-id="contract-snapshot" tabindex="0">contract snapshot</span> · <span class="term" data-term-id="flaky-guard" tabindex="0">flaky guard</span></p>
-    </div>
-
-    <div class="section-block">
-      <h3>代码示例</h3>
+      <h4>PGVector 容器 + Spring AI VectorStore</h4>
       <div class="code-block">
         <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-        <pre><code class="language-java">@SpringBootTest
-class RagApiTest {
-  @MockBean ChatModel chatModel;
+        <pre><code class="language-java">@Testcontainers
+@SpringBootTest
+class VectorStoreIntegrationTest {
+
+  @Container
+  static PostgreSQLContainer&lt;?&gt; postgres = new PostgreSQLContainer&lt;&gt;(
+      "pgvector/pgvector:pg16")
+      .withDatabaseName("corpassist")
+      .withUsername("test")
+      .withPassword("test");
+
+  @DynamicPropertySource
+  static void datasourceProps(DynamicPropertyRegistry registry) {
+    registry.add("spring.datasource.url", postgres::getJdbcUrl);
+    registry.add("spring.datasource.username", postgres::getUsername);
+    registry.add("spring.datasource.password", postgres::getPassword);
+  }
+
+  @Autowired VectorStore vectorStore;
+  @MockBean ChatModel chatModel; // embedding 仍 Mock，见下节
 
   @Test
-  void ragReturnsCitation() {
-    when(chatModel.call(any())).thenReturn(new ChatResponse(List.of(
-        new Generation(new AssistantMessage("依据 [pol-001] ...")))));
-    // assert controller response
+  void similarSearchRespectsDeptFilter() {
+    vectorStore.add(List.of(
+        new Document("pol-001 年假制度", Map.of("dept", "HR")),
+        new Document("it-002 VPN 手册", Map.of("dept", "IT"))));
+
+    var results = vectorStore.similaritySearch(
+        SearchRequest.query("年假").withTopK(3)
+            .withFilterExpression("dept == 'HR'"));
+
+    assertThat(results).hasSize(1);
+    assertThat(results.get(0).getMetadata()).containsEntry("dept", "HR");
   }
 }</code></pre>
       </div>
+
+      <p><strong>Embedding 策略</strong>：集成测可 (1) Mock <code>EmbeddingModel</code> 返回固定 1536 维向量，或 (2) 使用 <code>SimpleVectorStore</code> 内存实现测 filter 逻辑。CorpAssist 推荐 (1)+Testcontainers 组合，避免 CI 调 embedding API。</p>
+
       <div class="mermaid-wrap">
-        <h5>测试与本地替身 · CorpAssist 上下文</h5>
-        <pre class="mermaid">flowchart LR
-  Portal["企业门户 / BFF"]
-  Spring["CorpAssist Spring AI"]
-  LLM["模型网关"]
-  Py["Python 检索服务"]
-  Portal --> Spring
-  Spring --> LLM
-  Spring -.->|可选| Py</pre>
-        <p class="diagram-caption">Spring AI 轨消费模型网关；RAG 检索可内置或委托 Python 服务，以 OpenAPI 契约对齐。</p>
+        <h5>测试金字塔 · CorpAssist Spring 模块</h5>
+        <pre class="mermaid">flowchart TB
+  Unit["单元：Advisor / Prompt 工具"]
+  Int["集成：MockBean ChatModel + MockMvc"]
+  TC["Testcontainers：VectorStore + PG"]
+  Contract["契约：OpenAPI / WireMock Python"]
+  Unit --> Int --> TC --> Contract</pre>
+        <p class="diagram-caption">Python 轨用 pytest + testcontainers 对等；双栈共享 OpenAPI snapshot 文件。</p>
       </div>
-      <aside class="learn-scenario" aria-label="业务情境">
-        <span class="learn-scenario-title">CorpAssist · S2 智能客服</span>
-        员工在门户提问工单与制度；Spring AI 模块负责鉴权、会话记忆、模型路由与审计，Python 侧可承担批量索引与实验性算法。
-      </aside>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>组件</th><th>替身方案</th><th>验证目标</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>ChatModel</strong></td>
+            <td>@MockBean</td>
+            <td>Controller、Advisor、引用格式</td>
+          </tr>
+          <tr>
+            <td><strong>VectorStore</strong></td>
+            <td>Testcontainers PGVector</td>
+            <td>topK、metadata filter、相似度排序</td>
+          </tr>
+          <tr>
+            <td><strong>Python 检索</strong></td>
+            <td>WireMock / @MockBean RestClient</td>
+            <td>DTO 字段、timeout、traceparent 头</td>
+          </tr>
+          <tr>
+            <td><strong>模型网关</strong></td>
+            <td>禁止 CI 直连；预发再冒烟</td>
+            <td>成本与 flaky 控制</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>快照测试</h3>
+      <p><span class="term" data-term-id="snapshot-test" tabindex="0">snapshot test</span> 将「Prompt 渲染结果」「OpenAPI JSON」「RAG 响应样例」写入 <code>src/test/resources/__snapshots__/</code>。下次运行 byte-level 或 JSON 结构化对比；变更需 MR 里<strong>人工说明</strong>「为何 Prompt 结构变了」。</p>
+
+      <h4>Prompt 模板快照（AssertJ）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Test
+void ragSystemPromptMatchesSnapshot() {
+  String rendered = promptRenderer.render("rag-system.st",
+      Map.of("context", "[pol-001] 年假...", "query", "如何申请？"));
+
+  // 首次运行生成 snapshot；后续 compare
+  assertThat(rendered)
+      .isEqualToNormalizingNewlines(
+          Files.readString(Path.of("src/test/resources/snapshots/rag-system.txt")));
+}</code></pre>
+      </div>
+
+      <h4>OpenAPI 契约快照</h4>
+      <p>与 Python 轨共用 <code>contracts/rag-query.openapi.yaml</code>。Spring 测试导出 <code>/v3/api-docs</code>，与 baseline JSON diff；禁止静默删除 <code>sources</code> 或 <code>requestId</code> 字段。Python 侧 FastAPI 同样对比，实现 <span class="term" data-term-id="contract-snapshot" tabindex="0">contract snapshot</span> 双栈一致。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">快照含动态 UUID / 时间戳</span>
+          <ul>
+            <li>每次 CI 都失败</li>
+            <li>Review 噪音大</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">规范化后再快照</span>
+          <ul>
+            <li>替换 requestId 为 <code>&lt;REQ_ID&gt;</code></li>
+            <li>只快照 schema 与 Prompt 结构</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>自检：快照失败时能否直接 --updateAll？</summary>
+        <p>仅本地开发可更新；CI 必须 fail 并让人审 diff。否则 Prompt 注入或字段删除会静默上线。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>CI</h3>
+      <p><span class="term" data-term-id="ci-pipeline" tabindex="0">ci pipeline</span> 建议三 job：<code>unit</code>（无 Docker）、<code>integration</code>（Testcontainers，需 Docker-in-Docker）、<code>contract</code>（OpenAPI + WireMock）。环境变量 <code>CORPASSIST_LLM_API_KEY</code> 在 CI <strong>不设置</strong>，由 <span class="term" data-term-id="flaky-guard" tabindex="0">flaky guard</span> 断言无 outbound 调用模型域名。</p>
+
+      <h4>GitHub Actions 片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+      - name: Unit + Integration
+        run: ./mvnw -B verify -Dspring.profiles.active=test
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: false
+      - name: Fail if real LLM called
+        run: ./scripts/assert-no-llm-calls.sh target/test-traffic.log</code></pre>
+      </div>
+
+      <h4>WireMock 模拟 Python 检索</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@RegisterExtension
+static WireMockExtension pythonSearch = WireMockExtension.newInstance()
+    .options(wireMockConfig().dynamicPort())
+    .build();
+
+@DynamicPropertySource
+static void pythonUrl(DynamicPropertyRegistry r) {
+  r.add("corpassist.python-search.base-url", pythonSearch::baseUrl);
+}
+
+@BeforeEach
+void stubPythonSearch() {
+  pythonSearch.stubFor(post(urlEqualTo("/v1/search"))
+      .willReturn(okJson("""
+          {"chunks":[{"docId":"pol-001","text":"年假..."}]}
+          """)));
+}</code></pre>
+      </div>
+
+      <p>与 Python 轨对齐：Java CI 验 Spring 契约；Python CI 验 FastAPI 契约； nightly 可选双栈联调冒烟（真实密钥仅在密钥库）。</p>
+
+      <h4>测试 Profile 隔离</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># application-test.yml — CI 默认 profile
+spring:
+  ai:
+    openai:
+      api-key: test-no-key
+      chat:
+        options:
+          model: mock
+corpassist:
+  retrieval:
+    mode: local
+logging:
+  level:
+    org.springframework.ai: WARN</code></pre>
+      </div>
+      <p><code>@ActiveProfiles("test")</code> 保证本地误跑集成测时不触网；与 Python <code>pytest --env=test</code> 对称。预发 profile 才配置真实网关地址做冒烟。</p>
+
+      <div class="notice">
+        <strong>MR 门禁清单</strong>
+        <ul>
+          <li>新增 REST 字段 → 更新 OpenAPI snapshot + Python 契约 PR</li>
+          <li>改 Prompt 模板 → snapshot diff + 评测集回归说明</li>
+          <li>改 Advisor 顺序 → 补 MockChatModelTest 断言 guardrail 码</li>
+          <li>集成测 &gt; 3min → 拆分 Testcontainers 与 MockMvc  job</li>
+        </ul>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3。</p>
       <ul class="chapter-conclusions-list">
-        <li><strong>目标</strong>：@MockBean ChatModel、Testcontainers 与快照测试</li>
-        <li><strong>工程化</strong>：配置外部化、Advisor/测试/指标纳入同一模块。</li>
-        <li><strong>下一步</strong>：实战：CorpAssist Spring RAG API</li>
+        <li><strong>@MockBean ChatModel</strong>：保留 Advisor 链，只 stub 模型输出；MockMvc 断言 REST 与引用。</li>
+        <li><strong>Testcontainers</strong>：PGVector 验 VectorStore 与 metadata filter；Embedding 仍 Mock。</li>
+        <li><strong>快照测试</strong>：Prompt / OpenAPI / 响应结构；规范化动态字段后再对比。</li>
+        <li><strong>CI</strong>：零密钥、WireMock Python、flaky guard；单元与集成分 job。</li>
       </ul>
     </div>
 
@@ -99,48 +325,73 @@ class RagApiTest {
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="spring-ai_advanced_04_testing">
         <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
-        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
         <ul>
-          <li><label><input type="checkbox" data-id="concept" /> 能口述本章在 CorpAssist 中的位置</label></li>
-          <li><label><input type="checkbox" data-id="code" /> 能指出代码示例中 2 个关键类/配置项</label></li>
-          <li><label><input type="checkbox" data-id="demo" /> 已完成 Demo 练习</label></li>
+          <li><label><input type="checkbox" data-id="mockbean" /> 能解释 Mock ChatModel 而非 ChatClient 的原因</label></li>
+          <li><label><input type="checkbox" data-id="tc" /> 能写出 Testcontainers 动态数据源配置</label></li>
+          <li><label><input type="checkbox" data-id="snapshot" /> 能说明快照测试适用与不适用场景</label></li>
+          <li><label><input type="checkbox" data-id="demo" /> 已阅读 MockChatModelTest.java 并列出 3 条应测用例</label></li>
           <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
         </ul>
       </div>
-      <p class="chapter-review-next">下一章：<a href="#ch-advanced-05-corpassist-rag-api">实战：CorpAssist Spring RAG API</a></p>
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-advanced-05-corpassist-rag-api">实战：CorpAssist Spring RAG API</a>，把测试策略落到交付接口。</p>
     </div>
   </div>
 
   <div class="official-links content-section">
     <h3>官方文档</h3>
     <ul>
-      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 参考文档</a></li>
-      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/" target="_blank" rel="noopener">Spring Boot 参考</a></li>
-      <li><a href="https://spring.io/projects/spring-ai" target="_blank" rel="noopener">Spring AI 项目页</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/reference/testing/spring-boot-applications.html" target="_blank" rel="noopener">Spring Boot Testing</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/testing.html" target="_blank" rel="noopener">Spring AI — Testing</a></li>
+      <li><a href="https://java.testcontainers.org/" target="_blank" rel="noopener">Testcontainers Java</a></li>
+      <li><a href="https://wiremock.org/docs/" target="_blank" rel="noopener">WireMock</a></li>
     </ul>
   </div>
 
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <p class="steps-intro">约 30 分钟 · 在 demo 目录完成练习并作答测验。</p>
+    <p class="steps-intro">为 CorpAssist RAG API 设计测试矩阵，并对照 demo 中的 Mock 示例验收。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>进入 <code>demos/advanced-04-testing-lab/</code>，阅读 README。</li>
-      <li>按 README 操作或阅读代码/配置片段，完成验收项。</li>
-      <li>在笔记中写一条与 Python 轨或 Spring Boot 惯例的对照。</li>
-      <li>完成右侧章节测验。</li>
+      <li>阅读 <code>demos/advanced-04-testing-lab/MockChatModelTest.java</code>，补全 3 条测试用例：空检索、注入拦截、降级响应。</li>
+      <li>在笔记中画测试金字塔，标出 MockBean / Testcontainers / WireMock 各自覆盖哪一层。</li>
+      <li>列出 Prompt 快照应规范化的 2 类动态字段（如 requestId、timestamp）。</li>
+      <li>写一段 CI yaml 伪代码：integration job 需要 Docker 而 unit job 不需要。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">QA 要求「CI 必须调用真实 GPT 才能合并」，是否应采纳？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不应。</strong> 真实 LLM 导致 flaky、成本与密钥泄露风险。应用 Mock + 快照 + 预发/nightly 冒烟；评测集回归放在受控环境。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">只测 ChatService 单元测试、不测 MockMvc，能否保证 REST 契约正确？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不够。</strong> 序列化、状态码、响应头（<code>X-Request-Id</code>）在 Controller 层；需 MockMvc 或 WebTestClient 集成测。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
-      <h4 class="demo-box-title">Demo：测试与本地替身</h4>
-      <p>目录：<code>demos/advanced-04-testing-lab/</code> — 列出 CorpAssist RAG API 至少 3 条应自动化测试的用例</p>
+      <h4 class="demo-box-title">Demo：MockChatModelTest</h4>
+      <p>目录：<code>demos/advanced-04-testing-lab/</code>。<strong>验收</strong>：列出 CorpAssist RAG API 至少 3 条应自动化测试的用例，并说明每条用 MockBean 还是 Testcontainers。</p>
     </div>
   </div>
 
   <div class="resources content-section">
     <h3>延伸学习</h3>
     <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-03-micrometer">Micrometer 与可观测</a></li>
       <li><strong>下一章</strong>：<a href="#ch-advanced-05-corpassist-rag-api">实战：CorpAssist Spring RAG API</a></li>
-      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">ChatClient API</a></li>
+      <li><a href="#ch-practice-02-rag-pipeline">RAG 管道</a>：VectorStore 与 QuestionAnswerAdvisor</li>
+      <li><a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 工程轨</span><code class="course-ref-slug">python-engineering-for-llm</code></a>：pytest 与 httpx mock 对照</li>
     </ul>
   </div>
 </section>

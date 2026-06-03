@@ -1,4 +1,0 @@
-- request_id
-- step
-- tool_name
-- latency_ms

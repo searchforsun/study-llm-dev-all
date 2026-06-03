@@ -1,0 +1,392 @@
+<section id="ch-advanced-01" class="chapter" data-chapter="advanced-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>自定义 AI Agent 工作流设计</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>AI 工具链进阶与治理</strong> · 能力：设计可复用的 CorpAssist 多 Agent 研发工作流</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>在 <a href="#ch-practice-04">实战：CorpAssist 开发效率提升</a> 中你已用 AI 加速单点任务；当团队并行开发 RAG 管线、评测脚本与 API 契约时，需要把「一次性的 Prompt」升级为可版本化、可审计的 <span class="term" data-term-id="workflow-dag" tabindex="0">workflow DAG</span>。本章教你用 Cursor / Claude Code 的 <span class="term" data-term-id="cursor-skill" tabindex="0">Cursor Skill</span> 与 Command 把研发流水线产品化。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 CorpAssist Python 服务设计 Planner / Coder / Reviewer 多 Agent 分工</li>
+          <li>编写团队可共享的 Skill 与 Command，约束上下文与输出格式</li>
+          <li>用 DAG 编排「需求→实现→测试→门禁」并接入 GitHub Actions</li>
+          <li>在 CI 中触发 Agent 工作流且保留人工审批点</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Agent 要分工</strong>：单 Agent 包办设计+编码+评审会上下文爆炸，应用 <span class="term" data-term-id="multi-agent-orchestration" tabindex="0">multi-agent orchestration</span> 拆角色。</li>
+          <li><strong>Skill 是可复用 SOP</strong>：把团队规范写进 Skill，比每次粘贴长 Prompt 更稳。</li>
+          <li><strong>CI 只跑确定性步骤</strong>：Agent 生成物必须经 <a href="#ch-basics-03">AI 生成代码的质量管控</a> 与测试后再合并。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多 Agent 协作模式</h3>
+      <aside class="learn-scenario">
+        <strong>CorpAssist 场景</strong>：知识库团队要在两周内交付「合同条款 RAG 检索 + 引用溯源」接口。Tech Lead 用 Planner Agent 拆任务，Coder Agent 改 FastAPI 路由，Reviewer Agent 对照 OpenAPI 与 <a href="#ch-practice-02">AI 生成文档与 Schema</a> 做契约检查。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 研发多 Agent 协作</h5>
+        <pre class="mermaid">flowchart LR
+  PO[产品/架构输入] --> Planner[Planner Agent\n拆 Issue / 子任务]
+  Planner --> Coder[Coder Agent\n改 Python / 测试]
+  Coder --> Tester[Tester Agent\npytest / 覆盖率]
+  Tester --> Reviewer[Reviewer Agent\n安全 / 契约]
+  Reviewer -->|通过| MR[Pull Request]
+  Reviewer -->|打回| Coder
+  MR --> CI[GitHub Actions\nlint + test + judge]</pre>
+        <p class="diagram-caption">Planner→Coder→Tester→Reviewer 闭环；MR 进入确定性 CI。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>模式</th><th>适用</th><th>CorpAssist 示例</th><th>风险</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>顺序流水线</td><td>步骤依赖强</td><td>先改 chunker 再改检索 API</td><td>前步错误向后传播</td></tr>
+          <tr><td>主从委派</td><td>探索型任务</td><td>Lead Agent 派发子 Agent 查依赖源码</td><td><span class="term" data-term-id="subagent-delegation" tabindex="0">subagent delegation</span> 超时</td></tr>
+          <tr><td>并行+汇总</td><td>多模块无冲突</td><td>同时生成单元测试与 docstring</td><td>合并冲突需人工</td></tr>
+          <tr><td>人在回路</td><td>生产变更</td><td>发布索引前人工确认样本</td><td>审批 SLA 需约定</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：你的团队更适合哪种模式？</summary>
+        <p>若两人改同一 FastAPI 路由，优先顺序流水线；若一人写测试、一人写实现且文件不重叠，可并行+汇总。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>自定义 Skill/Command 开发</h3>
+      <p>Skill 是带触发描述的操作手册；Command 是斜杠命令入口。二者应引用仓库内的 <code>AGENTS.md</code>、<code>context/</code> 与 <code>.cursor/rules</code>，避免模型「发明」项目结构。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反例：巨型 Skill</span>
+          <ul>
+            <li>一个 Skill 覆盖「从需求到上线」全部步骤</li>
+            <li>无输出模板，每次 diff 格式不同</li>
+            <li>未声明禁止改动的目录（如 <code>infra/</code>）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐：单一职责 Skill</span>
+          <ul>
+            <li><code>corpassist-pytest-gen</code>：只生成 pytest，必须跑 <code>uv run pytest</code></li>
+            <li>固定输出：测试文件路径 + 覆盖场景列表</li>
+            <li>显式引用 <a href="#ch-practice-01">AI 生成测试用例</a> 中的 Fixture 约定</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Skill 骨架示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">---
+name: corpassist-rag-api-change
+description: 修改 CorpAssist Python RAG 路由时触发。生成实现+测试+OpenAPI 片段。
+---
+
+# CorpAssist RAG API 变更
+
+## 输入
+- Issue 链接或 diff 范围
+- 目标模块：`app/rag/` 或 `app/retrieval/`
+
+## 步骤
+1. 阅读 `context/tech/services/corpassist-python.md`
+2. 只修改列出的文件；禁止改 `deploy/`
+3. 输出：代码 diff 摘要、pytest 命令、OpenAPI 路径是否变更
+
+## 验收
+- `uv run ruff check app/`
+- `uv run pytest tests/rag/ -q`</code></pre>
+      </div>
+
+      <p>Command 适合一键动作，例如 <code>/gen-changelog</code> 只读最近 merge commit 生成发布说明，与 <a href="#ch-basics-04">规则与约定驱动开发</a> 中的 Conventional Commits 对齐。团队共享的 <span class="term" data-term-id="cursor-skill" tabindex="0">Cursor Skill</span> 应通过内部 PR 评审，版本号写入 manifest，避免每人维护冲突副本。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Workflow 编排最佳实践</h3>
+      <p>工作流文件（如 <code>.github/workflows/ai-dev.yml</code>）描述<strong>何时</strong>调用 Agent；<span class="term" data-term-id="workflow-dag" tabindex="0">Workflow DAG</span> 中每个 stage 的 artifact 应可机器校验。Skill 描述<strong>怎么做</strong>。二者分离可避免把 Prompt 硬编码进 YAML。</p>
+      <p>委派子任务时使用 <span class="term" data-term-id="subagent-delegation" tabindex="0">Subagent delegation</span> 规范：只读、限时、输出引用路径。合并前由 <span class="term" data-term-id="ci-agent-hook" tabindex="0">CI agent hook</span> 把评审结论写入 Check Run，供安全审计关联。</p>
+
+      <div class="role-cards">
+        <div class="role-card">
+          <h4>状态机显式化</h4>
+          <p>为每个阶段定义输入/输出 artifact：<code>design.md</code> → <code>patch.diff</code> → <code>test-report.xml</code>。</p>
+        </div>
+        <div class="role-card">
+          <h4>上下文预算</h4>
+          <p>Coder Agent 只挂载相关目录；Planner 可读 Issue，不读 node_modules。</p>
+        </div>
+        <div class="role-card">
+          <h4>失败可重入</h4>
+          <p>步骤 id 幂等；重跑 Tester 不应重复提交 MR。</p>
+        </div>
+      </div>
+
+      <h4>工作流 manifest 片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist-ai-workflow.yaml（示意）
+version: "1"
+stages:
+  - id: plan
+    agent: planner
+    inputs: ["issue_body"]
+    outputs: ["tasks.json"]
+  - id: implement
+    agent: coder
+    inputs: ["tasks.json", "repo_snapshot"]
+    outputs: ["branch.patch"]
+  - id: verify
+    agent: tester
+    inputs: ["branch.patch"]
+    outputs: ["pytest.xml", "coverage.json"]
+  - id: review
+    agent: reviewer
+    inputs: ["branch.patch", "pytest.xml"]
+    gates: ["no_secrets", "openapi_unchanged_or_approved"]</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 CorpAssist CI/CD 集成</h3>
+      <p>Agent 工作流在 CI 中应作为<strong>可选加速层</strong>，合并门禁仍以确定性工具为准。推荐在 PR 打开时运行「AI 辅助评审」，在 <code>main</code> 合并前强制 pytest + 静态检查。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># .github/workflows/corpassist-pr.yml（节选）
+on:
+  pull_request:
+    paths: ["app/**", "tests/**"]
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run pytest --cov=app --cov-fail-under=80
+  ai_assist:
+    needs: deterministic
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Invoke corpassist review agent
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          python scripts/ci_agent_review.py \
+            --skill corpassist-pr-review \
+            --pr ${{ github.event.pull_request.number }}</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="ci-agent-hook" tabindex="0">CI agent hook</span> 必须把模型输出写入 PR Comment 或 Check Run，并附带 <code>request_id</code> 便于与网关日志关联。敏感仓库应使用自托管 Runner + 私有模型端点（详见 <a href="#ch-advanced-04">企业级 AI 工具链安全与合规</a>）。</p>
+
+      <details class="learn-faq">
+        <summary>Agent 生成的 patch 能否自动 merge？</summary>
+        <div class="learn-faq-body">不建议。CorpAssist 生产变更至少保留：① 人类 Approve；② 确定性测试通过；③ 对安全/契约类 diff 的 CODEOWNERS 审查。Agent 可自动开 Draft PR，不可自动合入 <code>main</code>。</div>
+      </details>
+
+      <h4>Subagent 查依赖：何时用、何时不用</h4>
+      <p>当 Coder 需要确认第三方库 API（如 <code>langchain</code> 某版本签名）时，委派只读 Subagent 读取 lock 文件与文档，避免把整库塞进主会话。CorpAssist 约定：Subagent 超时 120s、最多 2 次重试，输出必须为「引用路径 + 结论」而非长文复述。</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># scripts/ci_agent_review.py（节选）— 统一 request_id
+import os
+import uuid
+
+def new_request_id() -> str:
+    rid = os.environ.get("GITHUB_RUN_ID")
+    return f"ca-ci-{rid}-{uuid.uuid4().hex[:8]}" if rid else f"ca-local-{uuid.uuid4().hex[:8]}"
+
+def run_review(skill: str, pr_number: int) -> int:
+    request_id = new_request_id()
+    # 写入 Check Run annotations，供 advanced-04 审计关联
+    ...</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="工作流成熟度">
+        <input type="radio" name="adt-a01-maturity" id="adt-a01-tab-l1" class="learn-tab-input" checked />
+        <input type="radio" name="adt-a01-maturity" id="adt-a01-tab-l2" class="learn-tab-input" />
+        <input type="radio" name="adt-a01-maturity" id="adt-a01-tab-l3" class="learn-tab-input" />
+        <label for="adt-a01-tab-l1">L1 个人</label>
+        <label for="adt-a01-tab-l2">L2 团队</label>
+        <label for="adt-a01-tab-l3">L3 平台</label>
+        <div class="learn-tab-panel" id="adt-a01-panel-l1" role="tabpanel">
+          <p>个人 Skill + 本地 Command；无 CI 集成。适合 PoC 与 <a href="#ch-basics-02">Prompt 驱动开发工作流</a> 摸索。</p>
+        </div>
+        <div class="learn-tab-panel" id="adt-a01-panel-l2" role="tabpanel">
+          <p>仓库内共享 Skill；PR 模板要求注明 AI 使用；pytest 门禁。对应本章 CorpAssist 目标态。</p>
+        </div>
+        <div class="learn-tab-panel" id="adt-a01-panel-l3" role="tabpanel">
+          <p>内部 Skill Registry + 统一 CI hook + 与 <a href="#ch-advanced-02">团队级 AI 编码度量与治理</a> 看板联动。</p>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>Planner 输出 tasks.json 应包含哪些字段？</summary>
+        <div class="learn-faq-body">建议最小字段：<code>id</code>、<code>title</code>、<code>files_allowlist</code>、<code>acceptance_commands</code>、<code>depends_on</code>。禁止 Planner 直接写「实现细节代码」，避免 Coder 失去检索上下文的机会。</div>
+      </details>
+      <details class="learn-faq">
+        <summary>与 Java 轨同事如何共用工作流？</summary>
+        <div class="learn-faq-body">Python 轨 Skill 聚焦 FastAPI/pytest；Java 轨使用 Spring AI 专用 Skill。共用部分：Issue 模板、PR 检查项、<code>request_id</code> 规范。跨栈契约变更须同时触发 OpenAPI diff 检查（见 practice-02）。</div>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>与 CorpAssist 路线图对照</h3>
+      <table class="outline-table">
+        <thead>
+          <tr><th>阶段</th><th>本章能力</th><th>关联章节</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>practice</td><td>单点 AI 提效</td><td><a href="#ch-practice-04">实战：CorpAssist 开发效率提升</a></td></tr>
+          <tr><td>advanced-01</td><td>工作流产品化</td><td>本章</td></tr>
+          <tr><td>advanced-02</td><td>度量与治理</td><td><a href="#ch-advanced-02">团队级 AI 编码度量与治理</a></td></tr>
+          <tr><td>advanced-03/04</td><td>门禁与合规</td><td><a href="#ch-advanced-03">Model-as-Judge</a>、<a href="#ch-advanced-04">安全与合规</a></td></tr>
+        </tbody>
+      </table>
+      <p>完成工作流设计后，务必在 <span class="term" data-term-id="multi-agent-orchestration" tabindex="0">multi-agent orchestration</span> 试点团队收集两周数据，再推广到全组；避免「只有 Skill 没有度量」导致无法证明 ROI。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>多 Agent 协作</strong>：Planner/Coder/Tester/Reviewer 分工，避免单会话上下文失控。</li>
+        <li><strong>Skill/Command</strong>：单一职责 + 固定验收命令，引用仓库真源文档。</li>
+        <li><strong>Workflow 编排</strong>：YAML 管触发与 artifact，Prompt 留在 Skill 内。</li>
+        <li><strong>CI/CD 集成</strong>：确定性 job 先行，Agent 评审作为可选加速且可审计。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="ai-dev-toolchain_advanced01">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="a01-roles" /> 能画出 CorpAssist 四角色 Agent 图</label></li>
+          <li><label><input type="checkbox" data-id="a01-skill" /> 能写一个最小 Skill 并声明验收命令</label></li>
+          <li><label><input type="checkbox" data-id="a01-dag" /> 能列出 workflow 各阶段 artifact</label></li>
+          <li><label><input type="checkbox" data-id="a01-ci" /> 能解释 CI 中 deterministic 与 ai_assist 先后关系</label></li>
+          <li><label><input type="checkbox" data-id="a01-delegate" /> 知道何时用 subagent 查依赖而非整库索引</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Planner</td><td>拆 Issue，不直接改生产代码</td></tr>
+                <tr><td>Skill</td><td>可版本化 SOP，绑定验收命令</td></tr>
+                <tr><td>workflow DAG</td><td>阶段 artifact 可重入</td></tr>
+                <tr><td>CI hook</td><td>输出进 Check Run，带 request_id</td></tr>
+                <tr><td>人在回路</td><td>Draft PR + 人工 Approve</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 CorpAssist 不建议单 Agent 完成「设计+编码+评审」？</li>
+              <li>Skill 与 <code>.cursor/rules</code> 如何分工？</li>
+              <li>描述一条 PR 从打开到合并的 AI+CI 时序。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-02">团队级 AI 编码度量与治理</a>，把接受率与缺陷密度纳入看板。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.cursor.com/context/skills" target="_blank" rel="noopener">Cursor Skills 文档</a></li>
+      <li><a href="https://docs.anthropic.com/en/docs/claude-code/skills" target="_blank" rel="noopener">Claude Code Skills</a></li>
+      <li><a href="https://docs.github.com/en/actions" target="_blank" rel="noopener">GitHub Actions 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist Python 服务起草一份「RAG API 变更」Skill，并在纸面设计 PR 上的 deterministic + ai_assist 两个 job。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照本章 Mermaid 图，在笔记中写出 Planner/Coder/Tester/Reviewer 各 1 条输入与输出 artifact。</li>
+      <li>按「Skill 骨架示例」填写 <code>corpassist-rag-api-change</code> 的禁止目录与验收命令（<code>ruff</code> + <code>pytest</code>）。</li>
+      <li>在 workflow manifest 中为 <code>verify</code> 阶段增加 <code>coverage.json</code> 输出，并说明谁消费该文件。</li>
+      <li>从「与 CorpAssist CI/CD 集成」YAML 节选复制骨架，补全 <code>needs: deterministic</code> 的含义一句话。</li>
+      <li>可选：在 <code>demos/advanced-01-lab/</code> 创建 Skill 文件并让小范围同事试用。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">PR 上 Agent 评审通过但 pytest 失败，是否应允许合并？说明理由。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不允许。确定性测试是硬门禁；Agent 评审仅辅助发现风格/安全问题，不能替代 <code>pytest</code>。应先修复测试再请求复审。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">Coder 与 Tester 两个 Agent 同时修改 <code>tests/rag/test_retrieve.py</code>，属于哪种协作模式？应如何调整？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>错误使用了并行+汇总且文件冲突。应改为顺序流水线：Coder 提交实现与测试草案 → Tester 只补充边界用例，或合并为单 Agent 会话。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：advanced-01-lab</h4>
+      <p>目录：<code>demos/advanced-01-lab/</code>。验收：存在可加载的 Skill 文件；同事按 Skill 执行后能得到固定格式的「diff 摘要 + pytest 命令」输出。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸资源</h3>
+    <ul>
+      <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents（Anthropic）</a></li>
+    </ul>
+    <p><strong>上一章</strong>：<a href="#ch-practice-04">实战：CorpAssist 开发效率提升</a> · <strong>下一章</strong>：<a href="#ch-advanced-02">团队级 AI 编码度量与治理</a></p>
+  </div>
+</section>
+

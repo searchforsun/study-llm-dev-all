@@ -6,89 +6,298 @@
 
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>生产化与可移植</strong> · 能力：掌握换模型步骤、配置外部化与面试常考点</p>
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>生产化与可移植</strong> · 能力：掌握换模型步骤、配置外部化、与 Python 抽象对照及面试 defense</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
-        <p>企业可能从 OpenAI 迁到通义/DeepSeek 私有化网关。Spring AI 抽象的价值在于换 ChatModel Bean 而非改业务代码。</p>
+        <p>CorpAssist 上线后，企业常面临：<strong>OpenAI → 通义/DeepSeek 私有化网关</strong>、<strong>embedding 模型升级</strong>、<strong>合规要求数据不出境</strong>。若业务代码直接 <code>new OpenAiApi(...)</code> 或 Prompt 写死 GPT-4，换供应商等于重写。Spring AI 1.0.x 的价值在于 <span class="term" data-term-id="abstraction-layer" tabindex="0">abstraction layer</span>：<code>ChatModel</code> / <code>EmbeddingModel</code> / <code>VectorStore</code> 接口 + <span class="term" data-term-id="externalized-config" tabindex="0">externalized config</span>；本章收尾全课，并对接 <span class="term" data-term-id="portability" tabindex="0">portability</span> 与 <span class="term" data-term-id="vendor-lock-in" tabindex="0">vendor lock in</span> 面试题。</p>
       </div>
       <div class="notice notice-outcome">
         <strong>学完你能</strong>
         <ul>
-          <li>在 CorpAssist-spring 模块实践本章核心能力</li>
-          <li>说明与 <a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 工程轨</span><code class="course-ref-slug">python-engineering-for-llm</code></a> 的分工与契约</li>
-          <li>完成 Demo 与章节测验</li>
+          <li>按 <span class="term" data-term-id="model-swap" tabindex="0">model swap</span> 五步清单切换 Chat/Embedding 模型，<code>RagQueryService</code> 零改动</li>
+          <li>用 K8s ConfigMap/Secret + <code>${ENV}</code> 外部化 base-url、api-key、model 名</li>
+          <li>对照 Python 轨 httpx + OpenAI SDK 抽象，完成 <span class="term" data-term-id="dual-stack-compare" tabindex="0">dual stack compare</span></li>
+          <li>回答 TOP 面试题：「如何降低 LLM 供应商锁定？」「换模型如何回归？」</li>
         </ul>
       </div>
       <div class="notice">
         <strong>本章先记住 3 件事</strong>
         <ul>
-          <li><strong>抽象优先</strong>：业务依赖 ChatClient/VectorStore，而非具体厂商 SDK。</li>
-          <li><strong>可配置</strong>：模型名、密钥、路由策略来自环境，不写死在代码。</li>
-          <li><strong>可观测</strong>：关键路径有日志、指标与 request_id，便于双栈联调。</li>
+          <li><strong>换配置不换代码</strong>：starter + yml；业务只依赖 ChatClient。</li>
+          <li><strong>OpenAI 兼容网关</strong>：<span class="term" data-term-id="openai-compatible" tabindex="0">openai compatible</span> base-url 可接多数国产私有化部署。</li>
+          <li><strong>换模型必跑评测</strong>：引用率、must_contain、P95 三线对比，见 demo model-migration.md。</li>
         </ul>
       </div>
     </div>
 
     <div class="section-block">
       <h3>换模型步骤</h3>
-      <p>改 starter 依赖与 application.yml；ChatClient 业务代码不变；回归评测集。 关联：<span class="term" data-term-id="vendor-lock-in" tabindex="0">vendor lock in</span>、<span class="term" data-term-id="model-swap" tabindex="0">model swap</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 网关迁移</span>
+        集团要求 Q2 前从公有云 API 切到内网「OpenAI 兼容」网关（通义 qwen-plus）。运维更新 Secret；开发确认 Spring AI starter 仍指向 <code>/v1/chat/completions</code>；算法同学用同一 golden 集对比 qwen 与 gpt-4o-mini 的引用率。
+      </aside>
+
+      <h4>五步检查单（见 demo model-migration.md）</h4>
+      <ol>
+        <li><strong>更新 base-url</strong> 指向私有化网关（含路径前缀是否含 <code>/v1</code>）</li>
+        <li><strong>确认 OpenAI 兼容路径</strong> <code>/v1/chat/completions</code> 与 embedding 路径</li>
+        <li><strong>调整 model 名</strong> 与 options（temperature、max_tokens）</li>
+        <li><strong>跑评测集</strong> 对比分数、引用率、must_contain</li>
+        <li><strong>灰度 10% 流量</strong>，看 P95 与 error rate，再全量</li>
+        <li><strong>准备回滚</strong>：保留旧 model 环境变量与镜像 tag 24h，metrics 劣化时一键切回</li>
+      </ol>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">xml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-xml">&lt;!-- pom.xml：换官方 starter，而非改业务包 import --&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.ai&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-ai-starter-model-openai&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;!-- 若网关纯 OpenAI 兼容，仍用 openai starter + 改 base-url --&gt;</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>model swap · 影响范围</h5>
+        <pre class="mermaid">flowchart LR
+  Yml["application.yml / Secret"]
+  Starter["spring-ai-starter"]
+  Bean["ChatModel Bean"]
+  Client["ChatClient / RagQueryService"]
+  Yml --> Starter --> Bean --> Client
+  Client -.->|不变| API["/v1/rag/query"]</pre>
+        <p class="diagram-caption">换模型动 yml + starter；<a href="#ch-advanced-05-corpassist-rag-api">RAG API</a> 与 Advisor 链代码不动。</p>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>变更类型</th><th>需改代码？</th><th>必做回归</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>同接口换 model 名</td>
+            <td>否（仅配置）</td>
+            <td>golden 集 + P95</td>
+          </tr>
+          <tr>
+            <td>换 embedding 维度</td>
+            <td>是（重建索引 / re-embed）</td>
+            <td>检索 recall@k</td>
+          </tr>
+          <tr>
+            <td>换 VectorStore 引擎</td>
+            <td>Adapter 层</td>
+            <td>集成测 + 数据迁移</td>
+          </tr>
+          <tr>
+            <td>Tool JSON schema 差异</td>
+            <td>可能（Advisor/Tool 定义）</td>
+            <td>NS2 Tool 调用用例</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>自检：换 Chat 模型为何要关心 embedding？</summary>
+        <p>Chat 与 embedding 独立；但若<strong>同时</strong>换 embedding 模型，向量空间变，旧 PGVector 索引失效，需 re-embed（Python 批处理或 Spring 调度任务）。</p>
+      </details>
     </div>
 
     <div class="section-block">
       <h3>配置外部化</h3>
-      <p>K8s ConfigMap/Secret 注入 api-key、base-url、model 名。 关联：<span class="term" data-term-id="externalized-config" tabindex="0">externalized config</span>、<span class="term" data-term-id="abstraction-layer" tabindex="0">abstraction layer</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
-    </div>
+      <p>Spring Boot 3.3 推荐：<strong>12-factor</strong> 配置进环境变量；密钥进 K8s Secret；非敏感路由策略进 ConfigMap。禁止在 Git 提交 api-key。</p>
 
-    <div class="section-block">
-      <h3>对比 Python 抽象与面试题</h3>
-      <p>Python httpx 与 Spring ChatModel 同层；面试问「如何降低供应商锁定」。 关联：<span class="term" data-term-id="openai-compatible" tabindex="0">openai compatible</span>、<span class="term" data-term-id="interview-rag" tabindex="0">interview rag</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
-    </div>
-
-    <div class="section-block">
-      <h3>关键术语</h3>
-      <p><span class="term" data-term-id="vendor-lock-in" tabindex="0">vendor lock in</span> · <span class="term" data-term-id="model-swap" tabindex="0">model swap</span> · <span class="term" data-term-id="externalized-config" tabindex="0">externalized config</span> · <span class="term" data-term-id="abstraction-layer" tabindex="0">abstraction layer</span> · <span class="term" data-term-id="openai-compatible" tabindex="0">openai compatible</span> · <span class="term" data-term-id="interview-rag" tabindex="0">interview rag</span> · <span class="term" data-term-id="portability" tabindex="0">portability</span> · <span class="term" data-term-id="dual-stack-compare" tabindex="0">dual stack compare</span></p>
-    </div>
-
-    <div class="section-block">
-      <h3>代码示例</h3>
+      <h4>application.yml + 环境变量</h4>
       <div class="code-block">
         <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
         <pre><code class="language-yaml">spring:
   ai:
     openai:
-      base-url: ${CORPASSIST_LLM_BASE_URL}
+      base-url: ${CORPASSIST_LLM_BASE_URL:https://api.openai.com}
       api-key: ${CORPASSIST_LLM_API_KEY}
       chat:
         options:
-          model: ${CORPASSIST_CHAT_MODEL:qwen-plus}</code></pre>
+          model: ${CORPASSIST_CHAT_MODEL:qwen-plus}
+          temperature: ${CORPASSIST_CHAT_TEMP:0.2}
+      embedding:
+        options:
+          model: ${CORPASSIST_EMBED_MODEL:text-embedding-v3}
+
+corpassist:
+  retrieval:
+    mode: ${CORPASSIST_RETRIEVAL_MODE:local}
+  python-search:
+    base-url: ${CORPASSIST_PYTHON_SEARCH_BASE_URL:http://localhost:8000}</code></pre>
       </div>
+
+      <h4>K8s Secret / ConfigMap 片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: corpassist-llm
+type: Opaque
+stringData:
+  CORPASSIST_LLM_API_KEY: "sk-***"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: corpassist-ai-config
+data:
+  CORPASSIST_LLM_BASE_URL: "https://llm-gateway.corp.internal/v1"
+  CORPASSIST_CHAT_MODEL: "qwen-plus"</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">多环境复制整份 yml</span>
+          <ul>
+            <li>dev/stage/prod 漂移</li>
+            <li>密钥误提交 Git</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">单 yml + 环境变量注入</span>
+          <ul>
+            <li>镜像不可变，配置在部署层</li>
+            <li>与 Python <code>settings.py</code> + env 对称</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>多模型路由（<a href="#ch-advanced-02-multimodel">NS3</a>）的 tier 表同样外部化：<code>corpassist.routing.rules</code> 用 YAML 或配置中心，避免改 Java 常量发版。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>对比 Python 抽象</h3>
+      <p>双栈可移植性来自<strong>同层抽象 + 同契约</strong>，而非「语言相同」。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>能力</th><th>Spring AI 1.0.x</th><th>Python 轨（典型）</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Chat 调用</td>
+            <td><code>ChatModel</code> / <code>ChatClient</code></td>
+            <td>OpenAI SDK / LangChain <code>ChatOpenAI</code></td>
+          </tr>
+          <tr>
+            <td>Embedding</td>
+            <td><code>EmbeddingModel</code></td>
+            <td><code>OpenAIEmbeddings</code></td>
+          </tr>
+          <tr>
+            <td>向量库</td>
+            <td><code>VectorStore</code> + PGVector</td>
+            <td>pgvector / Chroma client</td>
+          </tr>
+          <tr>
+            <td>配置</td>
+            <td><code>application.yml</code> + env</td>
+            <td>Pydantic Settings + env</td>
+          </tr>
+          <tr>
+            <td>网关</td>
+            <td><code>spring.ai.openai.base-url</code></td>
+            <td><code>OPENAI_BASE_URL</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>Python 批量索引脚本与 Spring 在线 API <strong>共用</strong> embedding model 名与维度配置；否则检索「能跑但召回差」难以排查。OpenAPI 契约（<a href="#ch-advanced-05-corpassist-rag-api">RAG API</a>）是跨语言边界，比抽象类名更重要。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># Python 轨 — settings.py（对照 Spring application.yml）
+class Settings(BaseSettings):
+    openai_base_url: str = Field(alias="OPENAI_BASE_URL")
+    openai_api_key: str = Field(alias="OPENAI_API_KEY")
+    chat_model: str = "qwen-plus"
+    embed_model: str = "text-embedding-v3"
+
+# 与 spring.ai.openai.* 环境变量同名便于双栈运维</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>仍会产生锁定的场景</strong>
+        <ul>
+          <li>Prompt 针对某一模型调优（few-shot 仅适用于 GPT 风格）</li>
+          <li>Structured Output JSON schema 厂商支持度不同</li>
+          <li>Tool calling 字段格式差异（需 Adapter）</li>
+          <li>向量维度变更未 re-embed</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>面试题</h3>
+      <p>以下结合 CorpAssist 场景，用于 TOP5 defense 与 <span class="term" data-term-id="interview-rag" tabindex="0">interview rag</span> 模块。</p>
+
+      <h4>Q1：如何降低 LLM 供应商锁定？</h4>
+      <div class="role-cards">
+        <div class="role-card">
+          <strong>要点</strong>
+          <ul>
+            <li>业务依赖 ChatClient / 领域 Service，不依赖厂商 SDK 类型</li>
+            <li>OpenAI 兼容网关 + base-url 外部化</li>
+            <li>Prompt / 检索 / 评测与模型解耦；golden 集回归</li>
+            <li>双栈 OpenAPI 契约，避免 BFF 绑死某一后端</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Q2：换模型后如何证明「没有变劣」？</h4>
+      <p>答：<strong>三线证据</strong>——(1) golden JSONL 引用率与 must_contain ≥ 阈值；(2) Grafana P95 / error rate 不劣于基线；(3) 人工 badcase 抽检 20 条。灰度期对比 <code>model</code> tag 的 metrics。</p>
+
+      <h4>Q3：Spring AI 与直接调 REST 有何取舍？</h4>
+      <p>答：Spring AI 提供 Advisor、Observation、VectorStore 统一抽象；直接 REST 少依赖但需自研护栏与指标。CorpAssist 选 Spring AI 因 NS2/NS3 需要 Advisor 链与 Micrometer 集成。</p>
+
+      <h4>Q4：embedding 换模型要注意什么？</h4>
+      <p>答：维度可能变化 → 重建 vector 表或 re-embed 全量文档；检索评测 recall@k 必须重跑；Chat 模型可独立更换。</p>
+
+      <details class="learn-micro-check">
+        <summary>自检：「我们用 Spring AI 所以不会 vendor lock-in」成立吗？</summary>
+        <p><strong>不成立。</strong> 抽象降低切换成本，但 Prompt 调优、Tool schema、索引与评测仍绑定行为；可移植性需要流程（配置 + 契约 + 评测）而不只是框架。</p>
+      </details>
+
+      <h4>全课回顾 · Spring AI 工程化能力栈</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>章节</th><th>能力</th><th>与可移植性关系</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Advisor 护栏</td><td>输入/输出策略与 vendor 无关</td><td>换模型后仍生效</td></tr>
+          <tr><td>多模型路由</td><td>tier 配置外部化</td><td>灰度新模型入口</td></tr>
+          <tr><td>Micrometer</td><td>按 model tag 对比</td><td>迁移验收证据</td></tr>
+          <tr><td>测试替身</td><td>MockBean 回归</td><td>换 starter 后 CI 仍绿</td></tr>
+          <tr><td>RAG API</td><td>RetrievalPort 抽象</td><td>检索后端可独立演进</td></tr>
+        </tbody>
+      </table>
+
       <div class="mermaid-wrap">
-        <h5>可移植性与供应商锁定 · CorpAssist 上下文</h5>
+        <h5>CorpAssist Java 轨 · 后续学习路径</h5>
         <pre class="mermaid">flowchart LR
-  Portal["企业门户 / BFF"]
-  Spring["CorpAssist Spring AI"]
-  LLM["模型网关"]
-  Py["Python 检索服务"]
-  Portal --> Spring
-  Spring --> LLM
-  Spring -.->|可选| Py</pre>
-        <p class="diagram-caption">Spring AI 轨消费模型网关；RAG 检索可内置或委托 Python 服务，以 OpenAPI 契约对齐。</p>
+  Done["spring-ai-engineering 结业"]
+  RAG["rag-system-java"]
+  Scene["scenario-java-rag-kb"]
+  Done --> RAG
+  Done --> Scene
+  RAG --> Scene</pre>
+        <p class="diagram-caption">先深化 RAG 工程（VectorStore、混合检索），再进 NS1 必修场景交付。</p>
       </div>
-      <aside class="learn-scenario" aria-label="业务情境">
-        <span class="learn-scenario-title">CorpAssist · S2 智能客服</span>
-        员工在门户提问工单与制度；Spring AI 模块负责鉴权、会话记忆、模型路由与审计，Python 侧可承担批量索引与实验性算法。
-      </aside>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3。</p>
       <ul class="chapter-conclusions-list">
-        <li><strong>目标</strong>：掌握换模型步骤、配置外部化与面试常考点</li>
-        <li><strong>工程化</strong>：配置外部化、Advisor/测试/指标纳入同一模块。</li>
-        <li><strong>下一步</strong>：回顾全课并对接评测与上线清单</li>
+        <li><strong>换模型步骤</strong>：base-url → 兼容路径 → model 名 → 评测 → 灰度；RagQueryService 不动。</li>
+        <li><strong>配置外部化</strong>：env + Secret；Chat/Embedding/retrieval 全外部化。</li>
+        <li><strong>Python 对照</strong>：同层抽象 + OpenAPI；embedding 配置双栈一致。</li>
+        <li><strong>面试题</strong>：锁定来源、三线回归、Spring AI 价值、re-embed。</li>
       </ul>
     </div>
 
@@ -96,48 +305,72 @@
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="spring-ai_advanced_06_portability">
         <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
-        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
         <ul>
-          <li><label><input type="checkbox" data-id="concept" /> 能口述本章在 CorpAssist 中的位置</label></li>
-          <li><label><input type="checkbox" data-id="code" /> 能指出代码示例中 2 个关键类/配置项</label></li>
-          <li><label><input type="checkbox" data-id="demo" /> 已完成 Demo 练习</label></li>
+          <li><label><input type="checkbox" data-id="swap" /> 能背诵 model swap 五步</label></li>
+          <li><label><input type="checkbox" data-id="config" /> 能写出 3 个 CORPASSIST_* 环境变量</label></li>
+          <li><label><input type="checkbox" data-id="dual" /> 能对照 Spring ChatModel 与 Python SDK 一层</label></li>
+          <li><label><input type="checkbox" data-id="demo" /> 已完成 model-migration.md 练习</label></li>
           <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
         </ul>
       </div>
-      <p class="chapter-review-next">恭喜完成 Spring AI 工程化全课！可继续 <a href="../rag-system-engineering/index.html">RAG 系统架构</a> 深化。</p>
+      <p class="chapter-review-next">恭喜完成《Spring AI 工程化开发》全课！建议继续 <a href="../rag-system-java/index.html">RAG 系统实践 · Java 栈</a> 或必修场景 <a href="../scenario-java-rag-kb/index.html">企业落地 · RAG 知识库问答</a>。</p>
     </div>
   </div>
 
   <div class="official-links content-section">
     <h3>官方文档</h3>
     <ul>
-      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 参考文档</a></li>
-      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/" target="_blank" rel="noopener">Spring Boot 参考</a></li>
-      <li><a href="https://spring.io/projects/spring-ai" target="_blank" rel="noopener">Spring AI 项目页</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatmodel.html" target="_blank" rel="noopener">Spring AI — ChatModel</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/reference/features/external-config.html" target="_blank" rel="noopener">Spring Boot Externalized Configuration</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/embeddings.html" target="_blank" rel="noopener">Spring AI — Embeddings</a></li>
     </ul>
   </div>
 
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <p class="steps-intro">约 25 分钟 · 在 demo 目录完成练习并作答测验。</p>
+    <p class="steps-intro">基于 demo 写出你们环境从厂商 A 切到 B 的检查单，并模拟面试答法。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>进入 <code>demos/advanced-06-portability-lab/</code>，阅读 README。</li>
-      <li>按 README 操作或阅读代码/配置片段，完成验收项。</li>
-      <li>在笔记中写一条与 Python 轨或 Spring Boot 惯例的对照。</li>
-      <li>完成右侧章节测验。</li>
+      <li>阅读 <code>demos/advanced-06-portability-lab/model-migration.md</code>，扩展为 8 步（含 re-embed 与回滚）。</li>
+      <li>列出当前项目所有硬编码 model 名与 api-key 位置（应为零）。</li>
+      <li>写一段 60 秒口语答案：「如何降低 LLM vendor lock-in？」</li>
+      <li>对照 Python 轨，写一张 Chat/Embedding/VectorStore 双栈对照表。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">换 Chat 模型后评测通过率下降 5%，是否必须回滚？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>视 SLA 阈值而定。若仍 ≥ 85% 且 P95 更好，可接受并修 Prompt；若低于门禁或 P95 劣化明显，<strong>灰度回滚</strong>并分析 badcase。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">为「快速上线」在 Java 里直接 new OpenAiApi 跳过 Spring AI，是否更好？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>否。</strong> 短期少写配置，长期失去 Advisor、Observation、MockBean 测试与换模型能力；与 CorpAssist 工程化目标相悖。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
-      <h4 class="demo-box-title">Demo：可移植性与供应商锁定</h4>
-      <p>目录：<code>demos/advanced-06-portability-lab/</code> — 写出你们环境从厂商 A 切到 B 的 5 步检查单</p>
+      <h4 class="demo-box-title">Demo：模型迁移清单</h4>
+      <p>目录：<code>demos/advanced-06-portability-lab/</code>。<strong>验收</strong>：写出从厂商 A 切到 B 的 5 步检查单，并附 1 条评测回归命令。</p>
     </div>
   </div>
 
   <div class="resources content-section">
     <h3>延伸学习</h3>
     <ul>
-      <li><strong>推荐</strong>：<a href="../rag-system-engineering/index.html">RAG 系统架构与双栈工程实践</a></li>
-      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">ChatClient API</a></li>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-05-corpassist-rag-api">实战：CorpAssist Spring RAG API</a></li>
+      <li><strong>推荐下一课</strong>：<a href="../rag-system-java/index.html">RAG 系统实践 · Java/Spring 栈</a>（深化 VectorStore、混合检索、评测）</li>
+      <li><strong>Graduation 场景</strong>：<a href="../scenario-java-rag-kb/index.html">企业落地 · RAG 知识库问答</a>（NS1 必修场景）</li>
+      <li><a href="#ch-advanced-02-multimodel">多模型路由</a>：NS3 与灰度配合</li>
     </ul>
   </div>
 </section>

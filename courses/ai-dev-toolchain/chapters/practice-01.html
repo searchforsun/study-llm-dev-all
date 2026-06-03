@@ -1,0 +1,380 @@
+<section id="ch-practice-01" class="chapter" data-chapter="practice-01">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>AI 生成测试用例</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>AI 自动化实践</strong> · 能力：用 AI 为 CorpAssist Python 服务批量生成 pytest 用例并解读覆盖率</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么要学本章</h4>
+        <p>CorpAssist 的 <span class="term" data-term-id="fastapi">FastAPI</span> RAG 接口迭代快，手工补测往往滞后于功能合并。AI 能在理解路由契约与 Pydantic 模型后，一次性产出可运行的 <span class="term" data-term-id="pytest">pytest</span> 骨架，再配合人工审查与 <span class="term" data-term-id="ruff">ruff</span> 静态检查，把「补测」从数小时压缩到数十分钟。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完你能</h4>
+        <ul>
+          <li>用结构化 Prompt 让 AI 为指定模块生成 pytest 文件与目录布局</li>
+          <li>设计边界表驱动 <span class="term" data-term-id="parametrize">parametrize</span>，覆盖空查询、超长上下文、鉴权失败等场景</li>
+          <li>生成 Mock LLM / 向量库 Fixture，避免 CI 调用真实模型</li>
+          <li>阅读 <span class="term" data-term-id="coverage">coverage</span> 报告，区分「行覆盖」与「分支覆盖」缺口</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <h4>本章先记住 3 件事</h4>
+        <ul>
+          <li>先给 AI「被测函数签名 + 错误码约定 + 禁止真实 LLM」三类约束，再要完整测试文件</li>
+          <li>边界用例必须来自产品/安全清单，不能只让模型「随便编几个」</li>
+          <li>生成测试同样要过 ruff + pytest，并纳入与业务代码相同的 Review 门禁</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>pytest 用例自动生成</h3>
+      <p>在 CorpAssist 仓库中，典型被测对象是 <code>app/rag/router.py</code> 下的 <code>POST /v1/rag/query</code>。向 Cursor / Claude Code 提供：路由源码、<code>schemas/query.py</code>、团队 Rules（禁止直连 LLM），可得到可提交的测试模块。</p>
+      <aside class="learn-scenario">
+        <strong>场景</strong>：迭代「引用溯源」字段后，需在 1 个 PR 内补齐回归测试。你把 diff、OpenAPI 片段与现有 <code>conftest.py</code> 一并 @ 给 AI，要求输出 <code>tests/rag/test_query_citations.py</code>。
+      </aside>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code>你是 CorpAssist Python 服务的测试工程师。请为以下被测代码生成 pytest 文件。
+
+约束：
+1) 使用 httpx.AsyncClient + ASGITransport，不要 TestClient 同步阻塞
+2) 所有 LLM 调用必须 mock，禁止环境变量中的真实 API Key
+3) 断言包含：HTTP 状态码、response_model 字段、X-Request-Id 响应头
+4) 文件顶部注明 # generated-by-ai，人工 review 后删除该行
+
+被测路由：（粘贴 router 源码）
+共享 fixture：（粘贴 conftest 片段）</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># tests/rag/test_query.py — AI 生成骨架经人工微调
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from app.main import app
+
+
+@pytest.mark.asyncio
+async def test_rag_query_returns_answer_and_citations(mock_rag_pipeline):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/rag/query",
+            json={"query": "年假几天", "top_k": 3},
+            headers={"X-Api-Key": "test-key"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"]
+    assert len(body["citations"]) &lt;= 3
+    assert resp.headers.get("X-Request-Id")</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>低效 Prompt</h4><p>「帮我写点测试」——缺少契约、无 mock 约束，常生成调用真实 OpenAI 的用例，CI 费用爆炸。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>可合并 Prompt</h4><p>提供路由 + Schema + conftest + 错误码表 + 「禁止真实 LLM」——输出可直接 <code>uv run pytest</code> 的文件。</p></div>
+      </div>
+      <details class="learn-micro-check"><summary>思考 10 秒：为什么要求 AsyncClient 而不是 Starlette TestClient？</summary><p>CorpAssist 路由多为 async；在 async 测试函数里用同步 TestClient 容易掩盖事件循环阻塞问题，且与生产 httpx 调用栈不一致。团队 Rules 统一要求 ASGITransport + AsyncClient。</p></details>
+      <div class="role-cards">
+        <div class="role-card"><h4>输入给 AI</h4><ul><li>router 源码 + Pydantic 模型</li><li>错误码枚举表</li><li>现有 conftest 片段</li></ul></div>
+        <div class="role-card"><h4>人工必改</h4><ul><li>断言 citations 字段结构</li><li>删除重复 happy path</li><li>核对 patch 路径</li></ul></div>
+        <div class="role-card"><h4>CI 门禁</h4><ul><li>ruff check tests/</li><li>pytest -q --cov-fail-under</li><li>禁止 secrets 扫描告警</li></ul></div>
+      </div>
+      <p>生成后执行 <code>uv run ruff format tests/</code> 与 <code>uv run ruff check</code>，避免 AI 使用已弃用 API（如旧版 <code>TestClient(app)</code> 同步写法）。若项目启用 <code>pytest-asyncio</code>，在 <code>pyproject.toml</code> 中声明 <code>asyncio_mode = auto</code>，并在 Prompt 中写明，减少 <code>@pytest.mark.asyncio</code> 遗漏。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>边界条件覆盖</h3>
+      <p>AI 擅长枚举参数组合，但<strong>业务边界</strong>须由你提供清单。对 RAG 查询接口，常见边界包括：空字符串、仅空白、超长 query（&gt;8k 字符）、<code>top_k=0</code>、未授权、租户隔离字段缺失等。</p>
+      <table class="outline-table">
+        <thead><tr><th>输入</th><th>期望</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>query=""</code></td><td>422</td><td>Pydantic min_length</td></tr>
+          <tr><td><code>top_k=101</code></td><td>422</td><td>Schema 上限</td></tr>
+          <tr><td>无 API Key</td><td>401</td><td>网关对齐错误体</td></tr>
+          <tr><td>mock 检索为空</td><td>200 + 空 citations</td><td>降级文案，非 500</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">import pytest
+
+BOUNDARY_CASES = [
+    pytest.param("", 422, id="empty-query"),
+    pytest.param("   ", 422, id="whitespace-query"),
+    pytest.param("x" * 9000, 422, id="overlong-query"),
+]
+
+
+@pytest.mark.parametrize("query,status", BOUNDARY_CASES)
+@pytest.mark.asyncio
+async def test_rag_query_validation(client, query, status):
+    resp = await client.post("/v1/rag/query", json={"query": query, "top_k": 3})
+    assert resp.status_code == status</code></pre>
+      </div>
+      <p>把上表粘贴进 Prompt，要求 AI 「为每一行生成独立 test id，并补充 mock 检索为空的第 4 条」。生成后人工删除重复或与产品冲突的用例。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">@pytest.mark.asyncio
+async def test_rag_query_empty_retrieval_returns_safe_answer(client, mock_rag_pipeline):
+    mock_rag_pipeline.return_value = {"answer": "未找到相关政策，请联系 HR。", "citations": []}
+    resp = await client.post("/v1/rag/query", json={"query": "火星年假", "top_k": 3})
+    assert resp.status_code == 200
+    assert "未找到" in resp.json()["answer"]
+    assert resp.json()["citations"] == []</code></pre>
+      </div>
+      <p>对多租户 CorpAssist 部署，边界表还应包含 <code>X-Tenant-Id</code> 缺失、跨租户 doc_id 等条目；把这些行写进 Prompt 的「必须覆盖」清单，避免 AI 只测单租户 happy path。</p>
+      <table class="outline-table">
+        <thead><tr><th>Prompt 片段</th><th>作用</th></tr></thead>
+        <tbody>
+          <tr><td>「每个边界独立 test id」</td><td>CI 失败时一眼定位场景</td></tr>
+          <tr><td>「422 断言 detail[0].loc」</td><td>与 OpenAPI 错误体一致</td></tr>
+          <tr><td>「401 断言 error_code 字段」</td><td>与 Java 网关 BFF 契约对齐</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>Mock 与 Fixture 生成</h3>
+      <p><span class="term" data-term-id="fixture">Fixture</span> 是 AI 测试生成的核心交付物。CorpAssist 约定在 <code>tests/conftest.py</code> 提供：<code>mock_rag_pipeline</code>（替换向量检索 + LLM 合成）、<code>fake_settings</code>（内存配置）、<code>client</code>（带鉴权头的 AsyncClient）。</p>
+      <div class="mermaid-wrap">
+        <h5>Fixture 依赖关系</h5>
+        <pre class="mermaid">
+flowchart TB
+    FS[fake_settings] --> APP[app lifespan]
+    MRP[mock_rag_pipeline] --> APP
+    APP --> CL[client AsyncClient]
+    CL --> TC[test_rag_query_*]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># tests/conftest.py 片段
+import pytest
+from unittest.mock import AsyncMock, patch
+
+from httpx import ASGITransport, AsyncClient
+from app.main import app
+
+
+@pytest.fixture
+def mock_rag_pipeline():
+    with patch("app.rag.service.RagPipeline.arun", new_callable=AsyncMock) as m:
+        m.return_value = {
+            "answer": "工作满一年可申请 5 天年假。",
+            "citations": [{"doc_id": "hr-001", "snippet": "年假 5 天"}],
+        }
+        yield m
+
+
+@pytest.fixture
+async def client(mock_rag_pipeline):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        ac.headers.update({"X-Api-Key": "test-key"})
+        yield ac</code></pre>
+      </div>
+      <p>向 AI 描述「patch 路径必须与被测 import 路径一致」（常见坑：<code>app.service</code> vs <code>app.rag.service</code>），并要求为每个 mock 写 <code>assert_called_once</code> 副作用断言。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">@pytest.mark.asyncio
+async def test_rag_query_passes_top_k_to_pipeline(client, mock_rag_pipeline):
+    await client.post("/v1/rag/query", json={"query": "报销流程", "top_k": 5})
+    mock_rag_pipeline.assert_awaited_once()
+    _, kwargs = mock_rag_pipeline.call_args
+    assert kwargs.get("top_k") == 5</code></pre>
+      </div>
+      <p>使用 <code>pytest-httpx</code> 时，可 mock 出站 embedding 请求；但 CorpAssist 默认在 service 层 patch <code>RagPipeline</code>，减少与 HTTP 层耦合。若 AI 生成 <code>respx</code> 用例，需确认不会与全局 fixture 冲突。</p>
+      <aside class="learn-scenario"><strong>场景</strong>：合并 AI 生成的 12 个用例后，CI 偶发失败。根因是 <code>mock_rag_pipeline</code> 未 autouse，顺序依赖导致状态泄漏。解决：session 级 fixture + 每个测试独立 return_value，或在 teardown 中 <code>reset_mock()</code>。</aside>
+    </div>
+
+    <div class="section-block">
+      <h3>覆盖率报告解读</h3>
+      <p>在 monorepo 根目录执行 <code>uv run pytest --cov=app --cov-report=term-missing</code>。AI 可读取终端输出或 <code>coverage.xml</code>，标出「未覆盖分支」并建议补测——但<strong>不要</strong>追求 100% 行覆盖，优先核心路径与合规相关分支。</p>
+      <table class="outline-table learn-decision-table">
+        <thead><tr><th>指标</th><th>CorpAssist 建议阈值</th><th>行动</th></tr></thead>
+        <tbody>
+          <tr><td>rag/service.py 行覆盖</td><td>≥ 85%</td><td>未覆盖的 except 分支补单测</td></tr>
+          <tr><td>auth 中间件</td><td>100% 分支</td><td>安全关键，禁止 AI 省略</td></tr>
+          <tr><td>generated 测试文件</td><td>同模块覆盖 +5%</td><td>合并前对比 diff coverage</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># CI 中与 AI Review 并列
+uv run ruff check tests/
+uv run pytest tests/rag -q --cov=app/rag --cov-fail-under=85
+# 将 missing 行列表 @ 给 AI：「仅针对下列行补 2 个测试，不要重复已有用例」</code></pre>
+      </div>
+      <details class="learn-micro-check"><summary>覆盖率从 72% 提到 88%，但缺陷仍上线，可能原因？</summary><p>1) 只覆盖 happy path，未 assert 错误体结构；2) mock 过度，未测真实 Pydantic 校验；3) 集成测试缺失。应结合变异测试或契约测试抽查关键断言。</p></details>
+    </div>
+
+    <div class="section-block">
+      <h3>CorpAssist 合码检查清单（测试维度）</h3>
+      <p>将下列清单写入 <code>.cursor/rules</code> 或 <code>CLAUDE.md</code>，PR 模板中勾选。AI 生成测试后，维护者按表逐项确认，避免「绿测无断言」。</p>
+      <table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>命令/证据</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>无真实 LLM/embedding 调用</td><td>CI 日志无 openai.azure 域名</td></tr>
+          <tr><td>2</td><td>鉴权失败返回 401 + error_code</td><td>test 中断言 JSON 字段</td></tr>
+          <tr><td>3</td><td>patch 路径与 import 一致</td><td>本地删除实现仍失败</td></tr>
+          <tr><td>4</td><td>新增分支有对应边界用例</td><td>coverage.xml 无新增裸分支</td></tr>
+          <tr><td>5</td><td>ruff 通过</td><td><code>uv run ruff check tests/</code></td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">toml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-toml"># pyproject.toml 片段
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true</code></pre>
+      </div>
+      <p>当 AI 建议「跳过慢测」时，应改为标记 <code>@pytest.mark.slow</code> 并在 CI 分 job，而不是删除 mock。CorpAssist 夜间 job 可跑少量集成测试，PR job 仅跑 mock 套件。</p>
+      <div class="learn-faq">
+        <details><summary>AI 生成的 patch 路径总是报错 ImportError？</summary><div class="learn-faq-body">常见原因：测试 patch 的是定义处（<code>app.rag.service.RagPipeline</code>），但被测路由 import 的是别名。在 Prompt 中粘贴 router 文件顶部的 import 行，要求「patch 被测模块内可见的名字」。用 <code>pytest --import-mode=importlib</code> 与 CI 对齐。</div></details>
+        <details><summary>如何测试 streaming SSE 响应？</summary><div class="learn-faq-body">httpx <code>stream=True</code> + 逐 chunk 断言 event 类型；mock 异步生成器返回固定 token 序列。Prompt 中附上 SSE 格式样例，避免 AI 用同步 <code>TestClient</code> 读流。</div></details>
+        <details><summary>parametrize 与 fixture 组合顺序？</summary><div class="learn-faq-body">fixture 先注入 client/mock，parametrize 提供输入；不要在 parametrize 里构造 AsyncClient。AI 生成后检查每个用例是否独立，避免共享 mutable mock 状态。</div></details>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># .github/workflows/test.yml 片段
+- run: uv run ruff check tests/ app/
+- run: uv run pytest tests/ -q --cov=app --cov-fail-under=85
+  env:
+    CORPAssist_DISABLE_LLM: "1"</code></pre>
+      </div>
+      <div class="learn-interview">
+        <h4>延伸：与 Java 侧契约测试</h4>
+        <details><summary>Python pytest 如何配合 BFF 契约测试？</summary><p>Python 导出 openapi.json；Pact 或 Schemathesis 对网关消费方做契约校验。AI 生成测试时可要求「断言响应 JSON 与 openapi components 中 RagQueryResponse 一致」，减少双栈字段漂移。</p></details>
+        <details><summary>AI 生成的测试很多，如何删冗余？</summary><p>按 coverage 增量排序保留；合并断言相同的 parametrize 行；删除只测 FastAPI 框架行为的用例（如 404 路由不存在）。</p></details>
+        <details><summary>如何测试流式 RAG 响应？</summary><p>使用 httpx 流式读取 + mock 异步迭代器；Prompt 中明确 SSE 事件格式；不要用一个巨型 assert 比较全文。</p></details>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>反模式</th><th>修复</th></tr></thead>
+        <tbody>
+          <tr><td>测试里 sleep 等待</td><td>mock 或 freezegun</td></tr>
+          <tr><td>依赖上传真实 PDF</td><td>fixtures 小文件或内存 BytesIO</td></tr>
+          <tr><td>无 assert 的 smoke test</td><td>删除或补断言</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>AI 生成 pytest 的价值在「契约对齐 + mock 骨架」，不是替代测试设计</li>
+        <li>边界表由人定义，AI 负责 parametrize 与断言样板</li>
+        <li>Fixture 与 patch 路径必须与生产 import 一致，否则测试「全绿但无意义」</li>
+        <li>覆盖率用于发现盲区，安全与鉴权模块阈值高于业务平均值</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-01-1"> 我能写出带约束的测试生成 Prompt（含禁止真实 LLM）</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-2"> 我能把产品边界表转为 parametrize 用例</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-3"> 我能维护 mock_rag_pipeline 与 AsyncClient fixture</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-4"> 我能根据 term-missing 报告决定补测优先级</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-01-5"> 我已完成 <code>demos/practice-01-lab/</code> 验收命令</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>ASGITransport</td><td>httpx 异步调用 FastAPI，不阻塞事件循环</td></tr>
+            <tr><td>parametrize</td><td>数据驱动多组输入/期望</td></tr>
+            <tr><td>patch 路径</td><td>必须 patch 被测模块内的引用名</td></tr>
+            <tr><td>cov-fail-under</td><td>CI 覆盖率门禁阈值</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>AI 生成的测试要不要进仓库？如何防劣化？</summary><p>可以进，但需标 generated-by-ai、经人工改断言、过 ruff/pytest、与手写测试同 Review。定期用覆盖率 diff 删除重复用例；禁止合并仅 assert True 的占位测试。</p></details>
+        <details><summary>为什么不建议在 CI 里调用真实 LLM 做断言？</summary><p>成本高、结果非确定、易泄露密钥。应 mock 固定 JSON；模型质量用离线评测流水线（见 <a href="#ch-practice-04">实战：CorpAssist 开发效率提升</a>）。</p></details>
+      </div>
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；上一章 <a href="#ch-basics-04">规则与约定驱动开发</a> 的 Rules 约束测试生成；下一章 <a href="#ch-practice-02">AI 生成文档与 Schema</a> 将 OpenAPI 与 docstring 纳入同一 PR 批次。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://docs.pytest.org/en/stable/" target="_blank" rel="noopener">pytest 文档</a> — fixture、parametrize、asyncio 插件</li>
+      <li><a href="https://www.python-httpx.org/advanced/transports/#asgi-transport" target="_blank" rel="noopener">httpx ASGITransport</a> — 异步测 FastAPI</li>
+      <li><a href="https://coverage.readthedocs.io/" target="_blank" rel="noopener">coverage.py</a> — 报告字段说明</li>
+    </ul>
+  </div>
+
+    <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 CorpAssist RAG 查询路由上，用 AI 生成 pytest 套件、边界 parametrize 与 mock fixture，并完成覆盖率解读（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>从 <code>app/rag/router.py</code> 复制 <code>POST /v1/rag/query</code> 到 Prompt，要求 AI 生成 <code>tests/rag/test_query.py</code>（含 AsyncClient）</li>
+      <li>手写 4 行边界表（空 query、超长、无 Key、空检索），让 AI 生成 <code>@pytest.mark.parametrize</code> 块</li>
+      <li>在 <code>conftest.py</code> 增加 <code>mock_rag_pipeline</code>，运行 <code>uv run pytest tests/rag -q</code> 直至全绿</li>
+      <li>可选：完成 <code>demos/practice-01-lab/</code> 验收命令，对照正文「CorpAssist 合码检查清单」表勾选 5 项</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+    <li>
+      <p class="judgment-stem">AI 生成的测试在本地通过，但 CI 失败，优先查什么？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>环境变量未 mock 导致请求外网；patch 路径在 CI 包结构下不一致；async 插件未安装；<code>uv.lock</code> 与本地依赖不一致。先看 CI 日志是 401/timeout 还是 ImportError。</p></div>
+        </details>
+      </div>
+    </li>
+    <li>
+      <p class="judgment-stem">覆盖率已 90%，是否可以不 Review AI 测试？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>不可以。高覆盖可能缺少断言业务字段（如 citations 结构）。必须 Review 每个 assert 是否验证契约。</p></div>
+        </details>
+      </div>
+    </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：practice-01-lab</h4>
+      <p>目录：<code>demos/practice-01-lab/</code>。含最小 FastAPI RAG 路由与待补全 <code>tests/conftest.py</code>。</p>
+      <p><strong>验收</strong>：在 lab 目录执行下列命令，全部通过后再合并 AI 生成的测试文件。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash">cd demos/practice-01-lab
+pip install -e ".[dev]"
+pytest tests/rag -q --cov=app/rag --cov-fail-under=85
+ruff check tests/ app/</code></pre>
+      </div>
+      <ul class="demo-acceptance">
+        <li>至少 6 个 pytest 用例 passed，无真实 LLM 外网请求</li>
+        <li><code>app/rag</code> 行覆盖 ≥ 85%，ruff 无告警</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-basics-04">规则与约定驱动开发</a> — 项目 Rules 如何约束 AI 测试生成</li>
+      <li>下一篇：<a href="#ch-practice-02">AI 生成文档与 Schema</a> — OpenAPI 与 docstring 自动化</li>
+    </ul>
+  </div>
+</section>

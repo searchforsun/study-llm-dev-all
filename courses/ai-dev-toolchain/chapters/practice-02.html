@@ -1,0 +1,380 @@
+<section id="ch-practice-02" class="chapter" data-chapter="practice-02">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>AI 生成文档与 Schema</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35</strong> 分钟 · 阶段：<strong>AI 自动化实践</strong> · 能力：用 AI 维护 CorpAssist FastAPI 的 docstring、OpenAPI 与 README 一致性</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么要学本章</h4>
+        <p>CorpAssist Python 服务与 Java BFF 通过 <span class="term" data-term-id="openapi">OpenAPI</span> 契约协作。接口迭代若不同步文档，网关代码生成与联调会频繁返工。AI 可从 Pydantic 模型反推 Schema、补全 <span class="term" data-term-id="docstring">docstring</span>，并用脚本做 <span class="term" data-term-id="schema-diff">schema-diff</span> 门禁。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完你能</h4>
+        <ul>
+          <li>批量生成符合 Google 风格的模块/路由 docstring</li>
+          <li>导出并与 Java 侧 OpenAPI 做 diff</li>
+          <li>用 AI 生成 README 与 API 文档章节</li>
+          <li>在 CI 中集成文档一致性校验（含 <span class="term" data-term-id="ruff">ruff</span> pydocstyle 规则）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <h4>本章先记住 3 件事</h4>
+        <ul>
+          <li>单一真源是 Pydantic 模型与路由装饰器，文档由代码生成而非手写 YAML</li>
+          <li>AI 补 docstring 时必须引用真实字段约束（min_length、examples）</li>
+          <li>OpenAPI diff 失败应阻断合并，与测试失败同级</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>docstring 自动化</h3>
+      <p>FastAPI 路由的说明来自函数 docstring 与 <code>response_model</code>。对 CorpAssist <code>rag/query</code> 端点，AI 可根据 Schema 生成包含参数、返回值、错误码的 docstring，供 Swagger UI 与 Redoc 展示。</p>
+      <aside class="learn-scenario"><strong>场景</strong>：新增 <code>stream=true</code> 查询参数后，需在同一个 PR 更新 docstring 与示例 JSON，否则 Java 同事在 Swagger 中看不到新字段。</aside>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends
+from app.rag.schemas import RagQueryRequest, RagQueryResponse
+from app.rag.service import RagPipeline, get_pipeline
+
+router = APIRouter(prefix="/v1/rag", tags=["rag"])
+
+
+@router.post("/query", response_model=RagQueryResponse)
+async def rag_query(
+    body: RagQueryRequest,
+    pipeline: RagPipeline = Depends(get_pipeline),
+) -> RagQueryResponse:
+    """企业知识库 RAG 查询（CorpAssist S1）。
+
+    Args:
+        body: 查询体。query 为自然语言问题；top_k 默认 3，最大 20。
+
+    Returns:
+        answer: 模型综合检索片段后的回答。
+        citations: 引用列表，含 doc_id 与 snippet，供前端溯源。
+
+    Raises:
+        HTTPException 401: 缺少或无效 X-Api-Key。
+        HTTPException 422: query 为空或超长。
+    """
+    return await pipeline.arun(query=body.query, top_k=body.top_k)</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code>请为下列 FastAPI 路由补全 Google 风格 docstring。约束：
+1) Args/Returns 字段名必须与 Pydantic 模型一致
+2) 列出与 app/errors.py 对应的 HTTP 状态
+3) 不要编造未实现的 stream 参数
+
+（粘贴 router 与 schemas）</code></pre>
+      </div>
+      <p>在 <code>pyproject.toml</code> 启用 <code>ruff lint select = ["D"]</code> 时，可让 AI 按 pydocstyle 规则修复 D100/D103 等告警。生成后运行 <code>uv run ruff check app/ --select D</code>。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">toml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-toml">[tool.ruff.lint]
+select = ["E", "F", "D", "I"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>手写散文档</h4><p>README 描述 top_k 最大 50，代码里 max 20——联调失败。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>代码驱动</h4><p>docstring + Field(description=) + examples 由 AI 从模型一次性生成。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OpenAPI Schema 生成</h3>
+      <p>FastAPI 自动生成 <span class="term" data-term-id="openapi-schema">OpenAPI 3.1</span>。CorpAssist 在 CI 导出 <code>openapi.json</code>，与仓库中 <code>contracts/corpassist-rag-v1.json</code> 比对；AI 可解释 diff hunk 并建议改模型还是改契约。</p>
+      <div class="mermaid-wrap">
+        <h5>契约同步流</h5>
+        <pre class="mermaid">
+flowchart LR
+    PY[FastAPI + Pydantic] -->|app.openapi| OAS[openapi.json]
+    OAS --> DIFF[schema-diff CI]
+    JAVA[Java BFF codegen] --> DIFF
+    DIFF -->|fail| PR[阻断 PR]
+    DIFF -->|pass| MERGE[合并]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># scripts/export_openapi.py
+import json
+from app.main import app
+
+if __name__ == "__main__":
+    schema = app.openapi()
+    with open("contracts/corpassist-rag-v1.json", "w", encoding="utf-8") as f:
+        json.dump(schema, f, ensure_ascii=False, indent=2)</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from pydantic import BaseModel, Field
+
+
+class RagQueryRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=8000, description="用户问题")
+    top_k: int = Field(3, ge=1, le=20, description="检索返回条数")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"query": "年假几天", "top_k": 3}]
+        }
+    }</code></pre>
+      </div>
+      <p>Prompt 示例：「根据下列 diff，判断应修改 Pydantic 还是升级契约 major 版本，并给出 semver 建议。」Breaking change（删除字段、改类型）必须走 ADR 与 Java 团队同步。</p>
+      <table class="outline-table">
+        <thead><tr><th>diff 类型</th><th>处理</th></tr></thead>
+        <tbody>
+          <tr><td>新增可选字段</td><td>minor 版本，Java 可忽略</td></tr>
+          <tr><td>required 变 optional</td><td>通常兼容，仍需回归</td></tr>
+          <tr><td>改字段类型</td><td>major，禁止静默合并</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>README 与 API 文档</h3>
+      <p>仓库根 <code>README.md</code> 面向工程师：本地启动、环境变量、<code>uv sync</code>。对外 API 文档可由 AI 从 OpenAPI 生成 Markdown 章节（认证、限流、示例 curl），但<strong>示例请求体</strong>必须来自 <code>json_schema_extra.examples</code>。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown">## CorpAssist RAG API（Python）
+
+### 认证
+所有请求需头 `X-Api-Key`，与网关一致。
+
+### 查询
+```bash
+curl -X POST "$BASE/v1/rag/query" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $KEY" \
+  -d '{"query":"年假几天","top_k":3}'
+```
+
+### 错误码
+| HTTP | error_code | 说明 |
+|------|------------|------|
+| 401 | AUTH_INVALID | Key 无效 |
+| 422 | VALIDATION_ERROR | 体校验失败 |</code></pre>
+      </div>
+      <p>让 AI 「仅更新 README 的 API 小节，保留安装章节不动」，可避免覆盖人工写的部署说明。使用 <code>.cursor/rules</code> 声明 README 章节标题不可删改。</p>
+      <div class="role-cards">
+        <div class="role-card"><h4>Swagger UI</h4><p><code>/docs</code> 开发环境开启，生产关闭</p></div>
+        <div class="role-card"><h4>Redoc 静态站</h4><p>CI 用 openapi.json 构建内网文档站</p></div>
+        <div class="role-card"><h4>Postman</h4><p>AI 可生成 collection，需人工核对环境变量</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>文档一致性校验</h3>
+      <p>在 GitHub Actions / GitLab CI 中串联：导出 OpenAPI → <code>openapi-diff</code> → ruff docstring → AI 可选「解释失败原因」步骤（不阻断，仅评论 PR）。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># .github/workflows/docs.yml 片段
+- run: uv run python scripts/export_openapi.py
+- run: npx openapi-diff contracts/corpassist-rag-v1.json contracts/corpassist-rag-v1.baseline.json --fail-on-incompatible
+- run: uv run ruff check app/ --select D
+- run: uv run python scripts/check_readme_examples.py  # 校验 README curl 与 examples 一致</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># scripts/check_readme_examples.py — 简化示意
+import json, re, pathlib
+
+examples = json.loads(pathlib.Path("contracts/corpassist-rag-v1.json").read_text())
+body = examples["paths"]["/v1/rag/query"]["post"]["requestBody"]
+sample = body["content"]["application/json"]["schema"]["examples"][0]
+readme = pathlib.Path("README.md").read_text()
+assert sample["query"] in readme, "README 缺少与 OpenAPI 一致的 query 示例"</code></pre>
+      </div>
+      <details class="learn-micro-check"><summary>OpenAPI diff 通过但 Java 仍报错，可能原因？</summary><p>Java 使用旧 baseline；枚举序列化命名策略不同（camelCase vs snake_case）；日期格式不一致。检查 <code>model_config populate_by_name</code> 与网关全局 ObjectMapper。</p></details>
+      <p>将 diff 输出 @ 给 AI 时，附上「兼容策略表」与上一版契约链接，可减少错误建议（如误删 required 字段）。CorpAssist 文档 Owner 应在 CODEOWNERS 中声明，AI 生成 docstring 仍须人审。</p>
+      <details class="learn-micro-check"><summary>仅改 examples 是否需要 major 版本？</summary><p>通常否，但若 examples 被 Java 测试快照引用，仍可能触发 CI 失败。跑 openapi-diff 与 Java 契约测试双确认。</p></details>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈契约协作要点</h3>
+      <p>CorpAssist Java BFF 通过 Feign/RestTemplate 调用 Python RAG 服务。文档变更流程：Python PR 更新 openapi.json → CI diff → 通知 Java 组刷新 codegen → 联合回归。AI 可生成「变更说明」Comment 模板，但 semver 决策人必须是维护者。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "paths": {
+    "/v1/rag/query": {
+      "post": {
+        "operationId": "ragQuery",
+        "summary": "企业知识库 RAG 查询",
+        "requestBody": { "required": true },
+        "responses": {
+          "200": { "description": "成功" },
+          "401": { "description": "鉴权失败" },
+          "422": { "description": "参数校验失败" }
+        }
+      }
+    }
+  }
+}</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>文档产物</th><th>消费者</th><th>更新触发</th></tr></thead>
+        <tbody>
+          <tr><td>openapi.json</td><td>Java codegen、网关</td><td>改 Pydantic 模型</td></tr>
+          <tr><td>Swagger /docs</td><td>前端、QA</td><td>改 docstring</td></tr>
+          <tr><td>README curl</td><td>新同学 onboarding</td><td>改 examples</td></tr>
+          <tr><td>Redoc 静态站</td><td>实施/客户集成</td><td>发版 tag</td></tr>
+        </tbody>
+      </table>
+      <p>使用 FastAPI <code>openapi_tags</code> 将 rag、health、agent 分组，AI 生成文档时按 tag 输出章节，避免单页过长。对废弃端点使用 <code>deprecated=True</code> 并在 description 写明替代路径与移除日期。</p>
+      <details class="learn-micro-check"><summary>能否让 AI 直接改 Java DTO？</summary><p>可以辅助，但真源仍是 openapi.json。应先合并 Python 契约，再触发 Java 生成；否则两边各自改字段名会再次漂移。</p></details>
+      <div class="learn-interview">
+        <h4>文档 FAQ</h4>
+        <details><summary>Swagger 上 examples 不显示？</summary><p>检查是否写在 <code>model_config json_schema_extra</code>；FastAPI 版本是否支持；是否被自定义 openapi() 覆盖。重新 export 并在 /docs 强制刷新。</p></details>
+        <details><summary>AI 生成的 docstring 与参数名不一致？</summary><p>要求 Prompt 附带函数签名 AST 或粘贴完整 def 行；生成后跑 ruff D417（参数文档缺失）修复。</p></details>
+        <details><summary>openapi-diff 报 incompatible 但确认是安全变更？</summary><p>走 ADR 更新 baseline 文件，并在 PR 描述写 Java 回归结果；禁止在未通知 BFF 的情况下合并。</p></details>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>Prompt 轮次</th><th>输入</th><th>期望输出</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>router + schemas 无 docstring</td><td>Google docstring + Field description</td></tr>
+          <tr><td>2</td><td>export 后的 openapi.json</td><td>解释 diff 是否 breaking</td></tr>
+          <tr><td>3</td><td>README API 小节</td><td>与 examples 一致的 curl</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-faq">
+        <details><summary>Redoc 与 Swagger 描述不一致？</summary><div class="learn-faq-body">两者同源 openapi.json；若不一致说明 export 步骤未跑或浏览器缓存旧版。CI 应 artifact 上传 openapi.json 供 Java 组下载。</div></details>
+        <details><summary>AI 把 Field description 写成英文而团队要求中文？</summary><div class="learn-faq-body">在 Rules 中声明「面向国内实施文档用中文 description」；生成后 <code>ruff</code> 无法检查语言，需人工 spot check 或脚本抽样。</div></details>
+        <details><summary>能否用 AI 从 Java OpenAPI 反向生成 Pydantic？</summary><div class="learn-faq-body">可以辅助，但 CorpAssist 约定 Python 为真源。Java 变更应通过 diff 驱动 Python 更新，避免双向漂移。</div></details>
+      </div>
+      <p>完成本章后，建议立即在 <code>demos/practice-02-lab/</code> 跑通验收，并将 export 脚本路径写入团队 <code>CLAUDE.md</code> 可执行命令列表。文档变更与功能变更宜分 PR，降低 review 认知负担。</p>
+      <p>文档变更与功能变更宜分 PR，降低 review 认知负担。</p>
+      <table class="outline-table">
+        <thead><tr><th>变更类型</th><th>是否更新 baseline</th><th>是否通知 Java</th></tr></thead>
+        <tbody>
+          <tr><td>仅 description 文案</td><td>可选</td><td>否</td></tr>
+          <tr><td>新增 optional 字段</td><td>是</td><td>是（minor）</td></tr>
+          <tr><td>删除/改类型</td><td>是 + ADR</td><td>是（major）</td></tr>
+        </tbody>
+      </table>
+      <p>文档 PR 还应附带 Swagger 截图（可选）与 Redoc 构建 job 结果。AI 可生成 PR 描述模板，semver 与 ADR 链接由维护者填写。</p>
+      <div class="role-cards">
+        <div class="role-card"><h4>Python Owner</h4><p>export openapi、更新 baseline、跑 ruff D</p></div>
+        <div class="role-card"><h4>Java BFF</h4><p>ACK minor/major、跑 codegen 回归</p></div>
+        <div class="role-card"><h4>AI 助手</h4><p>补 docstring、解释 diff、起草 README</p></div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Pydantic + FastAPI 是 OpenAPI 真源；docstring 服务人类阅读与 Swagger 描述</li>
+        <li>AI 适合批量补全文档与解释 diff，不适合擅自改 breaking 契约</li>
+        <li>README 示例必须与 json_schema_extra 同步，用脚本门禁</li>
+        <li>ruff pydocstyle 与 openapi-diff 应并列在 PR 检查中</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-02-1"> 我能用 AI 从 Schema 生成 Google 风格 docstring</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-2"> 我能导出 openapi.json 并跑 diff</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-3"> 我能维护 README API 小节与 examples 一致</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-4"> 我能判断 diff 属于 minor 还是 major</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-02-5"> 我已在 practice-02-lab 跑通 export + diff</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>response_model</td><td>响应体 OpenAPI 组件来源</td></tr>
+            <tr><td>Field(description)</td><td>字段级 Swagger 说明</td></tr>
+            <tr><td>openapi-diff</td><td>检测不兼容契约变更</td></tr>
+            <tr><td>json_schema_extra</td><td>嵌入示例与文档扩展</td></tr>
+            <tr><td>semver</td><td>major 改类型，minor 增可选字段</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>Python 与 Java 双栈如何共享 API 契约？</summary><p>Python 导出 openapi.json 入仓；Java 用 openapi-generator 生成 DTO；CI 双向 diff。变更走 semver 与联合 Review。</p></details>
+        <details><summary>AI 生成的 README 能否直接对外发布？</summary><p>需人工核对密钥占位、环境 URL、合规声明；示例必须经过 check_readme_examples 脚本。</p></details>
+        <details><summary>docstring 与 OpenAPI description 重复维护吗？</summary><p>FastAPI 可同时展示两者；团队可约定 docstring 给工程师、Field description 给 Swagger。AI 生成时一次输出两套，避免人工复制粘贴。</p></details>
+      </div>
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；上一章 <a href="#ch-practice-01">AI 生成测试用例</a> 的 pytest 门禁；下一章 <a href="#ch-practice-03">AI 辅助 Code Review 与调试</a> 在 diff 上做安全与性能 Review。完成 <code>demos/practice-02-lab/</code> 中 ruff D 与 openapi diff 验收。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://fastapi.tiangolo.com/tutorial/metadata/" target="_blank" rel="noopener">FastAPI Metadata</a> — OpenAPI 定制</li>
+      <li><a href="https://docs.pydantic.dev/latest/concepts/json_schema/" target="_blank" rel="noopener">Pydantic JSON Schema</a> — examples 与 Field</li>
+      <li><a href="https://docs.astral.sh/ruff/rules/#pydocstyle-d" target="_blank" rel="noopener">ruff pydocstyle</a> — D 规则集</li>
+    </ul>
+  </div>
+
+    <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist API 补全 docstring、OpenAPI examples 与 README curl，并跑一致性校验（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对 <code>rag/query</code> 路由运行 AI docstring 补全，再 <code>ruff check --select D</code></li>
+      <li>为 <code>RagQueryRequest</code> 添加 <code>json_schema_extra.examples</code></li>
+      <li>在 <code>demos/practice-02-lab/</code> 对照正文「OpenAPI Schema 生成」Mermaid 流程跑通 export + diff</li>
+      <li>让 AI 更新 README 的 curl 示例，并运行 <code>check_readme_examples.py</code></li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+    <li>
+      <p class="judgment-stem">仅改 docstring 未改 Schema，是否需要跑 openapi-diff？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>通常 OpenAPI 描述字段会变，diff 可能有 cosmetic 变更；若 CI 仅检查 incompatible，描述变更可通过。团队可配置是否把 description 变更视为需 Review。</p></div>
+        </details>
+      </div>
+    </li>
+    <li>
+      <p class="judgment-stem">AI 建议在契约中删除 deprecated 字段，是否采纳？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>需查 Java 与移动端是否仍发送该字段；删除为 major，走废弃周期与 telemetry 确认零流量。</p></div>
+        </details>
+      </div>
+    </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：practice-02-lab</h4>
+      <p>目录：<code>demos/practice-02-lab/</code>。路由故意缺少 docstring，含 baseline OpenAPI。</p>
+      <p><strong>验收</strong>：</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash">cd demos/practice-02-lab
+pip install fastapi pydantic ruff
+ruff check app/ --select D
+python scripts/export_openapi.py
+python scripts/check_openapi_diff.py</code></pre>
+      </div>
+      <ul class="demo-acceptance">
+        <li>ruff D 规则零告警；openapi diff 无 incompatible 变更</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-01">AI 生成测试用例</a></li>
+      <li>下一篇：<a href="#ch-practice-03">AI 辅助 Code Review 与调试</a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,402 @@
+<section id="ch-basics-03" class="chapter" data-chapter="basics-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>AI 生成代码的质量管控</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>28 分钟</strong> · 阶段：<strong>AI 编码工具全景</strong> · 能力：建立 CorpAssist AI 代码的双层门禁与覆盖率策略</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-02">Prompt 驱动开发工作流</a> 提高了生成效率，但 LLM 仍会产出<strong>看似正确、实则漏边界</strong>的代码：错用 blocking IO、臆造 env 变量、测试只覆盖 happy path。本章用 <span class="term" data-term-id="static-analysis" tabindex="0">静态检查</span> + <span class="term" data-term-id="ai-code-review" tabindex="0">AI Code Review</span> 与覆盖率监控，为 CorpAssist RAG 服务设质量底线。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>列举 AI 生成 Python 代码的<strong>Top 缺陷模式</strong>并在 Review 中拦截</li>
+          <li>配置 <strong>ruff + mypy + AI Review</strong> 双保险流水线</li>
+          <li>解释团队 <span class="term" data-term-id="ai-code-acceptance-ratio" tabindex="0">AI 代码可接受比例</span> 如何与覆盖率联动</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>AI 代码 ≠ 已审查代码</strong>：merge 前必须过自动化 + 人审。</li>
+          <li><strong>静态检查抓结构</strong>：AI Review 抓语义与安全；二者互补。</li>
+          <li><strong>比例要度量</strong>：接受率、缺陷密度、覆盖率变化要可追踪。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>生成代码的常见缺陷</h3>
+      <p>在 CorpAssist 仓库中，<span class="term" data-term-id="ai-code-smell" tabindex="0">AI 代码异味</span> 常出现在 RAG 检索、向量客户端与 FastAPI 路由层。识别模式比「感觉不对」更可靠。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 一次「几乎合并」的 MR</span>
+        AI 为 <code>hybrid_search()</code> 生成了 120 行实现，pytest 全绿，但 Review 发现：在 async 路由里用了 <code>requests.get</code>、硬编码了 <code>top_k=10</code>、测试未覆盖空索引分支 — 若上线将造成事件循环阻塞与静默错误。
+      </aside>
+
+      <h4>CorpAssist Python 常见缺陷 Top 6</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>缺陷</th><th>表现</th><th>检测手段</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Async 阻塞</td><td>async 路由里 requests / time.sleep</td><td>ruff ASYNC 规则、Code Review</td></tr>
+            <tr><td>臆造配置</td><td>读取不存在的 env 名</td><td>mypy + 集成测试</td></tr>
+            <tr><td>Happy path 测试</td><td>无 422/500/空结果用例</td><td>覆盖率分支 + 人审</td></tr>
+            <tr><td>契约漂移</td><td>字段 camelCase 与 OpenAPI 不一致</td><td>OpenAPI diff、schema 测试</td></tr>
+            <tr><td>静默吞异常</td><td>裸 <code>except Exception: pass</code></td><td>ruff BLE、AI Review</td></tr>
+            <tr><td>密钥进 repo</td><td>示例 Key 留在代码</td><td>gitleaks、AI 安全扫描</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="learn-code-compare">
+        <div>
+          <span class="learn-code-compare-label is-bad">AI 常生成 · 阻塞 async</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">python</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-python"># 反例：async 路由内同步 HTTP
+import requests
+
+async def fetch_embeddings(text: str) -> list[float]:
+    resp = requests.post(EMBED_URL, json={"input": text}, timeout=30)
+    return resp.json()["data"][0]["embedding"]</code></pre>
+          </div>
+        </div>
+        <div>
+          <span class="learn-code-compare-label is-good">CorpAssist 推荐</span>
+          <div class="code-block">
+            <div class="code-toolbar">
+              <span class="lang-tag">python</span>
+              <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+            </div>
+            <pre><code class="language-python">import httpx
+
+async def fetch_embeddings(client: httpx.AsyncClient, text: str) -> list[float]:
+    resp = await client.post("/v1/embeddings", json={"input": text}, timeout=30.0)
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：pytest 全绿为什么仍不能 merge？</summary>
+        <p>测试可能<strong>未覆盖缺陷路径</strong>（空索引、超时、422）；静态检查未跑或 AI 只测了 mock  happy path。需要分层门禁。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>静态检查 + AI Review 双保险</h3>
+      <p><span class="term" data-term-id="static-analysis" tabindex="0">静态分析</span> 在 CI 里快速拦截语法、风格与部分逻辑问题；<span class="term" data-term-id="ai-code-review" tabindex="0">AI Code Review</span> 对 MR diff 做语义审查（安全、并发、契约）。CorpAssist 推荐<strong>先机器后模型再人</strong>。</p>
+
+      <div class="mermaid-wrap">
+        <h5>MR 质量双保险流水线</h5>
+        <pre class="mermaid">flowchart TD
+  PR[Pull Request] --> R[ruff + mypy]
+  R --> T[pytest + cov]
+  T --> A[AI Review Bot]
+  A --> H[人类 Reviewer]
+  H --> M[Merge]
+  R -->|fail| X[阻断]
+  T -->|fail| X</pre>
+        <p class="diagram-caption">AI Review 不应替代 ruff/mypy；它补充「业务逻辑与安全隐患」视角。</p>
+      </div>
+
+      <h4>pyproject.toml 工具链片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">toml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-toml">[tool.ruff.lint]
+select = ["E", "F", "I", "ASYNC", "BLE", "S"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.coverage.run]
+source = ["corpassist"]
+branch = true</code></pre>
+      </div>
+
+      <h4>AI Review Prompt 要点（CI 或 Bot）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">审查此 MR diff（CorpAssist Python RAG 服务）：
+1. async 路由是否存在 blocking IO？
+2. 是否新增未文档化的 env 或硬编码 secret？
+3. API 字段是否与 docs/openapi/ 一致？
+4. 测试是否覆盖失败路径？
+输出：P0/P1/P2 问题列表，每条含文件:行号</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">单保险风险</span>
+          <ul>
+            <li>仅 ruff：语义错误漏网</li>
+            <li>仅 AI Review：幻觉误报/漏报，且无 deterministic 基线</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">双保险收益</span>
+          <ul>
+            <li>ruff/mypy 快速反馈（&lt;1 min）</li>
+            <li>AI 聚焦安全与 RAG 边界条件</li>
+            <li>人审只看 P0/P1 与架构</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>测试覆盖率监控</h3>
+      <p>AI 生成测试常<strong>覆盖率高但断言弱</strong>。CorpAssist 应监控<strong>分支覆盖率</strong>与<strong>关键模块下限</strong>，尤其 <code>corpassist/rag/</code> 与 <code>corpassist/api/</code>。可配合 <span class="term" data-term-id="static-analysis" tabindex="0">静态分析</span> 的 ASYNC rules 在 CI 中与覆盖率同 gate。</p>
+
+      <h4>覆盖率策略示意</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>模块</th><th>行覆盖下限</th><th>分支覆盖</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>corpassist/rag/</td><td>85%</td><td>必看</td><td>检索逻辑边界多</td></tr>
+            <tr><td>corpassist/api/</td><td>80%</td><td>必看</td><td>HTTP 错误码路径</td></tr>
+            <tr><td>corpassist/schemas/</td><td>70%</td><td>可选</td><td>Pydantic 校验器重点</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>CI 覆盖率门禁（bash）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">#!/usr/bin/env bash
+set -euo pipefail
+uv run pytest tests/ --cov=corpassist --cov-branch --cov-report=term-missing
+uv run coverage report --fail-under=80
+# 可选：diff-cover 只检查本 MR 新增行覆盖率</code></pre>
+      </div>
+
+      <p>对 AI 生成的测试文件，Reviewer 应抽查：<strong>是否 mock 了被测逻辑本身</strong>（导致假绿）。</p>
+
+      <h4>pytest 覆盖率报告解读（节选）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code>Name                              Stmts   Miss Branch BrPart  Cover
+src/corpassist/rag/retriever.py     142     18     44     12    84%
+src/corpassist/api/routes/rag.py      56      4     12      2    91%
+------------------------------------------------------------------
+TOTAL                               890     95    210     38    87%</code></pre>
+      </div>
+      <p>关注 <strong>BrPart</strong>（分支部分覆盖）与 <code>retriever.py</code> 的 Miss 行：AI 测试常漏「向量库空结果」「embedding 超时」分支。团队可为 <span class="term" data-term-id="test-coverage-gate" tabindex="0">测试覆盖率门禁</span> 设模块级 fail-under。</p>
+
+      <details class="learn-micro-check">
+        <summary>BrPart 升高说明什么？</summary>
+        <p>部分分支只跑了一半路径（如 if 只测了 true）；需补 else/except 用例，而非再堆 happy path。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>可接受的 AI 代码比例</h3>
+      <p><span class="term" data-term-id="ai-code-acceptance-ratio" tabindex="0">AI 代码可接受比例</span> 不是「越高越好」，而是与<strong>缺陷密度、Review 容量</strong>平衡。建议 CorpAssist 团队度量以下指标（advanced 阶段将建看板）。</p>
+
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">接受率</span>
+          <p class="role-card-desc">AI 建议中被开发者保留的行数 / 总建议行数。过低说明 Prompt 差；过高且缺陷多说明 Review 虚设。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">AI 行占比</span>
+          <p class="role-card-desc">合并代码中标记或估算的 AI 生成比例。核心路径（鉴权、计费）宜更低。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">AI 缺陷密度</span>
+          <p class="role-card-desc">合并后 30 天内与 AI 变更相关的 bug 数 / KLOC。用于调 Prompt 与 Rules。</p>
+        </article>
+      </div>
+
+      <h4>团队政策示意（非硬性标准）</h4>
+      <ul>
+        <li><strong>样板代码</strong>（DTO、测试脚手架）：AI 行占比可达 70–80%，须过静态检查。</li>
+        <li><strong>RAG 核心检索</strong>：AI 辅助 &lt;40%，算法改动需双人 Review。</li>
+        <li><strong>安全/密钥相关</strong>：禁止 AI 直接 merge，仅允许生成测试或文档草稿。</li>
+      </ul>
+
+      <p>规则与 Review 流程整合见 <a href="#ch-basics-04">规则与约定驱动开发</a>；实践阶段 <a href="#ch-practice-01">AI 生成测试用例</a> 将深化 pytest 自动化。</p>
+
+      <h4>度量采集示意（JSON 日志）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "event": "ai_suggestion_merged",
+  "ticket": "CA-1428",
+  "tool": "cursor",
+  "lines_suggested": 186,
+  "lines_accepted": 124,
+  "accept_rate": 0.67,
+  "module": "corpassist.rag",
+  "reviewer": "human+ai-bot"
+}</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>接受率 90% 是否一定健康？</summary>
+          <div class="learn-faq-body">不一定：若 Review 流于形式，高接受率伴高缺陷密度仍危险。须与<strong>合并后 bug 率</strong>、覆盖率变化联看。</div>
+        </details>
+        <details>
+          <summary>能否禁止 RAG 模块使用 AI？</summary>
+          <div class="learn-faq-body">极端政策会损失效率；更可行是<strong>低占比 + 双人 Review + 更高覆盖率下限</strong>。</div>
+        </details>
+      </div>
+
+      <h4>GitHub Actions 双保险（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># .github/workflows/quality.yml（节选）
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: uv sync --frozen
+      - run: uv run ruff check src tests
+      - run: uv run mypy src/corpassist
+  test:
+    needs: static
+    steps:
+      - run: uv run pytest tests/ --cov=corpassist --cov-fail-under=80</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>常见缺陷</strong>：async 阻塞、契约漂移、弱测试、密钥与吞异常 — 用模式表 Review。</li>
+        <li><strong>双保险</strong>：ruff/mypy/pytest 先行，AI Review 补语义与安全，人审收 P0/P1。</li>
+        <li><strong>覆盖率</strong>：分支覆盖 + 模块下限；警惕 mock 导致的假绿。</li>
+        <li><strong>可接受比例</strong>：分模块政策 + 接受率/缺陷密度度量，非一刀切禁止 AI。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="ai-dev-toolchain_basics03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="smells" /> 能说出 3 种 AI 代码异味及检测手段</label></li>
+          <li><label><input type="checkbox" data-id="dual-gate" /> 能解释静态检查与 AI Review 的分工</label></li>
+          <li><label><input type="checkbox" data-id="cov" /> 能说明为何要看分支覆盖率</label></li>
+          <li><label><input type="checkbox" data-id="ratio" /> 能区分接受率与 AI 行占比</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>项</th><th>要点</th></tr></thead>
+              <tbody>
+                <tr><td>双保险</td><td>ruff/mypy → pytest/cov → AI Review → 人</td></tr>
+                <tr><td>Async</td><td>httpx AsyncClient，禁 requests 进 async 路由</td></tr>
+                <tr><td>覆盖率</td><td>rag/api 分支覆盖 + fail-under</td></tr>
+                <tr><td>比例</td><td>分模块；核心路径低 AI 占比</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>AI Review 误报很多时，你会调 Prompt 还是关掉 AI Review？为什么？</li>
+              <li>如何发现「测试覆盖高但断言无效」的 AI 测试？</li>
+              <li>RAG 核心模块为何建议更低的 AI 行占比？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成测验；下一章 <a href="#ch-basics-04">规则与约定驱动开发</a> 把质量门禁写进 Rules 与 Code Review。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.astral.sh/ruff/" target="_blank" rel="noopener">Ruff — Python Linter</a></li>
+      <li><a href="https://mypy.readthedocs.io/" target="_blank" rel="noopener">mypy — Static Type Checking</a></li>
+      <li><a href="https://coverage.readthedocs.io/" target="_blank" rel="noopener">coverage.py — 覆盖率报告</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">审查一段 AI 生成的 <code>hybrid_search</code> 片段，输出 P0/P1 清单并补 2 条 pytest（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>从 Demo 目录取「问题代码」片段，用本章缺陷表标至少 3 个问题。</li>
+      <li>写 AI Review Prompt，对 diff 输出 P0/P1（含行号）。</li>
+      <li>本地运行 <code>uv run ruff check</code> 与 <code>uv run mypy src/corpassist</code>（或 Demo 等价命令）。</li>
+      <li>补 2 条测试：空索引分支 + 非法参数 422。</li>
+      <li>在 MR 描述中填写 AI 行占比估算（本章政策对照表）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">MR 行覆盖 92%，但新增 async 路由使用 <code>requests</code>。应 merge 吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不应</strong>：覆盖率高不能抵消 P0 并发缺陷；应改 httpx 并重跑 CI。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：AI 问题代码审查包</h4>
+      <p>目录：<code>demos/basics-03-lab/</code>。含故意植入 4 类缺陷的 <code>retriever_bad.py</code> 与 Review 模板。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04">规则与约定驱动开发</a></li>
+      <li><strong>前瞻</strong>：<a href="#ch-practice-01">AI 生成测试用例</a></li>
+      <li><a href="https://martinfowler.com/articles/llm-testing.html" target="_blank" rel="noopener">Martin Fowler — Testing LLM-powered applications</a></li>
+    </ul>
+  </div>
+</section>

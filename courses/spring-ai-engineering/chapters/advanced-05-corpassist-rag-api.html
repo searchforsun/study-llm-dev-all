@@ -6,86 +6,314 @@
 
   <div class="concept">
     <div class="chapter-intro content-section">
-      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>生产化与可移植</strong> · 能力：交付端到端 RAG 接口并与 Python 检索契约对齐</p>
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>生产化与可移植</strong> · 能力：交付 NS1 端到端 RAG 接口，与 Python 检索契约对齐，挂钩评测并输出上线交付物</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
-        <p>本章是 Java 轨里程碑：对外提供带引用的制度问答 API，并可切换「Spring 内置 VectorStore」或「委托 Python 检索服务」。</p>
+        <p>前序章节分别解决了护栏、路由、可观测与测试；本章是 Java 轨<strong>里程碑</strong>：对外提供带引用的制度问答 <span class="term" data-term-id="rag-api" tabindex="0">rag api</span>，供门户 BFF 与评测流水线调用。CorpAssist 双栈中，Spring 模块负责<strong>鉴权、审计、ChatClient 编排</strong>；Python 服务可选承担<strong>混合检索、重排实验</strong>——双方以 OpenAPI 为 <span class="term" data-term-id="python-contract" tabindex="0">python contract</span>，避免「字段名各写各的」导致联调黑洞。</p>
       </div>
       <div class="notice notice-outcome">
         <strong>学完你能</strong>
         <ul>
-          <li>在 CorpAssist-spring 模块实践本章核心能力</li>
-          <li>说明与 <a href="../python-engineering-for-llm/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 工程轨</span><code class="course-ref-slug">python-engineering-for-llm</code></a> 的分工与契约</li>
-          <li>完成 Demo 与章节测验</li>
+          <li>实现 <code>POST /v1/rag/query</code> <span class="term" data-term-id="e2e-flow" tabindex="0">e2e flow</span>：query + filter → answer + sources[] + requestId</li>
+          <li>在「内置 VectorStore」与「<span class="term" data-term-id="bff-delegate" tabindex="0">bff delegate</span> Python 检索」两种模式间切换，DTO 保持一致</li>
+          <li>挂载 <span class="term" data-term-id="eval-hook" tabindex="0">eval hook</span>，对接 golden JSONL 评测集并输出通过率</li>
+          <li>按 <span class="term" data-term-id="delivery-checklist" tabindex="0">delivery checklist</span> 交付 OpenAPI、运行手册与 <span class="term" data-term-id="acceptance-test" tabindex="0">acceptance test</span> 证据</li>
         </ul>
       </div>
       <div class="notice">
         <strong>本章先记住 3 件事</strong>
         <ul>
-          <li><strong>抽象优先</strong>：业务依赖 ChatClient/VectorStore，而非具体厂商 SDK。</li>
-          <li><strong>可配置</strong>：模型名、密钥、路由策略来自环境，不写死在代码。</li>
-          <li><strong>可观测</strong>：关键路径有日志、指标与 request_id，便于双栈联调。</li>
+          <li><strong>引用必返</strong>：NS1 制度问答无 <code>sources[]</code> 视为不合格；answer 中 docId 与 sources 一致。</li>
+          <li><strong>契约先行</strong>：改 DTO 先改 OpenAPI，再改 Spring 与 Python 两侧实现。</li>
+          <li><strong>可切换检索后端</strong>：<code>corpassist.retrieval.mode=local|python</code>，业务 Service 只依赖接口。</li>
         </ul>
       </div>
     </div>
 
     <div class="section-block">
       <h3>端到端接口</h3>
-      <p>POST /v1/rag/query：query、topK、dept filter → answer + sources[]。 关联：<span class="term" data-term-id="rag-api" tabindex="0">rag api</span>、<span class="term" data-term-id="python-contract" tabindex="0">python contract</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · NS1 制度知识库</span>
+        HR 政策 PDF 已入库。员工在门户输入「驻外人员年假如何计算？」——BFF 带 JWT 调 Spring <code>/v1/rag/query</code>，期望 200 JSON：自然语言 answer + 可点击 sources（docId、title、snippet）。
+      </aside>
+
+      <h4>请求 / 响应契约</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">// POST /v1/rag/query
+{
+  "query": "年假如何申请？",
+  "topK": 5,
+  "filter": { "dept": "HR", "acl": "employee" }
+}
+
+// 200 OK — 见 demos/rag-response.sample.json
+{
+  "answer": "依据 [pol-001]，年假至少 5 天...",
+  "sources": [
+    { "docId": "pol-001", "title": "年假制度", "snippet": "..." }
+  ],
+  "requestId": "req-abc",
+  "model": "qwen-plus",
+  "latencyMs": 842
+}</code></pre>
+      </div>
+
+      <h4>RagQueryController + Service</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@RestController
+@RequestMapping("/v1/rag")
+public class RagQueryController {
+
+  private final RagQueryService ragQueryService;
+
+  @PostMapping("/query")
+  public ResponseEntity&lt;RagQueryResponse&gt; query(
+      @RequestBody @Valid RagQueryRequest req,
+      @RequestHeader(value = "X-Request-Id", required = false) String requestId) {
+
+    String rid = Optional.ofNullable(requestId).orElse(UUID.randomUUID().toString());
+    RagQueryResponse body = ragQueryService.answer(req, rid);
+    return ResponseEntity.ok()
+        .header("X-Request-Id", rid)
+        .body(body);
+  }
+}
+
+@Service
+public class RagQueryService {
+
+  private final RetrievalPort retrievalPort;
+  private final ChatClient ragChatClient;
+
+  public RagQueryResponse answer(RagQueryRequest req, String requestId) {
+    List&lt;RetrievedChunk&gt; chunks = retrievalPort.search(req.query(), req.topK(), req.filter());
+    String context = formatContext(chunks);
+    String answer = ragChatClient.prompt()
+        .system(s -> s.text(loadTemplate("rag-system.st")))
+        .user(u -> u.text("上下文:\n" + context + "\n\n问题:" + req.query()))
+        .advisors(a -> a.param("requestId", requestId))
+        .call()
+        .content();
+    return RagQueryResponse.of(answer, chunks, requestId);
+  }
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>NS1 · RAG 端到端</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant B as 门户 BFF
+  participant S as Spring RAG API
+  participant R as RetrievalPort
+  participant C as ChatClient
+  participant L as 模型网关
+  B->>S: POST /v1/rag/query
+  S->>R: search(query, filter)
+  R-->>S: chunks
+  S->>C: prompt + context
+  C->>L: chat/completions
+  L-->>C: answer
+  C-->>S: text
+  S-->>B: answer + sources</pre>
+        <p class="diagram-caption">RetrievalPort 抽象本地 VectorStore 与远程 Python；ChatClient 仍走 NS1 Advisor 链（护栏 + RAG 模板）。</p>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Controller 直接调 VectorStore + ChatModel</span>
+          <ul>
+            <li>难以切换 Python 检索</li>
+            <li>评测 hook 无处挂载</li>
+            <li>单元测试需 Mock 多层</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">RetrievalPort + RagQueryService</span>
+          <ul>
+            <li>local / python 配置切换</li>
+            <li>Service 层统一 eval 与 metrics</li>
+            <li>Controller 薄，契约稳定</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>自检：answer 为空但 sources 非空，能否返回 200？</summary>
+        <p><strong>不应。</strong> 应走 SafeComplete 降级或 502；空 answer 会误导门户展示。评测集也应标记为 fail。</p>
+      </details>
     </div>
 
     <div class="section-block">
       <h3>与 Python 检索服务契约</h3>
-      <p>可选 RestClient 调 corpassist-python；DTO 字段与 OpenAPI 一致。 关联：<span class="term" data-term-id="eval-hook" tabindex="0">eval hook</span>、<span class="term" data-term-id="delivery-checklist" tabindex="0">delivery checklist</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
-    </div>
+      <p>当 <code>corpassist.retrieval.mode=python</code> 时，<code>PythonRetrievalAdapter</code> 用 <code>RestClient</code> 调 <code>POST {pythonBase}/v1/search</code>，请求/响应 DTO 与 Python FastAPI 共用 OpenAPI 生成类（或手写对齐）。</p>
 
-    <div class="section-block">
-      <h3>评测挂钩与交付物</h3>
-      <p>对接评测集 JSONL；交付 OpenAPI、运行手册、示例 curl。 关联：<span class="term" data-term-id="e2e-flow" tabindex="0">e2e flow</span>、<span class="term" data-term-id="bff-delegate" tabindex="0">bff delegate</span>。</p>
-      <details class="learn-micro-check"><summary>自检：能否向同事说明本节在 CorpAssist 哪条业务链路上？</summary><p>结合 S1/S2/S3 模块复述即可。</p></details>
-    </div>
-
-    <div class="section-block">
-      <h3>关键术语</h3>
-      <p><span class="term" data-term-id="rag-api" tabindex="0">rag api</span> · <span class="term" data-term-id="python-contract" tabindex="0">python contract</span> · <span class="term" data-term-id="eval-hook" tabindex="0">eval hook</span> · <span class="term" data-term-id="delivery-checklist" tabindex="0">delivery checklist</span> · <span class="term" data-term-id="e2e-flow" tabindex="0">e2e flow</span> · <span class="term" data-term-id="bff-delegate" tabindex="0">bff delegate</span> · <span class="term" data-term-id="openapi-export" tabindex="0">openapi export</span> · <span class="term" data-term-id="acceptance-test" tabindex="0">acceptance test</span></p>
-    </div>
-
-    <div class="section-block">
-      <h3>代码示例</h3>
+      <h4>Python 侧 search 契约（对齐字段）</h4>
       <div class="code-block">
         <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
-        <pre><code class="language-json">{
+        <pre><code class="language-json">// POST /v1/search — Python corpassist-retrieval
+{
   "query": "年假如何申请？",
-  "topK": 5,
+  "top_k": 5,
   "filter": { "dept": "HR" }
+}
+
+{
+  "chunks": [
+    { "doc_id": "pol-001", "text": "...", "score": 0.91, "metadata": { "title": "年假制度" } }
+  ],
+  "trace_id": "abc-123"
 }</code></pre>
       </div>
-      <div class="mermaid-wrap">
-        <h5>实战：CorpAssist Spring RAG API · CorpAssist 上下文</h5>
-        <pre class="mermaid">flowchart LR
-  Portal["企业门户 / BFF"]
-  Spring["CorpAssist Spring AI"]
-  LLM["模型网关"]
-  Py["Python 检索服务"]
-  Portal --> Spring
-  Spring --> LLM
-  Spring -.->|可选| Py</pre>
-        <p class="diagram-caption">Spring AI 轨消费模型网关；RAG 检索可内置或委托 Python 服务，以 OpenAPI 契约对齐。</p>
+
+      <h4>Spring Adapter 映射</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Component
+@ConditionalOnProperty(name = "corpassist.retrieval.mode", havingValue = "python")
+public class PythonRetrievalAdapter implements RetrievalPort {
+
+  private final RestClient restClient;
+
+  @Override
+  public List&lt;RetrievedChunk&gt; search(String query, int topK, Map&lt;String, String&gt; filter) {
+    PythonSearchRequest body = new PythonSearchRequest(query, topK, filter);
+    PythonSearchResponse resp = restClient.post()
+        .uri("/v1/search")
+        .header("traceparent", TraceContext.current())
+        .body(body)
+        .retrieve()
+        .body(PythonSearchResponse.class);
+    return resp.chunks().stream().map(this::toChunk).toList();
+  }
+}</code></pre>
       </div>
-      <aside class="learn-scenario" aria-label="业务情境">
-        <span class="learn-scenario-title">CorpAssist · S2 智能客服</span>
-        员工在门户提问工单与制度；Spring AI 模块负责鉴权、会话记忆、模型路由与审计，Python 侧可承担批量索引与实验性算法。
-      </aside>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>模式</th><th>适用</th><th>风险</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>local（PGVector）</strong></td>
+            <td>低延迟、Java 团队独立交付 MVP</td>
+            <td>与 Python 实验索引版本漂移</td>
+          </tr>
+          <tr>
+            <td><strong>python（远程检索）</strong></td>
+            <td>混合检索、重排算法在 Python 迭代</td>
+            <td>多一跳网络；需 timeout + 熔断</td>
+          </tr>
+          <tr>
+            <td><strong>双写索引</strong></td>
+            <td>Graduation 跨栈契约演示</td>
+            <td>索引一致性成本高，需版本号</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p><span class="term" data-term-id="openapi-export" tabindex="0">openapi export</span>：Spring 用 <code>springdoc-openapi</code> 暴露 <code>/v3/api-docs</code>；Python 用 FastAPI 自带 schema。CI 对比两份 spec 的 <code>/v1/rag/query</code> 与 <code>/v1/search</code> 字段集合一致。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>评测挂钩</h3>
+      <p>上线前必须跑 golden 集：<code>evals/rag_golden.jsonl</code> 每行含 <code>query</code>、<code>expected_doc_ids</code>、<code>must_contain</code>。<span class="term" data-term-id="eval-hook" tabindex="0">eval hook</span> 在 Service 或独立 CLI 调用同一 <code>RagQueryService</code>，避免「评测代码与生产代码分叉」。</p>
+
+      <h4>评测 runner 示意</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@SpringBootTest
+class RagGoldenEvalIT {
+
+  @Autowired RagQueryService service;
+
+  @Test
+  void goldenSetMeetsThreshold() throws IOException {
+    List&lt;GoldenCase&gt; cases = GoldenLoader.load("evals/rag_golden.jsonl");
+    long pass = cases.stream().filter(c -> {
+      var resp = service.answer(c.toRequest(), "eval-" + c.id());
+      boolean cites = c.expectedDocIds().stream()
+          .allMatch(id -> resp.sources().stream().anyMatch(s -> s.docId().equals(id)));
+      boolean wording = c.mustContain().stream().allMatch(resp.answer()::contains);
+      return cites &amp;&amp; wording;
+    }).count();
+    double rate = (double) pass / cases.size();
+    assertThat(rate).isGreaterThanOrEqualTo(0.85);
+  }
+}</code></pre>
+      </div>
+
+      <p>Python 轨可用同一份 JSONL 调 FastAPI；双栈对比<strong>引用率</strong>与<strong>must_contain 命中率</strong>，而非要求 answer 字面完全一致（模型随机性）。</p>
+
+      <div class="notice">
+        <strong>评测与生产隔离</strong>
+        <ul>
+          <li>eval profile 使用 MockChatModel 或专用 cheap 模型 tier</li>
+          <li>metrics tag <code>source=eval</code>，避免污染 SLA Dashboard</li>
+          <li>失败 case 写入 badcase 表，供后续 Prompt / 检索调优</li>
+        </ul>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>自检：评测通过是否等于可上线？</summary>
+        <p><strong>否。</strong> 还需 delivery checklist：OpenAPI 发布、health、鉴权、P95、安全扫描。评测是必要条件之一。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>交付物</h3>
+      <p>本章 Demo 提供 <code>delivery-checklist.md</code>；交付给运维与 BFF 团队的最小集如下。</p>
+
+      <h4>delivery-checklist.md 要点</h4>
+      <ul>
+        <li><strong>OpenAPI 已发布</strong> — <code>/v3/api-docs</code> + 静态 YAML 归档</li>
+        <li><strong>/health 与 /v1/rag/query 200</strong> — K8s readiness 探针</li>
+        <li><strong>响应含 sources 数组</strong> — 门户引用 UI 依赖</li>
+        <li><strong>request_id 响应头</strong> — <code>X-Request-Id</code> 与 body.requestId 一致</li>
+        <li><strong>评测集 20+ 条通过率 ≥ 阈值</strong> — 如 85%，附 CI 报告链接</li>
+      </ul>
+
+      <h4>运行手册片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># 冒烟
+curl -s -X POST http://localhost:8080/v1/rag/query \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"query":"年假如何申请？","topK":5}' | jq .
+
+# 切换 Python 检索
+export CORPASSIST_RETRIEVAL_MODE=python
+export CORPASSIST_PYTHON_SEARCH_BASE_URL=http://retrieval:8000</code></pre>
+      </div>
+
+      <div class="role-cards">
+        <div class="role-card">
+          <strong>BFF 团队</strong>
+          <p>消费 OpenAPI；转发 JWT；展示 sources 链接。</p>
+        </div>
+        <div class="role-card">
+          <strong>Python 检索</strong>
+          <p>保证 <code>/v1/search</code> 字段稳定；传递 traceparent。</p>
+        </div>
+        <div class="role-card">
+          <strong>SRE</strong>
+          <p>配置探针、HPA、模型网关 Secret；看 Grafana NS1 面板。</p>
+        </div>
+      </div>
+
+      <p>Graduation Layer 1 要求完成 Java 轨 RAG API + 场景课衔接；本章交付物即 capstone 的 Spring 侧输入。</p>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3。</p>
       <ul class="chapter-conclusions-list">
-        <li><strong>目标</strong>：交付端到端 RAG 接口并与 Python 检索契约对齐</li>
-        <li><strong>工程化</strong>：配置外部化、Advisor/测试/指标纳入同一模块。</li>
-        <li><strong>下一步</strong>：可移植性与供应商锁定</li>
+        <li><strong>端到端接口</strong>：POST /v1/rag/query；RetrievalPort + ChatClient；sources 必填。</li>
+        <li><strong>Python 契约</strong>：OpenAPI 对齐；Adapter 映射 doc_id ↔ docId；trace 贯通。</li>
+        <li><strong>评测挂钩</strong>：golden JSONL；引用率 + must_contain；与生产同 Service。</li>
+        <li><strong>交付物</strong>：checklist + OpenAPI + 冒烟 curl + 评测报告。</li>
       </ul>
     </div>
 
@@ -93,48 +321,73 @@
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="spring-ai_advanced_05_corpassist_rag_api">
         <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
-        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
         <ul>
-          <li><label><input type="checkbox" data-id="concept" /> 能口述本章在 CorpAssist 中的位置</label></li>
-          <li><label><input type="checkbox" data-id="code" /> 能指出代码示例中 2 个关键类/配置项</label></li>
-          <li><label><input type="checkbox" data-id="demo" /> 已完成 Demo 练习</label></li>
+          <li><label><input type="checkbox" data-id="api" /> 能口述请求/响应必填字段</label></li>
+          <li><label><input type="checkbox" data-id="python" /> 能说明 local vs python 检索切换配置</label></li>
+          <li><label><input type="checkbox" data-id="eval" /> 能解释 golden 集两条断言维度</label></li>
+          <li><label><input type="checkbox" data-id="demo" /> 已勾选 delivery-checklist.md 全部项</label></li>
           <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
         </ul>
       </div>
-      <p class="chapter-review-next">下一章：<a href="#ch-advanced-06-portability">可移植性与供应商锁定</a></p>
+      <p class="chapter-review-next">下一步：继续 <a href="#ch-advanced-06-portability">可移植性与供应商锁定</a>，确保换模型/换网关不推翻本章 API。</p>
     </div>
   </div>
 
   <div class="official-links content-section">
     <h3>官方文档</h3>
     <ul>
-      <li><a href="https://docs.spring.io/spring-ai/reference/" target="_blank" rel="noopener">Spring AI 参考文档</a></li>
-      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/" target="_blank" rel="noopener">Spring Boot 参考</a></li>
-      <li><a href="https://spring.io/projects/spring-ai" target="_blank" rel="noopener">Spring AI 项目页</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html" target="_blank" rel="noopener">Spring AI — RAG</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">Spring AI — ChatClient</a></li>
+      <li><a href="https://springdoc.org/" target="_blank" rel="noopener">springdoc-openapi</a></li>
+      <li><a href="https://spec.openapis.org/oas/v3.0.3" target="_blank" rel="noopener">OpenAPI 3.0</a></li>
     </ul>
   </div>
 
   <div class="chapter-practice">
     <h3>动手练习</h3>
-    <p class="steps-intro">约 40 分钟 · 在 demo 目录完成练习并作答测验。</p>
+    <p class="steps-intro">对照 delivery-checklist 与 sample JSON，完成 NS1 RAG API 交付验收表。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>进入 <code>demos/advanced-05-corpassist-rag-api-lab/</code>，阅读 README。</li>
-      <li>按 README 操作或阅读代码/配置片段，完成验收项。</li>
-      <li>在笔记中写一条与 Python 轨或 Spring Boot 惯例的对照。</li>
-      <li>完成右侧章节测验。</li>
+      <li>打开 <code>demos/advanced-05-corpassist-rag-api-lab/delivery-checklist.md</code>，逐项勾选并补全缺失证据（截图或 curl 输出）。</li>
+      <li>对照 <code>rag-response.sample.json</code>，列出与 Python <code>/v1/search</code> 的字段映射表。</li>
+      <li>设计 <code>corpassist.retrieval.mode</code> 切换时的 2 条回归测试（local / python）。</li>
+      <li>写 3 条 golden JSONL 样例（query + expected_doc_ids + must_contain）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">BFF 直接调 Python 检索 + Spring Chat，跳过 Spring RAG API，是否更「微服务」？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不推荐。</strong> 审计、鉴权、Advisor 护栏与统一 OpenAPI 应在 Spring RAG API 收敛；BFF 不应拼装两条后端链路到门户。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">sources 只返回 docId 不返回 snippet，是否可以？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>视产品而定；CorpAssist 门户需 snippet 做预览。<strong>评测引用率</strong>仍看 docId；但 UX 与 audit 要求 snippet 非空。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
-      <h4 class="demo-box-title">Demo：实战：CorpAssist Spring RAG API</h4>
-      <p>目录：<code>demos/advanced-05-corpassist-rag-api-lab/</code> — 勾选 delivery-checklist.md，并对照 rag-response.sample.json</p>
+      <h4 class="demo-box-title">Demo：交付清单</h4>
+      <p>目录：<code>demos/advanced-05-corpassist-rag-api-lab/</code>。<strong>验收</strong>：勾选 delivery-checklist.md，并对照 rag-response.sample.json 解释每个字段的业务含义。</p>
     </div>
   </div>
 
   <div class="resources content-section">
     <h3>延伸学习</h3>
     <ul>
+      <li><strong>上一章</strong>：<a href="#ch-advanced-04-testing">测试与本地替身</a></li>
       <li><strong>下一章</strong>：<a href="#ch-advanced-06-portability">可移植性与供应商锁定</a></li>
-      <li><a href="https://docs.spring.io/spring-ai/reference/api/chatclient.html" target="_blank" rel="noopener">ChatClient API</a></li>
+      <li><a href="#ch-practice-02-rag-pipeline">RAG 管道</a>：QuestionAnswerAdvisor 基础</li>
+      <li><a href="#ch-practice-05-rest-api">REST 与 SSE</a>：对外暴露模式</li>
     </ul>
   </div>
 </section>

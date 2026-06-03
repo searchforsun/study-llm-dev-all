@@ -1,0 +1,379 @@
+<section id="ch-practice-03" class="chapter" data-chapter="practice-03">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>AI 辅助 Code Review 与调试</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38</strong> 分钟 · 阶段：<strong>AI 自动化实践</strong> · 能力：用 Prompt 模式定位 Bug、做安全/性能 Review，并接入 CI</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么要学本章</h4>
+        <p>CorpAssist 合码前已有 <span class="term" data-term-id="ruff">ruff</span> 与 pytest，但逻辑漏洞、Prompt 注入与 RAG 性能热点仍需人眼。AI Review 适合作为<strong>第二层</strong>：在 diff 上下文中执行 <span class="term" data-term-id="owasp-llm">OWASP LLM</span> 清单与 <span class="term" data-term-id="prompt-debug">Prompt 调试</span> 模板，并与 <span class="term" data-term-id="ci-ai-review">CI AI Review</span> 机器人评论 PR。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完你能</h4>
+        <ul>
+          <li>使用结构化 Bug 定位 Prompt（复现步骤、假设、验证）</li>
+          <li>对 RAG/Agent 代码做安全 Review 清单扫描</li>
+          <li>结合 py-spy / 日志做性能热点分析 Prompt</li>
+          <li>在 GitHub Actions 中集成 AI Review（仅评论、不自动合码）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <h4>本章先记住 3 件事</h4>
+        <ul>
+          <li>AI Review 不能替代 ruff/pytest，只补充语义与威胁建模</li>
+          <li>给 AI 的上下文 = diff + 相关文件 + 错误日志，而非整个仓库</li>
+          <li>CI 中 AI 输出应脱敏，禁止把密钥片段贴回 PR 评论</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Bug 定位 Prompt 模式</h3>
+      <p>生产告警「RAG 偶发 500」时，把 Sentry 堆栈、<code>request_id</code> 关联日志与最近 diff @ 给 Cursor，使用固定四段式 Prompt，避免 AI 泛泛而谈。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code>【现象】POST /v1/rag/query 约 3% 返回 500，多发生在 top_k&gt;10
+【复现】附最小 curl 与 test 日志
+【已排除】pytest 全绿；向量库健康
+【任务】
+1) 列出 3 个最可能根因（按概率排序）
+2) 每个根因给出「验证命令或断点位置」
+3) 给出最小修复 diff，不要重构无关代码
+
+（粘贴 stack trace + rag/service.py 相关 80 行）</code></pre>
+      </div>
+      <aside class="learn-scenario"><strong>场景</strong>：日志显示 <code>NoneType has no attribute 'strip'</code> 在 <code>chunk.text</code>。AI 指出检索结果含空 Node，建议在 merge 前过滤；你补充单测覆盖空 snippet。</aside>
+      <div class="mermaid-wrap">
+        <h5>调试闭环</h5>
+        <pre class="mermaid">
+flowchart TD
+    A[告警/工单] --> B[收集 request_id 日志]
+    B --> C[AI 根因假设]
+    C --> D[人工验证 1 条]
+    D -->|确认| E[最小修复 + 回归测试]
+    D -->|否定| C
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 修复示例：过滤空 chunk，避免 .strip() 崩溃
+def normalize_chunks(chunks: list) -> list:
+    return [c for c in chunks if c and getattr(c, "text", None) and c.text.strip()]</code></pre>
+      </div>
+      <p>对异步 Bug，Prompt 中要求 AI 「检查 await 缺失、在 async 路由中调用同步 httpx.Client」。这与 <span class="term" data-term-id="static-analysis">静态分析</span> 规则互补。</p>
+      <details class="learn-micro-check"><summary>AI 给出 5 个根因都不对，下一步？</summary><p>缩小上下文：只给失败请求的参数组合；添加「上一次正常发布的 git tag」对比 diff；用二分法注释检索步骤。避免一次性 @ 整个 monorepo。</p></details>
+    </div>
+
+    <div class="section-block">
+      <h3>安全漏洞扫描 Review</h3>
+      <p>CorpAssist 处理企业文档，需防 Prompt 注入、越权检索、敏感片段回显。将 OWASP LLM Top 10 检查表写入 Rules，让 AI 对 PR diff 逐条打勾/标风险。</p>
+      <table class="outline-table">
+        <thead><tr><th>检查项</th><th>CorpAssist 示例</th></tr></thead>
+        <tbody>
+          <tr><td>LLM01 提示注入</td><td>用户 query 是否拼进 system 未转义</td></tr>
+          <tr><td>越权检索</td><td>向量过滤是否带 tenant_id</td></tr>
+          <tr><td>敏感泄露</td><td>citations 是否可能含薪资/身份证</td></tr>
+          <tr><td>依赖漏洞</td><td>requirements 是否 pin 版本</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 坏：用户输入直接覆盖 system
+messages = [{"role": "system", "content": user_query}]
+
+# 好：固定 system + 明确分隔的用户块
+messages = [
+    {"role": "system", "content": SYSTEM_POLICY},
+    {"role": "user", "content": f"&lt;query&gt;{escape(user_query)}&lt;/query&gt;"},
+]</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code>对以下 diff 做安全 Review。输出表格：风险等级(高/中/低)、位置、修复建议。
+必须覆盖：租户隔离、日志是否打印 query 原文、API Key 是否进日志。
+
+（粘贴 PR diff）</code></pre>
+      </div>
+      <p>结合 <code>bandit</code> / <code>pip-audit</code> 机器结果一并 @ 给 AI，要求「不要重复 bandit 已报的低危项，聚焦 LLM 特有路径」。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 检索层强制 tenant 过滤（Review 必查）
+async def aretrieve(self, query: str, top_k: int, tenant_id: str):
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+    return await self._store.search(
+        vector=await self._embed(query),
+        filter={"tenant_id": tenant_id},
+        limit=top_k,
+    )</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>日志字段</th><th>可否记录 query 原文</th></tr></thead>
+        <tbody>
+          <tr><td>request_id</td><td>是</td></tr>
+          <tr><td>tenant_id</td><td>是</td></tr>
+          <tr><td>query 全文</td><td>否（仅 hash 或截断）</td></tr>
+          <tr><td>answer 全文</td><td>视合规分级</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>只跑 bandit</h4><p>无法发现「检索未过滤 tenant」类逻辑漏洞。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>bandit + AI 威胁建模</h4><p>机器扫依赖与硬编码密钥，AI 扫 RAG 数据流。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>性能热点分析</h3>
+      <p>P95 延迟超标时，导出 <span class="term" data-term-id="profiling">py-spy</span> 火焰图或 OpenTelemetry trace，让 AI 解读「哪一层占用」并建议优化（批量化 embedding、缓存、减少串行 LLM 调用）。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># 对运行中的 CorpAssist worker 采样 30s
+py-spy record -o profile.svg --pid $(pgrep -f "uvicorn app.main")
+# 将 profile.svg 与 trace JSON 片段描述给 AI</code></pre>
+      </div>
+      <table class="outline-table learn-decision-table">
+        <thead><tr><th>热点</th><th>常见原因</th><th>AI 常建议</th></tr></thead>
+        <tbody>
+          <tr><td>embed 40%</td><td>逐条 encode</td><td>batch size 32</td></tr>
+          <tr><td>llm 35%</td><td>串行重试</td><td>并发上限 + 超时</td></tr>
+          <tr><td>milvus 15%</td><td>无过滤索引</td><td>tenant 分区键</td></tr>
+          <tr><td>json 序列化 10%</td><td>大 citations 体</td><td>截断 snippet 长度</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 批量化 embedding 示意
+async def embed_batch(texts: list[str]) -> list[list[float]]:
+  return await embedding_client.aembed_documents(texts, batch_size=32)</code></pre>
+      </div>
+      <p>要求 AI 「估算优化后 P95 降幅区间」时，需附上优化前 baseline 数字，否则拒绝空泛「会更快」。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "trace_id": "7f3c",
+  "spans": [
+    {"name": "embed", "duration_ms": 420},
+    {"name": "milvus_search", "duration_ms": 180},
+    {"name": "llm_complete", "duration_ms": 2100}
+  ]
+}</code></pre>
+      </div>
+      <p>把 trace JSON 附在 Prompt 末尾，要求 AI 只建议改「占比 &gt;25% 且非必要串行」的 span。CorpAssist 常见 wins：embedding batch、检索与 rerank 并行上限、LLM 超时从 60s 降到 15s 并配合重试预算。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>CI 中集成 AI Review</h3>
+      <p>推荐模式：<strong>机器门禁 + AI 评论</strong>。ruff/pytest/coverage 失败阻断；AI 通过 GitHub App 在 PR 留言，标签 <code>ai-review:needs-human</code>。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># .github/workflows/ai-review.yml 概念片段
+jobs:
+  ai-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - run: git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+      - name: Run AI review script
+        env:
+          REVIEW_API_KEY: ${{ secrets.REVIEW_BOT_KEY }}
+        run: uv run python scripts/ai_pr_review.py pr.diff
+      # 脚本：调用内部 LLM，输出 markdown 评论，禁止自动 approve</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># scripts/ai_pr_review.py 核心逻辑（示意）
+def build_prompt(diff: str) -> str:
+    return f"""你是 CorpAssist 代码审查员。仅根据 diff 评论。
+规则：不建议预训练/换模型；优先 tenant 隔离与测试。
+输出 Markdown，分 重要/轻微。diff:\n{diff[:120_000]}"""</code></pre>
+      </div>
+      <p>企业内网需走私有模型 endpoint；diff 超限时按文件拆分多次 Review 再合并。Secrets 扫描必须在送模前完成 redaction。</p>
+      <div class="role-cards">
+        <div class="role-card"><h4>阻断门禁</h4><p>ruff, pytest, openapi-diff, bandit</p></div>
+        <div class="role-card"><h4>AI 评论</h4><p>逻辑、安全、性能建议</p></div>
+        <div class="role-card"><h4>人工</h4><p>合并权永远在维护者</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Review 评论分级与 SLA</h3>
+      <p>统一 AI 与人工 Review 的严重级别，避免「全是重要」导致维护者麻木。CorpAssist 建议：</p>
+      <table class="outline-table learn-decision-table">
+        <thead><tr><th>级别</th><th>示例</th><th>SLA</th></tr></thead>
+        <tbody>
+          <tr><td>P0</td><td>tenant 未过滤、密钥进日志</td><td>阻断合并，当场修</td></tr>
+          <tr><td>P1</td><td>缺 await、未处理空 chunk</td><td>本 PR 修或开 issue</td></tr>
+          <tr><td>P2</td><td>命名、重复代码</td><td>可跟进</td></tr>
+          <tr><td>P3</td><td>风格建议</td><td>ruff 自动修</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown">## AI Review 摘要（自动生成）
+### 重要
+- [P1] rag/service.py:42 可能对 None 调用 strip → 建议 normalize_chunks
+### 轻微
+- [P3] 变量名 ret 可改为 retrieval_result
+### 已覆盖（无需重复）
+- bandit B105 已在 baseline 中忽略</code></pre>
+      </div>
+      <p>将历史误报标注为「已覆盖」反馈给 Prompt 维护者，每月收敛一次模板。对 RAG 路径，固定附加「请检查 citations 是否可能泄露 PII 正则匹配」规则，比泛泛「注意安全」更有效。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code>PR Review 输出格式（强制）：
+## 重要
+- [P0/P1] 文件:行 — 问题 — 修复建议
+## 轻微
+- [P2/P3] …
+## 已覆盖（勿重复）
+- bandit B105 …</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># scripts/redact_diff.py — 送模前脱敏
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+text = re.sub(r"sk-[A-Za-z0-9]{20,}", "[REDACTED]", text)
+text = re.sub(r"AKIA[A-Z0-9]{16}", "[REDACTED]", text)
+print(text[:120_000])</code></pre>
+      </div>
+      <p>企业内网 Review Bot 应记录 Prompt 哈希与 diff 行数，便于 advanced 阶段审计溯源。practice-03-lab 的 <code>sample.pr.diff</code> 可用于团队 onboarding 演练。修复 tenant 过滤后，应同步更新 OWASP 检查表中的「越权检索」行为例。</p>
+      <aside class="learn-scenario"><strong>场景</strong>：合码后 7d 缺陷上升。复盘发现 AI Review 未标出「重试未退避」导致 Milvus 被打满。后续在 Prompt 中增加「检查外部依赖重试与熔断」专项检查。</aside>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># 退避重试示意 — Review 应要求存在 max_retries/backoff
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=0.2, max=2))
+async def call_milvus(...):
+    ...</code></pre>
+      </div>
+      <details class="learn-micro-check"><summary>diff 超过 120k 字符送不进模型怎么办？</summary><p>按文件拆分多次 Review；或只送「变更符号摘要」+ 完整小文件；大文件只送 hunk 上下文 ±30 行。</p></details>
+      <p>修复 tenant 过滤后，应同步更新 OWASP 检查表中的「越权检索」行为例，并补 pytest 防回归。</p>
+      <table class="outline-table">
+        <thead><tr><th>Review 类型</th><th>机器门禁</th><th>AI 辅助</th></tr></thead>
+        <tbody>
+          <tr><td>语法/风格</td><td>ruff</td><td>解释告警含义</td></tr>
+          <tr><td>逻辑/安全</td><td>pytest + bandit</td><td>OWASP 威胁建模</td></tr>
+          <tr><td>性能</td><td>基准测试 job</td><td>解读 py-spy/trace</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-faq">
+        <details><summary>AI Review 与人工 Review 评论冲突怎么办？</summary><div class="learn-faq-body">以机器可验证项（pytest、bandit）为准；AI 与人工分歧时维护者裁决并更新 Prompt 模板。记录「误报/漏报」进 advanced 阶段 Judge 调优 backlog。</div></details>
+        <details><summary>能否在 IDE 里实时 Review 未提交的 diff？</summary><div class="learn-faq-body">可以作个人自检；合码仍以 PR diff 为准。IDE 实时 Review 易漏 CI 才出现的路径（如仅 Linux 触发的 import）。</div></details>
+        <details><summary>Review 发现 tenant 未过滤但 pytest 全绿？</summary><div class="learn-faq-body">说明测试未覆盖多租户场景。应补集成测试或 parametrize tenant_id；AI Review 与测试门禁互补，不能互相替代。</div></details>
+        <details><summary>py-spy 需要 root 吗？</summary><div class="learn-faq-body">Linux 上 attach 其他用户进程可能需要权限；容器内可对 pid 1 采样。Windows 开发机可用本地压测 + trace 代替。</div></details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>Bug 定位 Prompt 要含现象、复现、已排除与验证任务</li>
+        <li>安全 Review 必须覆盖租户隔离与 Prompt 注入，不能只看 bandit</li>
+        <li>性能分析需附 profiling/trace 数据，AI 只做解读与建议</li>
+        <li>CI 中 AI 只评论不阻断（或仅对 labeled 文件），机器检查仍阻断</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-03-1"> 我能写出四段式 Bug 定位 Prompt</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-2"> 我能用 OWASP 表做 RAG PR 安全 Review</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-3"> 我能结合 py-spy 让 AI 解释热点</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-4"> 我理解 AI Review 与机器门禁的分工</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-03-5"> 我已在 practice-03-lab 产出 Review 并修复 pytest</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>request_id</td><td>跨服务日志关联键</td></tr>
+            <tr><td>tenant_id 过滤</td><td>向量检索强制条件</td></tr>
+            <tr><td>py-spy</td><td>生产安全采样 profiler</td></tr>
+            <tr><td>diff 上限</td><td>送模前截断与脱敏</td></tr>
+            <tr><td>P0/P1</td><td>Review 严重级别，P0 阻断合并</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>AI Review 误报很多，团队还要用吗？</summary><p>用作提醒而非否决；维护者标记「误报」反馈微调 Prompt；高危项（tenant 泄漏）仍靠自动化测试与集成测试兜底。</p></details>
+        <details><summary>能否让 AI 在 CI 里自动修复？</summary><p>不建议默认开启。可选手动 workflow_dispatch 生成 patch 分支，必须经人 Review 后合并。</p></details>
+        <details><summary>AI Review 与 Model-as-Judge 有何区别？</summary><p>Review 偏 diff 语义与威胁建模；Judge 偏评分卡与 CI 阻断。详见 <a href="#ch-advanced-03">Model-as-Judge 代码质量门禁</a>。两者可并行，不可互相替代。</p></details>
+      </div>
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；上一章 <a href="#ch-practice-02">AI 生成文档与 Schema</a> 的契约与日志字段；下一章 <a href="#ch-practice-04">实战：CorpAssist 开发效率提升</a> 将 Review 与 eval 纳入同一 Sprint。在 <code>demos/practice-03-lab/</code> 完成 Review Markdown 与 pytest 修复后再合码。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://owasp.org/www-project-top-10-for-large-language-model-applications/" target="_blank" rel="noopener">OWASP LLM Top 10</a></li>
+      <li><a href="https://github.com/benfred/py-spy" target="_blank" rel="noopener">py-spy</a></li>
+      <li><a href="https://docs.astral.sh/ruff/" target="_blank" rel="noopener">ruff</a> — 与 AI Review 并列的静态检查</li>
+    </ul>
+  </div>
+
+    <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对含缺陷的 RAG PR diff 做 AI Review、安全扫描与 py-spy 性能解读（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>选取一个含「空 chunk」风险的 PR diff，用四段式 Prompt 让 AI 给出验证步骤</li>
+      <li>用 OWASP 表对 <code>rag/service.py</code> diff 做安全 Review，整理 3 条可执行修复</li>
+      <li>本地 py-spy 采样 30s，让 AI 解读 top 3 热点并估 P95 影响</li>
+      <li>打开 <code>demos/practice-03-lab/sample.pr.diff</code>，对照正文 OWASP 表产出 Review，修复后跑 lab 验收命令</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+    <li>
+      <p class="judgment-stem">AI 建议「换更大模型」降低延迟，是否采纳？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>通常否。先查批量化、缓存与检索过滤；换模型涉及成本与合规，走变更流程，不属于 Code Review 范畴。</p></div>
+        </details>
+      </div>
+    </li>
+    <li>
+      <p class="judgment-stem">CI AI Review 把 API Key 打在评论里，如何处理？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>立即旋转密钥；修复 redaction 脚本；删除 PR 评论历史；事故复盘写入团队 Rules。</p></div>
+        </details>
+      </div>
+    </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：practice-03-lab</h4>
+      <p>目录：<code>demos/practice-03-lab/</code>。含 <code>sample.pr.diff</code> 与故意缺陷的 <code>app/rag/service.py</code>。</p>
+      <p><strong>验收</strong>：对 diff 产出 AI Review Markdown 后，修复 tenant 过滤并跑：</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash">cd demos/practice-03-lab
+pip install pytest pytest-asyncio
+pytest tests/test_service.py -q</code></pre>
+      </div>
+      <ul class="demo-acceptance">
+        <li>Review 含 ≥1 重要 + ≥2 轻微；pytest 2 passed</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-02">AI 生成文档与 Schema</a></li>
+      <li>下一篇：<a href="#ch-practice-04">实战：CorpAssist 开发效率提升</a></li>
+    </ul>
+  </div>
+</section>

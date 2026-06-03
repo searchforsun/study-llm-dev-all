@@ -1,0 +1,376 @@
+<section id="ch-practice-04" class="chapter" data-chapter="practice-04">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>实战：CorpAssist 开发效率提升</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40</strong> 分钟 · 阶段：<strong>AI 自动化实践</strong> · 能力：在一周内用 AI 加速 CorpAssist RAG/Agent/评测交付并量化收益</p>
+      <div class="notice notice-why-learn">
+        <h4>为什么要学本章</h4>
+        <p>前 3 章分别覆盖测试、文档与 Review。本章把能力串成<strong>一条迭代线</strong>：用 AI 搭建 <span class="term" data-term-id="rag-pipeline">RAG 管线</span>、生成 <span class="term" data-term-id="agent-workflow">Agent 工作流</span>、编写 <span class="term" data-term-id="eval-script">评测脚本</span>，并用 <span class="term" data-term-id="dev-metrics">dev-metrics</span> 对比人工基线。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <h4>学完你能</h4>
+        <ul>
+          <li>在 2 天内完成 CorpAssist 检索链路的 MVP（含 pytest + OpenAPI）</li>
+          <li>用 AI 生成 LangGraph 风格 Agent 草图并人工收口</li>
+          <li>自动生成 golden set 评测与报告</li>
+          <li>汇报可审计的效率数据（工时、缺陷率、覆盖率）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <h4>本章先记住 3 件事</h4>
+        <ul>
+          <li>效率提升 = 自动化重复劳动 + 不降低门禁（ruff/pytest/eval）</li>
+          <li>每个 AI 产物必须有「人工验收清单」与可回滚 commit</li>
+          <li>用数据说话：记录 AI 接受率与合码后 7 天缺陷</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>AI 辅助 RAG 管线开发</h3>
+      <p>目标：为 CorpAssist S1 知识库实现「 ingest → embed → milvus → retrieve → synthesize」最小链路。把架构图、接口契约与依赖版本写入 Prompt，让 AI 生成模块骨架，你用 1 个下午接好配置与 secrets。</p>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist RAG MVP</h5>
+        <pre class="mermaid">
+flowchart LR
+    IN[PDF ingest] --> CH[chunk]
+    CH --> EM[embed batch]
+    EM --> MV[(Milvus)]
+    Q[query API] --> RET[retrieve+filter tenant]
+    RET --> SYN[LLM synthesize]
+    SYN --> OUT[answer+citations]
+</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># app/rag/pipeline.py — AI 生成骨架经人工调整
+from dataclasses import dataclass
+
+@dataclass
+class RagPipeline:
+    retriever: "TenantRetriever"
+    llm: "ChatClient"
+
+    async def arun(self, query: str, top_k: int = 3) -> dict:
+        chunks = await self.retriever.aretrieve(query=query, top_k=top_k)
+        chunks = [c for c in chunks if c.text and c.text.strip()]
+        context = "\n---\n".join(c.text for c in chunks)
+        answer = await self.llm.acomplete(system=RAG_SYSTEM, user=build_user(query, context))
+        return {
+            "answer": answer,
+            "citations": [{"doc_id": c.doc_id, "snippet": c.text[:200]} for c in chunks],
+        }</code></pre>
+      </div>
+      <p>同步让 AI 生成：<code>tests/rag/test_pipeline.py</code>（mock LLM）、<code>export_openapi</code> 更新、<code>README</code> curl。合码前跑通 <code>uv run ruff check &amp;&amp; uv run pytest</code>。</p>
+      <table class="outline-table">
+        <thead><tr><th>任务</th><th>人工(h)</th><th>AI 辅助(h)</th></tr></thead>
+        <tbody>
+          <tr><td>管线骨架+路由</td><td>16</td><td>6</td></tr>
+          <tr><td>pytest+mock</td><td>8</td><td>3</td></tr>
+          <tr><td>OpenAPI+README</td><td>4</td><td>1.5</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario"><strong>场景</strong>：周五下班前需演示「年假政策」问答。AI 生成 pipeline + 5 条 golden question 单测；你只做 Milvus collection 与 20 份 PDF 入库脚本验收。</aside>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># FastAPI 路由 — 与 pipeline 同 PR 由 AI 生成
+from fastapi import APIRouter, Depends
+from app.rag.schemas import RagQueryRequest, RagQueryResponse
+from app.rag.pipeline import RagPipeline, get_pipeline
+
+router = APIRouter(prefix="/v1/rag", tags=["rag"])
+
+@router.post("/query", response_model=RagQueryResponse)
+async def rag_query(body: RagQueryRequest, pipeline: RagPipeline = Depends(get_pipeline)):
+    return await pipeline.arun(query=body.query, top_k=body.top_k)</code></pre>
+      </div>
+      <p>同一 Prompt 可要求输出 <code>tests/</code>、<code>scripts/export_openapi.py</code> 变更说明，形成「一次生成、三门禁验证」批次，减少上下文切换。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Agent 工作流生成</h3>
+      <p>S3 办公自动化需要「查知识库 → 填表单 → 人工审批」多步流。可用 AI 生成 <span class="term" data-term-id="agent-workflow">LangGraph</span> 状态图草图，再按团队 Rules 加 <code>interrupt</code> 与步数上限。对外仍通过 <span class="term" data-term-id="fastapi">FastAPI</span> 暴露同步/流式接口，与 Java BFF 契约一致。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># app/agent/graph.py 示意 — AI 生成后须人工加预算与白名单
+from langgraph.graph import StateGraph, END
+
+def build_corpassist_agent():
+    g = StateGraph(dict)
+    g.add_node("retrieve", retrieve_node)
+    g.add_node("draft_form", draft_form_node)
+    g.add_node("human_approve", human_approve_node)
+    g.set_entry_point("retrieve")
+    g.add_edge("retrieve", "draft_form")
+    g.add_conditional_edges("draft_form", need_approval, {"yes": "human_approve", "no": END})
+    g.add_edge("human_approve", END)
+    return g.compile(interrupt_before=["human_approve"])</code></pre>
+      </div>
+      <p>Prompt 要点：列出工具白名单（只读 HR API、禁止 shell）、最大步数 8、必须写 <code>request_id</code> 到 state。生成后对照 <a href="#ch-advanced-01">自定义 AI Agent 工作流设计</a> 做治理加固。</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>直接上线 AI 图</h4><p>无 interrupt、无 tool 白名单，易越权写表单。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>草图 + 人工门禁</h4><p>AI 出拓扑，人补安全与可观测性（trace、审计日志）。</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>评测脚本自动编写</h3>
+      <p>RAG 质量不能靠「感觉」。让 AI 从 PRD 抽取 30 条 golden Q/A，生成 <code>evals/rag_golden.jsonl</code> 与跑分脚本，输出 faithfulness、 citation 命中率。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># scripts/run_rag_eval.py
+import json, asyncio
+from app.rag.pipeline import RagPipeline
+
+async def main():
+    pipeline = RagPipeline.from_settings()
+    rows = [json.loads(l) for l in open("evals/rag_golden.jsonl")]
+    ok = 0
+    for row in rows:
+        out = await pipeline.arun(query=row["question"], top_k=3)
+        hit = any(k in out["answer"] for k in row.get("must_contain", []))
+        ok += int(hit)
+    print(f"hit_rate={ok/len(rows):.2%}")
+
+if __name__ == "__main__":
+    asyncio.run(main())</code></pre>
+      </div>
+      <p>CI 夜间 job 跑 eval（可调用真实模型），PR 内只跑 mock 快测。AI 还可生成「失败样例分析报告」模板，供周五质量例会使用。</p>
+      <details class="learn-micro-check"><summary>hit_rate 90% 能否直接上线？</summary><p>需看失败是否集中在合规高风险问题；检查 citations 是否伪造；对比人工评测子集。评测脚本本身也要 code review。</p></details>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># PR 内快测（mock）
+uv run pytest tests/rag -q
+uv run python scripts/run_rag_eval.py --mock
+# 夜间 staging（真实模型，需密钥）
+uv run python scripts/run_rag_eval.py --env staging</code></pre>
+      </div>
+      <p>AI 可生成 eval 报告 Markdown 模板，填入 hit_rate、失败样例 top5、建议补测问题。人工只需核实失败样例是否真缺陷。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>效率数据对比</h3>
+      <p>团队用表格记录两周 Sprint：AI 辅助组 vs 对照组（同一仓库不同 feature）。指标建议：</p>
+      <table class="outline-table learn-decision-table">
+        <thead><tr><th>指标</th><th>定义</th><th>CorpAssist 试点结果（示例）</th></tr></thead>
+        <tbody>
+          <tr><td>交付周期</td><td>需求到 prod</td><td>11d → 7d</td></tr>
+          <tr><td>AI 代码接受率</td><td>合并行数/AI 建议行数</td><td>62%</td></tr>
+          <tr><td>合码后 7d 缺陷</td><td>P1/P2 per KLOC</td><td>0.4 → 0.5（需加固 Review）</td></tr>
+          <tr><td>rag 行覆盖</td><td>pytest cov</td><td>72% → 88%</td></tr>
+          <tr><td>文档 diff 失败</td><td>openapi-diff 次数</td><td>3 → 0（契约先行）</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># 从 git 统计 AI 标记提交（commit message 含 ai-assisted）
+git log --since=2026-05-01 --grep=ai-assisted --pretty=oneline | wc -l
+# 结合 IDE 插件导出「接受片段」CSV，汇入 dev-metrics 看板</code></pre>
+      </div>
+      <p>向管理层汇报时强调：<strong>门禁未降低</strong>（<span class="term" data-term-id="ruff">ruff</span>/pytest/eval 全过），效率来自模板化与并行（测试+文档同时生成）。若缺陷率上升，优先加 AI Review 与 golden eval，而非停用 AI。</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><h4>只报工时节省</h4><p>缺陷率上升、eval 未跑，技术债滞后爆发。</p></div>
+        <div class="learn-compare-col learn-compare-good"><h4>工时 + 质量双指标</h4><p>周期 11d→7d 且 7d 缺陷未恶化，覆盖率与 hit_rate 提升。</p></div>
+      </div>
+      <p>扩写 golden 至 20 条后再跑 eval，避免过拟合 3 条样例。</p>
+      <table class="outline-table">
+        <thead><tr><th>汇报对象</th><th>必展示指标</th><th>可选</th></tr></thead>
+        <tbody>
+          <tr><td>工程经理</td><td>周期、7d 缺陷、覆盖率</td><td>AI 接受率</td></tr>
+          <tr><td>平台组</td><td>openapi-diff、eval hit_rate</td><td>Agent interrupt 覆盖率</td></tr>
+          <tr><td>客户/合规</td><td>tenant 过滤、审计日志</td><td>私有模型占比</td></tr>
+        </tbody>
+      </table>
+      <p>Sprint 结束时应将 dev-metrics 与 eval 报告归档到 <code>docs/sprints/</code>，供 advanced 阶段度量看板导入。lab 中 <code>run_rag_eval.py</code> 退出码非 0 表示 hit_rate 未达标。扩写 golden 至 20 条后再跑 eval，避免过拟合 3 条样例。</p>
+      <ul>
+        <li>记录每个 PR 的 AI 建议行数 vs 合并行数（接受率）</li>
+        <li>标记 <code>ai-assisted</code> commit 便于 git 统计</li>
+        <li>复盘会上展示 1 个失败样例与修复闭环（badcase 飞轮）</li>
+        <li>与 <a href="#ch-practice-01">AI 生成测试用例</a>、<a href="#ch-practice-03">AI 辅助 Code Review</a> 的门禁对照，证明未偷工减料</li>
+        <li>在 <code>demos/practice-04-lab/</code> 填写 dev-metrics 模板，作为 Sprint 汇报附件</li>
+      </ul>
+      <div class="role-cards">
+        <div class="role-card"><h4>第 1 天</h4><p>RAG MVP + mock 测试</p></div>
+        <div class="role-card"><h4>第 2–3 天</h4><p>入库+检索调参+eval</p></div>
+        <div class="role-card"><h4>第 4–5 天</h4><p>Agent 草图+CI 门禁</p></div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>端到端 Prompt 示例（可复制）</h3>
+      <p>将下列模板存入团队 Snippet，新 feature 从 Day1 复用，减少 Prompt 漂移。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code>任务：CorpAssist S1 RAG MVP（Python/FastAPI）
+交付：
+1) app/rag/pipeline.py + router + pydantic schemas
+2) tests/rag/* 全 mock，uv run pytest 通过
+3) 更新 contracts/corpassist-rag-v1.json + README curl
+4) evals/rag_golden.jsonl 20 条 + scripts/run_rag_eval.py
+约束：tenant_id 过滤、禁止真实 LLM、遵循 .cursor/rules
+（@ 相关文件）</code></pre>
+      </div>
+      <p>第二轮 Prompt 只做「根据 coverage missing 补 2 个测试」；第三轮只做「openapi-diff 解释」。小步 Prompt 比一次要「完整系统」质量更高。Day5 向平台组汇报时使用 <code>dev-metrics-template.md</code>，避免只报工时节省。</p>
+      <table class="outline-table">
+        <thead><tr><th>风险信号</th><th>应对</th></tr></thead>
+        <tbody>
+          <tr><td>eval hit_rate 高但用户投诉</td><td>扩充 golden + 线上 badcase</td></tr>
+          <tr><td>周期缩短但 7d 缺陷升</td><td>加强 AI Review + 降 AI 占比</td></tr>
+          <tr><td>openapi-diff 频繁 fail</td><td>契约先行 + 小步 PR</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>一周冲刺日程模板</h3>
+      <table class="outline-table">
+        <thead><tr><th>日</th><th>交付物</th><th>AI 用途</th><th>人工必做</th></tr></thead>
+        <tbody>
+          <tr><td>D1</td><td>RagPipeline + 路由</td><td>骨架代码</td><td>Milvus 连接串、tenant 策略</td></tr>
+          <tr><td>D2</td><td>pytest + cov 85%</td><td>用例与 fixture</td><td>断言 citations 结构</td></tr>
+          <tr><td>D3</td><td>openapi + README</td><td>docstring、curl</td><td>semver 与 Java 同步</td></tr>
+          <tr><td>D4</td><td>golden eval</td><td>jsonl + 跑分脚本</td><td>抽检 10 条质量</td></tr>
+          <tr><td>D5</td><td>Agent 草图 + metrics</td><td>LangGraph 拓扑</td><td>interrupt、白名单</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># evals/rag_golden.jsonl 示例行（AI 生成后人工删改）
+{"question": "年假几天", "must_contain": ["5"], "tenant": "demo"}
+{"question": "报销上限", "must_contain": ["5000"], "tenant": "demo"}
+{"question": "火星移民政策", "must_contain": ["未找到"], "tenant": "demo"}</code></pre>
+      </div>
+      <p>汇报模板：① 周期对比 ② 覆盖率 ③ eval hit_rate ④ 7d 缺陷 ⑤ AI 接受率 ⑥ 下迭代风险。避免只展示「节省 40% 工时」而无质量侧指标。</p>
+      <div class="mermaid-wrap">
+        <h5>practice 阶段能力串联</h5>
+        <pre class="mermaid">
+flowchart LR
+    T[practice-01 测试] --> D[practice-02 文档]
+    D --> R[practice-03 Review]
+    R --> S[practice-04 实战]
+    S --> A[advanced-01 Agent 治理]
+</pre>
+      </div>
+      <aside class="learn-scenario"><strong>场景</strong>：向平台组汇报 Sprint 成果。除周期缩短外，必须展示 eval hit_rate、7d 缺陷与 openapi-diff 零 breaking，证明 AI 未降低门禁。</aside>
+      <div class="learn-faq">
+        <details><summary>Agent 草图能否跳过人工 interrupt？</summary><div class="learn-faq-body">演示环境也不行。CorpAssist S3 办公自动化涉及写表单，必须 <code>interrupt_before</code> 人工审批；AI 生成图后由架构师加白名单与步数上限。</div></details>
+        <details><summary>eval 只有 3 条 golden 够吗？</summary><div class="learn-faq-body">不够。lab 要求扩至 20 条并覆盖「未找到」类降级；上线前还需 staging 真实模型抽检与 badcase 飞轮。</div></details>
+        <details><summary>dev-metrics 只报周期缩短够吗？</summary><div class="learn-faq-body">不够。必须同时报 7d 缺陷、覆盖率、hit_rate 与 openapi-diff，证明门禁未降低。见正文「效率数据对比」表。</div></details>
+        <details><summary>Agent 与 RAG 能否同一个 PR 交付？</summary><div class="learn-faq-body">可以，但 eval 与 pytest 须分模块；Agent 图须单独 Review 白名单与 interrupt，避免与 RAG 路由混在一个 giant diff 里。</div></details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>AI 加速的是骨架、测试、文档与评测脚本，架构决策仍由人负责</li>
+        <li>RAG + Agent + eval 三件套应在同一迭代内闭环</li>
+        <li>效率数据要同时看周期与缺陷率，避免片面追求速度</li>
+        <li>进阶治理见 advanced 阶段的自定义 Agent 工作流</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist">
+        <h4>过关清单</h4>
+        <ul>
+          <li><label><input type="checkbox" data-check-id="practice-04-1"> 我能用 AI 在 2 天内交付 RAG MVP（含测试）</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-04-2"> 我能审查 AI 生成的 Agent 图并加 interrupt</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-04-3"> 我能维护 golden eval 与 hit_rate 报告</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-04-4"> 我能解释 AI 辅助前后的 dev-metrics</label></li>
+          <li><label><input type="checkbox" data-check-id="practice-04-5"> 我已在 practice-04-lab 跑通 eval 并提交 dev-metrics</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <h4>概念速查</h4>
+        <table class="outline-table">
+          <thead><tr><th>术语</th><th>一句话</th></tr></thead>
+          <tbody>
+            <tr><td>tenant filter</td><td>检索强制带租户维度</td></tr>
+            <tr><td>golden set</td><td>固定 Q/A 回归集</td></tr>
+            <tr><td>interrupt</td><td>人工审批前暂停图执行</td></tr>
+            <tr><td>ai-assisted commit</td><td>可追踪的 AI 贡献标记</td></tr>
+            <tr><td>hit_rate</td><td>golden 集 must_contain 命中率</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="learn-interview">
+        <h4>面试可能问</h4>
+        <details><summary>如何证明 AI 提升了效率而不是制造技术债？</summary><p>展示 dev-metrics：周期缩短且 7d 缺陷未恶化；覆盖率与 eval 命中率上升；openapi-diff 零 breaking。技术债用 ADR 与重构 budget 管理。</p></details>
+        <details><summary>RAG MVP 最先做哪一段？</summary><p>retrieve+synthesize 闭环 + mock 测试；ingest 可用手工小 corpus；eval 与 tenant 过滤从第一天纳入，避免后期返工。</p></details>
+        <details><summary>practice 阶段与 advanced 如何衔接？</summary><p>本章 Sprint 数据 feeds advanced-02 度量看板；Agent 草图在 advanced-01 加固；合规清单见 advanced-04。完成 lab 后再进入 advanced 阶段。</p></details>
+      </div>
+      <p class="chapter-review-next">下一步：勾选过关清单、完成右侧测验与下方 Demo；回顾 <a href="#ch-practice-01">AI 生成测试用例</a> 至本章的 practice 串联 Mermaid；下一章 <a href="#ch-advanced-01">自定义 AI Agent 工作流设计</a> 进入团队级 Agent 治理。提交 <code>demos/practice-04-lab/dev-metrics-template.md</code> 复盘。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方参考</h3>
+    <ul>
+      <li><a href="https://fastapi.tiangolo.com/" target="_blank" rel="noopener">FastAPI</a></li>
+      <li><a href="https://langchain-ai.github.io/langgraph/" target="_blank" rel="noopener">LangGraph</a> — Agent 编排</li>
+      <li><a href="https://docs.pytest.org/" target="_blank" rel="noopener">pytest</a> — 与 AI 生成测试配合</li>
+    </ul>
+  </div>
+
+    <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成 CorpAssist RAG MVP、eval 脚本与 dev-metrics 复盘表（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>用 AI 生成 <code>RagPipeline</code> + <code>POST /v1/rag/query</code>，本地 pytest 全绿</li>
+      <li>导出 OpenAPI 并更新 README curl，跑一致性脚本</li>
+      <li>让 AI 生成 20 条 golden jsonl + <code>run_rag_eval.py</code>，记录 hit_rate</li>
+      <li>填写 <code>demos/practice-04-lab/dev-metrics-template.md</code>，对照正文「效率数据对比」表写 200 字复盘</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+    <li>
+      <p class="judgment-stem">为赶演示关闭 tenant 过滤，是否可接受？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>不可。演示环境也需用测试 tenant 数据；否则上线前必重构，且易养成坏习惯。应用 feature flag 而非删除过滤。</p></div>
+        </details>
+      </div>
+    </li>
+    <li>
+      <p class="judgment-stem">eval hit_rate 100% 但用户仍投诉，原因？</p>
+      <div class="learn-practice-answer">
+        <details>
+          <summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>golden 过拟合、未覆盖口语化问法；citations 不可点击；延迟超标。需扩充 eval 与线上 badcase 飞轮。</p></div>
+        </details>
+      </div>
+    </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：practice-04-lab</h4>
+      <p>目录：<code>demos/practice-04-lab/</code>。含 RAG stub、golden jsonl、eval 脚本与 <code>dev-metrics-template.md</code>。</p>
+      <p><strong>验收</strong>：</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash">cd demos/practice-04-lab
+pip install pytest
+pytest tests/ -q
+python scripts/run_rag_eval.py</code></pre>
+      </div>
+      <ul class="demo-acceptance">
+        <li>pytest 2 passed；eval 输出 <code>hit_rate&gt;=85%</code></li>
+        <li>提交填写完整的 dev-metrics 复盘一页纸</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸阅读</h3>
+    <ul>
+      <li>上一篇：<a href="#ch-practice-03">AI 辅助 Code Review 与调试</a></li>
+      <li>下一篇：<a href="#ch-advanced-01">自定义 AI Agent 工作流设计</a> — 团队级 Agent 治理与 CI/CD 集成</li>
+    </ul>
+  </div>
+</section>
