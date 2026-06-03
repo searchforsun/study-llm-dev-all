@@ -1,0 +1,366 @@
+<section id="ch-practice-04-qps" class="chapter" data-chapter="practice-04-qps">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>生产 QPS 与缓存分层</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-qps" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>治理与运维</strong> · 能力：从应用工程视角（非 Infra）优化 CorpAssist S3 的 HTTP 连接池、异步化与削峰，提升 DashScope 有效 QPS</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>面试常问「S3 Agent 如何扛 500 QPS」——答案不应是「加 Pod」这么简单。LLM 调用慢、串行 Tool 多、同步 Servlet 占线程，都会让<strong>应用层</strong>先触顶。<span class="term" data-term-id="http-connection-pool" tabindex="0">http connection pool</span>、<span class="term" data-term-id="async-llm" tabindex="0">async llm</span> 与 <span class="term" data-term-id="peak-shaving" tabindex="0">peak shaving</span> 是 Java 工程师能直接落地的手段；本章刻意<strong>非 Infra 视角</strong>：不谈 GPU 集群，谈 Spring 侧如何把有限 DashScope QPS 用满。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>调优 DashScope HTTP Client 连接池（max connections、keep-alive、超时）</li>
+          <li>将长任务（OCR、批量汇总）改为 <code>@Async</code> / 消息队列 + SSE 通知</li>
+          <li>用队列削峰：高峰订会议室请求排队而非打满 DashScope</li>
+          <li>设计 L1/L2 缓存分层，与 practice-02 语义缓存衔接</li>
+          <li>用压测指标（有效 QPS、线程池饱和度）回答 S3 面试题</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>瓶颈常在串行</strong>：intent + clarify + reply 三次 LLM 可合并或缓存意图。</li>
+          <li><strong>线程 ≠ 连接</strong>：Tomcat 200 线程但连接池 50，仍会排队。</li>
+          <li><strong>异步改体验</strong>：长任务返回 taskId，比同步 30s 超时更好。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>连接池：DashScope HTTP 出口</h3>
+      <p>Spring AI Alibaba 底层通过 HTTP 调百炼 API。默认连接池过小会导致 QPS 上升时大量等待连接；过大则占满 DashScope 侧配额。应在<strong>应用配置</strong>显式声明 <span class="term" data-term-id="http-connection-pool" tabindex="0">http connection pool</span>，并与 Resilience4j 超时联调。</p>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 早高峰</span>
+        500 并发短问 FAQ，P99 从 2s 飙到 12s。排查发现 OkHttp <code>maxRequests</code> 默认 64，连接等待占 8s。调池后 P99 回到 3s——无需先扩 Pod。
+      </aside>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">corpassist:
+  dashscope:
+    http:
+      max-connections: 200
+      max-connections-per-route: 100
+      connect-timeout-ms: 2000
+      read-timeout-ms: 8000
+      keep-alive-duration-ms: 300000</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>参数</th><th>调大效果</th><th>S3 风险</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>max-connections</code></td><td>减少等连接</td><td>超过 DashScope 账号 QPS 仍 429</td></tr>
+          <tr><td><code>read-timeout</code></td><td>允许慢模型</td><td>占连接过久，需配合异步</td></tr>
+          <tr><td><code>keep-alive</code></td><td>降 TLS 握手</td><td>长连接与 LB 空闲断开需对齐</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>连接池 vs Tomcat 线程</h5>
+        <pre class="mermaid">flowchart LR
+  T[Tomcat 200 threads]
+  P[HTTP pool 100 conn]
+  DS[DashScope QPS quota]
+  T -->|每请求占 1 线程| P
+  P -->|并发上限| DS</pre>
+        <p class="diagram-caption">线程多不等于 QPS 高；连接池与账号配额才是硬顶。</p>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：连接池 200 仍 429，下一步做什么？</summary>
+        <p>应用层：语义缓存 + 合并 LLM 调用 + 削峰队列；配额层：申请提额或多 Key 分流。非 Infra 视角下仍应先证明无串行浪费。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>异步：长任务与 Servlet 线程释放</h3>
+      <p>S3 中「批量 OCR 发票」「生成月度报销摘要」远超 8s。<span class="term" data-term-id="async-llm" tabindex="0">async llm</span> 模式：API 立即返回 <code>taskId</code>，Worker 消费队列调 DashScope，完成通过 SSE / 企微推送。同步 Servlet 只负责受理与鉴权。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@PostMapping("/s3/expense/summary")
+public TaskAccepted submitSummary(@RequestBody SummaryRequest req) {
+  String taskId = taskQueue.enqueue(req);
+  return new TaskAccepted(taskId, "处理中，完成后通知");
+}
+
+@Async("s3LlmExecutor")
+public void processSummary(String taskId, SummaryRequest req) {
+  String result = chatClient.prompt().user(buildPrompt(req)).call().content();
+  taskStore.complete(taskId, result);
+  notifier.send(req.employeeId(), result);
+}</code></pre>
+      </div>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>路径</th><th>同步 / 异步</th><th>理由</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>FAQ 短问</td><td>同步 + 缓存</td><td>&lt;3s，体验直接</td></tr>
+          <tr><td>订会议室多轮</td><td>同步 SSE 流式</td><td>逐 token 反馈</td></tr>
+          <tr><td>发票 OCR 批次</td><td>异步队列</td><td>避免占满 Tomcat</td></tr>
+          <tr><td>审批摘要生成</td><td>异步 + 回调</td><td>可重试、可审计</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>30s 同步阻塞等 OCR+LLM</li>
+            <li>@Async 无界线程池</li>
+            <li>队列无 DLQ，失败任务丢失</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>有界队列 + 拒绝策略返回 503+retry-after</li>
+            <li>Worker 与 API 分模块扩缩</li>
+            <li>task 状态可查询 <code>GET /tasks/{id}</code></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>削峰：队列、令牌桶与合并请求</h3>
+      <p><span class="term" data-term-id="peak-shaving" tabindex="0">peak shaving</span> 把瞬时 800 QPS 摊平到 DashScope 允许的 200 QPS：入口网关令牌桶、应用内 <code>BlockingQueue</code>、或对相同 FAQ 做 request coalescing（合并相同 query 的一次 LLM 调用）。</p>
+      <div class="mermaid-wrap">
+        <h5>S3 削峰三层（应用视角）</h5>
+        <pre class="mermaid">flowchart TB
+  GW[网关令牌桶 300 QPS]
+  L1[L1 本地 Caffeine FAQ]
+  L2[L2 Redis 语义缓存]
+  Q[内存队列 max 500]
+  LLM[DashScope 有效 200 QPS]
+  GW --> L1
+  L1 -->|miss| L2
+  L2 -->|miss| Q
+  Q --> LLM</pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>手段</th><th>实现</th><th>效果</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>令牌桶</td><td>gateway 或 Resilience4j RateLimiter</td><td>保护下游</td></tr>
+          <tr><td>合并</td><td>相同 FAQ key 单飞（singleflight）</td><td>风暴时 1 次 LLM</td></tr>
+          <tr><td>排队</td><td>返回「排队位置」+ WebSocket</td><td>可预期等待</td></tr>
+          <tr><td>降级</td><td>见 practice-02 turbo</td><td>保可用</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度 FAQ 风暴</span>
+        HR 发全员邮件后 1 分钟内 3000 人问「年假新规」。L1/L2 缓存 + singleflight 将 LLM 调用压到 &lt;50 次；未命中排队 120s 内消化，DashScope 无 429。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>非 Infra 视角：工程师能答的 S3 QPS 题</h3>
+      <p>面试不要求你调 K8s HPA，而要求说清<strong>有效 QPS</strong> = 成功完成业务请求的速率，而非 HTTP 入口计数。下列指标应在 Micrometer 仪表盘可见（见 practice-03）。</p>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">有效 QPS</span>
+          <p class="role-card-desc">完成 S3 业务闭环（含 Tool）/s；排除仅返回「排队中」。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">LLM 调用比</span>
+          <p class="role-card-desc">每业务请求平均 LLM 次数；目标 FAQ &lt;1.2，复杂 Agent &lt;3。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">连接等待 P99</span>
+          <p class="role-card-desc">等 HTTP 连接时长；&gt;500ms 先调池再扩 Pod。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">缓存命中率</span>
+          <p class="role-card-desc">L1+L2 命中 / 只读请求；制度类目标 &gt;60%。</p>
+        </article>
+      </div>
+      <div class="notice">
+        <strong>压测清单（应用层）</strong>
+        <ul>
+          <li>Mock DashScope，测连接池与线程池饱和点</li>
+          <li>混合 70% FAQ + 20% 订会议室 + 10% 异步 OCR</li>
+          <li>记录 429、排队丢弃率、P95 延迟</li>
+          <li>对比「无缓存 vs L1/L2 vs 削峰队列」三条曲线</li>
+        </ul>
+      </div>
+      <div class="learn-faq">
+        <details>
+          <summary>何时才需要 Infra 扩 Pod？</summary>
+          <div class="learn-faq-body">当连接池、缓存、异步化已优化，CPU 仍 &gt;70% 且 LLM 调用比合理，或 Worker 队列持续积压。应用层先证无浪费，再要资源。</div>
+        </details>
+        <details>
+          <summary>流式 SSE 是否更占连接？</summary>
+          <div class="learn-faq-body">单请求占用连接时间更长，但用户体验更好。S3 订会议室等多轮场景用 SSE；纯 FAQ 用非流式 + 缓存。连接池 sizing 需按<strong>并发流式连接数</strong>单独估算。</div>
+        </details>
+      </div>
+      <h4>L1 / L2 缓存分层参数（起点）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>层</th><th>技术</th><th>容量</th><th>TTL</th><th>S3 内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>L1</td><td>Caffeine</td><td>5k keys</td><td>5min</td><td>精确 FAQ hash</td></tr>
+          <tr><td>L2</td><td>Redis + 向量</td><td>100k</td><td>1h</td><td>语义近邻制度问</td></tr>
+          <tr><td>负缓存</td><td>Redis</td><td>—</td><td>30s</td><td>429/超时短暂标记，防击穿</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// singleflight：相同 FAQ key 合并一次 LLM
+public CompletableFuture&lt;String&gt; askFaq(String normalizedQuery) {
+  return inflight.computeIfAbsent(normalizedQuery, key -&gt;
+      CompletableFuture.supplyAsync(() -&gt; llmCall(key), faqExecutor)
+          .whenComplete((r, e) -&gt; inflight.remove(key)));
+}</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Infra 思维（本章不优先）</span>
+          <ul>
+            <li>未看调用比先 HPA 扩 10 倍 Pod</li>
+            <li>加 GPU 推理集群（应用课不涉及）</li>
+            <li>全链路加 Kafka 却不计量 LLM 次数</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">应用工程思维</span>
+          <ul>
+            <li>缓存 + 合并 + 异步 + 连接池</li>
+            <li>Metrics 证明瓶颈已转移再要资源</li>
+            <li>与 practice-02/03 降级、Trace 联动</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>通义栈视角：配额隔离与削峰</h3>
+      <p>Python 批量任务（索引、实验）不应与 Java 在线 S3 API 争用同一 DashScope Key 配额。在线轨优先 cache + singleflight + 异步；离线轨优先 batch 窗口与队列——<strong>配额隔离</strong>是双栈共存前提。</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>dev / 在线 / 批处理共用一把 Key，429 互相拖累</li>
+            <li>未算「有效 QPS」就要求扩 Pod</li>
+            <li>写路径走缓存，导致脏读</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>分 Key + 分连接池：在线 vs 批处理</li>
+            <li>用 LLM 调用比、连接等待、命中率证明瓶颈</li>
+            <li>只读 FAQ / availability 可缓存；写 Tool 强制 bypass</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>连接池</strong>：显式 max-connections / timeout；区分线程池与连接池瓶颈。</li>
+        <li><strong>异步</strong>：OCR/摘要走 taskId + 队列；同步路径留给短 FAQ 与 SSE。</li>
+        <li><strong>削峰</strong>：网关限流 + L1/L2 缓存 + singleflight + 排队反馈。</li>
+        <li><strong>非 Infra 视角</strong>：用有效 QPS、LLM 调用比、连接等待、命中率叙事，再谈扩 Pod。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba_practice04_qps">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="pool" /> 能说明连接池与 Tomcat 线程的区别</label></li>
+          <li><label><input type="checkbox" data-id="async" /> 能举 2 个 S3 异步场景与 API 形态</label></li>
+          <li><label><input type="checkbox" data-id="peak" /> 能画 L1/L2/队列/LLM 四层削峰</label></li>
+          <li><label><input type="checkbox" data-id="metric" /> 能定义有效 QPS 与 LLM 调用比</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>手段</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>连接池</td><td>先调池再等扩 Pod</td></tr>
+                <tr><td>异步</td><td>长任务 taskId，释放 Servlet</td></tr>
+                <tr><td>削峰</td><td>缓存 + singleflight + 队列</td></tr>
+                <tr><td>面试</td><td>有效 QPS + 调用比 + 命中率</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <h4>面试问答</h4>
+        <details>
+          <summary>S3 办公 Agent 如何从 100 QPS 提到 500 QPS（不谈加机器）？</summary>
+          <div class="learn-interview-body">
+            <p><strong>答：</strong>① L1/L2 缓存制度 FAQ，降 LLM 调用比；② 调 HTTP 连接池与超时；③ 意图+回复合并减少轮次；④ 高峰 singleflight + 令牌桶削峰；⑤ 长任务异步化释放线程；⑥ turbo 降级保可用。用压测证明有效 QPS 与 429 率。</p>
+          </div>
+        </details>
+        <details>
+          <summary>连接池已经 200，延迟仍高，你还查什么？</summary>
+          <div class="learn-interview-body">
+            <p><strong>答：</strong>Trace 看是 LLM 慢还是 Tool 慢；LLM 调用比是否过高；线程是否在等连接（metrics）；DashScope 429 重试风暴；必要时异步化或缓存，而非继续加连接。</p>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一章：<a href="#ch-practice-05-bailian-governance">百炼安全与合规治理</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/io.html#io.rest-client" target="_blank" rel="noopener">Spring Boot — REST Client</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html" target="_blank" rel="noopener">Spring — @Async 与调度</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/rate-limit" target="_blank" rel="noopener">百炼 API 限流说明</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">设计 S3 混合流量压测方案与连接池参数表，并估算缓存命中后 DashScope 有效 QPS。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-04-qps-lab/README.md</code>。</li>
+      <li>填写 70/20/10 流量模型下的 LLM 调用比估算。</li>
+      <li>给出 <code>max-connections</code> 起点值及与 DashScope QPS 配额关系。</li>
+      <li>设计 FAQ 风暴 singleflight 时序（文字或简图）。</li>
+      <li>完成章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">入口 QPS 500 但 DashScope 有效 QPS 只有 80，可能原因有哪些？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>缓存命中率高；大量请求排队未调 LLM；网关限流；同步线程阻塞在 Tool 未到达 LLM；重复计算应用层 QPS 与 LLM 调用次数混淆。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：生产 QPS 与缓存分层</h4>
+      <p>目录：<code>demos/practice-04-qps-lab/</code>。<strong>验收</strong>：混合流量 LLM 调用比估算 + 连接池参数 rationale。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-03-obs">观测与调试</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-01-interview">面试：通义栈架构题</a></li>
+      <li><a href="../llm-serving-and-ops/index.html" class="course-ref" target="_blank" rel="noopener">模型服务与运维 — Infra 侧扩缩对照</a></li>
+    </ul>
+  </div>
+</section>

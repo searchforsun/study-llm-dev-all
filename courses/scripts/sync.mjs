@@ -534,7 +534,7 @@ function enrichCourse(slug, c, spec, scenarioMetaBySlug) {
     themePreset: slug,
     accent: accents[slug] ?? { light: '#1565c0', dark: '#64b5f6' },
     stats: {
-      phases: 3,
+      phases: (c.outline || []).length,
       chapters: chapters(c),
       publishedChapters: published[slug] ?? 0,
     },

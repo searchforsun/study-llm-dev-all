@@ -1,0 +1,351 @@
+<section id="ch-practice-05-bailian-governance" class="chapter" data-chapter="practice-05-bailian-governance">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>百炼安全与合规治理</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-bailian-governance" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>治理与运维</strong> · 能力：RAM 子账号、Key 轮换、配额审计与多租户隔离，满足 CorpAssist 百炼合规要求</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 多事业部共用百炼能力时，主账号 <span class="term" data-term-id="dashscope-api-key" tabindex="0">dashscope api key</span> 一旦泄露，影响面覆盖 S3 Agent、制度 RAG 与批处理索引。<span class="term" data-term-id="bailian-console" tabindex="0">bailian console</span> 与阿里云 RAM 提供子账号、权限边界与用量审计；应用层还须 <span class="term" data-term-id="token-billing" tabindex="0">token billing</span> 打标实现多租户成本分摊。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 dev/staging/prod 与批处理/在线创建 RAM 子账号与最小权限策略</li>
+          <li>设计 Key 轮换流程且不断服（双 Key 重叠窗口）</li>
+          <li>从百炼控制台与 Micrometer 导出配额/Token 审计报表</li>
+          <li>在 Spring 侧注入 tenantId 标签，支撑 NS3 成本治理</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>最小权限</strong>：在线 Agent 子账号禁止调管理 API；批处理账号禁止 Chat 写操作。</li>
+          <li><strong>密钥不进 Git</strong>：Secret Manager / K8s Secret + <span class="term" data-term-id="environment-variable" tabindex="0">environment variable</span> 注入。</li>
+          <li><strong>租户可审计</strong>：每个 DashScope 请求带 tenantId、scene（S1/S2/S3）标签。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>RAM 子账号</h3>
+      <p>阿里云 RAM 为百炼/DashScope 创建<strong>按环境、按用途</strong>隔离的子账号。CorpAssist 推荐至少四账号：<code>corpassist-dashscope-dev</code>、<code>-staging</code>、<code>-prod-online</code>、<code>-prod-batch</code>。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>子账号</th><th>权限范围</th><th>绑定服务</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>prod-online</td><td>Chat、Embedding 读、Rerank</td><td>corpassist-agent-java、门户 RAG</td></tr>
+          <tr><td>prod-batch</td><td>Embedding 写、批量任务</td><td>Python 索引 Job</td></tr>
+          <tr><td>staging</td><td>与 prod 同构、低配额</td><td>预发全链路</td></tr>
+          <tr><td>dev</td><td>个人沙箱配额</td><td>本地 stub + 偶发 live</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>RAM 子账号与 CorpAssist 服务</h5>
+        <pre class="mermaid">flowchart TB
+  RAM[阿里云 RAM]
+  RAM --> K1[prod-online AK]
+  RAM --> K2[prod-batch AK]
+  K1 --> Java[S3 Agent / Chat]
+  K2 --> Py[索引 Job]
+  Java --> DS[(DashScope)]
+  Py --> DS</pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 离职工程师</span>
+        某同学生前把 prod Key 写在本地 <code>.env</code> 并提交到私有 fork。RAM 子账号可单独禁用其 AK，无需轮换主账号；配合 CloudTrail 查异常调用 IP。
+      </aside>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">主账号一把梭</span>
+          <ul>
+            <li>全环境共用同一 AK/SK</li>
+            <li>子账号拥有 <code>*:*</code> 管理权限</li>
+            <li>批处理脚本与 Agent 共用 Key，无法分账</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">RAM 最小权限</span>
+          <ul>
+            <li>Custom Policy 仅 <code>dashscope:Call*</code> 所需 API</li>
+            <li>在线/离线 Key 分离，泄露面可控</li>
+            <li>控制台按子账号看用量与告警</li>
+          </ul>
+        </div>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># K8s Secret 引用（示意）
+env:
+  - name: AI_DASHSCOPE_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: corpassist-dashscope-prod-online
+        key: api-key</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Key 轮换</h3>
+      <p>Key 轮换目标：<strong>定期更换 + 泄露应急</strong>，且 Java/Python 双栈同时切换。流程：新 Key 写入 Secret → 滚动发布 Pod（重叠 24h 双 Key 有效）→ 禁用旧 Key → 审计确认零 401。</p>
+      <div class="mermaid-wrap">
+        <h5>双 Key 重叠轮换</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant SM as Secret Manager
+  participant K8S as K8s Deployment
+  participant DS as DashScope
+  SM->>K8S: 挂载 KEY_PRIMARY + KEY_SECONDARY
+  K8S->>DS: 主 Key 调用
+  SM->>K8S: 更新 PRIMARY 为新 Key
+  K8S->>DS: 验证新 Key
+  SM->>SM: 吊销旧 Key</pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>阶段</th><th>动作</th><th>验收</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>T0</td><td>RAM 创建新 AK，写入 Secret v2</td><td>staging 冒烟通过</td></tr>
+          <tr><td>T1</td><td>prod 滚动发布，双 Key 均有效</td><td>错误率无上升</td></tr>
+          <tr><td>T2</td><td>禁用旧 AK</td><td>24h 无 401 告警</td></tr>
+          <tr><td>T3</td><td>Git 历史扫描 + 工单关闭</td><td>合规留痕</td></tr>
+        </tbody>
+      </table>
+      <details class="learn-micro-check">
+        <summary>自检：能否在 application.yml 写 api-key 方便本地调试？</summary>
+        <p>禁止提交仓库。本地用 <code>.env.local</code>（gitignore）或 IDE Env；CI 用 stub profile。见 practice-03 观测章的 Secret 红线。</p>
+      </details>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash"># 轮换后验证：双栈探针（示意）
+curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer $AI_DASHSCOPE_API_KEY" \
+  "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>配额审计</h3>
+      <p><span class="term" data-term-id="dashscope-billing" tabindex="0">dashscope billing</span> 按 Token 与模型计费；S3 Agent 步数多、工具返回长，成本波动大。审计三层：<strong>百炼控制台用量</strong> → <strong>应用 Micrometer</strong>（<code>corpassist.llm.tokens</code>）→ <strong>财务 tenant 分摊表</strong>。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>信号</th><th>来源</th><th>告警阈值（示例）</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>日 Token 总量</td><td>百炼账单 API</td><td>较 7 日均值 +40%</td></tr>
+          <tr><td>429 率</td><td>Agent Trace</td><td>&gt; 2% 持续 5min</td></tr>
+          <tr><td>单 tenant 占比</td><td>自定义 tag</td><td>单租户 &gt; 35% 总 Token</td></tr>
+          <tr><td>qwen-max 占比</td><td>model tag</td><td>S3 超预算时降 turbo 路由</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Advisor 或 Filter：为 DashScope 调用打 tenant/scene tag
+meterRegistry.counter("corpassist.llm.tokens",
+    "tenant", tenantId,
+    "scene", "S3",
+    "model", modelName
+).increment(tokenCount);</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 月底成本复盘</span>
+        财务发现「华东事业部」Token 暴涨：Trace 显示某 Agent 循环调 <code>searchPolicy</code> 无步数预算。修复 StepBudget 后，配额审计报表用于证明治理生效。
+      </aside>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">只信账单</span>
+          <ul>
+            <li>月底才知道某租户失控</li>
+            <li>无法关联到具体 Agent 版本</li>
+            <li>429 与成本 spike 无关联分析</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">三层审计</span>
+          <ul>
+            <li>实时 Micrometer + 百炼控制台交叉验证</li>
+            <li>Trace 关联 prompt 回放定位 Badcase</li>
+            <li>Admin DSL 版本号写入 cost 报表</li>
+          </ul>
+        </div>
+      </div>
+      <p>百炼控制台可按模型设置 RPM 上限；与 practice-04 应用层限流叠加时，<strong>应用配额应略低于</strong>控制台硬顶，预留 headroom 给 Rerank 与重试。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户</h3>
+      <p>CorpAssist 多法人实体共用集群时，<strong>数据与配额</strong>须 tenant 隔离：VectorStore metadata filter、ChatMemory 分区、DashScope 调用 tag。百炼侧无原生「租户」概念，靠应用层 <code>X-Tenant-Id</code> 与 RAM 子账号组合实现。</p>
+      <div class="mermaid-wrap">
+        <h5>多租户请求路径</h5>
+        <pre class="mermaid">flowchart LR
+  GW[Gateway JWT tenant] --> Svc[Agent Service]
+  Svc --> Filter[TenantContextFilter]
+  Filter --> VS[VectorStore filter]
+  Filter --> LLM[DashScope + tags]
+  Filter --> Audit[审计日志 tenantId]</pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>层</th><th>隔离手段</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>网关</td><td>JWT <code>tenant_id</code>，禁止客户端自报</td></tr>
+          <tr><td>RAG</td><td>检索 filter <code>tenant_id == ctx</code></td></tr>
+          <tr><td>Memory</td><td>Redis key 前缀 <code>{tenant}:{session}</code></td></tr>
+          <tr><td>配额</td><td>tenant 级 rate limit + 百炼子账号可选分账</td></tr>
+        </tbody>
+      </table>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">逻辑多租户</span>
+          <p class="role-card-desc">单 RAM 账号 + 应用 tag；成本低，适合初期。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">物理分账</span>
+          <p class="role-card-desc">大事业部独立 RAM + 独立 Key；合规隔离强。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">混合</span>
+          <p class="role-card-desc">核心 tenant 独立 Key；长尾 tenant 共享 + 硬 quota。</p>
+        </article>
+      </div>
+      <p>与 <span class="term" data-term-id="spring-ai-alibaba-admin" tabindex="0">spring ai alibaba admin</span> 配合：Studio 调试须选 tenant 沙箱，禁止直连 prod 数据。</p>
+      <div class="learn-faq">
+        <details>
+          <summary>dev 工程师能否共用 staging Key 加快联调？</summary>
+          <div class="learn-faq-body">可以共用 staging 子账号，但禁止共用 prod Key。个人本地须 .env.local；离职时只吊销个人沙箱 AK，不影响 staging 轮换窗口。</div>
+        </details>
+        <details>
+          <summary>百炼控制台配额告警如何对接 On-call？</summary>
+          <div class="learn-faq-body">控制台阈值告警 → 飞书/钉钉 Webhook；与 Micrometer 429 率告警双通道。On-call runbook 第一步：查是否单 tenant 刷量或 Agent 偏航循环。</div>
+        </details>
+      </div>
+      <h4>合规留痕清单</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>事件</th><th>留痕位置</th><th>保留期</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Key 轮换</td><td>工单 + Secret 版本号</td><td>3 年</td></tr>
+          <tr><td>RAM 策略变更</td><td>CloudTrail</td><td>按公司策略</td></tr>
+          <tr><td>超配额调用</td><td>百炼账单 + Trace</td><td>1 年</td></tr>
+          <tr><td>跨 tenant 访问尝试</td><td>网关审计日志</td><td>1 年</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>RAM 子账号</strong>：在线/批处理/环境分离；最小权限 Custom Policy。</li>
+        <li><strong>Key 轮换</strong>：双 Key 重叠 + 滚动发布；禁用前 staging 验证。</li>
+        <li><strong>配额审计</strong>：百炼账单 + Micrometer + Trace 三层；S3 关注步数与 429。</li>
+        <li><strong>多租户</strong>：网关 JWT → 检索/Memory/成本 tag 全链路透传。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba-engineering_practice05_governance">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="ram" /> 能列出 4 类 RAM 子账号及权限差异</label></li>
+          <li><label><input type="checkbox" data-id="rotate" /> 能口述 Key 轮换四阶段</label></li>
+          <li><label><input type="checkbox" data-id="audit" /> 能说明配额审计三层数据源</label></li>
+          <li><label><input type="checkbox" data-id="tenant" /> 能画多租户从 Gateway 到 VectorStore 的隔离链</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>RAM</td><td>在线/批处理/环境分账号</td></tr>
+                <tr><td>轮换</td><td>双 Key 重叠 · 滚动发布 · 再吊销</td></tr>
+                <tr><td>审计</td><td>百炼账单 + Micrometer + Trace</td></tr>
+                <tr><td>多租户</td><td>JWT tenant → RAG/Memory/cost tag</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <h4>面试快问快答</h4>
+        <details>
+          <summary>百炼 API Key 泄露你怎么应急响应？</summary>
+          <p><strong>答：</strong>立即 RAM 禁用泄露 AK → 启用预备 Key 滚动发布 → CloudTrail/百炼用量查异常调用 → 根因（Git/日志/截图）→ 轮换所有同权限 Key → 复盘补 CI secret scan。</p>
+        </details>
+        <details>
+          <summary>多租户共用一套 DashScope Key 有何风险？</summary>
+          <p><strong>答：</strong>无法分账与独立吊销；一 tenant 被攻击刷 Token 影响全体配额。应用层 tag 是底线，大 tenant 应独立 RAM 子账号或 Key。</p>
+        </details>
+      </div>
+      <p class="chapter-review-next">practice 阶段收尾。下一章进入 advanced：<a href="#ch-advanced-01-interview">面试：S3 Agent 五连问</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://help.aliyun.com/zh/ram/user-guide/overview-of-ram" target="_blank" rel="noopener">阿里云 RAM 概述</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/getting-started/quick-start" target="_blank" rel="noopener">百炼控制台快速入门</a></li>
+      <li><a href="https://help.aliyun.com/zh/dashscope/developer-reference/api-details" target="_blank" rel="noopener">DashScope API 与鉴权</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 35 分钟 · 填写 governance-checklist.md 与 RAM 策略表。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-05-bailian-governance-lab/README.md</code>。</li>
+      <li>为 dev/staging/prod-online/prod-batch 四类子账号填写权限边界表。</li>
+      <li>编写 Key 轮换 runbook（四阶段 + 回滚条件）。</li>
+      <li>设计 Micrometer tag 列表：tenant、scene、model、agent_version。</li>
+      <li>画多租户数据流，标注 VectorStore filter 与 Memory key 前缀。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">为「方便排查」，把 prod DashScope Key 贴进 Admin Studio 截图发群。是否合规？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>严重违规：Key 泄露需紧急轮换。Studio 应连 staging 沙箱；prod 排障用 Trace/Prompt 回放，密钥仅 Secret Manager。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">批处理索引与 S3 Agent 共用 prod-online Key，仅依靠「晚上跑批」控制成本。问题在哪？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>无法分账与独立限流；批处理 spike 可能触发 429 影响白天 Agent。应 prod-batch 子账号 + 独立 quota 告警。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：百炼安全与合规治理</h4>
+      <p>目录：<code>demos/practice-05-bailian-governance-lab/</code>。<strong>验收</strong>：RAM 表 4 行完整；轮换 runbook 含回滚；Micrometer tag ≥4 个；多租户图含 RAG 过滤。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-01-interview">面试：S3 Agent 五连问</a></li>
+      <li><a href="../spring-ai-engineering/index.html#ch-practice-06-security" class="course-ref" target="_blank" rel="noopener">Spring AI 工程化 — 安全与护栏</a></li>
+      <li><strong>上一章</strong>：<a href="#ch-practice-04-qps">生产 QPS 与缓存分层</a></li>
+    </ul>
+  </div>
+</section>

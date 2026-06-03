@@ -1,0 +1,361 @@
+<section id="ch-basics-05-embedding-rerank" class="chapter" data-chapter="basics-05-embedding-rerank">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Embedding 与 Rerank（百炼）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05-embedding-rerank" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>DashScope 与扩展</strong> · 能力：配置百炼 Embedding/Rerank，接入 Spring AI VectorStore，完成 CorpAssist 制度库索引链路</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><span class="term" data-term-id="s3-office-automation" tabindex="0">S3 办公 Agent</span> 在创建 Jira 前常需检索制度与历史纪要；<span class="term" data-term-id="corpassist-knowledge" tabindex="0">corpassist knowledge</span> 依赖向量检索而非把 PDF 全文塞进 Prompt。百炼提供 <span class="term" data-term-id="qwen-model" tabindex="0">qwen model</span> 同族的 Embedding 与 Rerank API；Spring AI Alibaba 通过 <span class="term" data-term-id="spring-ai-dashscope" tabindex="0">spring ai dashscope</span> 自动配置 <code>EmbeddingModel</code>，与 <a href="../spring-ai-engineering/index.html#ch-practice-01-vectorstore" class="course-ref" target="_blank" rel="noopener">Spring AI 工程化 · VectorStore</a> 抽象对齐。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>选型 <code>text-embedding-v3</code> 等百炼 Embedding 模型并配置维度与 batch</li>
+          <li>在检索链中插入 DashScope Rerank，提升 Top-K 精度</li>
+          <li>将 <code>VectorStore</code> 与 PGVector/Redis 集成，供 Agent Tool 与 RAG Advisor 共用</li>
+          <li>设计制度库离线索引 + 在线检索分工（Python 建库、Java 查询）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Embedding 管召回</strong>：粗排靠向量相似度；精排靠 Rerank 或 metadata filter。</li>
+          <li><strong>索引与查询分离</strong>：全量 reindex 走 Python 批处理；S3 Agent 在线只读 VectorStore。</li>
+          <li><strong>与 SAA extensions 分工</strong>：<span class="term" data-term-id="document-parser" tabindex="0">document parser</span> 解析 PDF；Embedding 写向量；勿混为一谈。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Embedding 模型</h3>
+      <p>DashScope 百炼 Embedding API 与 Chat 共用 API Key，模型名通过 <code>spring.ai.dashscope.embedding.options.model</code> 配置。CorpAssist 制度库推荐 <code>text-embedding-v3</code>（维度 1024，支持中英文混合 FAQ）。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    dashscope:
+      api-key: ${AI_DASHSCOPE_API_KEY}
+      embedding:
+        options:
+          model: ${CORPASSIST_EMBEDDING_MODEL:text-embedding-v3}
+          dimensions: 1024</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>模型</th><th>维度</th><th>CorpAssist 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>text-embedding-v3</code></td><td>1024（可配）</td><td>制度 FAQ、纪要 chunk（默认）</td></tr>
+          <tr><td><code>text-embedding-v2</code></td><td>1536</td><td>历史索引兼容；新库勿混用</td></tr>
+          <tr><td>多模态 embedding</td><td>视模型</td><td>带图表制度页；见 <span class="term" data-term-id="vision-rag" tabindex="0">vision rag</span></td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 纪要检索</span>
+        Agent 收到「上周采购制度里对 Jira 字段的要求」：先对 query 做 Embedding，从 <code>policy-v2026-03</code> 集合检索 Top-20；若仅 embedding 召回含过期版本，靠 metadata <code>effective_date</code> 过滤。
+      </aside>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>在线 API 上传 PDF 并同步 embedding（阻塞 Agent）</li>
+            <li>v2/v3 向量混存同一 collection</li>
+            <li>不设 batch，逐 chunk 调 API 触发 429</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>夜间 Job 批量 embedding + 版本号写入 metadata</li>
+            <li>单 collection 单模型维度；迁移时新 collection</li>
+            <li><code>EmbeddingModel.embed(List&lt;Document&gt;)</code> 批量 16–32</li>
+          </ul>
+        </div>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：Agent Memory 与制度库 Embedding 能否共用同一 VectorStore？</summary>
+        <p>不推荐同一 index：Memory 含会话噪声且 TTL 短；制度库需 ACL 与版本。分 collection + <code>tenantId</code> metadata，见 <span class="term" data-term-id="memory-budget-saa" tabindex="0">memory budget saa</span>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>DashScope Rerank</h3>
+      <p>向量 Top-K 常含语义相近但无关片段。百炼 <code>gte-rerank</code>（或文档最新 Rerank 模型）对 query–passage 对重打分，Spring 侧可在 <code>VectorStoreDocumentRetriever</code> 后接自定义 <code>DocumentPostProcessor</code> 或检索服务 BFF 调用 Rerank HTTP API。</p>
+      <div class="mermaid-wrap">
+        <h5>召回 + Rerank 两阶段</h5>
+        <pre class="mermaid">flowchart LR
+  Q[用户 query] --> EMB[EmbeddingModel]
+  EMB --> VS[VectorStore Top-20]
+  VS --> RR[DashScope Rerank]
+  RR --> TOP[Top-5 进 Prompt]
+  TOP --> LLM[qwen-plus Agent]</pre>
+        <p class="diagram-caption">S3 Agent 工具 <code>searchPolicy</code> 内部走两阶段；Chat 直连 RAG Advisor 同样适用。</p>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 示意：检索后 Rerank 截断（伪代码）
+List&lt;Document&gt; candidates = vectorStore.similaritySearch(
+    SearchRequest.query(query).withTopK(20));
+List&lt;Document&gt; reranked = dashScopeRerankClient.rerank(query, candidates, 5);
+return reranked;</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>阶段</th><th>参数</th><th>S3 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>向量召回</td><td>topK=20, threshold=0.65</td><td>宁可多召回，交给 Rerank 筛</td></tr>
+          <tr><td>Rerank</td><td>topN=5</td><td>进 Agent context；附 doc_id 供 citation</td></tr>
+          <tr><td>缓存</td><td>query hash TTL 1h</td><td>只读制度查询可 <span class="term" data-term-id="semantic-cache-agent" tabindex="0">semantic cache agent</span></td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">跳过 Rerank</span>
+          <ul>
+            <li>Top-1 向量分 0.72 但段落讲「离职流程」而非「采购审批」</li>
+            <li>Agent 基于错误制度创建 Jira，HITL 才发现</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Rerank + 引用</span>
+          <ul>
+            <li>响应带 <code>policy_doc_id</code> 与生效日期</li>
+            <li>Trace span 记录 rerank 前后 score 分布</li>
+            <li>Badcase 入库驱动 Rerank 阈值调参</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>VectorStore 集成</h3>
+      <p>Spring AI 的 <code>VectorStore</code> 接口与厂商无关；SAA 提供 DashScope <code>EmbeddingModel</code> Bean，存储层常用 PGVector 或 Redis Stack。与 <a href="../spring-ai-engineering/index.html#ch-practice-01-vectorstore" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI 工程化</span><code class="course-ref-slug">practice-01-vectorstore</code></a> 相同模式：<code>EmbeddingModel</code> + <code>PgVectorStore</code> + <code>QuestionAnswerAdvisor</code>。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">xml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-xml">&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.ai&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-ai-pgvector-store-spring-boot-starter&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;com.alibaba.cloud.ai&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-ai-alibaba-starter-dashscope&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    vectorstore:
+      pgvector:
+        index-type: HNSW
+        distance-type: COSINE_DISTANCE
+        dimensions: 1024
+        table-name: corpassist_policy_chunks</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>S3 Agent 与 VectorStore</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph ingest [离线索引 Python]
+    PDF[制度 PDF] --> Tika[tika parser]
+    Tika --> Split[chunk 500/50]
+    Split --> EMB2[DashScope Embedding]
+    EMB2 --> PG[(PGVector)]
+  end
+  subgraph online [在线 Java SAA]
+    Agent[ReactAgent] --> Tool[searchPolicy Tool]
+    Tool --> VS[VectorStore]
+    VS --> PG
+    Agent --> Chat[DashScope Chat]
+  end</pre>
+      </div>
+      <p>深度 RAG 流水线见 <a href="../rag-system-java/index.html" class="course-ref" target="_blank" rel="noopener">rag-system-java</a>；本章聚焦百炼 Embedding/Rerank 在 SAA 栈的接入点。</p>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">Advisor 路径</span>
+          <p class="role-card-desc">门户制度问答：<code>QuestionAnswerAdvisor</code> 自动检索 + 生成。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Tool 路径</span>
+          <p class="role-card-desc">S3 Agent 多步：模型主动调 <code>searchPolicy</code>，可组合 Jira 工具。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">BFF 委托</span>
+          <p class="role-card-desc">Java 调 Python 检索服务 OpenAPI，Embedding 仍在 Python 侧（双栈）。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>制度库索引</h3>
+      <p>CorpAssist 制度库索引是 S3 Agent 的「只读知识底座」：metadata 必含 <code>tenantId</code>、<code>policy_version</code>、<code>effective_date</code>、<code>acl_roles</code>。索引任务用 <span class="term" data-term-id="tika-parser" tabindex="0">tika parser</span> 或 SAA extensions Reader 解析，chunk 策略与 Python 轨 rag-system 对齐（500/50）。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>步骤</th><th>执行栈</th><th>产出</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1 采集</td><td>数据湖 / SharePoint 导出</td><td>PDF + manifest.json</td></tr>
+          <tr><td>2 解析切块</td><td>Python 或 extensions</td><td>Document 列表 + metadata</td></tr>
+          <tr><td>3 Embedding</td><td>DashScope batch API</td><td>向量写入 PGVector</td></tr>
+          <tr><td>4 发布</td><td>CI 打 <code>index_version</code></td><td>Java Agent 读最新 version</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "doc_id": "HR-LEAVE-2026",
+  "tenant_id": "corp-hq",
+  "policy_version": "2026.03.1",
+  "effective_date": "2026-03-01",
+  "acl_roles": ["employee", "manager"],
+  "chunk_index": 12
+}</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度版本切换</span>
+        新规生效日 00:00：索引 Job 写入 <code>policy_version=2026.04</code>；Java 检索 filter <code>effective_date &lt;= today</code>。旧版保留 90 天供审计，Agent 默认不召回过期 chunk。
+      </aside>
+      <div class="learn-faq">
+        <details>
+          <summary>制度库与 S3 Agent 工具有何关系？</summary>
+          <div class="learn-faq-body">Agent 不直接读 PDF；通过 <code>searchPolicy</code> Tool 调 VectorStore（或 RAG BFF）。Tool 返回截断摘要 + doc_id，完整条文走 citation 链接，符合 <span class="term" data-term-id="tool-result-truncation" tabindex="0">tool result truncation</span>。</div>
+        </details>
+        <details>
+          <summary>index_version 如何在 Java 检索侧生效？</summary>
+          <div class="learn-faq-body">Agent Service 启动时读 ConfigMap <code>CORPASSIST_INDEX_VERSION</code>；<code>SearchRequest</code> filter 只查 <code>index_version == current</code>。Python 发布新索引后 bump 版本并滚动 Java Deployment，避免读到半写入向量。</div>
+        </details>
+      </div>
+      <h4>与 spring-ai-engineering VectorStore 章对照</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>项</th><th>spring-ai-engineering</th><th>本章（百炼 SAA）</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>EmbeddingModel</td><td>OpenAI / Ollama starter</td><td><code>spring-ai-alibaba-starter-dashscope</code></td></tr>
+          <tr><td>模型名</td><td><code>text-embedding-3-small</code></td><td><code>text-embedding-v3</code></td></tr>
+          <tr><td>Rerank</td><td>可选 Cohere 等</td><td>DashScope <code>gte-rerank</code></td></tr>
+          <tr><td>抽象层</td><td colspan="2">均为 <code>VectorStore</code> + <code>QuestionAnswerAdvisor</code></td></tr>
+        </tbody>
+      </table>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：S3 创建 Jira 前是否必须先 RAG？</summary>
+        <p>视任务：若 Jira 字段映射依赖采购制度，应先 <code>searchPolicy</code> 再写；纯「创建空白任务」可跳过。Router 与 Prompt 应声明何时强制检索，避免幻觉字段。</p>
+      </details>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Embedding 模型</strong>：text-embedding-v3 + 批量离线索引；禁止在线同步 embed 大 PDF。</li>
+        <li><strong>DashScope Rerank</strong>：Top-20 召回 + Top-5 Rerank；Trace 记录 score 便于 Badcase。</li>
+        <li><strong>VectorStore 集成</strong>：SAA EmbeddingModel + PGVector；Advisor 与 Agent Tool 双入口。</li>
+        <li><strong>制度库索引</strong>：metadata 版本/ACL；Python 建库、Java 查询，对齐 spring-ai-engineering VectorStore 章。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba-engineering_basics05_embedding">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="emb" /> 能写出 embedding 的 yaml 配置与推荐模型名</label></li>
+          <li><label><input type="checkbox" data-id="rerank" /> 能画两阶段检索并说明 topK/topN</label></li>
+          <li><label><input type="checkbox" data-id="vs" /> 能说明 VectorStore 与 EmbeddingModel 的分工</label></li>
+          <li><label><input type="checkbox" data-id="index" /> 能列举制度库 metadata 四类字段</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Embedding</td><td>text-embedding-v3 · 1024 维 · 离线 batch</td></tr>
+                <tr><td>Rerank</td><td>召回 20 → 精排 5 → 带 doc_id</td></tr>
+                <tr><td>VectorStore</td><td>PGVector + SAA EmbeddingModel</td></tr>
+                <tr><td>索引</td><td>version/ACL metadata · Python 写 Java 读</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <h4>面试快问快答</h4>
+        <details>
+          <summary>S3 Agent 为什么需要 Rerank，单靠 Embedding 不够吗？</summary>
+          <p><strong>答：</strong>制度与纪要 chunk 语义相近度高，向量 Top-1 常「像但对」。Rerank 对 query-passage 交叉编码，降低 Agent 引用错误制度的概率；配合 metadata 过滤与 citation 可审计。</p>
+        </details>
+        <details>
+          <summary>百炼 Embedding 与 OpenAI embedding 在 Spring AI 里如何切换？</summary>
+          <p><strong>答：</strong>业务依赖 <code>EmbeddingModel</code> 接口，不依赖厂商；CorpAssist 通义栈用 SAA DashScope starter。切换需重建向量 index（维度可能不同），不能混存。</p>
+        </details>
+      </div>
+      <p class="chapter-review-next">basics 阶段收尾。下一章进入 practice：<a href="#ch-practice-01-admin">Admin 与可视化</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://help.aliyun.com/zh/dashscope/developer-reference/text-embedding-api-details" target="_blank" rel="noopener">DashScope 文本 Embedding API</a></li>
+      <li><a href="https://help.aliyun.com/zh/dashscope/developer-reference/text-rerank-api" target="_blank" rel="noopener">DashScope 文本 Rerank API</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/vectordbs.html" target="_blank" rel="noopener">Spring AI VectorStore</a></li>
+      <li><a href="https://java2ai.com/docs/overview/" target="_blank" rel="noopener">Spring AI Alibaba 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 40 分钟 · 配置 embedding-rerank.yaml，并对照制度库索引 manifest。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/basics-05-embedding-rerank-lab/README.md</code> 与配置文件模板。</li>
+      <li>填写 <code>CORPASSIST_EMBEDDING_MODEL</code> 与 pgvector <code>dimensions</code>，保证一致。</li>
+      <li>在笔记画「召回 20 → Rerank 5」序列图，标注 Agent Tool 入口。</li>
+      <li>对照 <a href="../spring-ai-engineering/index.html#ch-practice-01-vectorstore" class="course-ref" target="_blank" rel="noopener">spring-ai-engineering VectorStore 章</a>，列出 3 处配置差异（百炼 vs OpenAI）。</li>
+      <li>起草制度库 chunk metadata JSON 样例（含 tenant、version、ACL）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">S3 Agent 收到 PDF 附件后，在 Tool 内同步解析+embedding+检索再调 Jira。有何问题？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>在线路径阻塞、重复 embedding 浪费配额、超时导致 Agent 偏航。应：附件走 extensions 解析→异步索引；在线只检索已发布 index_version。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">为省 Rerank 费用，直接把向量 Top-1 塞进 Prompt。在采购审批场景 acceptable 吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不可接受：合规场景需可解释引用；Top-1 误召回会导致错误审批依据。至少 Rerank + doc_id citation；高风控流程加 HITL。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Embedding 与 Rerank</h4>
+      <p>目录：<code>demos/basics-05-embedding-rerank-lab/</code>。<strong>验收</strong>：yaml 配置完整；能口述两阶段检索；metadata 样例含 4 类字段；对照 VectorStore 章列出 3 项差异。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-01-admin">Admin 与可视化</a></li>
+      <li><a href="../spring-ai-engineering/index.html#ch-practice-01-vectorstore" class="course-ref" target="_blank" rel="noopener">Spring AI 工程化 — VectorStore 与 Embedding</a></li>
+      <li><a href="../rag-system-java/index.html" class="course-ref" target="_blank" rel="noopener">RAG 系统 Java 轨 — 完整 ingest 流水线</a></li>
+    </ul>
+  </div>
+</section>

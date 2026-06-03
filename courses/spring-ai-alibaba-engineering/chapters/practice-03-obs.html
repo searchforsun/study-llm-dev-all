@@ -1,0 +1,364 @@
+<section id="ch-practice-03-obs" class="chapter" data-chapter="practice-03-obs">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>观测与调试</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-obs" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>治理与运维</strong> · 能力：为 CorpAssist S3 办公 Agent 建立结构化日志、分布式 Trace 与 Prompt 回放，支撑 badcase 定位与面试 S3 排障叙事</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>员工反馈「Agent 说订好了其实没订」——没有 <span class="term" data-term-id="request-id" tabindex="0">request id</span> 贯穿网关、Tool 与 DashScope，研发只能猜。S3 多 Tool 链路必须可追踪：<span class="term" data-term-id="structured-logging" tabindex="0">structured logging</span> 落盘、<span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span> 串 Span、<span class="term" data-term-id="prompt-replay" tabindex="0">prompt replay</span> 在脱敏前提下复现 LLM 输入输出，形成 CorpAssist 观测闭环。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>定义 S3 Agent 统一日志字段（<code>trace_id</code>、<code>session_id</code>、<code>tool_name</code>、token 用量）</li>
+          <li>用 Micrometer + OpenTelemetry 导出 DashScope 调用 Span，并接入现有 APM</li>
+          <li>设计 Prompt 回放存储：保留 messages 快照、模型参数与 Tool 结果，满足审计与复现</li>
+          <li>配置采样与 PII 脱敏，避免日志成为新的合规风险</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>一条 trace 管到底</strong>：从 BFF 到 Tool 到 DashScope 同一 trace_id。</li>
+          <li><strong>日志给机器，回放给人</strong>：JSON 日志检索；回放 UI 看完整对话链。</li>
+          <li><strong>脱敏默认开</strong>：工号、金额、发票号 hash 后再存。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>日志：结构化字段与级别</h3>
+      <p>传统「打印 prompt 字符串」无法检索。S3 服务应输出 JSON 行日志，字段固定，便于 ELK / SLS 聚合：按 <code>app=corpassist-s3</code>、<code>tool=roomBooking</code>、<code>outcome=error</code> 过滤。</p>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 订会议室失败</span>
+        运维在 SLS 搜 <code>trace_id=7f3a...</code>，看到顺序：intent=BOOK_ROOM → roomAvailability OK → roomBooking ERROR(OA 409 冲突) → LLM 仍回复「已预订」。据此修复：Tool ERROR 须约束模型不得编造成功。
+      </aside>
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>示例</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>trace_id</code></td><td>W3C traceparent</td><td>跨服务关联</td></tr>
+          <tr><td><code>session_id</code></td><td>s3-emp-E1024-uuid</td><td>多轮对话</td></tr>
+          <tr><td><code>span</code></td><td>llm.call / tool.roomBooking</td><td>阶段定位</td></tr>
+          <tr><td><code>model</code></td><td>qwen-plus</td><td>成本与质量分模型统计</td></tr>
+          <tr><td><code>tokens</code></td><td>in=820 out=156</td><td>NS3 成本</td></tr>
+          <tr><td><code>latency_ms</code></td><td>2340</td><td>SLO 告警</td></tr>
+          <tr><td><code>outcome</code></td><td>ok / error / degraded</td><td>仪表盘</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Slf4j
+@Component
+public class S3ObservabilityAdvisor implements CallAroundAdvisor {
+  @Override
+  public AdvisedResponse aroundCall(AdvisedRequest req, CallAroundAdvisorChain chain) {
+    long start = System.currentTimeMillis();
+    try {
+      AdvisedResponse resp = chain.nextAroundCall(req);
+      log.info("{}", Map.of(
+          "trace_id", TraceContext.traceId(),
+          "span", "llm.call",
+          "model", req.adviseContext().getOrDefault("model", "unknown"),
+          "latency_ms", System.currentTimeMillis() - start,
+          "outcome", "ok"));
+      return resp;
+    } catch (Exception e) {
+      log.warn("{}", Map.of("trace_id", TraceContext.traceId(), "outcome", "error",
+          "error", e.getClass().getSimpleName()));
+      throw e;
+    }
+  }
+}</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>INFO 全量打印 user prompt 明文</li>
+            <li>每个 Tool 自定义 log 格式</li>
+            <li>无 trace_id，网关与 Agent 日志对不上</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>MDC 注入 trace_id / session_id</li>
+            <li>错误日志带 tool_name + error_code</li>
+            <li>敏感字段走脱敏器再入 log</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Trace：Span 模型与 DashScope 出口</h3>
+      <p><span class="term" data-term-id="distributed-trace" tabindex="0">distributed trace</span> 把一次 S3 请求拆成 Span 树：HTTP in → intent LLM → tool.roomAvailability → tool.roomBooking → final LLM。Spring AI Alibaba 与 Micrometer Observation 集成后，可导出到 Jaeger / 阿里云 ARMS。</p>
+      <div class="mermaid-wrap">
+        <h5>S3 一次订会议室 Trace</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph trace["trace_id: abc123"]
+    A[HTTP POST /s3/chat]
+    B[llm.intent qwen-plus 420ms]
+    C[tool.roomAvailability 80ms]
+    D[llm.clarify 310ms]
+    E[tool.roomBooking 120ms]
+    F[llm.reply 280ms]
+  end
+  A --> B --> C --> D --> E --> F</pre>
+        <p class="diagram-caption">P95 超标时看最宽 Span；429 常出现在连续 llm.* 段。</p>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">management:
+  tracing:
+    sampling:
+      probability: 0.1   # 生产 10%；badcase 可提权到 1.0
+  otlp:
+    tracing:
+      endpoint: http://otel-collector:4318/v1/traces
+spring:
+  ai:
+    chat:
+      observations:
+        log-prompt: false
+        log-completion: false</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>告警</th><th>条件（S3 起点）</th><th>动作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>延迟</td><td>P95 &gt; 8s 持续 5m</td><td>查 DashScope + Tool 慢 Span</td></tr>
+          <tr><td>错误率</td><td>tool.error &gt; 5%</td><td>对接 OA/费控值班</td></tr>
+          <tr><td>成本</td><td>tokens/req P99 飙升</td><td>查是否陷入多轮 clarify 循环</td></tr>
+        </tbody>
+      </table>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：采样 10% 时如何保证 badcase 必留 trace？</summary>
+        <p>badcase 上报接口带 trace_id 强制 <code>recording=true</code>；或对 <code>outcome=error</code> 全量采样。Prompt 回放存储与 trace_id 关联即可补全未采样链路的上下文。</p>
+      </details>
+      <h4>日志级别约定（S3）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>级别</th><th>场景</th><th>示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>INFO</td><td>正常 LLM/Tool 完成</td><td>结构化 JSON 单行</td></tr>
+          <tr><td>WARN</td><td>可恢复降级、Tool 4xx</td><td>turbo 切换、OA 业务拒绝</td></tr>
+          <tr><td>ERROR</td><td>未捕获异常、写 Tool 5xx</td><td>带 trace_id，触发告警</td></tr>
+          <tr><td>DEBUG</td><td>仅 staging</td><td>Advisor 链顺序、cache miss 原因</td></tr>
+        </tbody>
+      </table>
+      <p>生产禁止 DEBUG 打印完整 prompt；需要内容级排障走 Prompt 回放权限通道。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Prompt 回放：存储、检索与复现</h3>
+      <p><span class="term" data-term-id="prompt-replay" tabindex="0">prompt replay</span> 在合规存储中保留每次 LLM 调用的 messages、generation 参数、Tool call/result，供研发在 Admin 调试台或内部 UI「一键复现」。这是 S3 面试高频：如何证明不是模型随机胡答，而是 Tool 返回了错误数据。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "trace_id": "abc123",
+  "session_id": "s3-emp-E1024",
+  "recorded_at": "2026-06-03T10:15:00Z",
+  "turns": [
+    {
+      "span": "llm.intent",
+      "model": "qwen-plus",
+      "messages": [{"role": "user", "content": "订明天下午三点小会议室"}],
+      "completion": {"tool_calls": [{"name": "roomAvailability", "args": {"date": "2026-06-04"}}]}
+    },
+    {
+      "span": "tool.roomAvailability",
+      "result": {"rooms": [{"id": "R-301", "free": true}]}
+    }
+  ],
+  "redaction": "employee_id hashed"
+}</code></pre>
+      </div>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>能力</th><th>实现要点</th><th>S3 价值</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>写入</td><td>Advisor 异步写 OSS / DB；失败不阻塞主链</td><td>高可用</td></tr>
+          <tr><td>检索</td><td>trace_id / session_id / 时间范围</td><td>工单式排障</td></tr>
+          <tr><td>复现</td><td>用快照 messages 调 staging 模型</td><td>验证 Prompt 修复</td></tr>
+          <tr><td>保留期</td><td>90 天；审计类 1 年</td><td>合规</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · badcase 飞轮</span>
+        客服标记「报销 Agent 答错税率」→ 系统带 trace_id 进入回放队列 → 研发在 staging 复现 → 修 Admin Prompt v1.2.1 → Eval 回归 → 关闭工单。与 NS3 成本/质量权衡叙事一致。
+      </aside>
+      <div class="notice">
+        <strong>合规红线</strong>
+        <ul>
+          <li>回放库与生产 DB 分库；研发只读 staging 复现权限。</li>
+          <li>发票影像 URL 存签名短期链接，不进 messages 明文。</li>
+          <li>导出 replay 包需审批水印。</li>
+        </ul>
+      </div>
+      <h4>与 Admin Studio 调试台联动</h4>
+      <p>Prompt 回放 record 可 deep-link 到 Admin：携带 <code>trace_id</code> 打开对应会话，运营查看「用户原话 + Tool 结果 + 模型答复」时间线，研发在 staging 一键「用此快照重放」。缩短 badcase 从工单到 Prompt 发布的周期。</p>
+      <div class="mermaid-wrap">
+        <h5>badcase 闭环</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant U as 员工
+  participant S3 as S3 Agent
+  participant R as Replay Store
+  participant AD as Admin Studio
+  U->>S3: 反馈答错
+  S3->>R: 按 trace_id 归档
+  R->>AD: 打开回放时间线
+  AD->>S3: staging 复现 + Prompt 修复
+  S3->>U: 通知已修复</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">properties</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-properties"># 脱敏规则示例（application.properties）
+corpassist.obs.redact.fields=employeeId,invoiceNo,amount
+corpassist.obs.redact.strategy=hash
+corpassist.obs.replay.retention-days=90
+corpassist.obs.replay.error-sampling=1.0</code></pre>
+      </div>
+      <div class="learn-faq">
+        <details>
+          <summary>Micrometer 与 ARMS / Jaeger 如何选型？</summary>
+          <div class="learn-faq-body">已用阿里云栈选 ARMS OTLP 出口；多云或自建选 Jaeger/Tempo。关键是 <strong>trace_id 进 MDC</strong>，与 Spring AI observations 开关一致，避免双轨 instrumentation。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>通义栈视角：观测与 Prompt 回放</h3>
+      <p>S3 Agent 排障第一入口是 Trace + Prompt 回放，而非翻日志猜 prompt。Java Micrometer 与 Python OpenTelemetry 共用 W3C <code>trace_id</code>；Prompt 回放 JSON schema 双栈同构，便于 Python 实验后在 Java 生产复现。</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Java / Python 各一套 trace 字段，Grafana 无法关联</li>
+            <li>Prompt 回放存明文 PII，无脱敏与 TTL</li>
+            <li>只在 error 时采样，步数偏航 badcase 抓不到</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>BFF 注入 traceparent，双栈 span 可串联</li>
+            <li>messages + Tool 快照脱敏存储，trace 驱动复现</li>
+            <li>步数 / token / tool error 指标 + error 全采样</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>日志</strong>：JSON 固定字段 + MDC trace_id；Tool/LLM 分 span 记 outcome 与 tokens。</li>
+        <li><strong>Trace</strong>：Micrometer + OTLP；P95/错误率/ token 告警；error 全采样。</li>
+        <li><strong>Prompt 回放</strong>：messages + Tool 快照脱敏存储；trace 驱动 badcase 复现与 Prompt 迭代。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba_practice03_obs">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="log" /> 能列 6 个 S3 结构化日志字段</label></li>
+          <li><label><input type="checkbox" data-id="trace" /> 能画出一次订会议室的 Span 树</label></li>
+          <li><label><input type="checkbox" data-id="replay" /> 能说明 Prompt 回放与 badcase 闭环</label></li>
+          <li><label><input type="checkbox" data-id="pii" /> 能举 2 项脱敏规则</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>trace_id</td><td>全链路唯一键</td></tr>
+                <tr><td>Span</td><td>llm.* / tool.* 分段计时</td></tr>
+                <tr><td>回放</td><td>messages 快照 + 脱敏</td></tr>
+                <tr><td>采样</td><td>常态 10%，error 100%</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <h4>面试问答</h4>
+        <details>
+          <summary>用户说 Agent 乱答，你如何在一个小时内定位是模型还是 Tool 问题？</summary>
+          <div class="learn-interview-body">
+            <p><strong>答：</strong>要 trace_id → SLS 查结构化日志 → Trace 看 tool.roomBooking Span 是否 error → Prompt 回放看 Tool result 是否已返回失败但 LLM 仍生成成功话术 → 若是后者修 System 约束；若是前者修 OA 集成。</p>
+          </div>
+        </details>
+        <details>
+          <summary>Prompt 回放会不会泄露员工报销明细？</summary>
+          <div class="learn-interview-body">
+            <p><strong>答：</strong>写入前脱敏工号/金额/发票号；影像用短期签名 URL；回放 UI 权限与审计日志；staging 复现不用生产 Key。</p>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：Demo 设计回放 JSON schema；下一章 <a href="#ch-practice-04-qps">生产 QPS 与缓存分层</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html#actuator.micrometer-tracing" target="_blank" rel="noopener">Spring Boot — Micrometer Tracing</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/observability/" target="_blank" rel="noopener">Spring AI — Observability</a></li>
+      <li><a href="https://opentelemetry.io/docs/concepts/signals/traces/" target="_blank" rel="noopener">OpenTelemetry Traces</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 S3 定义日志字段表与一条完整 replay JSON，并设计 2 条告警阈值。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-03-obs-lab/README.md</code>。</li>
+      <li>填写 S3 结构化日志字段表（至少 8 列含义）。</li>
+      <li>根据 README 模板编写一次「roomBooking 409 冲突」replay JSON。</li>
+      <li>补充 P95 &gt; 8s 与 tool.error &gt; 5% 告警的处理 runbook 各 3 步。</li>
+      <li>完成章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">生产开启 <code>log-prompt: true</code> 方便排障，有何风险？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>Prompt 含 PII 与商业敏感信息，落日志违反合规；且日志体积暴涨。应使用 Prompt 回放专用存储 + 脱敏，而非全局 log prompt。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：观测与调试</h4>
+      <p>目录：<code>demos/practice-03-obs-lab/</code>。<strong>验收</strong>：日志字段表 + 1 条 replay JSON + 2 条告警 runbook。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-02-resilience">容灾、限流与降级</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-qps">生产 QPS 与缓存分层</a></li>
+      <li><a href="../spring-ai-engineering/index.html" class="course-ref" target="_blank" rel="noopener">Spring AI 工程化 — Micrometer 章对照</a></li>
+    </ul>
+  </div>
+</section>

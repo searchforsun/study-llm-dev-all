@@ -1,3 +1,8 @@
+---
+description: 
+alwaysApply: true
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -159,3 +164,7 @@ The example's full source is at the skill package path `example/java-distributed
 - Branch: `main`
 - Commit style: conventional commits (`feat:`, `fix:`, `style:`, `refactor:`) — see recent commit history
 - The project has a clean working tree at baseline
+
+## Agent hygiene
+
+- 仅为排障/一次性验证写的脚本（如 `_foo.mjs`）：用完后**删除**，不要提交；要长期保留则正式放入 `courses/scripts/` 并更新上表。

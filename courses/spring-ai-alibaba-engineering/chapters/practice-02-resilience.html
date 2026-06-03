@@ -1,0 +1,369 @@
+<section id="ch-practice-02-resilience" class="chapter" data-chapter="practice-02-resilience">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>容灾、限流与降级</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-resilience" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>治理与运维</strong> · 能力：为 CorpAssist S3 办公 Agent 配置熔断、语义缓存与多模型降级，保障 DashScope 抖动时仍可有限服务</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>S3 Agent 在月底报销高峰、大模型侧 rate limit 或网络抖动时，若仍同步阻塞调 <code>qwen-plus</code>，整链路透传 503 到员工端。<span class="term" data-term-id="circuit-breaker" tabindex="0">circuit breaker</span>、<span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span> 与 <span class="term" data-term-id="multi-model-fallback" tabindex="0">multi model fallback</span> 是应用层容灾三板斧——在 Spring AI Alibaba 栈内完成，而非等 K8s 重启 Pod。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 Resilience4j / Spring Cloud CircuitBreaker 包裹 DashScope 调用并配置半开探测</li>
+          <li>设计 S3 场景的 <span class="term" data-term-id="llm-cache" tabindex="0">llm cache</span>（精确 + 语义）及 TTL/失效策略</li>
+          <li>配置 primary / fallback <code>ChatModel</code> 路由（qwen-plus → qwen-turbo → 规则答复）</li>
+          <li>读懂 <code>resilience.yaml</code> 并与 Admin DSL 中的模型字段对齐</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>先保护再优化</strong>：熔断失败率阈值先于缓存调参。</li>
+          <li><strong>写操作不缓存</strong>：<code>roomBooking</code>、<code>submitExpense</code> 禁止语义缓存命中。</li>
+          <li><strong>降级可感知</strong>：切 turbo 或模板答复时，响应头/文案告知用户「简版模式」。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>熔断：失败率、慢调用与半开</h3>
+      <p>DashScope 超时或 429 会拖垮 Tomcat 线程池。对 <code>ChatModel</code> 外包一层 <span class="term" data-term-id="circuit-breaker" tabindex="0">circuit breaker</span>：失败率超阈则快速失败，走 fallback 或排队；半开期放少量探测请求恢复。</p>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 百炼限流</span>
+        09:00–10:00 订会议室集中爆发，DashScope 返回 429。熔断打开后，Agent 改答「当前繁忙，已为您排队；可查看常订会议室规则」并异步重试，而非 30s 白屏。
+      </aside>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># resilience.yaml 片段 — 见 Demo
+resilience4j:
+  circuitbreaker:
+    instances:
+      dashscopeChat:
+        slidingWindowSize: 20
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 3
+  timelimiter:
+    instances:
+      dashscopeChat:
+        timeoutDuration: 8s</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>熔断状态与 S3 Agent 行为</h5>
+        <pre class="mermaid">stateDiagram-v2
+  [*] --> Closed
+  Closed --> Open: 失败率 &gt; 50%
+  Open --> HalfOpen: 等待 30s
+  HalfOpen --> Closed: 探测成功
+  HalfOpen --> Open: 探测失败
+  note right of Open: 走 fallback ChatModel 或静态 FAQ</pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>参数</th><th>建议起点（S3）</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>timeoutDuration</code></td><td>8s（同步 API）</td><td>长于模型 P95 但短于网关总超时</td></tr>
+          <tr><td><code>failureRateThreshold</code></td><td>50%</td><td>小流量时结合 minimumNumberOfCalls</td></tr>
+          <tr><td><code>waitDurationInOpenState</code></td><td>30s</td><td>避免抖动期反复半开</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Service
+public class ResilientS3ChatService {
+  private final ChatModel primary;
+  private final ChatModel fallback;
+  private final CircuitBreaker breaker;
+
+  public String chat(String userMessage) {
+    Supplier&lt;String&gt; supplier = CircuitBreaker
+        .decorateSupplier(breaker, () -&gt;
+            primary.call(new Prompt(userMessage)).getResult().getOutput().getText());
+    return Try.ofSupplier(supplier)
+        .recover(CallNotPermittedException.class, e -&gt; invokeFallback(userMessage))
+        .get();
+  }
+}</code></pre>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：Tool 调用失败应否触发 Chat 熔断？</summary>
+        <p>应分开计量：OA 费控 503 不应打开 DashScope 熔断。按依赖拆 CircuitBreaker 实例（<code>dashscopeChat</code> vs <code>expenseApi</code>）。</p>
+      </details>
+      <h4>CorpAssist S3 容灾演练清单</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>演练</th><th>注入方式</th><th>期望行为</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>DashScope 429</td><td>WireMock 限流</td><td>熔断 → turbo → 简版文案</td></tr>
+          <tr><td>OA 409 冲突</td><td>Stub roomBooking</td><td>LLM 不得宣称成功；日志 outcome=error</td></tr>
+          <tr><td>缓存击穿</td><td>同一 FAQ 1k QPS</td><td>singleflight + L2 命中升速</td></tr>
+          <tr><td>plus 全不可用</td><td>Mock 5xx</td><td>FAQ 静态模板 + 异步排队</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 季度容灾演练</span>
+        SRE 在 staging 注入 429，验证 5 分钟内：① 熔断指标可见；② 用户侧降级文案出现；③ Admin 可回滚 Prompt；④ 无写 Tool 被缓存误命中。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>缓存：精确键与语义相似</h3>
+      <p>S3 大量重复问法：「年假制度在哪」「报销截止日」。<span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span> 对 embedding 相近的问题返回已缓存答复，降低 token 与延迟。须严格排除带 Tool 写路径与含 PII 的会话。</p>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>策略</th><th>键</th><th>S3 适用</th><th>风险</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>精确缓存</td><td>hash(system+user+model)</td><td>静态 FAQ</td><td>低</td></tr>
+          <tr><td>语义缓存</td><td>query embedding 近邻</td><td>制度类只读问答</td><td>相似问法误命中</td></tr>
+          <tr><td>Tool 结果缓存</td><td>tool+args hash</td><td><code>roomAvailability</code> 只读查询</td><td>TTL 须短（≤60s）</td></tr>
+          <tr><td>禁止缓存</td><td>—</td><td>booking/expense/含工号</td><td>合规</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>全 Agent 对话一把梭缓存</li>
+            <li>无 TTL，会议室空闲状态过期仍命中</li>
+            <li>缓存 Key 不含 model 版本</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Advisor 链前置 CacheAdvisor，可配置 bypass 写 Tool</li>
+            <li>Redis + 向量近邻（CorpAssist 共用缓存层）</li>
+            <li>Key 含 <code>appVersion</code> 与 <code>qwen-plus</code> 标识</li>
+          </ul>
+        </div>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// CacheAdvisor 示意：写 Tool 路径 bypass
+public class S3CacheAdvisor implements CallAroundAdvisor {
+  @Override
+  public AdvisedResponse aroundCall(AdvisedRequest req, CallAroundAdvisorChain chain) {
+    if (req.toolsScheduled() || containsWriteTool(req)) {
+      return chain.nextAroundCall(req);
+    }
+    return cache.getOrCompute(cacheKey(req), () -&gt; chain.nextAroundCall(req));
+  }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多模型：主备路由与静态降级</h3>
+      <p><span class="term" data-term-id="multi-model-fallback" tabindex="0">multi model fallback</span> 在 DashScope 内切换 <code>qwen-plus</code> → <code>qwen-turbo</code>；再失败则返回规则模板或「请稍后再试」。与 Admin DSL 的 <code>model.primary/fallback</code> 字段保持一致，避免 Studio 配 plus、代码走 turbo。</p>
+      <div class="mermaid-wrap">
+        <h5>S3 多模型降级链</h5>
+        <pre class="mermaid">flowchart TD
+  Q[用户请求]
+  P[qwen-plus]
+  T[qwen-turbo]
+  R[规则 FAQ / 异步队列]
+  Q --> P
+  P -->|超时/429/熔断| T
+  T -->|仍失败| R</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    dashscope:
+      chat:
+        options:
+          model: qwen-plus
+    # 自定义 fallback bean 见 Java @Configuration
+corpassist:
+  s3:
+    models:
+      primary: qwen-plus
+      fallback: qwen-turbo
+      degrade-message: "当前为简版答复模式，复杂审批请稍后在 OA 提交"</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>触发</th><th>用户体验</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>L1 同厂商换模型</td><td>plus 429/超时</td><td>质量略降，功能保留</td></tr>
+          <tr><td>L2 只读 FAQ</td><td>turbo 仍失败</td><td>制度链接 + 人工入口</td></tr>
+          <tr><td>L3 异步</td><td>长任务 OCR/汇总</td><td>返回 taskId，消息通知完成</td></tr>
+        </tbody>
+      </table>
+      <div class="notice">
+        <strong>NS3 成本视角</strong>
+        <ul>
+          <li>语义缓存命中可降 30%+ token；须监控命中率与错答率。</li>
+          <li>turbo 降级节省成本，但 Eval 需单独基线，勿与 plus 混评。</li>
+        </ul>
+      </div>
+      <h4>Resilience4j 与 Spring AI Advisor 组合</h4>
+      <p>推荐顺序：<strong>RateLimiter（入口）</strong> → <strong>CacheAdvisor（只读）</strong> → <strong>CircuitBreaker 包裹 ChatModel</strong> → Tool 调用各自 breaker。避免在 Controller 手写 try/catch，统一在 Advisor 链或可观测装饰器完成。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Bean
+ChatClient s3ChatClient(ChatModel primary, ChatModel fallback, S3CacheAdvisor cache) {
+  return ChatClient.builder(primary)
+      .defaultAdvisors(cache, new DegradeHeaderAdvisor())
+      .build();
+}
+
+@Bean
+@Primary
+ChatModel resilientPrimary(@Qualifier("dashscopePlus") ChatModel plus,
+                           CircuitBreakerRegistry registry) {
+  return new CircuitBreakerChatModelProxy(plus, registry.circuitBreaker("dashscopeChat"));
+}</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>Metric</th><th>标签</th><th>告警</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>resilience4j.circuitbreaker.state</code></td><td>name=dashscopeChat</td><td>OPEN &gt; 1min</td></tr>
+          <tr><td><code>corpassist.cache.hit</code></td><td>layer=L1|L2</td><td>命中率 &lt; 30% 且 QPS 高</td></tr>
+          <tr><td><code>corpassist.model.degraded</code></td><td>to=qwen-turbo</td><td>比例 &gt; 20% 持续 10m</td></tr>
+        </tbody>
+      </table>
+      <details class="learn-micro-check">
+        <summary>RateLimiter 与熔断应设在网关还是 Agent 服务？</summary>
+        <p>网关做粗粒度租户/全局 QPS；Agent 服务做 DashScope 配额保护与语义缓存。两层互补，不要只在网关限流却仍在应用内打满 429。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>通义栈视角：容灾与百炼配额</h3>
+      <p>DashScope 429 与下游 OA 超时是 S3 Agent 最常见的外部故障。Java 轨用 Resilience4j + 语义缓存 + 多模型 Fallback；Python 轨用 tenacity + Redis。双栈须共享降级文案与缓存 Key 规范（含 model 版本）。</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只在网关限流，应用内仍打满 DashScope 429</li>
+            <li>Java 已切 turbo、Python 仍调 plus，用户体验分裂</li>
+            <li>catch 后返回空字符串，诱发 Agent 假执行</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>网关粗粒度 QPS + Agent 服务 DashScope 配额保护</li>
+            <li>plus → turbo → 规则/异步，双栈同一降级文案</li>
+            <li>熔断 OPEN 告警 + 语义缓存读路径兜底</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>熔断</strong>：DashScope 与下游 OA 分开实例；8s 超时 + 50% 失败率起步。</li>
+        <li><strong>缓存</strong>：只读 FAQ/availability 可缓存；写 Tool 与 PII 强制 bypass。</li>
+        <li><strong>多模型</strong>：plus → turbo → 规则/异步；与 Admin DSL model 字段一致。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba_practice02_resilience">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cb" /> 能解释熔断 Closed/Open/HalfOpen 与 S3 行为</label></li>
+          <li><label><input type="checkbox" data-id="cache" /> 能列 2 类可缓存与 2 类禁止缓存的 S3 请求</label></li>
+          <li><label><input type="checkbox" data-id="model" /> 能画出 plus → turbo → FAQ 降级链</label></li>
+          <li><label><input type="checkbox" data-id="yaml" /> 已阅读 Demo 中 resilience.yaml</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>手段</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>熔断</td><td>快速失败，保护线程池</td></tr>
+                <tr><td>语义缓存</td><td>只读问法；写 Tool 禁止</td></tr>
+                <tr><td>多模型</td><td>primary/fallback 与 Admin 对齐</td></tr>
+                <tr><td>指标</td><td>熔断次数、缓存命中率、降级比例</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <h4>面试问答</h4>
+        <details>
+          <summary>DashScope 429 时你会怎么做，而不是无限重试？</summary>
+          <div class="learn-interview-body">
+            <p><strong>答：</strong>Resilience4j 熔断 + 指数退避有限次；打开熔断后切 qwen-turbo 或 FAQ；写操作进异步队列。监控 429 率与降级比例，配合配额申请与缓存降 QPS。</p>
+          </div>
+        </details>
+        <details>
+          <summary>语义缓存会不会导致会议室状态答错？</summary>
+          <div class="learn-interview-body">
+            <p><strong>答：</strong>会，若对 <code>roomAvailability</code> 缓存 TTL 过长或误缓存含时间槽的上下文。只读 availability TTL ≤60s；确认预订成功后 invalidate 相关 Key；写路径永不缓存。</p>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：Demo 调 resilience.yaml；下一章 <a href="#ch-practice-03-obs">观测与调试</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j — CircuitBreaker</a></li>
+      <li><a href="https://docs.spring.io/spring-cloud-circuitbreaker/docs/current/reference/html/" target="_blank" rel="noopener">Spring Cloud CircuitBreaker</a></li>
+      <li><a href="https://java2ai.com/docs/overview/" target="_blank" rel="noopener">Spring AI Alibaba</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">修改 Demo 中 <code>resilience.yaml</code>，为 S3 订会议室链路设熔断阈值，并标注哪些接口走语义缓存。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/practice-02-resilience-lab/README.md</code> 与 <code>resilience.yaml</code>。</li>
+      <li>将 <code>dashscopeChat</code> 超时改为适合你们网关的值（6–10s），写明理由。</li>
+      <li>在 README 表格中标记：FAQ / roomAvailability / roomBooking / submitExpense 的缓存策略。</li>
+      <li>写出 primary→fallback 模型切换时响应头 <code>X-CorpAssist-Degraded: true</code> 的插入点。</li>
+      <li>完成章节测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">熔断打开后仍同步重试 10 次 DashScope，用户等待 80s。错在哪？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>未 respect 熔断 Open 状态，CallNotPermitted 应立刻走 fallback。重试仅限 Closed 态且有限次退避。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：容灾、限流与降级</h4>
+      <p>目录：<code>demos/practice-02-resilience-lab/</code>。<strong>验收</strong>：resilience.yaml 已调参 + 四类 S3 接口缓存策略表。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-01-admin">Admin 与可视化</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-obs">观测与调试</a></li>
+      <li><a href="../llm-application-backend/index.html" class="course-ref" target="_blank" rel="noopener">大模型应用后端 — 分布式限流</a></li>
+    </ul>
+  </div>
+</section>

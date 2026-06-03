@@ -1,0 +1,358 @@
+<section id="ch-basics-01-dashscope" class="chapter" data-chapter="basics-01-dashscope">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>DashScope/百炼接入</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01-dashscope" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>DashScope 与扩展</strong> · 能力：为 CorpAssist S3 办公 Agent 接入百炼 API 并完成首条对话</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist <strong>S3 办公 Agent</strong> 的 Java 轨以通义千问为默认模型。若不清楚 <span class="term" data-term-id="dashscope-api-key" tabindex="0">dashscope api key</span> 如何分环境注入、<span class="term" data-term-id="qwen-model" tabindex="0">qwen model</span> 如何选型，后面 <a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排 · SAA 版</span><code class="course-ref-slug">agent-orchestration-java</code></a> 的 ReactAgent 与 <span class="term" data-term-id="streaming-flux" tabindex="0">streaming flux</span> 都会变成「本地能跑、上线报错」。本章把<strong>密钥 → 模型 → 流式 → 计费</strong>一次讲透。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>在 <span class="term" data-term-id="bailian-console" tabindex="0">bailian console</span> 创建 Key，并用环境变量注入 Spring Boot，不写死在源码</li>
+          <li>为 S3 Agent 选择 qwen-plus / qwen-turbo 等模型，并说明与 <a href="../spring-ai-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI 工程化</span><code class="course-ref-slug">spring-ai-engineering</code></a> OpenAI 兼容模式的差异</li>
+          <li>用 ChatClient 发起流式响应，并估算 <span class="term" data-term-id="token-billing" tabindex="0">token billing</span> 对 Agent 多步调用的成本影响</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>密钥外部化</strong>：生产 Key 只来自环境或密钥服务，禁止提交 Git。</li>
+          <li><strong>模型按场景选</strong>：Agent 规划用 plus，简单 FAQ 用 turbo；多模态另选 VL 系列。</li>
+          <li><strong>流式优先</strong>：门户 SSE 体验依赖 Flux；同步 call 仅用于批处理或测试。</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>预览 · RAM 子账号</strong>：本章 API Key 仅覆盖 dev/staging/prod 分环境与注入方式；RAM 子账号最小权限、Key 轮换、配额审计与多租户隔离的完整治理见 <a href="#ch-practice-05-bailian-governance">practice-05 · 百炼安全与合规治理</a>。
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>API Key</h3>
+      <p>DashScope（百炼 <span class="term" data-term-id="model-studio" tabindex="0">model studio</span>）通过 API Key 鉴权。Spring AI Alibaba 1.1.x 约定环境变量 <code>AI_DASHSCOPE_API_KEY</code> 或配置项 <code>spring.ai.dashscope.api-key</code>。CorpAssist S3 模块与 Python 实验服务应使用<strong>不同子账号 Key</strong>，便于配额与审计分账。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>来源</th><th>配置方式</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>百炼控制台</td>
+            <td>创建 RAM 子账号 Key，绑定「模型调用」权限</td>
+            <td>dev / staging / prod 各一把 Key</td>
+          </tr>
+          <tr>
+            <td>环境变量</td>
+            <td><code>AI_DASHSCOPE_API_KEY</code></td>
+            <td>K8s Secret / CI 注入，本地 <code>.env</code> 不入库</td>
+          </tr>
+          <tr>
+            <td>application.yml</td>
+            <td><code>spring.ai.dashscope.api-key: ${AI_DASHSCOPE_API_KEY}</code></td>
+            <td>与 <span class="term" data-term-id="corpassist-s3" tabindex="0">corpassist s3</span> Agent 服务共用前缀</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># corpassist-agent-office/application.yml
+spring:
+  application:
+    name: corpassist-s3-agent
+  ai:
+    dashscope:
+      api-key: ${AI_DASHSCOPE_API_KEY}
+      chat:
+        options:
+          model: ${CORPASSIST_AGENT_MODEL:qwen-plus}
+          temperature: 0.3</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>把 Key 写在 Java 常量或 <code>application-prod.yml</code> 提交 Git</li>
+            <li>dev 与 prod 共用同一 Key，无法按环境限流</li>
+            <li>在日志中打印完整 api-key</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>环境变量 + Spring 占位符引用</li>
+            <li>RAM 子账号最小权限；定期轮换 Key</li>
+            <li>日志只记录 Key 后 4 位与 request_id</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 办公 Agent · 密钥分账</span>
+        S3 Agent 服务（Java）与批量评测脚本（Python）各用独立 Key：Agent 在线 QPS 高、Token 消耗大；评测 Key 可设更低配额，避免压测误伤生产额度。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不用 OpenAI 的 <code>OPENAI_API_KEY</code> 命名？</summary>
+        <p>Spring AI Alibaba DashScope Starter 默认读取 <code>AI_DASHSCOPE_API_KEY</code>；与 <a href="../spring-ai-engineering/index.html" class="course-ref" target="_blank" rel="noopener">Spring AI 工程化</a> 的 OpenAI 兼容轨并行时，两套 Key 互不覆盖，便于双栈网关切换。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>模型列表</h3>
+      <p>百炼提供通义千问系列：<strong>turbo</strong>（低延迟）、<strong>plus</strong>（Agent 推理）、<strong>max</strong>（复杂规划）、<strong>vl-plus</strong>（图文）。S3 办公 Agent 默认 <code>qwen-plus</code>；工具调用密集时可升 max，简单意图分类可降 turbo。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>模型</th><th>典型场景</th><th>CorpAssist S3 用法</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>qwen-turbo</code></td><td>低延迟、低成本 FAQ</td><td>意图路由、槽位抽取</td></tr>
+          <tr><td><code>qwen-plus</code></td><td>平衡质量与成本</td><td>ReactAgent 主模型（默认）</td></tr>
+          <tr><td><code>qwen-max</code></td><td>复杂多步规划</td><td>跨系统审批链、长上下文摘要</td></tr>
+          <tr><td><code>qwen-vl-plus</code></td><td>图文理解</td><td>扫描件请假单、发票 OCR（extensions 章展开）</td></tr>
+        </tbody>
+      </table>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">DashScope 原生</span>
+          <p class="role-card-desc">通过 <code>spring.ai.dashscope.*</code> 由 SAA Starter 注册 <code>DashScopeChatModel</code>。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">OpenAI 兼容模式</span>
+          <p class="role-card-desc"><span class="term" data-term-id="compatible-mode" tabindex="0">compatible mode</span>：<code>https://dashscope.aliyuncs.com/compatible-mode/v1</code>，可与 spring-ai-openai Starter 共用（见 basics-04 对照）。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Embedding</span>
+          <p class="role-card-desc"><code>text-embedding-v3</code> 用于制度库 RAG；与 Agent 对话模型分开配置。</p>
+        </article>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@RestController
+@RequestMapping("/api/agent")
+public class OfficeAgentController {
+
+  private final ChatClient agentChat;
+
+  public OfficeAgentController(ChatClient.Builder builder) {
+    this.agentChat = builder
+        .defaultSystem("你是 CorpAssist S3 办公助手，工具调用须遵守审批策略。")
+        .build();
+  }
+
+  @PostMapping("/chat")
+  public String chat(@RequestBody ChatRequest req) {
+    return agentChat.prompt()
+        .user(req.message())
+        .call()
+        .content();
+  }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>流式</h3>
+      <p>企业门户期望「打字机」体验：Spring AI 的 <code>ChatClient</code> 返回 <code>Flux&lt;ChatResponse&gt;</code>，Controller 用 <code>text/event-stream</code> 推送。S3 Agent 在 ReactAgent 多步循环中，<strong>最终回答</strong>宜流式；中间 Thought 可只写 Trace 不落 SSE。</p>
+      <div class="mermaid-wrap">
+        <h5>S3 门户 SSE 流式路径</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant UI as 企业门户
+  participant API as corpassist-s3-agent
+  participant DS as DashScope
+  UI->>API: POST /chat/stream
+  API->>DS: stream chat (qwen-plus)
+  loop 每个 chunk
+    DS-->>API: delta token
+    API-->>UI: SSE data
+  end
+  API-->>UI: event: done</pre>
+        <p class="diagram-caption">流式只暴露用户可见内容；Agent 内部工具 Observation 走结构化日志（practice-03 观测章）。</p>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;ServerSentEvent&lt;String&gt;&gt; stream(@RequestBody ChatRequest req) {
+  return agentChat.prompt()
+      .user(req.message())
+      .stream()
+      .content()
+      .map(chunk -> ServerSentEvent.builder(chunk).build());
+}</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Agent 每步工具结果也 SSE 给前端（泄露内部推理）</li>
+            <li>同步 <code>.call()</code> 等全量 Token 再返回（门户超时）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>最终答案 Flux；中间步骤进 Trace</li>
+            <li>网关设置 SSE 超时与心跳</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 请假 Agent · 流式答复</span>
+        用户问「帮我查年假并提交请假」：Agent 内部 3 次工具调用同步完成；门户仅流式展示「您剩余 5 天年假，已为您起草申请…」最终文案。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>计费</h3>
+      <p>百炼按 <strong>输入 Token + 输出 Token</strong> 计费，Agent 多轮对话会放大输入侧（历史 + 工具 Observation）。<span class="term" data-term-id="token-billing" tabindex="0">token billing</span> 需在架构层设 <code>maxSteps</code>、上下文压缩（见 context-memory 课）与模型降级策略。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>成本驱动</th><th>S3 Agent 表现</th><th>治理手段</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>多步 ReAct</td><td>每步重发完整历史</td><td><code>maxSteps=12</code>；超步降级 turbo</td></tr>
+          <tr><td>长制度引用</td><td>RAG 片段进入 Prompt</td><td>Top-K 限制 + 摘要 Advisor</td></tr>
+          <tr><td>流式输出</td><td>输出 Token 按 chunk 累计</td><td><code>maxTokens</code> 上限</td></tr>
+          <tr><td>评测压测</td><td>误用 prod Key</td><td>独立 Key + 配额告警</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">spring:
+  ai:
+    dashscope:
+      chat:
+        options:
+          model: qwen-plus
+          max-tokens: 2048
+    tool:
+      max-steps: 12   # 与 agent-orchestration-java 对齐</code></pre>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：一次 Agent 任务为何比单轮 Chat 贵 5～10 倍？</summary>
+        <p>每步工具调用都会把 Thought、Action、Observation 追加进上下文再次计费；若无步数预算与模型路由，成本线性膨胀。</p>
+      </details>
+      <div class="learn-faq">
+        <details>
+          <summary>百炼控制台配额告警应绑哪个 Key？</summary>
+          <div class="learn-faq-body">生产 S3 Agent 专用 Key；dev/staging 独立阈值。告警触发时 practice-02 熔断与 turbo 降级联动，避免单 Agent 拖垮全站额度。</div>
+        </details>
+        <details>
+          <summary>compatible-mode 与原生 DashScope 计费是否相同？</summary>
+          <div class="learn-faq-body">同一模型通常同价；差异在集成方式而非单价。CorpAssist 选型看框架能力（ReactAgent、Graph），不是看计费公式差异。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>API Key</strong>：百炼 RAM 子账号 + <code>AI_DASHSCOPE_API_KEY</code> 外部化，S3 与评测分 Key。</li>
+        <li><strong>模型列表</strong>：Agent 默认 qwen-plus；turbo/max/vl 按场景切换，勿全站绑死单一模型。</li>
+        <li><strong>流式</strong>：门户 SSE 用 Flux；内部 Agent 步骤走 Trace，不泄露给前端。</li>
+        <li><strong>计费</strong>：多步 Agent 放大 Token；maxSteps、maxTokens 与模型降级是工程必选项。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba-engineering_basics01_dashscope">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="key" /> 能说明 AI_DASHSCOPE_API_KEY 与 spring.ai.dashscope.api-key 的关系</label></li>
+          <li><label><input type="checkbox" data-id="model" /> 能选出 S3 Agent 默认模型并解释 turbo/plus/max 差异</label></li>
+          <li><label><input type="checkbox" data-id="stream" /> 能写出 ChatClient.stream() 与 SSE 的对接要点</label></li>
+          <li><label><input type="checkbox" data-id="billing" /> 能列举 2 个 Agent 场景下的 Token 成本放大因素</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>API Key</td><td>环境变量 AI_DASHSCOPE_API_KEY，分环境分账号</td></tr>
+                <tr><td>默认模型</td><td>S3 Agent → qwen-plus</td></tr>
+                <tr><td>流式</td><td>Flux + SSE，中间步骤不进门户</td></tr>
+                <tr><td>计费</td><td>多步 ReAct 重复计费输入 Token</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <h4>面试快问快答</h4>
+        <details>
+          <summary>DashScope 原生接入与 OpenAI 兼容模式各适合什么场景？</summary>
+          <p><strong>答：</strong>原生 <code>spring.ai.dashscope.*</code> 适合 SAA 全特性（Agent、Graph、扩展）；兼容模式适合已有 spring-ai-openai 配置、需与 Python OpenAI SDK 共用 endpoint 的双栈迁移。CorpAssist 新模块优先原生 Starter。</p>
+        </details>
+        <details>
+          <summary>生产 Agent 如何控制百炼账单失控？</summary>
+          <p><strong>答：</strong>步数上限、maxTokens、模型路由（turbo 降级）、独立评测 Key、Micrometer 按 model 统计 Token；配合 practice 章熔断与缓存。</p>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成下方 Demo 与右侧测验；下一章 <a href="#ch-basics-02-starters">Starter 与自动配置</a> 讲 BOM、AutoConfiguration 与多环境 Profile。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java2ai.com/docs/overview/" target="_blank" rel="noopener">Spring AI Alibaba 概览</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/" target="_blank" rel="noopener">阿里云百炼 Model Studio</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/getting-started/models" target="_blank" rel="noopener">通义模型列表与定价</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 30 分钟 · 在 Demo 目录完成 DashScope 首连，并对照 S3 Agent 列出 3 个需配置的项。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/basics-01-dashscope-lab/README.md</code>，在百炼控制台创建 RAM 子账号 Key。</li>
+      <li>复制 <code>application.yml</code>，设置 <code>AI_DASHSCOPE_API_KEY</code> 与 <code>CORPASSIST_AGENT_MODEL=qwen-plus</code>。</li>
+      <li>启动 Spring Boot，用 curl 调用 <code>/api/agent/chat</code> 验证非流式响应。</li>
+      <li>改为 <code>/chat/stream</code>，用浏览器或 curl 观察 SSE chunk。</li>
+      <li>在笔记中估算一次 3 步 Agent 调用的 Token 倍数，并完成右侧测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">同事把 <code>AI_DASHSCOPE_API_KEY</code> 写进 <code>application-prod.yml</code> 并提交 Git。请指出风险与改法。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>密钥泄露与无法轮换。应改用 K8s Secret / 环境变量注入，YAML 仅保留 <code>${AI_DASHSCOPE_API_KEY}</code> 占位符；已泄露 Key 立即在百炼控制台作废重建。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">S3 Agent 把每步 Thought 也 SSE 给前端，产品称「更透明」。违反本章哪条原则？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反流式<strong>只暴露用户可见内容</strong>原则：泄露内部推理与工具细节，且有合规风险。Thought/Observation 应进 Trace 与审计日志，SSE 仅推送最终答案。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：DashScope/百炼接入</h4>
+      <p>目录：<code>demos/basics-01-dashscope-lab/</code>。<strong>验收</strong>：非流式与流式各通一次；能说明 Key、model、temperature 三处配置含义。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-02-starters">Starter 与自动配置</a></li>
+      <li><a href="../spring-ai-engineering/index.html" class="course-ref" target="_blank" rel="noopener">Spring AI 工程化 — ChatClient 与配置外部化</a></li>
+      <li><a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener">Agent 编排 Java 版 — ReactAgent 与 maxSteps</a></li>
+    </ul>
+  </div>
+</section>

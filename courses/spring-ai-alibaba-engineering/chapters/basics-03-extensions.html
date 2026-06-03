@@ -1,0 +1,343 @@
+<section id="ch-basics-03-extensions" class="chapter" data-chapter="basics-03-extensions">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>spring-ai-alibaba-extensions</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-extensions" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>DashScope 与扩展</strong> · 能力：为 CorpAssist S3 接入文档解析、多模态与社区插件</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>S3 办公 Agent 不仅要「聊天」：员工上传 PDF 请假制度、拍照发票、调用日历 MCP 都需要 <span class="term" data-term-id="saa-extensions" tabindex="0">saa extensions</span>。若只会 DashScope Starter 而不会选 <span class="term" data-term-id="document-parser" tabindex="0">document parser</span> 与 <span class="term" data-term-id="multimodal-vl" tabindex="0">multimodal vl</span> 模块，RAG 与 OCR 只能手写 SDK，与 Spring AI 抽象脱节。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>说明 extensions 仓库与主框架的分工，并用 <span class="term" data-term-id="extension-bom" tabindex="0">extension bom</span> 管理版本</li>
+          <li>为制度库 PDF 选用 <span class="term" data-term-id="tika-parser" tabindex="0">tika parser</span> 或百炼文档解析能力</li>
+          <li>配置 qwen-vl 处理扫描件，并了解 <span class="term" data-term-id="community-plugin" tabindex="0">community plugin</span> 的接入边界</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>扩展独立发版</strong>：DashScope Starter、解析器在 extensions 仓库，BOM 单独 import。</li>
+          <li><strong>文档进 RAG 先解析</strong>：PDF/Word 必须结构化再 Embedding，勿直接把二进制塞 Prompt。</li>
+          <li><strong>多模态有成本</strong>：VL 模型 Token 更贵；S3 场景先 OCR 再文本 Agent 往往更稳。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>文档解析</h3>
+      <p><span class="term" data-term-id="corpassist-knowledge" tabindex="0">corpassist knowledge</span> 制度库含 PDF、Word、扫描件。extensions 提供基于 Apache Tika / 百炼文档理解的 <span class="term" data-term-id="document-parser" tabindex="0">document parser</span>，输出可切块文本供 VectorStore 索引。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>能力</th><th>适用格式</th><th>S3 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Tika Document Reader</td><td>PDF、Office、HTML</td><td>员工手册、请假制度 PDF</td></tr>
+          <tr><td>百炼文档解析 API</td><td>复杂版式、表格</td><td>含合并单元格的考勤表</td></tr>
+          <tr><td>自定义 Reader</td><td>内部 OA 导出格式</td><td>CorpAssist 专有 JSON 工单 dump</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 制度 PDF → 文本块 → Embedding（示意）
+@Bean
+DocumentReader leavePolicyReader() {
+  return new TikaDocumentReader("classpath:policies/leave-policy.pdf");
+}
+
+@Bean
+VectorStore ingestLeavePolicy(
+    DocumentReader reader,
+    VectorStore vectorStore,
+    EmbeddingModel embeddingModel) {
+  List&lt;Document&gt; docs = reader.get();
+  TextSplitter splitter = new TokenTextSplitter(512, 50);
+  vectorStore.add(splitter.apply(docs));
+  return vectorStore;
+}</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>把 PDF Base64 直接塞进 Chat Prompt</li>
+            <li>不切块，整篇制度一次 Embedding</li>
+            <li>解析失败静默跳过，Agent 仍回答「根据制度…」</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Reader → Splitter → VectorStore 标准管道</li>
+            <li>解析失败入 dead-letter，检索降级</li>
+            <li>元数据标记 doc_version 便于增量更新</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 请假制度 RAG</span>
+        HR 更新 PDF 后，批处理 Job 重新解析并写入 VectorStore；S3 Agent 在线只检索，不在请求路径做重解析。与 Python 轨索引服务可 OpenAPI 分工（basics-04 双栈）。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何 Agent 工具查制度仍需要 VectorStore？</summary>
+        <p>Token 窗口装不下全文；检索 Top-K 片段 + 引用来源才是可审计答案。文档解析是 RAG 上游，不是 Agent 替代品。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>多模态</h3>
+      <p><span class="term" data-term-id="multimodal-vl" tabindex="0">multimodal vl</span>（如 <code>qwen-vl-plus</code>）可理解图片中的表格与印章。S3 场景：员工拍照上传请假单、报销发票。extensions 与 DashScope 多模态 API 对接 Spring AI 的 <code>Media</code> 类型。</p>
+      <div class="mermaid-wrap">
+        <h5>扫描件请假单 → VL → 结构化槽位</h5>
+        <pre class="mermaid">flowchart LR
+  IMG[员工上传 JPG] --> API[S3 Agent API]
+  API --> VL[qwen-vl-plus]
+  VL --> JSON[结构化字段 JSON]
+  JSON --> TOOL[submit_leave Tool]
+  TOOL --> OA[OA 审批系统]</pre>
+        <p class="diagram-caption"><span class="term" data-term-id="vision-rag" tabindex="0">vision rag</span>：图片理解 + 文本 Agent 可串联；复杂流程见 multimodel-routing 课。</p>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">public LeaveDraft parseLeaveForm(byte[] imageBytes) {
+  var media = Media.builder()
+      .mimeType(MimeTypeUtils.IMAGE_JPEG)
+      .data(imageBytes)
+      .build();
+
+  String json = chatClient.prompt()
+      .user(u -> u.text("提取请假单字段，输出 JSON：姓名、起止日期、事由")
+                  .media(media))
+      .call()
+      .content();
+  return objectMapper.readValue(json, LeaveDraft.class);
+}</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>策略</th><th>优点</th><th>缺点</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>端到端 VL</td><td>实现快，适应版式变化</td><td>Token 贵、可解释性弱</td></tr>
+          <tr><td>OCR + 文本模型</td><td>成本低、可缓存 OCR 结果</td><td>两阶段流水线运维复杂</td></tr>
+          <tr><td>专用 OCR 服务 + 规则</td><td>发票等固定格式最稳</td><td>新格式需开发</td></tr>
+        </tbody>
+      </table>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">qwen-vl-plus</span>
+          <p class="role-card-desc">通用图文理解，适合请假单、截图 FAQ。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">text-embedding-v3</span>
+          <p class="role-card-desc">纯文本向量；图片须先 OCR/VL 转文本再索引。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">Media API</span>
+          <p class="role-card-desc">Spring AI 统一 Media 模型，换 VL 模型不改业务接口。</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>社区插件</h3>
+      <p><span class="term" data-term-id="community-plugin" tabindex="0">community plugin</span> 与 <span class="term" data-term-id="saa-extensions" tabindex="0">saa extensions</span> 生态提供可选集成：MCP 连接器、第三方 VectorStore、观测导出等。CorpAssist 生产环境须过<strong>安全评审</strong>：插件来源、网络出站、许可证。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>类型</th><th>示例</th><th>S3 Agent 用法</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>MCP Server 桥接</td><td>日历、邮件、工单</td><td>与 agent-orchestration-java MCP 章一致</td></tr>
+          <tr><td>观测插件</td><td>Trace 导出 OTLP</td><td>practice-03 观测章落地</td></tr>
+          <tr><td>文档/存储扩展</td><td>OSS Reader</td><td>制度库从对象存储增量拉取</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">xml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-xml">&lt;!-- 按需引入 extensions 模块，版本由 extensions-bom 管理 --&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;com.alibaba.cloud.ai&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-ai-alibaba-starter-dashscope&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;!-- 具体 extension artifact 以 java2ai.com 文档为准 --&gt;</code></pre>
+      </div>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>未审计的社区插件直接上生产</li>
+            <li>插件与主框架 major 版本不对齐</li>
+            <li>每个 Tool 各引一个重复 HTTP 客户端</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>插件清单 + SBOM + 出站域名白名单</li>
+            <li>extensions-bom 锁版本，CI 依赖扫描</li>
+            <li>统一 WebClient / RestClient 配置超时与重试</li>
+          </ul>
+        </div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 插件治理</span>
+        S3 Agent 允许 Tool：query_leave、send_email（MCP）、search_policy（RAG）。新增「订会议室」插件须走 NS2 护栏评审：数据范围、审批、审计字段。community 插件默认 dev 启用，prod 需显式 Feature Flag。
+      </aside>
+      <div class="mermaid-wrap">
+        <h5>Extensions 在 CorpAssist 栈中的位置</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph core [spring-ai-alibaba 核心]
+    AGENT[ReactAgent]
+    CHAT[DashScope ChatModel]
+  end
+  subgraph ext [extensions]
+    PARSE[Document Parser]
+    VL[Multimodal VL]
+    MCP[MCP 桥接]
+  end
+  AGENT --> CHAT
+  AGENT --> MCP
+  PARSE --> RAG[VectorStore]
+  VL --> AGENT</pre>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：extensions 与 agent-framework 依赖边界？</summary>
+        <p>agent-framework 管 ReAct/Graph 循环；extensions 管模型侧能力与第三方集成。二者版本分别由 alibaba-bom 与 extensions-bom 对齐。</p>
+      </details>
+      <table class="outline-table">
+        <thead>
+          <tr><th>扩展场景</th><th>推荐模块</th><th>与 RAG 课衔接</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>制度 PDF 增量更新</td><td>Tika Reader + 定时 Job</td><td>rag-system-java 索引管道</td></tr>
+          <tr><td>发票 OCR</td><td>VL 或专用 OCR 服务</td><td>multimodel-routing VL 章</td></tr>
+          <tr><td>工单 MCP</td><td>community MCP 桥接</td><td>agent-orchestration-java MCP 章</td></tr>
+        </tbody>
+      </table>
+      <div class="learn-faq">
+        <details>
+          <summary>extensions 升级是否必须停服 Agent？</summary>
+          <div class="learn-faq-body">Reader/Embedding 变更影响索引管道，可滚动重建 VectorStore；在线 Agent 只依赖检索 API。升级前在 staging 跑完整 reindex 验收。</div>
+        </details>
+        <details>
+          <summary>CorpAssist 能否只用 Python 做文档解析、Java 只检索？</summary>
+          <div class="learn-faq-body">可以，且是推荐双栈分工（basics-04）。Python 批处理解析 + 写索引版本；Java extensions 侧保留 Reader 用于小规模热更新或灾备。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上文一个小节，便于串起全章再做题。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>文档解析</strong>：Reader → Splitter → VectorStore；PDF 勿直塞 Prompt。</li>
+        <li><strong>多模态</strong>：qwen-vl 处理扫描件；权衡 VL 端到端 vs OCR+文本。</li>
+        <li><strong>社区插件</strong>：MCP/观测/OSS 按需引入；生产须版本对齐与安全评审。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="spring-ai-alibaba-engineering_basics03_extensions">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="ext-bom" /> 能说明 extensions 仓库与主框架的分工</label></li>
+          <li><label><input type="checkbox" data-id="parse" /> 能描述制度 PDF 进入 RAG 的三步管道</label></li>
+          <li><label><input type="checkbox" data-id="vl" /> 能对比 VL 端到端与 OCR+文本两种策略</label></li>
+          <li><label><input type="checkbox" data-id="plugin" /> 能列举 S3 Agent 引入社区插件的 2 条安全要求</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>extensions</td><td>DashScope Starter、解析、多模态</td></tr>
+                <tr><td>文档解析</td><td>Tika/百炼 → 切块 → Embedding</td></tr>
+                <tr><td>多模态</td><td>qwen-vl-plus + Media API</td></tr>
+                <tr><td>插件</td><td>dev 试用，prod 须评审+SBOM</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <h4>面试快问快答</h4>
+        <details>
+          <summary>CorpAssist 制度库更新后，Agent 如何感知新版本？</summary>
+          <p><strong>答：</strong>批处理重新解析 PDF → 写 VectorStore（带 doc_version 元数据）；在线 Agent 检索时过滤最新 version；可选 Admin 发布 DSL 触发重建（practice-01）。</p>
+        </details>
+        <details>
+          <summary>为何不把所有 extensions 一次性引入？</summary>
+          <p><strong>答：</strong>增大攻击面与启动时间；未用模块仍可能拉 transitive 依赖。按场景最小引入，BOM 统一版本。</p>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；下一章 <a href="#ch-basics-04-vs-python">与 Python 通义 SDK 对照</a> 做双栈能力矩阵与选型。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://github.com/alibaba/spring-ai-alibaba/tree/main/spring-ai-alibaba-extensions" target="_blank" rel="noopener">spring-ai-alibaba-extensions GitHub</a></li>
+      <li><a href="https://java2ai.com/docs/overview/" target="_blank" rel="noopener">Spring AI Alibaba 组件总览</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html" target="_blank" rel="noopener">Spring AI ETL / DocumentReader</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">约 30 分钟 · 阅读 extensions 清单，为 S3 请假场景勾选解析与多模态方案。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>demos/basics-03-extensions-lab/README.md</code> 与 <code>extensions-list.md</code>。</li>
+      <li>为「PDF 制度 RAG」勾选 Document Reader + Embedding 依赖。</li>
+      <li>为「拍照请假单」在 VL 与 OCR+文本 两种方案中做选型并写 3 条理由。</li>
+      <li>列出 S3 Agent 计划启用的 MCP 插件及审批要求。</li>
+      <li>画一张 extensions 与 ReactAgent 的依赖关系草图，并完成测验。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">直接把 20 页 PDF Base64 放进 Agent Prompt 让模型「总结制度」。问题在哪？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>超 Token 限额、成本高、无法引用页码审计。应 DocumentReader 切块 + VectorStore 检索，Agent 只消费 Top-K 片段。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">未经验证的社区 MCP 插件部署到 prod 发邮件 Tool。违反哪条原则？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>违反 NS2 护栏与插件治理：须安全评审、出站白名单、human-approval-tools 配置；community 插件默认不应直上生产。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：spring-ai-alibaba-extensions</h4>
+      <p>目录：<code>demos/basics-03-extensions-lab/</code>。<strong>验收</strong>：完成 extensions 选型表；能说明 PDF RAG 与 VL 请假单各用哪条扩展链路。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-vs-python">与 Python 通义 SDK 对照</a></li>
+      <li><a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener">Agent 编排 Java 版 — MCP 与 Tool</a></li>
+      <li><a href="../multimodel-routing-multimodal/index.html" class="course-ref" target="_blank" rel="noopener">多模型路由 — VL 与双栈</a></li>
+    </ul>
+  </div>
+</section>
