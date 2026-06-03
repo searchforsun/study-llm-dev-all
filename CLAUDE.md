@@ -75,6 +75,8 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 
 ### Key scripts in `scripts/` (repo root)
 
+项目专有脚本 — **不得**移入 skill 包；通用能力见 skill [skill-project-boundary.md](.cursor/skills/programming-html-tutorial/reference/skill-project-boundary.md)。
+
 | Script | Purpose |
 |--------|---------|
 | `sync.mjs` | `outline-specs.json` → `courses.json` (always run after spec edits) |

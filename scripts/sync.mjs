@@ -567,7 +567,7 @@ const courses = Object.keys(specFinal.courses)
 const catalog = {
   title: '大模型应用开发 · 课程中心',
   subtitle: 'Python × Spring AI 双轨并行 · 复合型应用工程（3–5 年）',
-  globalThemeKey: 'study-self_theme',
+  globalThemeKey: 'html-tutorial_theme',
   outlineSpecFile: 'outline-specs.json',
   outlineSpecVersion: specFinal.schemaVersion ?? '1',
   courseTitleCatalog: Object.fromEntries(

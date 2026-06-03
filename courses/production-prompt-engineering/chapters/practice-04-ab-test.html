@@ -114,6 +114,22 @@ corpassist:
           </ul>
         </div>
       </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标类型</th><th>最小样本量（经验）</th><th>检验方法</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>faithfulness（连续/打分）</td><td>≥ 200 / 臂</td><td>均值差 + bootstrap CI</td></tr>
+          <tr><td>refusal_rate（比例）</td><td>≥ 500 / 臂</td><td>两比例 z 检验</td></tr>
+          <tr><td>json_pass_rate</td><td>≥ 300 工单</td><td>比例检验，α=0.05</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：treatment 样本 80 条、faithfulness +5pp，能否宣布显著？</summary>
+        <p><strong>不能</strong>。样本量不足时置信区间很宽；应继续 canary 至达到「指标」节最小样本量，或合并离线 golden 与在线采样再判断 <span class="term" data-term-id="significance" tabindex="0">significance</span>。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -172,6 +188,24 @@ public class PromptVariantRouter {
         <summary>先想 10 秒：离线 golden 全过，能否跳过 5% canary 直接全量？</summary>
         <p><strong>不建议</strong>。离线集无法覆盖生产分布与延迟 guardrail；canary 验证在线 primary/guardrail，破线则 <span class="term" data-term-id="rollback-prompt" tabindex="0">rollback prompt</span>。</p>
       </details>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">#!/bin/bash
+# rollback-prompt.sh · 实验紧急回滚
+EXP=${1:?usage: rollback-prompt.sh rag-refusal-v23}
+kubectl patch configmap corpassist-experiments --type merge \
+  -p "{\"data\":{\"${EXP}\":\"{\\\"variant_split\\\":{\\\"control\\\":1.0,\\\"treatment\\\":0.0}}\"}}"
+echo "Rollback $EXP to 100% control; check prompt_version in traces"</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · canary 破线回滚</span>
+        rag-v2.3 上线 48h 后 faithfulness +2pp（未达 +3pp 假设），但 refusal_rate +8pp 破 guardrail。On-call 执行 rollback-prompt，treatment 流量归零；postmortem 对比 diff 发现拒答句过严，离线 golden 未覆盖边界问句。
+      </aside>
     </div>
 
     <div class="section-block">
@@ -200,6 +234,69 @@ assert metrics["faithfulness"] &gt;= baseline + 0.03
 assert metrics["refusal_rate"] &lt;= baseline + 0.05
 assert metrics["p95_ms"] &lt;= baseline * 1.1</code></pre>
       </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S2 Agent recovery A/B</span>
+        对照 agent-system v1.4（504 转人工）与 v1.5（多一次 retry）。Primary：<code>task_completion_rate</code>；Guardrail：<code>avg_steps</code>、<code>p95_latency</code>。假设 v1.5 完成率 +2pp，步数 ≤ +0.3。
+      </aside>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>实验 ID</th><th>control</th><th>treatment</th><th>primary</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>rag-refusal-v23</td><td>rag-v2.2.0</td><td>rag-v2.3.0</td><td>faithfulness</td></tr>
+          <tr><td>cs-recovery-v15</td><td>agent-v1.4.0</td><td>agent-v1.5.0</td><td>task_completion</td></tr>
+          <tr><td>ticket-json-v13</td><td>ticket-v1.2.0</td><td>ticket-v1.3.0</td><td>json_pass_rate</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>多场景实验排期（避免重叠 canary）</h5>
+        <pre class="mermaid">gantt
+  title CorpAssist Prompt 实验排期
+  dateFormat YYYY-MM-DD
+  section S1 RAG
+  rag-refusal-v23 canary :2026-06-01, 7d
+  section S2 Agent
+  cs-recovery-v15 canary :2026-06-15, 7d
+  section 工单
+  ticket-json-v13 canary :2026-06-22, 5d</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## rollback-triggers.md 模板
+1. refusal_rate 较 control +5pp 持续 24h → rollback
+2. faithfulness 较 control -2pp 任意窗口 → rollback
+3. p95_latency &gt; control × 1.15 持续 12h → hold + 评估
+4. injection_block_rate &lt; 0.95 → 立即 rollback + 安全复盘
+5. 人工队列占比 +10pp → rollback 并补 golden</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>审计与沟通</h3>
+      <p>每次 <span class="term" data-term-id="prompt-deploy" tabindex="0">prompt deploy</span> 或 <span class="term" data-term-id="rollback-prompt" tabindex="0">rollback</span> 须留审计：实验 ID、control/treatment tag、假设、primary/guardrail 快照、决策人。对业务沟通时用「指标 + 样本量 + 置信区间」，避免只报点估计。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>事件</th><th>必记字段</th><th>留存</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>canary 启动</td><td>variant_split、start_at、hypothesis</td><td>config-center 版本 + Git tag</td></tr>
+          <tr><td>guardrail 破线</td><td>metric delta、窗口、告警 ID</td><td>incident ticket</td></tr>
+          <tr><td>rollback</td><td>rollback_at、operator、新 split</td><td>trace 采样 24h</td></tr>
+          <tr><td>全量发布</td><td>significance 结论、样本量</td><td>eval 报告 artifact</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：rollback 后如何向产品解释「拒答率突然下降」？</summary>
+        <p>说明 treatment 拒答句过严导致 +8pp，已回滚至 control；附 canary 窗口曲线与假设未达标的 guardrail 证据。避免只说「系统恢复了」——业务需要理解决策依据。</p>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -250,6 +347,8 @@ assert metrics["p95_ms"] &lt;= baseline * 1.1</code></pre>
               <li>离线 golden 全过，为何还要 5% canary？</li>
               <li>如何设计 RAG 拒答句 A/B 的 primary 与 guardrail 指标？</li>
               <li>prompt_version 回滚后，如何向业务解释指标波动？</li>
+              <li>Agent 实验 primary 选 tool_acc 还是 task_completion？guardrail 如何设？</li>
+              <li>同一时期两个 Prompt 实验重叠分桶，如何避免相互污染？</li>
             </ol>
           </div>
         </details>
@@ -273,9 +372,10 @@ assert metrics["p95_ms"] &lt;= baseline * 1.1</code></pre>
     <p class="steps-intro">填写 RAG 拒答句 A/B 实验计划，含假设、指标与 rollback 条件。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>打开 <code>demos/practice-04-ab-test-lab/ab-plan.md</code>，补全假设与 variant_split。</li>
-      <li>定义 1 个 primary、2 个 guardrail 指标及阈值。</li>
-      <li>写 eval-gate 伪代码与 rollback 触发条件各 3 条。</li>
+      <li>打开 <code>demos/practice-04-ab-test-lab/ab-plan.md</code>，补全假设与 variant_split（参照「实验设计」YAML 配置）。</li>
+      <li>定义 1 个 primary、2 个 guardrail 指标及阈值（参照「场景化指标对照」表）。</li>
+      <li>写 eval-gate 伪代码与 rollback 触发条件各 3 条（参照「发布闸门」Python 片段与「回滚」Mermaid）。</li>
+      <li>对照「significance 最小样本量」表，估算 RAG 拒答实验需跑多久。</li>
       <li>画 timeline：离线评测 → 5% canary → 全量或回滚。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
@@ -288,10 +388,26 @@ assert metrics["p95_ms"] &lt;= baseline * 1.1</code></pre>
           </details>
         </div>
       </li>
+      <li>
+        <p class="judgment-stem">control 与 treatment 同时跑两个不同 Prompt 实验（RAG 拒答 + Agent recovery），session 分桶相同，有何风险？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>相互污染</strong>：无法归因指标变化。应<strong>一次单变量</strong>或正交分桶（实验层叠设计）；默认 CorpAssist 禁止重叠 canary，见「实验设计」隔离行。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">离线 golden faithfulness +4pp，在线 canary 仅 +0.5pp，说明什么？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>离线集与生产分布不一致，或 canary 样本不足。应扩充 golden、延长 canary、按 tenant 分层看指标，<strong>勿</strong>仅凭离线结果全量。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：A/B 实验计划</h4>
-      <p>目录：<code>demos/practice-04-ab-test-lab/</code>（<code>ab-plan.md</code>）。<strong>验收</strong>：ab-plan 含假设、variant_split、rollback 条件各 3 条；timeline 含 canary 5% 节点。</p>
+      <p>目录：<code>demos/practice-04-ab-test-lab/</code>（<code>ab-plan.md</code>、<code>rollback-triggers.md</code>）。<strong>验收</strong>：ab-plan 含假设、variant_split、rollback 条件各 3 条；timeline 含 canary 5% 节点；样本量估算引用「significance」表。</p>
     </div>
   </div>
 

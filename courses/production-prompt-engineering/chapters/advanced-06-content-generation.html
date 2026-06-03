@@ -139,6 +139,18 @@ facts: {{verified_facts}}</code></pre>
       </div>
 
       <p><span class="term" data-term-id="review-prompt" tabindex="0">review prompt</span> 与 <a href="#ch-practice-03-json-output">结构化输出</a> 共用 schema 约束；低于阈值时只把 <code>fix_hints</code> 对应段落送 repair，避免全文重写浪费 Token。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## section-repair prompt（定点修复）
+仅重写以下段落，保持其余正文不变：
+段落 ID: {{section_id}}
+扣分明细: {{fix_hints}}
+约束: 仍遵守 style-structure 与 verified_facts</code></pre>
+      </div>
     </div>
 
     <div class="section-block">
@@ -154,6 +166,23 @@ facts: {{verified_facts}}</code></pre>
           <tr><td>政治/敏感</td><td>content-safety 自检指令</td><td>第三方 API block</td></tr>
         </tbody>
       </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># shared/forbidden-phrases.yaml · S5 与 S2 共用
+forbidden:
+  - pattern: 全网最低|史上最强|100%保证
+    action: block_and_rewrite
+  - pattern: 未授权折扣码
+    action: escalate_human
+content_safety:
+  self_check: "输出前自检是否含绝对化用语或未证实数据"</code></pre>
+      </div>
+
+      <p>Prompt 层 <span class="term" data-term-id="content-safety-prompt" tabindex="0">content safety prompt</span> 要求模型输出前自检；后处理规则引擎做最终 block，与 <a href="#ch-advanced-02-i18n-tone">forbidden phrase</a> 列表同源。</p>
     </div>
 
     <div class="section-block">
@@ -209,6 +238,68 @@ assert safety.passed</code></pre>
       </details>
     </div>
 
+    <div class="section-block">
+      <h3>Capstone 与评测</h3>
+      <p>S5 纳入 <a href="#ch-advanced-04-capstone">Capstone 套件</a>：<code>s5-content-style-v1.j2</code> 绑定 <code>content-golden.jsonl</code>。primary：<code>tone_rubric</code>；guardrail：<code>forbidden_hits</code>、<code>dedup_rate</code>。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">jinja</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-jinja">{# s5-content-style-v1.j2 #}
+{% include "shared/tone-compliance.yaml" %}
+{% include "shared/forbidden-phrases.yaml" %}
+&lt;system&gt;
+你是 CorpAssist 内容创作助手（S5）。创意表达允许，数字与政策仅来自 verified_facts。
+&lt;/system&gt;</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>评测指标</th><th>离线 golden</th><th>发版闸门</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>tone_rubric</td><td>review prompt 均分</td><td>≥ 4.0</td></tr>
+          <tr><td>forbidden_hits</td><td>禁用语子集</td><td>0 条 P0</td></tr>
+          <tr><td>dedup_rate</td><td>句对相似度 &gt;0.92</td><td>≤ 5%</td></tr>
+          <tr><td>factuality</td><td>与 verified_facts 对齐</td><td>≥ 0.90</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// Spring · S5 内容服务路由
+@Service
+public class ContentPromptService {
+  public String renderS5(ContentRequest req) {
+    return promptRegistry.load("s5-content-style-v1.j2")
+        .render(Map.of(
+            "audience", req.audience(),  // BFF 注入，非 user
+            "channel", req.channel(),
+            "max_words", req.maxWords(),
+            "verified_facts", factsService.forTopic(req.topic())
+        ));
+  }
+}</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>S5 全链路（Prompt 视角）</h5>
+        <pre class="mermaid">flowchart TB
+  BFF[BFF personalize var] --> Plan[longform plan]
+  Plan --> Sec[section prompts]
+  Sec --> Dedup[dedup prompt]
+  Dedup --> Rev[review JSON]
+  Rev -->|fail| Repair[section repair]
+  Rev -->|pass| Safe[content safety API]
+  Safe --> Pub[发布/人工]</pre>
+      </div>
+    </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="production-prompt-engineering_advanced06">
@@ -247,6 +338,8 @@ assert safety.passed</code></pre>
               <li>如何在不牺牲创意的前提下防止营销文案瞎编数据？</li>
               <li>review 四维里哪一维最适合做 A/B primary 指标？</li>
               <li>S5 与 S1 在 Capstone 里如何共享 tone 又不共享引用规则？</li>
+              <li>dedup 用 embedding 阈值 0.92 还是纯 Prompt，如何选型？</li>
+              <li>verified_facts 与创意段落混写导致事实错误，Prompt 如何分区？</li>
             </ol>
           </div>
         </details>
@@ -279,8 +372,9 @@ assert safety.passed</code></pre>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
       <li>阅读 <code>demos/advanced-06-content-generation-lab/content-prompt-chain.md</code>，补全 plan/dedup/review 三步 Prompt 标题（对照「长文规划与去重」「质量评估流水线」节）。</li>
-      <li>设计 4 个 <span class="term" data-term-id="personalize-var" tabindex="0">personalize var</span> 及合法取值枚举。</li>
-      <li>写 review prompt 的 JSON 输出 schema（含 4 维分数）。</li>
+      <li>设计 4 个 <span class="term" data-term-id="personalize-var" tabindex="0">personalize var</span> 及合法取值枚举（对照「个性化参数」列表，禁止 user 覆盖）。</li>
+      <li>写 review prompt 的 JSON 输出 schema（含 4 维分数，参照「质量评估流水线」JSON 示例）。</li>
+      <li>为 S5 填一行 Capstone registry 条目（path、eval、primary 指标，参照「Capstone 与评测」表）。</li>
       <li>完成本章测验。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
@@ -301,10 +395,18 @@ assert safety.passed</code></pre>
           </details>
         </div>
       </li>
+      <li>
+        <p class="judgment-stem">S5 长文 dedup 后 tone 分下降，应回滚 dedup prompt 还是 review 阈值？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>先看 <code>fix_hints</code> 是否指向 dedup 改写过度。若 dedup 破坏语调，收紧 dedup prompt「保留原表述优先」或降低 embedding 阈值；不应单纯降低 review 阈值放行低质量稿。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：S5 内容 Prompt 链</h4>
-      <p>目录：<code>demos/advanced-06-content-generation-lab/</code>（<code>content-prompt-chain.md</code>）。<strong>验收</strong>：三步 Prompt 标题完整；review schema 含 4 维分数。</p>
+      <p>目录：<code>demos/advanced-06-content-generation-lab/</code>（<code>content-prompt-chain.md</code>、<code>review-schema.json</code>）。<strong>验收</strong>：三步 Prompt 标题完整；review schema 含 4 维分数；personalize 4 变量含 BFF 注入说明。</p>
     </div>
   </div>
 

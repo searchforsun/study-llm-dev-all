@@ -19,6 +19,15 @@
           <li>在 5 分钟内口述完整排障案例（含指标）</li>
         </ul>
       </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>先分层</strong>：检索 → 模型 → Prompt → 数据，勿跳步。</li>
+          <li><strong>固定检索对比</strong>：证明 Prompt 根因的金标准实验。</li>
+          <li><strong>小步单层改写</strong>：每步 golden 子集 50 条。</li>
+          <li><strong>口述必报数</strong>：metric delta + rollback tag，不说「感觉好了」。</li>
+        </ul>
+      </div>
     </div>
 
     <div class="section-block">
@@ -129,6 +138,30 @@
 
       <p><span class="term" data-term-id="debug-prompt" tabindex="0">debug prompt</span> 技巧：在 staging 加「请先列出你将引用的 chunk_id，再生成答案」的 CoT 中间步，便于定位是检索空还是生成违例。</p>
 
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## debug-prompt（staging 专用，非生产）
+在回答前先输出 JSON：
+{ "chunk_ids": ["doc-12#p3"], "will_refuse": false }
+然后再生成用户可见答案。用于定位 faithfulness 下跌根因。</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>五段式</th><th>时间分配</th><th>必含关键词</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>现象</td><td>30s</td><td>prompt_version、指标、反馈渠道</td></tr>
+          <tr><td>假设</td><td>45s</td><td>检索/模型/Prompt 各 1 条</td></tr>
+          <tr><td>验证</td><td>60s</td><td>diff、固定 chunk A/B、trace</td></tr>
+          <tr><td>改动</td><td>90s</td><td>before/after、单层改动理由</td></tr>
+          <tr><td>结果</td><td>45s</td><td>metric delta、rollback tag、canary</td></tr>
+        </tbody>
+      </table>
+
       <div class="learn-interview">
         <details>
           <summary>答辩 / 面试口述题</summary>
@@ -178,6 +211,11 @@ query_order: 只读；po_number 格式 PO-YYYY-NNN；勿与 create_refund 混用
       </table>
 
       <p>五段式口述示例（S1 faithfulness 下跌）：「v3.1 发版后 faithfulness 0.89→0.72；假设 System 裁剪引用指令；diff 证实 context-only 段缺失；恢复 v3.1.1 仅补 System 两行；faithfulness 回 0.88，保留 v3.0 tag 作 rollback。」</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：tool 误调应先改 description 还是 System 白名单？</summary>
+        <p>多数场景<strong>先改 tool description</strong>（边界、反例、与相似工具区分），再补 System「只读意图禁止 mutating 工具」。若 description 已清晰仍误调，再查 few-shot 或意图分类 Prompt。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -198,6 +236,68 @@ query_order: 只读；po_number 格式 PO-YYYY-NNN；勿与 create_refund 混用
       </table>
     </div>
 
+    <div class="section-block">
+      <h3>案例四 · 注入防护回退</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">面试题 · shared injection 块误删</span>
+        发版 <code>prompts-suite-v1.4.1</code> 合并时误删 <code>injection-guard.yaml</code> 一行规则。injection_block_rate 从 0.98 跌至 0.89，P0 红队 case RT-01 失败。
+      </aside>
+      <p>排障：先跑 <code>eval/injection.jsonl</code> 对比 v1.4.0/v1.4.1；diff shared 块而非单场景模板。修复：恢复 include + 热修 tag v1.4.2；<strong>整体 rollback</strong> 至 v1.4.0 作备选（见 <a href="#ch-advanced-04-capstone">跨场景依赖</a>）。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>v1.4.0</th><th>v1.4.1</th><th>v1.4.2</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>injection_block_rate</td><td>0.98</td><td>0.89</td><td>0.97</td></tr>
+          <tr><td>system_leak_rate</td><td>0</td><td>0.02</td><td>0</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：只 rollback S1 RAG、不 rollback S2，合理吗？</summary>
+        <p><strong>不合理</strong>。shared injection 块三场景共用；应 suite 级 tag 回滚或全场景同步热修，避免 S2 仍暴露而 S1 已恢复。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Trace 排查清单</h3>
+      <p>线上坏例优先拉 trace（Langfuse / 自研），按字段逐项排除：</p>
+      <ol>
+        <li><code>prompt_version</code> 是否与 registry 一致</li>
+        <li><code>retrieved_chunk_count</code> 是否为 0 或骤降</li>
+        <li>System token 长度是否较上版缩短（裁剪嫌疑）</li>
+        <li>工具调用 name 是否与意图匹配（Agent）</li>
+        <li>输出 filter 是否命中但未 block（配置漂移）</li>
+        <li>repair-loop 次数是否异常升高（结构化输出章节）</li>
+      </ol>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## 排障报告模板（debug-case.md）
+1. 现象：版本 / 指标 / 时间窗
+2. 假设：检索 | 模型 | Prompt | 数据
+3. 验证：trace ID、diff 链接、固定 chunk 实验
+4. 改动：before/after（单层）
+5. 结果：metric delta、rollback tag、canary 计划</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>场景</th><th>首选 primary 指标</th><th>典型 Prompt 改动层</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>S1 RAG</td><td>faithfulness</td><td>System 引用/拒答</td></tr>
+          <tr><td>S2 Agent</td><td>tool_acc</td><td>tool description</td></tr>
+          <tr><td>S5 内容</td><td>tone_rubric</td><td>shared tone include</td></tr>
+          <tr><td>注入</td><td>injection_block_rate</td><td>shared injection-guard</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <div class="section-block learn-review-block">
       <h3>复习与自检</h3>
       <div class="learn-checklist" data-storage-key="production-prompt-engineering_advanced07">
@@ -211,16 +311,6 @@ query_order: 只读；po_number 格式 PO-YYYY-NNN；勿与 create_refund 混用
           <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
         </ul>
       </div>
-    </div>
-
-    <div class="section-block chapter-conclusions-block notice">
-      <h3>本章结论</h3>
-      <ul class="chapter-conclusions-list">
-        <li>排障先分层（检索/模型/Prompt/数据）；<span class="term" data-term-id="bad-prompt-triage" tabindex="0">bad prompt triage</span> 有固定检查顺序。</li>
-        <li><span class="term" data-term-id="rewrite-strategy" tabindex="0">rewrite strategy</span> 小步单层改动，每步 golden 子集验证。</li>
-        <li>口述必报 <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span> 与回滚 tag，避免无指标「已修好」。</li>
-        <li><span class="term" data-term-id="answer-template" tabindex="0">answer template</span> 五段式适用于 S1/S2/S5 坏例答辩。</li>
-      </ul>
       <div class="learn-cheat-sheet">
         <details>
           <summary>本章速查卡</summary>
@@ -237,6 +327,29 @@ query_order: 只读；po_number 格式 PO-YYYY-NNN；勿与 create_refund 混用
           </div>
         </details>
       </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题（复习）</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>固定检索 chunk 对比两版 Prompt，如何设计实验？</li>
+              <li>shared 块变更导致 injection 失败，rollback 粒度选 suite 还是单场景？</li>
+              <li>五段式口述如何控制在 5 分钟内？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">课程收官：结合 <a href="#ch-advanced-04-capstone">Capstone 套件</a> 做完整答辩演练；坏例库可并入 <code>eval/debug-cases.jsonl</code> 持续回归。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li>排障先分层（检索/模型/Prompt/数据）；<span class="term" data-term-id="bad-prompt-triage" tabindex="0">bad prompt triage</span> 有固定检查顺序。</li>
+        <li><span class="term" data-term-id="rewrite-strategy" tabindex="0">rewrite strategy</span> 小步单层改动，每步 golden 子集验证。</li>
+        <li>口述必报 <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span> 与回滚 tag，避免无指标「已修好」。</li>
+        <li><span class="term" data-term-id="answer-template" tabindex="0">answer template</span> 五段式适用于 S1/S2/S5 坏例答辩。</li>
+      </ul>
     </div>
   </div>
 
@@ -253,9 +366,11 @@ query_order: 只读；po_number 格式 PO-YYYY-NNN；勿与 create_refund 混用
     <p class="steps-intro">用五段式完成 1 页 Prompt 排障报告，含 before/after 与 metric delta。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>阅读 <code>demos/advanced-07-interview-lab/debug-case.md</code>，用五段式写 1 页排障报告（对照「答题模板」节）。</li>
-      <li>为 faithfulness 下降案例写 before/after System diff（≥ 2 行）。</li>
-      <li>录音 5 分钟口述，自检是否含 metric delta 与回滚预案。</li>
+      <li>阅读 <code>demos/advanced-07-interview-lab/debug-case.md</code>，按「答题模板」五段式写 1 页排障报告。</li>
+      <li>对照「坏例分析」节 <span class="term" data-term-id="bad-prompt-triage" tabindex="0">bad prompt triage</span> 顺序，在报告中列检索/模型/Prompt/数据四层排除过程。</li>
+      <li>为 faithfulness 下降写 before/after System diff（≥ 2 行，遵循「改写策略」单层小步原则）。</li>
+      <li>填写「指标变化」节格式 <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span> 表（发版前/坏例/修复后四列）。</li>
+      <li>录音 5 分钟口述，自检 rollback tag 与 canary 计划（参照「答题模板」时间分配表）。</li>
       <li>完成本章测验。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
@@ -268,10 +383,26 @@ query_order: 只读；po_number 格式 PO-YYYY-NNN；勿与 create_refund 混用
           </details>
         </div>
       </li>
+      <li>
+        <p class="judgment-stem">排障时先改模型温度还是先 diff Prompt？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>先确认发版变更清单。若仅 Prompt tag 变更，优先 diff Prompt + 固定检索实验；温度/模型变更应作为独立假设，<strong>勿与 Prompt 改写同批</strong>，否则无法归因 <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span>。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">口述只讲「我加了引用指令就好了」而不报数，面试会扣什么分？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>缺可验证性：无 faithfulness/citation 前后对比、无 rollback tag、无 canary 计划。应报 v3.1→v3.1.1 的 metric delta 表，体现工程化 <span class="term" data-term-id="rewrite-strategy" tabindex="0">rewrite strategy</span>。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：Prompt 排障案例实验室</h4>
-      <p>目录：<code>demos/advanced-07-interview-lab/</code>（<code>debug-case.md</code>）。<strong>验收</strong>：五段式报告 1 页；含 before/after diff 与 metric 表。</p>
+      <p>目录：<code>demos/advanced-07-interview-lab/</code>（<code>debug-case.md</code>、<code>metric-delta-template.md</code>）。<strong>验收</strong>：五段式报告 1 页；含 before/after diff、metric 表与 rollback tag。</p>
     </div>
   </div>
 

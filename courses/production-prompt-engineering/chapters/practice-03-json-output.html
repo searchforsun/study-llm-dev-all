@@ -210,11 +210,99 @@ throw new TicketParseException("repair exhausted");</code></pre>
         <summary>先想 10 秒：只用 OpenAI JSON mode，能否省略 repair-loop？</summary>
         <p><strong>不能省略校验</strong>。JSON mode 提高语法正确率，但 enum/pattern/业务规则仍可能违例；生产必须 <span class="term" data-term-id="output-validate" tabindex="0">output validate</span> + 有上限的 <span class="term" data-term-id="repair-loop" tabindex="0">repair loop</span>，失败降级人工。</p>
       </details>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>方式</th><th>优点</th><th>局限</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Prompt-only schema-inject</td><td>模型无关、可审计 diff</td><td>围栏/enum 仍可能错</td><td>默认路径，配合 repair</td></tr>
+          <tr><td>原生 response_format</td><td>语法正确率高</td><td>enum/业务规则不保证</td><td>可选叠加，不替代 validate</td></tr>
+          <tr><td>BeanOutputConverter / with_structured_output</td><td>与 DTO 绑定紧</td><td>双栈需同源 schema</td><td>Java/Python 共用 ticket-schema.json</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># ticket-service 业务规则（output-validate 语义层）
+rules:
+  - when: priority == P1
+    require: order_id
+    message: "P1 工单必须含 order_id"
+  - when: intent == refund
+    require: summary.length &gt;= 20
+  - when: order_id present
+    pattern: ^PO-\d{4}-\d+$</code></pre>
+      </div>
+    </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># strip_markdown_fence · repair-loop 前置
+import re
+def strip_markdown_fence(raw: str) -> str:
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    return m.group(1).strip() if m else raw.strip()</code></pre>
+      </div>
+
+      <p>CI 在 Prompt PR 上对 <code>broken-samples.json</code> 跑 repair 推演，确保 schema-inject 模板变更不会提高 repair 次数均值。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈同源</h3>
+      <p><code>ticket-schema.json</code> 为单一事实来源：OpenAPI 生成 Java record、Python Pydantic、Prompt schema-inject 三处引用同文件。semver 变更 schema 时三处同步 PR，避免模型输出与 ITSM 契约漂移。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>产物</th><th>生成方式</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ticket-schema.json</td><td>手写 + JSON Schema 校验</td></tr>
+          <tr><td>CorpAssistTicket.java</td><td>openapi-generator / 手工对齐</td></tr>
+          <tr><td>json-schema-prompt.md</td><td>CI 嵌入 schema 哈希</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="section-block">
       <h3>CorpAssist 工单</h3>
       <p>端到端：<code>dialog-orchestrator</code> 在多轮结束后调用 <code>ticket-json</code> 专用模板（版本 <code>ticket-v1.2</code>），经 repair-loop 得到对象，POST 至 <code>ticket-service</code>。失败进人工队列并记录 <code>prompt_version</code> 便于 <a href="#ch-practice-04-ab-test">A/B</a> 回滚。</p>
+
+      <div class="mermaid-wrap">
+        <h5>对话 → 工单 JSON 端到端</h5>
+        <pre class="mermaid">flowchart LR
+  D[多轮对话结束] --> T[ticket-v1.2 template]
+  T --> G[LLM + schema-inject]
+  G --> R{repair-loop}
+  R -->|通过| V[output-validate]
+  V -->|OK| ITSM[ticket-service POST]
+  V -->|fail| R
+  R -->|exhaust| Q[人工队列 + trace]</pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "intent": "shipping",
+  "priority": "P2",
+  "summary": "客户询问 PO-2024-889 物流状态，ERP 504 后已转人工跟进。",
+  "order_id": "PO-2024-889"
+}</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · repair 耗尽降级</span>
+        模型连续 3 次输出 <code>priority: "high"</code>，repair-loop 耗尽。编排器将原始对话 + 最后一次 raw 输出写入人工队列，trace 标记 <code>ticket_parse_failed</code> 与 <code>prompt_version=ticket-v1.2</code>，供 <a href="#ch-practice-04-ab-test">json_pass_rate</a> 监控。
+      </aside>
 
       <div class="notice">
         <strong>关键术语速览</strong>
@@ -270,6 +358,8 @@ throw new TicketParseException("repair exhausted");</code></pre>
               <li>Schema 与 Java DTO 如何保持同源？</li>
               <li>repair 3 次仍失败，降级路径是什么？</li>
               <li>Python LangChain 与 Spring BeanOutputConverter 如何共用 schema 文件？</li>
+              <li>P1 工单缺 order_id，应在 repair 第几次拦截？业务层还是 schema 层？</li>
+              <li>如何监控 json_pass_rate 与 repair_count 以驱动 Prompt 迭代？</li>
             </ol>
           </div>
         </details>
@@ -293,10 +383,11 @@ throw new TicketParseException("repair exhausted");</code></pre>
     <p class="steps-intro">完善 ticket-schema.json 与 repair-loop 伪代码，并完成 2 个坏 JSON 修复推演。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>打开 <code>demos/practice-03-json-output-lab/ticket-schema.json</code>，补全 enum 与 pattern。</li>
-      <li>编写 <code>json-schema-prompt.md</code>：schema-inject 模板 + 「仅 JSON」禁令。</li>
-      <li>对 <code>broken-samples.json</code> 中 2 条坏输出，写 repair user 消息。</li>
-      <li>列出 output-validate 业务规则 3 条（如 P1 必含 order_id，对照「校验」节）。</li>
+      <li>打开 <code>demos/practice-03-json-output-lab/ticket-schema.json</code>，补全 enum 与 pattern（对照「JSON schema」节完整 Schema 示例）。</li>
+      <li>编写 <code>json-schema-prompt.md</code>：schema-inject 模板 + 「仅 JSON」禁令（参照 Python Jinja 片段）。</li>
+      <li>对 <code>broken-samples.json</code> 中 2 条坏输出，写 repair user 消息（参照「修复循环」priority 枚举漂移场景）。</li>
+      <li>列出 output-validate 业务规则 3 条（对照「校验」节 YAML rules 与 P1/order_id 表）。</li>
+      <li>对照「response_format vs Prompt-only」表，说明 CorpAssist 默认选型及理由。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
@@ -316,10 +407,18 @@ throw new TicketParseException("repair exhausted");</code></pre>
           </details>
         </div>
       </li>
+      <li>
+        <p class="judgment-stem">模型输出合法 JSON 但 intent 为 <code>refund</code>、summary 仅 5 字，能否直接 POST ticket-service？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不能</strong>。语法通过不等于语义通过；<span class="term" data-term-id="output-validate" tabindex="0">output validate</span> 业务层要求 refund 场景 summary ≥ 20 字。应触发 repair 或降级人工，不可裸 POST。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：工单 JSON 实验</h4>
-      <p>目录：<code>demos/practice-03-json-output-lab/</code>（<code>ticket-schema.json</code>、<code>broken-samples.json</code>）。<strong>验收</strong>：schema 含 enum/pattern；2 条坏 JSON 各有 repair user 消息。</p>
+      <p>目录：<code>demos/practice-03-json-output-lab/</code>（<code>ticket-schema.json</code>、<code>broken-samples.json</code>、<code>business-rules.yaml</code>）。<strong>验收</strong>：schema 含 enum/pattern；2 条坏 JSON 各有 repair user 消息；业务规则 3 条与 YAML 示例一致。</p>
     </div>
   </div>
 
