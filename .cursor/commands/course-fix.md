@@ -1,51 +1,33 @@
-# 按优化方案执行课程改进（多 Agent）
+# 课程修复
 
-读取 `optimization-plan.json`，并行派发子 Agent 改稿，每批完成后重跑 Gate 并迭代（最多 2 轮/章）。
-
-## 参数
-
-- **必填**：课程 slug
-- **可选**：`--tasks T1,T3` 仅执行指定任务；`--max-rounds 2` 返工上限
+按评审待办或用户指定范围改稿，并按 skill 回归 Gate。
 
 ## 前置
 
-1. 确认 `agent-workspace/course-quality/<slug>/optimization-plan.json` 存在；否则先 `/course-review`。
-2. 读取 `programming-html-tutorial` skill（工作流 B + delivery-review + chapter-authoring）。
+1. 读取 skill：`programming-html-tutorial/SKILL.md`
+2. `<skill-root>` 解析顺序见 `/course-gate`
+3. 打开 `reference/workflow-b-checklist.md`、`reference/delivery-review.md`
+4. 有待办清单（来自 `/course-review`）或用户明确修改范围
 
-## 执行流程
+## 执行
 
-### 1. 并行改稿
-
-按 `tasks[].assignedAgent` 分组，同章串行、异章并行：
-
-| assignedAgent | 职责 |
-|---------------|------|
-| `chapter-writer` | `chapters/<id>.html` |
-| `quiz-writer` | `quiz.partial.html` + `course.json.quizzes` |
-| `continuity-editor` | 跨章引用、CorpAssist 叙事 |
-| `terms-enricher` | `course.json.terms` |
-| `demo-fixer` | `demos/*/README.md` |
-
-### 2. 每批 Gate 回归
+1. 按 **工作流 B-修订** 修改源文件（`chapters/`、`quiz.partial.html`、`course.json`、`demos/` 等；细则见 skill reference，此处不列）
+2. 涉及 demo 时：改完后执行 lab README 中的验收命令
+3. 每批改完回归 Gate（命令见 `delivery-review.md`）：
 
 ```bash
 node <skill-root>/scripts/assemble-index.mjs --dir courses/<slug>
-node <skill-root>/scripts/validate-tutorial.mjs --dir courses/<slug> --strict
-node <skill-root>/scripts/review-chapter.mjs --dir courses/<slug> --strict
+node <skill-root>/scripts/validate-tutorial.mjs --dir courses/<slug> [--strict]
+node <skill-root>/scripts/review-chapter.mjs --dir courses/<slug> [--strict]
 ```
 
-- 全过 → Gate 3 快速复检
-- 仍失败 → 失败章再开 1 轮（计入 max-rounds）
-- 更新 `optimization-plan.json` 中 `tasks[].status`
+4. 正文大改时补做 Gate 3（`chapter-quality-rubric.md`）；demo 变更时补做 lab 验收
+5. 失败则返工，同一章/lab 遵循 skill 返工上限
 
-### 3. 产出
+## 产出
 
-写入 `agent-workspace/course-quality/<slug>/optimization-result.md`（摘要、变更文件、未解决项）。
+`agent-workspace/course-quality/<slug>/` 下简要记录：已完成任务、Gate 结果、变更文件路径。
 
-## 改稿硬约束
+## 交付
 
-1. 只改源 fragment，不手改 `index.html`
-2. UTF-8；必填 DOM 块见 chapter-blocks-policy.md
-3. 每章 5 道测验（单选/多选/填空）
-4. 概念章：Mermaid + learn-compare + learn-scenario
-5. 实践章：代码块 + steps-operate + demo-box
+全部 blocking 项清除后，使用 `delivery-review.md` §通过时话术。

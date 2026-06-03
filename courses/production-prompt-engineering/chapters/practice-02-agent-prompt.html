@@ -1,4 +1,4 @@
-<section id="ch-practice-02-agent-prompt" class="chapter" data-chapter="practice-02-agent-prompt">
+﻿<section id="ch-practice-02-agent-prompt" class="chapter" data-chapter="practice-02-agent-prompt">
   <header class="chapter-header">
     <h2><span class="chapter-done-badge">已完成</span>Agent 与工具 Prompt</h2>
     <button type="button" class="btn-mark-done" data-chapter="practice-02-agent-prompt" aria-label="标记本章完成">标记完成</button>
@@ -109,6 +109,28 @@ PromptTemplate agentSystemPrompt() {
           </ul>
         </div>
       </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># tools/agent-tools.yaml · 与 OpenAPI 对齐
+- name: query_erp_order
+  description: |
+    按采购单号查询 ERP 订单状态。po_number 格式 PO-YYYY-NNN。
+    404=单号不存在；504=网关超时，最多重试 1 次后转人工。
+    勿用于客户名模糊搜索（请用 search_order_by_customer）。
+  parameters:
+    type: object
+    required: [po_number]
+    properties:
+      po_number:
+        type: string
+        pattern: ^PO-\d{4}-\d{3,}$</code></pre>
+      </div>
+
+      <p>Spring <code>@Tool</code> 的 description 应与 YAML 同源生成（或 CI 校验一致），避免 Java 注解与 LangChain 侧描述分叉。</p>
     </div>
 
     <div class="section-block">
@@ -146,6 +168,22 @@ Thought: 需先查 PO 状态再决定是否发邮件
 Action: query_erp_order
 Action Input: {"po_number": "PO-2024-889"}</code></pre>
       </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>任务复杂度</th><th>建议 plan 步数</th><th>max_steps</th><th>示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>单工具查询</td><td>0～1（可省略 Plan）</td><td>3</td><td>查 PO 状态</td></tr>
+          <tr><td>查单 + 通知</td><td>2～3</td><td>5</td><td>查 ERP → 发邮件</td></tr>
+          <tr><td>多系统编排</td><td>3～5</td><td>6～8</td><td>查单 → 建工单 → 更新 CRM</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：用户只问「PO-889 到哪了」，需要 Plan 块吗？</summary>
+        <p>单工具单步可省略显式 Plan，但 System 仍应写「简单查询可直接 Action」。多步 S2 必须 plan-steps，否则模型易跳步或循环调工具。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -156,6 +194,34 @@ Action Input: {"po_number": "PO-2024-889"}</code></pre>
       </aside>
 
       <p><span class="term" data-term-id="retry-hint" tabindex="0">retry hint</span> 写在 system：429/503 可间隔重试 1 次；404 禁止重试；参数校验失败应修正 JSON 而非换工具。Observation 模板应结构化：<code>{"ok": false, "code": "504", "hint": "..."}</code>。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>错误码</th><th>Prompt 策略</th><th>用户可见话术</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>404</td><td>禁止重试；请用户核对单号</td><td>「未找到该 PO，请确认格式 PO-YYYY-NNN」</td></tr>
+          <tr><td>429/503</td><td>retry-hint：间隔 2s，最多 1 次</td><td>「系统繁忙，正在重试…」</td></tr>
+          <tr><td>504</td><td>重试 1 次后转人工</td><td>「ERP 响应超时，已为您转接专员」</td></tr>
+          <tr><td>400 参数</td><td>修正 Action Input JSON</td><td>不暴露内部字段名</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># agent-system 片段 · failure-recovery
+tool_errors:
+  "504":
+    retry: 1
+    then: escalate_human
+    user_message_id: CS-ERP-TIMEOUT-01
+  "404":
+    retry: 0
+    user_message_id: CS-PO-NOT-FOUND-01</code></pre>
+      </div>
 
       <div class="learn-compare">
         <div class="learn-compare-col learn-compare-bad">
@@ -192,10 +258,44 @@ Action Input: {"po_number": "PO-2024-889"}</code></pre>
         </tbody>
       </table>
 
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Agent Prompt 只在 Python Notebook 迭代、Spring 硬编码字符串，风险？</summary>
+        <p>双栈 Prompt 漂移；生产行为与实验不一致。应 Git 共享 <code>agent-system-v*.md</code> 与工具 YAML，Spring 只加治理（步数熔断、IAM），见 <span class="term" data-term-id="dual-agent" tabindex="0">dual agent</span> 节。</p>
+      </details>
+
+      <p>联调 checklist：① Python agent 与 Spring 使用同一 <code>PROMPT_TAG</code>；② 工具白名单一致；③ trace 中 <code>prompt_version</code> 与 registry 对齐；④ 504 recovery 话术 ID 与 CMS 模板同步。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>验收项</th><th>Python 侧</th><th>Spring 侧</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Prompt 哈希</td><td><code>sha256(agent-system-v1.4.md)</code></td><td>ConfigMap 同哈希</td></tr>
+          <tr><td>工具数</td><td>LangChain tools 列表</td><td><code>tools_whitelist</code> 长度一致</td></tr>
+          <tr><td>504 话术</td><td>Notebook 推演通过</td><td>CMS <code>CS-ERP-TIMEOUT-01</code> 存在</td></tr>
+        </tbody>
+      </table>
+
       <div class="notice">
         <strong>关键术语速览</strong>
         <p><span class="term" data-term-id="tool-desc-spec" tabindex="0">tool desc spec</span> · <span class="term" data-term-id="plan-steps" tabindex="0">plan steps</span> · <span class="term" data-term-id="failure-recovery" tabindex="0">failure recovery</span> · <span class="term" data-term-id="agent-prompt" tabindex="0">agent prompt</span> · <span class="term" data-term-id="tool-schema-prompt" tabindex="0">tool schema prompt</span> · <span class="term" data-term-id="react-format" tabindex="0">react format</span> · <span class="term" data-term-id="retry-hint" tabindex="0">retry hint</span> · <span class="term" data-term-id="dual-agent" tabindex="0">dual agent</span></p>
       </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># agent-runtime 生产配置（Spring）
+corpassist:
+  agent:
+    prompt_ref: classpath:prompts/agent-system-v1.4.md
+    tools_whitelist: [query_erp_order, search_order_by_customer]
+    max_steps: 6
+    tenant_isolation: true</code></pre>
+      </div>
+
+      <p>Python 侧 <code>langgraph dev</code> 使用同路径 Git submodule；Notebook 评测通过后升 semver，Spring 只更新 <code>prompt_ref</code> 与 <code>max_steps</code>，不改自然语言正文。</p>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -221,6 +321,35 @@ Action Input: {"po_number": "PO-2024-889"}</code></pre>
           <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
         </ul>
       </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>主题</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>tool-desc-spec</td><td>用途+参数+失败码+反例</td></tr>
+                <tr><td>plan-steps</td><td>先 Plan 再 Action，max_steps 熔断</td></tr>
+                <tr><td>retry-hint</td><td>按 HTTP 码分支，504 转人工</td></tr>
+                <tr><td>dual-agent</td><td>Git 共享 Prompt，Spring 管治理</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Agent 乱调 <code>create_refund</code> 而非 <code>query_order</code>，你先改工具描述还是 System？</li>
+              <li>如何写 504 的 failure-recovery 避免模型 hallucinate「已发货」？</li>
+              <li>Python 实验 Agent 与 Spring 生产 Agent 的 Prompt 如何同步？</li>
+              <li>ReAct Thought 能否省略？什么场景必须保留？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
       <p class="chapter-review-next">下一步：<a href="#ch-practice-03-json-output">结构化输出 Prompt</a> — 工单 JSON 与修复循环。</p>
     </div>
   </div>
@@ -240,10 +369,11 @@ Action Input: {"po_number": "PO-2024-889"}</code></pre>
     <p class="steps-intro">为 CorpAssist ERP 查询工具补全 tool-desc-spec，并写 agent-system 中的 failure-recovery 段。</p>
     <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
-      <li>打开 <code>demos/practice-02-agent-prompt-lab/tool-desc-checklist.md</code>，勾选 8 项规范。</li>
-      <li>编写 <code>query_erp_order</code> 的完整 description（含 404/504）。</li>
-      <li>在 <code>agent-system-snippet.md</code> 添加 plan-steps 与 retry-hint 段落。</li>
-      <li>桌面推演：504 → 重试 1 次 → 仍失败 → 转人工话术。</li>
+      <li>打开 <code>demos/practice-02-agent-prompt-lab/tool-desc-checklist.md</code>，勾选 8 项规范（对照「工具描述规范」节）。</li>
+      <li>编写 <code>query_erp_order</code> 的完整 description（含 404/504，对照「失败恢复」错误码表）。</li>
+      <li>在 <code>agent-system-snippet.md</code> 添加 plan-steps 与 retry-hint 段落（对照「计划步骤」Mermaid）。</li>
+      <li>桌面推演：504 → 重试 1 次 → 仍失败 → 转人工话术（使用 CS-ERP-TIMEOUT-01 模板）。</li>
+      <li>对照 <code>tools/agent-tools.yaml</code>，确认 tool-schema 与 OpenAPI 字段名一致。</li>
     </ol>
     <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
@@ -255,15 +385,31 @@ Action Input: {"po_number": "PO-2024-889"}</code></pre>
           </details>
         </div>
       </li>
+      <li>
+        <p class="judgment-stem">工具 description 写「查询订单」够吗？还缺什么？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不够。缺 <code>po_number</code> 格式、404/504 语义、何时改用 <code>search_order_by_customer</code>。违反 <span class="term" data-term-id="tool-desc-spec" tabindex="0">tool desc spec</span> 会导致错参与高 retry。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">用户说「查 PO-889 并邮件通知采购」，Agent 应调几个工具？Plan 怎么写？</p>
+        <div class="learn-practice-answer">
+          <details><summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>至少 2 步：<code>query_erp_order</code> → <code>send_email</code>（若状态满足条件）。Plan 应显式列出两步；max_steps 建议 5。若第一步 504，按 failure-recovery 转人工，<strong>禁止</strong>在未确认状态时发邮件。</p></div>
+          </details>
+        </div>
+      </li>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：Agent Prompt 实验</h4>
-      <p><code>demos/practice-02-agent-prompt-lab/</code> — checklist 8/8；agent-system 含 recovery 段。</p>
+      <p>目录：<code>demos/practice-02-agent-prompt-lab/</code>（<code>tool-desc-checklist.md</code>、<code>agent-system-snippet.md</code>、<code>tools/agent-tools.yaml</code>）。<strong>验收</strong>：checklist 8/8；agent-system 含 recovery 段；504 推演含转人工话术；YAML 与 OpenAPI 字段名一致。</p>
     </div>
   </div>
 
   <div class="resources content-section">
-    <h3>延伸学习</h3>
+    <h4 class="resources-title">延伸学习</h4>
     <ul>
       <li><a href="#ch-practice-01-rag-prompt">RAG 专用 Prompt</a></li>
       <li><a href="#ch-practice-03-json-output">结构化输出 Prompt</a></li>

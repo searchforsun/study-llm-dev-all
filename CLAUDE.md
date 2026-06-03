@@ -83,58 +83,20 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 | `enrich-term-prompts.mjs` | Complete term tip/prompt fields |
 | `fix-course-ref-links.mjs` | Batch-fix cross-course link markup in chapters/welcome |
 
-### Reference example: chapter depth & breadth
+### Reference example & quality gates (skill is SSOT)
 
-The skill's `example/java-distributed-architecture/` is the **gold standard** for all courses. When generating or reviewing chapters, match these thresholds:
+Do **not** duplicate chapter DOM / quiz HTML templates here — follow the skill package:
 
-**Scale targets:**
-- 15 chapters per course (3 phases × 5 chapters each) — but follow the spec's `outline` for each specific course
-- 380–500 lines per chapter HTML fragment (the example ranges from 381 to 499 lines)
-- ~25–30 term entries per course with detailed AI explanation prompts
-- 5 quiz questions per chapter (mix of single-choice, multi-choice, fill-in-the-blank)
+| Topic | Where |
+|-------|--------|
+| Example course (structure & density) | `.cursor/skills/programming-html-tutorial/example/java-distributed-architecture/` |
+| Chapter count / outline | `courses/outline-specs.json` → this course's `course.json` → `outline` |
+| Authoring & required blocks | skill `reference/chapter-authoring.md`, `chapter-blocks-policy.md` |
+| Gate 2 numeric thresholds | skill `config/chapter-quality.json` (**JSON wins** over prose) |
+| Gate 3 semantic review | skill `reference/chapter-quality-rubric.md` |
+| Cursor commands | `/course-gate`, `/course-review`, `/course-fix`, `/course-pipeline` (see `.cursor/commands/`) |
 
-**Mandatory chapter DOM blocks (every chapter must have all of these):**
-- `chapter-header` → title + `.chapter-done-badge` + `.btn-mark-done`
-- `.chapter-intro` → `.chapter-meta` (time, phase, competency) + `.notice-why-learn` + `.notice-outcome` + key-points (3 items)
-- Multiple `.section-block` subsections, each with `h3` + rich content
-- `.chapter-conclusions-block` → conclusion list
-- `.learn-review-block` → `.learn-checklist` (checkbox items) + `.learn-cheat-sheet` (concept table) + `.learn-interview` (defense/interview Q&A)
-- `.official-links` → links to official docs
-- `.chapter-practice` → `.steps-operate` (numbered steps) + `.steps-judgment-list` (judgment exercises with `<details>` answers) + `.demo-box`
-- `.resources` → extended reading + next chapter link
-
-**Content richness per section (match the example's density):**
-- Inline `<span class="term" data-term-id="...">` glossary terms (linked to `course.json` terms)
-- `<aside class="learn-scenario">` for business context (tied to the unified case study)
-- `<div class="learn-compare">` for "bad vs good" comparison tables
-- Mermaid diagrams (`<pre class="mermaid">`) for architecture/flow visualization
-- `<details class="learn-micro-check">` for "think first" reflection boxes
-- `<div class="role-cards">` for structured info cards
-
-**Quiz pattern (in `quiz.partial.html` or `quiz-partial/*.html`):**
-```html
-<article class="quiz-item" data-qid="q{N}" data-answer="...">
-  <p class="stem"><strong>N.</strong> （类型·单选/多选/填空）题目</p>
-  <!-- options for single/multi; input.fill-input for fill -->
-  <div class="quiz-actions">
-    <button class="btn-check">检查</button>
-    <button class="btn-hint">提示</button>
-    <button class="btn-answer">答案</button>
-  </div>
-  <p class="hint hidden">...</p>
-  <p class="answer hidden"><strong>答案：</strong>...</p>
-</article>
-```
-
-**Term prompt pattern (in `course.json` `terms`):**
-```json
-"term-slug": {
-  "label": "中文标签",
-  "prompt": "我在学习{domain}。请结合{业务案例}场景说明..."
-}
-```
-
-The example's full source is at the skill package path `example/java-distributed-architecture/` — open its `chapters/*.html`, `course.json`, `quiz.partial.html`, and `welcome.partial.html` as direct templates when generating new courses.
+**`<skill-root>` resolution** (same order as `/course-gate`): workspace `.cursor/skills/programming-html-tutorial` → env `PROGRAMMING_HTML_TUTORIAL_SKILL` → `~/.cursor/skills/programming-html-tutorial` → `~/.claude/skills/programming-html-tutorial`.
 
 ### Content rules
 

@@ -1,51 +1,23 @@
-# 课程质量全流程（校验 → 评审 → 优化）
+# 课程质量全流程
 
-一键编排：**Gate 1–2** → **多 Agent 评审** → **按方案优化** → **终检**。
+串联 skill 定义的校验 → 评审 → 修复。
 
-## 参数
+## 前置
 
-- **必填**：课程 slug
-- **可选**：`--skip-fix` 仅评审不改稿；`--tasks T1,T2`；`--chapter <id>`
-
-## 流水线
-
-```
-/course-gate  →  /course-review  →  /course-fix
-                      │                  │
-           optimization-plan.json  optimization-result.md
-```
+读取 `programming-html-tutorial/SKILL.md` 与 `reference/workflows.md` §Gate 总表；`<skill-root>` 见 `/course-gate`。
 
 ## 步骤
 
-### Step 1 — `/course-gate`
+1. `/course-gate` — Gate 1–2 + Gate 1 清单
+2. `/course-review` — Gate 3 + demo 验收（四 Agent）；产出待办清单
+3. `/course-fix` — 按待办改稿并回归 Gate（用户 `--skip-fix` 时跳过）
+4. 终检：Gate 1–3 与 lab 验收均通过，或列出剩余项
 
-运行技能包三条 Gate 命令（`--strict`）。Gate 1 失败则先修结构再继续。
+## 参数
 
-### Step 2 — `/course-review`
+- **必填**：`slug`
+- **可选**：`--skip-fix`；`--chapter <id>`；`--tasks …`（传给 fix 阶段）
 
-并行 Agent A/B/C → 产出 `agent-workspace/course-quality/<slug>/optimization-plan.json`。
+## 产出
 
-若 `overallVerdict` 为 `ready` 且无 blockers → 跳过 Step 3。
-
-### Step 3 — `/course-fix`（除非 `--skip-fix`）
-
-P0 → P1 → P2，每章最多 2 轮返工。
-
-### Step 4 — 终检汇报
-
-| 输出 | 路径 |
-|------|------|
-| 优化方案 | `agent-workspace/course-quality/<slug>/optimization-plan.json` |
-| 执行结果 | `agent-workspace/course-quality/<slug>/optimization-result.md` |
-
-## 环境
-
-- Node.js 18+；技能包路径见 `/course-gate`
-- 参照：`courses/REFERENCE.md`、`courses/outline-specs.json`、金标准 `java-distributed-architecture`
-
-## 示例
-
-```
-/course-pipeline spring-ai-alibaba-engineering
-/course-pipeline spring-ai-alibaba-engineering --skip-fix
-```
+待办与修复记录放在 `agent-workspace/course-quality/<slug>/`（可选，供续跑）。
