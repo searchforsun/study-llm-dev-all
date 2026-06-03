@@ -203,6 +203,18 @@ async def safety_middleware(request: Request, call_next):
           <summary><span class="term" data-term-id="toxic-detect" tabindex="0">Toxic detect</span> 和 Moderation 的关系？</summary>
           <div class="learn-faq-body">Toxic detect 是检测有毒内容的子集（仇恨言论、暴力），Moderation API 覆盖更广（含自残、违法活动等）。CorpAssist 两者并用。</div>
         </details>
+        <details>
+          <summary>四层审核的延迟预算怎么分配？</summary>
+          <div class="learn-faq-body">L1 网关 ~5ms（关键词），L2 Input Advisor ~50ms（Moderation API），L3 Python middleware ~50ms，L4 Output Advisor ~50ms。总预算建议 &lt;200ms；超时走 fail-closed 并记录 audit 事件，勿静默放行。</div>
+        </details>
+        <details>
+          <summary>审核规则放代码还是配置中心？</summary>
+          <div class="learn-faq-body">词库与阈值放配置中心（如 Nacos），代码只负责调用与 fail-closed 逻辑。合规变更时改 YAML 即可热更新，避免发版窗口。</div>
+        </details>
+        <details>
+          <summary>输出审核漏掉手机号怎么办？</summary>
+          <div class="learn-faq-body">Output Advisor 须叠加正则（身份证/手机号）与 Moderation API；模型可能「复述」用户 PII，仅依赖输入脱敏不够。</div>
+        </details>
       </div>
 
       <div class="notice">
@@ -213,6 +225,31 @@ async def safety_middleware(request: Request, call_next):
           <li><strong>使用单一审核层</strong> — 4 层纵深确保任何一层被绕过还有 backup。</li>
           <li><strong>不记录审核日志</strong> — 安全审计需知道哪些内容被拦截。</li>
         </ul>
+      </div>
+
+      <div class="notice">
+        <strong>生产踩坑</strong>
+        <ul>
+          <li><strong>Moderation 超时 fail-open</strong> — 高峰期 API 抖动导致恶意内容静默放行；须默认拦截并告警。</li>
+          <li><strong>只审中文不审附件</strong> — OCR/PDF 文本绕过 chat 审核层，须在 L1 或入库前扫描。</li>
+          <li><strong>双栈规则不一致</strong> — Spring 拦了 Python 未拦，攻击者改打 Agent 直连路径。</li>
+          <li><strong>审核日志无 requestId</strong> — 无法与业务审计关联，拦截事件须带 trace 与 tenant。</li>
+        </ul>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>CorpAssist 如何验收四层审核？</summary>
+          <div class="learn-faq-body">每 layer 准备 1 条应拦与 1 条应放样本；跑通后检查 audit 表有四层 event_type，且 fail-closed 时用户看到统一拒答而非 500。</div>
+        </details>
+        <details>
+          <summary>Spring AI Advisor 与 Servlet Filter 能否二选一？</summary>
+          <div class="learn-faq-body">不能。Filter 管 HTTP 形态（大小、Content-Type），Advisor 管 ChatRequest/Response 与 tool 消息；LLM 专用规则须在 Advisor，否则看不到结构化 tool 调用。</div>
+        </details>
+        <details>
+          <summary>内容安全与注入防护的边界？</summary>
+          <div class="learn-faq-body">内容安全偏合规与有害内容（Moderation）；注入偏行为篡改（指令层级、分隔符）。CorpAssist 两层都要：L2 拦 toxic，basics-03 专章讲 injection bypass。</div>
+        </details>
       </div>
     </div>
 
@@ -238,6 +275,8 @@ async def safety_middleware(request: Request, call_next):
           <li><label><input type="checkbox" data-id="middleware" /> 能实现 Python middleware 护栏</label></li>
           <li><label><input type="checkbox" data-id="moderation" /> 能解释 Moderation API 用法和局限</label></li>
           <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+          <li><label><input type="checkbox" data-id="failclosed" /> 能解释 Moderation 超时 fail-closed 行为</label></li>
+          <li><label><input type="checkbox" data-id="audit-layer" /> 四层审核各有 audit event_type</label></li>
         </ul>
       </div>
 
@@ -270,6 +309,8 @@ async def safety_middleware(request: Request, call_next):
               <li>你们怎么实现 LLM 输入输出的内容审核？Advisor 和 Filter 怎么分工？</li>
               <li>Moderation API 误报或漏报怎么处理？</li>
               <li>为什么不能只依赖模型自带的安全对齐？</li>
+              <li>Moderation 超时 fail-closed 时前端应展示什么？</li>
+              <li>四层审核各层的 audit event_type 如何命名？</li>
             </ol>
           </div>
         </details>
@@ -304,7 +345,7 @@ async def safety_middleware(request: Request, call_next):
       <div class="learn-practice-answer">
         <details>
           <summary>参考答案</summary>
-          <div class="learn-practice-answer-body"><p>选 B（fail-closed）。安全场景默认可用性降级优于静默放行。</p></div>
+          <div class="learn-practice-answer-body"><p>选 B（fail-closed）。安全场景默认可用性降级优于静默放行，须记录 audit 事件。</p></div>
         </details>
       </div>
     </li>
@@ -320,7 +361,7 @@ async def safety_middleware(request: Request, call_next):
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：内容安全检测</h4>
-      <p>目录：<code>demos/basics-02-content-safety-lab/</code>。<strong>验收</strong>：<code>moderation-rules.yaml</code> 包含 4 层审核的规则配置。</p>
+      <p>目录：<code>demos/basics-02-content-safety-lab/</code>。<strong>验收</strong>：<code>moderation-flow.md</code> 包含 L1–L4 四层审核流程说明。</p>
     </div>
   </div>
 <div class="resources content-section">
@@ -329,6 +370,10 @@ async def safety_middleware(request: Request, call_next):
       <li><strong>下一章</strong>：<a href="#ch-basics-03-injection">注入与越狱</a></li>
       <li><a href="https://platform.openai.com/docs/guides/moderation" target="_blank" rel="noopener">OpenAI Moderation</a></li>
       <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
+      <li><a href="https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP Prompt Injection Cheat Sheet</a></li>
+      <li><strong>本课 Demo</strong>：<code>demos/basics-02-content-safety-lab/moderation-flow.md</code></li>
+      <li><strong>对照</strong>：下一章 <a href="#ch-basics-03-injection">注入与越狱</a> 专讲 bypass 手法</li>
+      <li><strong>验收</strong>：四层审核每层至少 1 条应拦/应放样本</li>
     </ul>
   </div>
 </section>
