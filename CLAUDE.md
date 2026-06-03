@@ -35,7 +35,7 @@ npx --yes serve .
 **After editing `outline-specs.json`, always run:**
 
 ```bash
-node courses/scripts/sync.mjs
+node scripts/sync.mjs
 ```
 
 This regenerates `courses/courses.json` (the portal catalog that `index.html` fetches).
@@ -73,7 +73,7 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 
 **Never hand-edit `index.html` directly** — it's an assembly output. Edit the source fragments instead.
 
-### Key scripts in `courses/scripts/`
+### Key scripts in `scripts/` (repo root)
 
 | Script | Purpose |
 |--------|---------|
@@ -81,6 +81,7 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 | `bootstrap-course-from-spec.mjs` | Initialize a new course directory from spec |
 | `merge-course-manifests.mjs` | Merge incremental manifest files into `course.json` |
 | `enrich-term-prompts.mjs` | Complete term tip/prompt fields |
+| `fix-course-ref-links.mjs` | Batch-fix cross-course link markup in chapters/welcome |
 
 ### Reference example: chapter depth & breadth
 
@@ -167,4 +168,4 @@ The example's full source is at the skill package path `example/java-distributed
 
 ## Agent hygiene
 
-- 仅为排障/一次性验证写的脚本（如 `_foo.mjs`）：用完后**删除**，不要提交；要长期保留则正式放入 `courses/scripts/` 并更新上表。
+- 仅为排障/一次性验证写的脚本（如 `_foo.mjs`）：用完后**删除**，不要提交；要长期保留则正式放入仓库根 `scripts/` 并更新上表。

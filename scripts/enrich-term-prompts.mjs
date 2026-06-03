@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const coursesRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'courses');
 const slug = process.argv[2];
 const force = process.argv.includes('--force');
 const MIN_CHARS = 80;
@@ -174,7 +174,7 @@ function enrichTerms(terms, course) {
   return { added, skipped };
 }
 
-const courseDir = path.join(root, slug);
+const courseDir = path.join(coursesRoot, slug);
 const coursePath = path.join(courseDir, 'course.json');
 if (!fs.existsSync(coursePath)) {
   console.error(`not found: ${coursePath}`);

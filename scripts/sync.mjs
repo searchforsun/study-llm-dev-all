@@ -6,13 +6,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const specPath = path.join(root, 'outline-specs.json');
+const coursesRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'courses');
+const specPath = path.join(coursesRoot, 'outline-specs.json');
 
 function migrateLegacyFiles(spec) {
   let changed = false;
 
-  const legacyInterview = path.join(root, 'interview-scenarios.json');
+  const legacyInterview = path.join(coursesRoot, 'interview-scenarios.json');
   if (fs.existsSync(legacyInterview)) {
     const legacy = JSON.parse(fs.readFileSync(legacyInterview, 'utf8'));
     spec.interviewScenarios = legacy;
@@ -21,7 +21,7 @@ function migrateLegacyFiles(spec) {
     console.log('已合并并删除 interview-scenarios.json');
   }
 
-  const legacyLanding = path.join(root, 'scenario-landing-courses.json');
+  const legacyLanding = path.join(coursesRoot, 'scenario-landing-courses.json');
   if (fs.existsSync(legacyLanding)) {
     fs.unlinkSync(legacyLanding);
     console.log('已删除 scenario-landing-courses.json（内容已在 outline-specs）');
@@ -103,7 +103,7 @@ function buildInterviewMap() {
 
 const interviewByCourse = buildInterviewMap();
 
-const prevPath = path.join(root, 'courses.json');
+const prevPath = path.join(coursesRoot, 'courses.json');
 const prev = fs.existsSync(prevPath)
   ? JSON.parse(fs.readFileSync(prevPath, 'utf8'))
   : { courses: [] };
@@ -113,7 +113,7 @@ const prevPublished = Object.fromEntries(
 // Count actual chapter HTML files on disk for each course
 const published = {};
 for (const slug of Object.keys(specFinal.courses)) {
-  const chDir = path.join(root, slug, 'chapters');
+  const chDir = path.join(coursesRoot, slug, 'chapters');
   const onDisk = fs.existsSync(chDir) ? fs.readdirSync(chDir).filter(f => f.endsWith('.html')).length : 0;
   published[slug] = Math.max(prevPublished[slug] ?? 0, onDisk);
 }

@@ -6,21 +6,21 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const coursesRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'courses');
 const slug = process.argv[2];
 if (!slug) {
   console.error('Usage: node scripts/bootstrap-course-from-spec.mjs <slug>');
   process.exit(1);
 }
 
-const spec = JSON.parse(fs.readFileSync(path.join(root, 'outline-specs.json'), 'utf8'));
+const spec = JSON.parse(fs.readFileSync(path.join(coursesRoot, 'outline-specs.json'), 'utf8'));
 const entry = spec.courses?.[slug];
 if (!entry) {
   console.error(`outline-specs.courses 中未找到: ${slug}`);
   process.exit(1);
 }
 
-const courseDir = path.join(root, slug);
+const courseDir = path.join(coursesRoot, slug);
 fs.mkdirSync(path.join(courseDir, 'chapters'), { recursive: true });
 fs.mkdirSync(path.join(courseDir, 'demos'), { recursive: true });
 

@@ -23,7 +23,7 @@ npx --yes serve .
 
 ## 学习路径
 
-真源：`outline-specs.json` → `learningPath`（`schemaVersion: 2`）。`node scripts/sync.mjs` 同步到 `courses.json`。
+真源：`outline-specs.json` → `learningPath`（`schemaVersion: 2`）。在**仓库根目录**执行 `node scripts/sync.mjs` 同步到 `courses.json`。
 
 **8 阶段双轨独立路径**：Python 轨和 Java 轨从阶段二开始分叉，各自独立完成工程基座 → RAG → Agent，场景课提供双版本。
 
@@ -44,20 +44,21 @@ npx --yes serve .
 
 ## 维护
 
-改 `outline-specs.json` 后：
+改 `outline-specs.json` 后（在**仓库根目录**执行）：
 
 ```powershell
 node scripts/sync.mjs
 ```
 
-单课生成流水线（bootstrap → 章节/demo → merge → enrich → assemble）见各课 `README.md`；常驻脚本：
+单课生成流水线（bootstrap → 章节/demo → merge → enrich → assemble）见各课 `README.md`；常驻脚本位于仓库根 **`scripts/`**：
 
 | 脚本 | 用途 |
 |------|------|
-| `sync.mjs` | `outline-specs.json` → `courses.json` |
-| `bootstrap-course-from-spec.mjs` | 从 spec 初始化单课目录 |
-| `merge-course-manifests.mjs` | 合并 manifest-*.json → course.json |
-| `enrich-term-prompts.mjs` | 补全术语 tip / prompt |
+| `scripts/sync.mjs` | `outline-specs.json` → `courses.json` |
+| `scripts/bootstrap-course-from-spec.mjs` | 从 spec 初始化单课目录 |
+| `scripts/merge-course-manifests.mjs` | 合并 manifest-*.json → course.json |
+| `scripts/enrich-term-prompts.mjs` | 补全术语 tip / prompt |
+| `scripts/fix-course-ref-links.mjs` | 批量修复跨课链接 markup |
 
 ## 生成单课（programming-html-tutorial）
 

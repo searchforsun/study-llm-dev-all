@@ -106,4 +106,4 @@
 
 每门落地课三阶段：**业务架构 → 双栈实战（含 production-pitfalls）→ 生产化/面试答辩**。横切：`llm-application-fundamentals`、`enterprise-llm-solution-delivery`。
 
-维护：改 `outline-specs.json` → `node scripts/sync.mjs`。
+维护：改 `outline-specs.json` → 在仓库根目录执行 `node scripts/sync.mjs`。

@@ -112,13 +112,13 @@ flowchart TB
 ```text
 study-profile-0/
 ├── README.md                 # 本文件
+├── scripts/                  # 大纲同步、bootstrap、跨课链修复等
 └── courses/
     ├── index.html            # 课程中心（入口页）
     ├── courses.json          # 门户目录（33 门课元数据）
     ├── outline-specs.json    # 大纲与场景规划真源
     ├── REFERENCE.md          # 40 项能力 + 面试 TOP5 速查
     ├── README.md             # 启动方式与维护约定
-    ├── scripts/sync.mjs      # 大纲 → 门户目录同步
     ├── <shared-slug>/        # 共享能力课（12 门）
     ├── <python-slug>/        # Python 轨（6 门）
     ├── <java-slug>/          # Java 轨（5 门）
@@ -129,7 +129,7 @@ study-profile-0/
 
 ## 维护与贡献
 
-- 改大纲：编辑 `courses/outline-specs.json` 后执行 `node courses/scripts/sync.mjs`  
+- 改大纲：编辑 `courses/outline-specs.json` 后于**仓库根目录**执行 `node scripts/sync.mjs`  
 - 单课正文：维护 `courses/<slug>/chapters/*.html`，再 assemble 生成 `index.html`（详见 [`courses/README.md`](courses/README.md)）  
 
 ---
