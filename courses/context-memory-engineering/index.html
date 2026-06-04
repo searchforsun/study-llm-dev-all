@@ -5609,7 +5609,7 @@ public class TokenBudget {
     </div>
 
     <div class="section-block">
-      <h3>三种截断策略：FIFO / Semantic / Sliding Window</h3>
+      <h3>策略对比：FIFO / Semantic / Sliding Window</h3>
 
       <p>当上下文总 token 超过预算上限时，需要执行 <span class="term" data-term-id="truncation-strategy" tabindex="0">truncation strategy</span> 来裁剪内容。三种主流策略各有优劣。</p>
 
@@ -5802,9 +5802,12 @@ public class FifoTruncation {
             parts.append(f"助手: {t['assistant']}")
         return "\n".join(parts)</code></pre>
       </div>
+    </div>
 
-      <h4>质量风险分析</h4>
-      <p><span class="term" data-term-id="quality-risk" tabindex="0">quality risk</span> 是截断策略中最容易被忽视的问题。</p>
+    <div class="section-block">
+      <h3>质量风险</h3>
+
+      <p><span class="term" data-term-id="quality-risk" tabindex="0">quality risk</span> 是截断与摘要策略中最容易被忽视的问题：窗口看似「还在预算内」，但关键约束已在压缩链路中丢失。</p>
       <ul>
         <li><strong><span class="term" data-term-id="lose-constraint" tabindex="0">lose constraint</span></strong> — 用户在第 2 轮说「请用英文回答」，第 8 轮摘要后这条约束消失了，LLM 切回中文。</li>
         <li><strong>摘要偏斜</strong> — LLM 生成摘要时可能放大某些细节忽略其他，导致后续回复偏离用户原意。</li>
@@ -6656,9 +6659,9 @@ public class ContextIsolation {
     </div>
 
     <div class="section-block">
-      <h3><span class="term" data-term-id="security-bridge" tabindex="0">security bridge</span>：与安全合规课衔接</h3>
+      <h3>与安全课衔接</h3>
 
-      <p>上下文污染是 LLM 安全的重要维度，但与更广泛的 AI 安全课程有明确分工：</p>
+      <p><span class="term" data-term-id="security-bridge" tabindex="0">security bridge</span> 将本章「上下文污染」与《安全与合规工程》中的提示注入、数据出境等专题衔接。上下文污染是 LLM 安全的重要维度，但与更广泛的 AI 安全课程有明确分工：</p>
 
       <table class="outline-table">
         <thead>
@@ -7094,7 +7097,14 @@ class RedisSessionStore:
           <summary>会话超长怎么办？</summary>
           <div class="learn-faq-body">限制最大轮次（如 8 轮），超出时压缩最早轮次或触发摘要。可以在写入 Redis 时做长度检查。</div>
         </details>
+        <details>
+          <summary>Java 与 Python 谁负责写 Redis？</summary>
+          <div class="learn-faq-body">推荐<strong>单一写入方</strong>：BFF（Java）聚合用户可见轮次后写入；Python 记忆服务只读或通过内部 API 追加，避免双写导致历史翻倍。</div>
+        </details>
       </div>
+
+      <p>会话状态变更（清空、切换租户、登出）必须同步失效 Redis key 与进程内 ChatMemory 缓存，否则会出现「UI 已新会话、模型仍带旧历史」的隐性 bug。</p>
+      <p>压测时建议同时观测 Redis 内存占用与单 key 长度，避免「轮次限制失效」导致单用户 key 膨胀拖垮集群。</p>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -7848,10 +7858,18 @@ class HybridMemoryReader:
           <div class="learn-faq-body">不是。<span class="term" data-term-id="mem-router" tabindex="0">mem router</span> 根据请求类型决定。简单查询只需要工作记忆和会话；需要用户知识的查询才触发长期记忆召回。</div>
         </details>
         <details>
+          <summary>一致性冲突时以哪一层为准？</summary>
+          <div class="learn-faq-body">默认优先级：工作记忆 &gt; 会话层 &gt; 长期层。用户当场纠正的事实写入会话层后，应异步回写或作废长期层中的冲突记录。</div>
+        </details>
+        <details>
           <summary>异步写入长期记忆失败了怎么办？</summary>
           <div class="learn-faq-body">使用重试机制（最多 3 次）。3 次后仍失败则记录失败日志，由定时补偿任务重试。不影响用户当前请求。</div>
         </details>
       </div>
+
+      <p>混合架构评审时可用一张「读写路径」泳道图对照：写入是否都经过 mem router、读取是否去重、异步队列是否有死信监控。缺任一环节都可能在长会话场景下放大一致性问题。</p>
+      <p>建议在配置中心为每层记忆单独暴露「最后同步时间」指标，便于告警「长期层滞后 &gt;5 分钟」类隐性故障。</p>
+      <p>读写路径评审可与《上下文与混合记忆》后续 RAG 课对齐：检索注入是否计入工作记忆预算，避免「记忆 + RAG」双通道挤占同一窗口。</p>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -8608,6 +8626,22 @@ public class MemoryEvalController {
         </tbody>
       </table>
 
+      <p>端到端验收时建议固定三类用例：<strong>多轮约束保持</strong>（语言/格式）、<strong>跨会话事实召回</strong>（长期记忆）、<strong>人在回路纠正</strong>（审批后写入）。每类至少 5 条 badcase 入库，作为后续压缩策略与路由规则的回归集。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么评测要覆盖「纠正后」场景？</summary>
+        <p>用户纠正往往只更新会话层；若评测只测首轮写入，会高估长期记忆一致性，上线后仍会出现「用户已否认、模型仍引用旧事实」。</p>
+      </details>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 记忆子系统发布门禁</span>
+        发布前 consistency 评测 ≥0.85、P95 记忆召回延迟 &lt;120ms，且双栈对照表已签字（Python 记忆服务 + Java BFF 职责无重叠写入）。
+      </aside>
+
+      <p>双栈对照不仅是 API 映射表，还要约定<strong>失败语义</strong>：Python 记忆服务不可用时 Java BFF 是降级为无长期记忆，还是返回可重试错误码，避免静默丢事实。</p>
+      <p>端到端演示环境应预置「纠正—审批—回放」脚本，让产品、法务能在发布评审会上复现记忆写入全链路，而不只依赖单元测试报告。</p>
+      <p>Capstone 验收时把「记忆子系统」作为独立模块打标签，便于与 RAG、Agent 课的集成问题单区分归属。</p>
+
       <p><span class="term" data-term-id="integration-mem" tabindex="0">integration mem</span> 是双栈协作的关键：Python 负责 AI 密集型任务（事实提取、向量搜索），Java 负责事务型任务（审批、审计、Advisor 集成）。两者通过统一的 <span class="term" data-term-id="mem-api" tabindex="0">mem api</span> 通信。</p>
 
       <div class="notice">
@@ -8741,7 +8775,7 @@ public class MemoryEvalController {
     </div>
 
     <div class="section-block">
-      <h3>SAA 上下文压缩与编辑</h3>
+      <h3>压缩/编辑：SAA 上下文能力</h3>
 
       <p><span class="term" data-term-id="saa-compress-edit" tabindex="0">saa compress edit</span> 提供了两种核心能力：上下文压缩和记忆编辑。通过 <span class="term" data-term-id="saa-advisor" tabindex="0">saa advisor</span> 实现自动注入。</p>
 
@@ -8975,6 +9009,13 @@ graph.execute(conversationState, "thread:" + sessionId);</code></pre>
         <p>State Reducer 管理 Graph 执行的当前状态（如当前轮次的消息列表），是短暂的。记忆系统管理用户的长期知识（如用户偏好、事实），是持久的。两者分离，各司其职。</p>
       </details>
 
+      <p>落地 SAA 时建议把「压缩/编辑」与「限制」拆成两条配置线：前者管<strong>内容形态</strong>（摘要、裁剪、编辑），后者管<strong>硬边界</strong>（最大 token、敏感字段脱敏）。上线前用固定 20 轮对话回放，对比压缩前后 System 层占比是否仍 ≥10%。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · SAA 上线检查</span>
+        发布前在预发环境跑一轮「长会话压测」：同一 thread_id 连续 15 轮工具调用 + RAG，确认 ContextCompressAdvisor 触发后 P95 延迟不劣化超过 20%，且输出仍遵守 JSON 格式约束。
+      </aside>
+
       <h4>常见问题（FAQ）</h4>
       <div class="learn-faq">
         <details>
@@ -9111,7 +9152,7 @@ graph.execute(conversationState, "thread:" + sessionId);</code></pre>
     </div>
 
     <div class="section-block">
-      <h3>LangGraph Checkpoint：Agent 状态持久化</h3>
+      <h3>LangGraph checkpoint：Agent 状态持久化</h3>
 
       <p><span class="term" data-term-id="langgraph-checkpoint" tabindex="0">langgraph checkpoint</span> 是 LangGraph 的 Agent 状态持久化机制。<span class="term" data-term-id="checkpoint-store" tabindex="0">checkpoint store</span> 存储到 PostgreSQL 或 Redis。</p>
 
@@ -9879,9 +9920,9 @@ class TokenCostAnalyzer:
     </div>
 
     <div class="section-block">
-      <h3>真实案例：CorpAssist 20 轮爆窗</h3>
+      <h3>案例：CorpAssist 20 轮爆窗</h3>
 
-      <p><span class="term" data-term-id="overflow-case" tabindex="0">overflow case</span>：CorpAssist 客服系统上线后，前 5 轮表现良好，20 轮后 P95 延迟从 800ms 飙升到 8s，且 LLM 开始不遵守输出格式。</p>
+      <p><span class="term" data-term-id="overflow-case" tabindex="0">overflow case</span>：CorpAssist 客服系统上线后，前 5 轮表现良好，20 轮后 P95 延迟从 800ms 飙升到 8s，且 LLM 开始不遵守输出格式。该案例可作为面试中「现象—数据—根因」的完整叙事素材。</p>
 
       <div class="mermaid-wrap">
         <h5>爆窗前后 Token 分布对比</h5>
@@ -9978,9 +10019,11 @@ for issue in issues:
     </div>
 
     <div class="section-block">
-      <h3>排障清单：Debug Checklist</h3>
+      <h3>清单：Debug Checklist</h3>
 
       <p><span class="term" data-term-id="debug-checklist" tabindex="0">debug checklist</span> 是系统排查上下文爆窗的步骤清单。</p>
+
+      <p>现场排障时建议把 checklist 打印成一页纸，按顺序勾选；跳过步骤最容易把「检索重复注入」误判为「模型退化」。</p>
 
       <ol>
         <li><strong>查看 Token 分布</strong> — 使用 diagnoser 工具查看各层占比。正常范围：System 10-25%、History 15-30%、Retrieval 30-45%。</li>
@@ -9991,6 +10034,13 @@ for issue in issues:
         <li><strong>检查双栈冲突</strong> — Python 和 Java 是否都注入了同一会话，导致历史翻倍？</li>
         <li><strong>检查缓存</strong> — <span class="term" data-term-id="trim-debug" tabindex="0">trim debug</span>：缓存是否生效？还是每次都重新召回？</li>
       </ol>
+
+      <p>每一步排查都应记录<strong>观测值</strong>（占比、轮次、配置项），而不是只记结论。这样在跨团队复盘时，运维、后端、算法能基于同一组数据对齐，而不是各说各话。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么「检查双栈冲突」要放在靠后步骤？</summary>
+        <p>前序步骤能解释大部分单栈爆窗。只有 token 分布正常、策略已配置仍异常时，才值得怀疑 Python/Java 双写或重复注入，避免一上来就怀疑架构而忽略滑动窗口未开。</p>
+      </details>
 
       <div class="learn-compare">
         <div class="learn-compare-col learn-compare-bad">
@@ -10017,7 +10067,20 @@ for issue in issues:
     <div class="section-block">
       <h3>面试答题模板</h3>
 
-      <p><span class="term" data-term-id="answer-template-mem" tabindex="0">answer template mem</span> 提供了一套面试答题模板，帮助组织清晰的技术回答。</p>
+      <p><span class="term" data-term-id="answer-template-mem" tabindex="0">answer template mem</span> 提供了一套面试答题模板，帮助组织清晰的技术回答。口述时控制在 2～3 分钟：先给结论（上下文管理问题），再展开数据，最后落到可执行修复。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## 爆窗面试答题骨架（可背诵）
+1. 现象：P95 从 800ms → 8s，20 轮后 JSON 格式失守
+2. 数据：History 20%→44%，System 13%→7%
+3. 根因：未配置滑动窗口 + 每轮 RAG 重复注入
+4. 修复：滑动窗口 6 轮 + 检索结果缓存 + System 预算保护
+5. 预防：window_usage&gt;90%、history&gt;35% 告警</code></pre>
+      </div>
 
       <table class="outline-table">
         <thead>
@@ -10085,7 +10148,30 @@ alerts:
           <summary>「双栈环境下如何排查爆窗问题？」</summary>
           <div class="learn-faq-body">双栈环境中，常见爆窗原因是 Python 和 Java 分别注入各自的会话历史，导致总历史翻倍。排查方法：检查 Redis 中 session key 的存储内容，确认是否只有一端在写入会话。</div>
         </details>
+        <details>
+          <summary>「如何向业务解释『不是模型变差』？」</summary>
+          <div class="learn-faq-body">用 token 分布图说明：System 被挤压后角色约束失效，表现为「格式乱了」而非模型能力退化。修复上下文管理后质量可恢复，无需盲目换更大模型。</div>
+        </details>
       </div>
+
+      <p>排障完成后应留下三类证据：<strong>修复前 token 分布截图</strong>、<strong>配置 diff</strong>（滑动窗口/压缩阈值）、<strong>修复后同会话回放对比</strong>。面试口述时用这三类证据支撑「根因—修复—预防」闭环。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：History 占比 44% 时，为什么优先查滑动窗口而不是换 128K 模型？</summary>
+        <p>换大窗口只延缓爆窗且成本线性上升；44% History 说明管理策略缺失。滑动窗口或摘要链通常可在不改模型的情况下把 History 压回 30% 以内。</p>
+      </details>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>信号</th><th>可能根因</th><th>优先动作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>P95 延迟突增</td><td>总 token 接近上限</td><td>跑 diagnoser，看各层占比</td></tr>
+          <tr><td>输出 JSON 破格式</td><td>System 层 &lt;10%</td><td>保护 System 预算 + 压缩 History</td></tr>
+          <tr><td>回答重复旧事实</td><td>长期记忆每轮重复注入</td><td>记忆召回去重 + 缓存</td></tr>
+          <tr><td>双端行为不一致</td><td>session key 或双写</td><td>统一 key、单一写入方</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">

@@ -399,8 +399,22 @@ const trackOrder = {
   'enterprise-llm-solution-delivery': 8,
 };
 
-function chapters(c) {
-  return c.outline.reduce((n, ph) => n + ph.chapters.length, 0);
+/** 优先用磁盘 course.json 的 outline（与侧栏一致），否则 outline-specs */
+function loadOutlineForSlug(slug, specCourse) {
+  const courseJsonPath = path.join(coursesRoot, slug, 'course.json');
+  if (fs.existsSync(courseJsonPath)) {
+    try {
+      const local = JSON.parse(fs.readFileSync(courseJsonPath, 'utf8'));
+      if (Array.isArray(local.outline) && local.outline.length) return local.outline;
+    } catch (e) {
+      console.warn(`warn: ${slug}/course.json outline 解析失败，回退 outline-specs`);
+    }
+  }
+  return specCourse.outline || [];
+}
+
+function chaptersFromOutline(outline) {
+  return outline.reduce((n, ph) => n + (ph.chapters?.length || 0), 0);
 }
 
 const TRACK_LABELS = {
@@ -522,6 +536,9 @@ function enrichCourse(slug, c, spec, scenarioMetaBySlug) {
   }
 
   const track = c.track ?? 'shared';
+  const outline = loadOutlineForSlug(slug, c);
+  const totalChapters = chaptersFromOutline(outline);
+  const publishedTotal = published[slug] ?? 0;
   return {
     slug,
     track,
@@ -534,9 +551,9 @@ function enrichCourse(slug, c, spec, scenarioMetaBySlug) {
     themePreset: slug,
     accent: accents[slug] ?? { light: '#1565c0', dark: '#64b5f6' },
     stats: {
-      phases: (c.outline || []).length,
-      chapters: chapters(c),
-      publishedChapters: published[slug] ?? 0,
+      phases: outline.length,
+      chapters: totalChapters,
+      publishedChapters: publishedTotal,
     },
     capabilityIds: c.capabilityIds ?? [],
     prerequisites: prerequisites[slug] ?? [],
