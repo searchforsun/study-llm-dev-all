@@ -1,0 +1,370 @@
+<section id="ch-advanced-02-policy-code" class="chapter" data-chapter="advanced-02-policy-code">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>策略即代码</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-policy-code" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>合规交付</strong> · 能力：用 OPA/Rego 与规则包把 CorpAssist 安全策略版本化、可测试、可门禁</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>ToB 交付最怕「安全靠人肉 checklist」：上线后改一句拒答策略就要发版。把 <span class="term" data-term-id="policy-as-code" tabindex="0">policy as code</span> 与 Advisor/Guardrails 解耦，策略可评审、可回滚、可在 CI 阻断不合规配置。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>编写 <span class="term" data-term-id="opa-rego" tabindex="0">opa rego</span> 策略并本地 <code>opa test</code></li>
+          <li>发布 <span class="term" data-term-id="guard-bundle" tabindex="0">guard bundle</span> 供双栈加载</li>
+          <li>在流水线启用 <span class="term" data-term-id="ci-policy-gate" tabindex="0">ci policy gate</span></li>
+          <li>把 Spring/Python 规则映射到 <span class="term" data-term-id="corpassist-policy" tabindex="0">corpassist policy</span> 统一 ID</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>策略与业务代码分离</strong>：Rego/规则 YAML 独立仓库或目录，签名发布。</li>
+          <li><strong>默认拒绝</strong>：工具调用、外呼模型、跨境传输均 fail-closed。</li>
+          <li><strong>测试即验收</strong>：每个控制项至少 1 条 allow + 1 条 deny 用例。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>OPA</h3>
+
+      <p><span class="term" data-term-id="opa-rego" tabindex="0">opa rego</span> 适合描述「在给定输入 JSON 下是否允许某操作」。CorpAssist 在准入阶段把请求上下文（租户、用户角色、数据分级、工具名、模型端点）序列化为 <code>input</code>，由 OPA 决策。</p>
+
+      <div class="mermaid-wrap">
+        <h5>策略即代码在 CorpAssist 流水线中的位置</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant Client as 客户端
+    participant GW as API 网关
+    participant OPA as OPA / 策略引擎
+    participant App as CorpAssist 服务
+    participant LLM as 模型/工具
+
+    Client->>GW: 请求 + JWT
+    GW->>OPA: input 包（租户/分级/工具）
+    alt deny
+        OPA-->>GW: 拒绝 + 原因码
+        GW-->>Client: 403 POLICY_DENY
+    else allow
+        OPA-->>GW: allow + 义务(obligation)
+        GW->>App: 转发 + 义务头
+        App->>LLM: Advisor 链二次校验
+        LLM-->>App: 响应
+        App-->>Client: 响应 + 审计 ID
+    end</pre>
+        <p class="diagram-caption">OPA 在网关或服务侧做粗粒度准入；Advisor 链做细粒度内容/PII 处理。</p>
+      </div>
+
+      <h4>Rego：工具白名单与数据分级</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">rego</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># policies/corpassist/tool_authz.rego
+package corpassist.tool
+
+default allow = false
+
+allow {
+  input.tenant == data.tenants[input.tenant].name
+  tool := input.tool_name
+  tool in data.tenants[input.tenant].allowed_tools
+  input.data_class != "STATE_SECRET"
+}
+
+deny[msg] {
+  input.data_class == "STATE_SECRET"
+  msg := "STATE_SECRET 禁止进入 LLM 流水线"
+}
+
+deny[msg] {
+  input.tool_name == "transfer_funds"
+  not input.approvers
+  msg := "资金类工具需要双人审批 approvers"
+}</code></pre>
+      </div>
+
+      <h4>OPA 单元测试</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">rego</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># policies/corpassist/tool_authz_test.rego
+package corpassist.tool
+
+test_allow_readonly_tool {
+  allow with input as {
+    "tenant": "fin-bank-01",
+    "tool_name": "query_balance",
+    "data_class": "INTERNAL"
+  }
+}
+
+test_deny_secret {
+  count(deny) > 0 with input as {
+    "tenant": "gov-hall-01",
+    "tool_name": "faq_search",
+    "data_class": "STATE_SECRET"
+  }
+}</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="rego-test" tabindex="0">rego test</span> 在 CI 中执行：<code>opa test -v policies/</code>，与 <span class="term" data-term-id="admission-webhook" tabindex="0">admission webhook</span>（K8s 部署侧）或 API 网关插件（请求侧）配合，形成双层门禁。</p>
+
+      <p class="learn-micro-check"><strong>先想 10 秒：</strong>若 OPA 返回 allow 但 Advisor 仍拒答，这算策略冲突还是纵深防御？你会如何记录审计？</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>在 Java/Python 业务里散落 if-else 合规逻辑</li>
+            <li>无测试的 Rego，上线后才发现 deny 过宽</li>
+            <li>策略与模型 Prompt 混在同一文件</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>策略包版本号写入审计与响应头 <code>X-Policy-Bundle</code></li>
+            <li>每租户 overlay 只改 data，不改核心 rego</li>
+            <li>OPA + Advisor 职责清晰，冲突以 stricter 为准</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>规则</h3>
+
+      <p>并非所有控制都适合 Rego。内容安全、越狱模式、PII 正则、拒答话术适合 <span class="term" data-term-id="guard-bundle" tabindex="0">guard bundle</span>（YAML/JSON 规则 + NeMo/Spring 加载器）。<span class="term" data-term-id="policy-as-code" tabindex="0">policy as code</span> 在此指「可 diff、可签名、可回滚」的规则制品，而非单指 OPA。</p>
+
+      <h4>CorpAssist 规则包结构</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># guard-bundle/v2026.06.04/manifest.yaml
+bundle_id: corpassist-guard-2026.06.04
+controls:
+  - id: CTRL-INJ-01
+    type: prompt_injection
+    engine: nemo_colang
+    file: injection/rails.co
+  - id: CTRL-PII-02
+    type: pii_mask
+    engine: spring_advisor
+    file: pii/fin-mask.json
+  - id: CTRL-TOOL-03
+    type: opa
+    file: policies/tool_authz.rego
+signature: sha256:abc123...</code></pre>
+      </div>
+
+      <h4>双栈加载同一 bundle</h4>
+      <div class="learn-code-compare">
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">java</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-java">@Configuration
+public class PolicyBundleConfig {
+  @Bean PolicyBundleClient bundleClient() {
+    return PolicyBundleClient.fromUrl("https://policy.corp.internal/bundles/latest");
+  }
+  @Bean Advisor policyAdvisor(PolicyBundleClient c) {
+    return new BundleDrivenAdvisor(c.control("CTRL-PII-02"));
+  }
+}</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python">bundle = GuardBundle.load("https://policy.corp.internal/bundles/latest")
+chain = (
+    bundle.nemo_rail("CTRL-INJ-01")
+    | bundle.langchain_mask("CTRL-PII-02")
+    | bundle.opa_sidecar("CTRL-TOOL-03")
+)</code></pre>
+        </div>
+      </div>
+
+      <p><span class="term" data-term-id="corpassist-policy" tabindex="0">corpassist policy</span> 要求每个 <code>CTRL-*</code> 在合规矩阵有行业列（金融/政务）、双栈实现列与测试用例 ID。<span class="term" data-term-id="ci-policy-gate" tabindex="0">ci policy gate</span> 在 MR 阶段执行：</p>
+      <ol>
+        <li><code>opa test</code> 全绿</li>
+        <li>规则包签名验证</li>
+        <li>与上一版本 diff 生成「影响面报告」（哪些租户 overlay 受影响）</li>
+        <li>红队用例子集回归（见 <a href="#ch-practice-04-red-team">红队与演练</a>）</li>
+      </ol>
+
+      <h4>租户 overlay：只改 data 不改核心 Rego</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "tenants": {
+    "fin-bank-01": {
+      "name": "fin-bank-01",
+      "allowed_tools": ["query_balance", "faq_search"],
+      "data_classes_allowed": ["PUBLIC", "INTERNAL"]
+    },
+    "gov-hall-01": {
+      "name": "gov-hall-01",
+      "allowed_tools": ["faq_search", "case_status"],
+      "data_classes_allowed": ["PUBLIC", "INTERNAL"],
+      "deny_tools": ["public_web_browse"]
+    }
+  }
+}</code></pre>
+      </div>
+
+      <h4>CI 流水线策略门禁（GitLab 摘录）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">stages: [policy, test, publish]
+
+policy:opa:
+  script:
+    - opa test -v policies/
+    - opa eval --fail-defined data.corpassist.deny &lt; input/fixtures/attack.json
+
+policy:bundle:
+  script:
+    - node scripts/verify-bundle-signature.mjs bundle/manifest.yaml
+    - node scripts/diff-bundle.mjs --base main --head $CI_COMMIT_SHA
+
+policy:redteam-subset:
+  script:
+    - python run_redteam_subset.py --cases inj_tool,piilog,policy_bypass
+  allow_failure: false</code></pre>
+      </div>
+
+      <p>发布阶段将 <code>bundle_id</code> 写入容器环境变量 <code>CORPASSIST_POLICY_BUNDLE</code>，Advisor 启动时校验签名并热加载。回滚时切换上一签名版本，审计中保留两个版本并存窗口的可观测指标。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>CTRL-ID</th><th>引擎</th><th>测试资产</th><th>负责人</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>CTRL-INJ-01</td><td>NeMo Colang</td><td>rails/injection.co</td><td>应用安全</td></tr>
+          <tr><td>CTRL-PII-02</td><td>Spring Advisor</td><td>pii/fin-mask.json</td><td>平台 Java</td></tr>
+          <tr><td>CTRL-PII-02-PY</td><td>LangChain</td><td>pii/mask_chain.py</td><td>平台 Python</td></tr>
+          <tr><td>CTRL-TOOL-03</td><td>OPA</td><td>policies/tool_authz*</td><td>架构组</td></tr>
+          <tr><td>CTRL-AUDIT-06</td><td>Sidecar</td><td>audit/schema.json</td><td>SRE</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-faq">
+        <details>
+          <summary>OPA 与 NeMo Guardrails 会不会重复？</summary>
+          <div class="learn-faq-body">会部分重叠，但层次不同：OPA 擅长结构化准入（工具、租户、分级）；Guardrails 擅长对话流与 Colang 叙事。重复时以<strong>更严格</strong>结果为准，并在审计中记录两层决策。</div>
+        </details>
+        <details>
+          <summary>策略热更新如何做？</summary>
+          <div class="learn-faq-body">bundle 拉取 + 版本头；禁止无版本静默覆盖。金融/政务常要求变更工单号写入 <code>X-Change-Ticket</code>，并与 <span class="term" data-term-id="spring-advisor-policy" tabindex="0">spring advisor policy</span> 缓存 TTL 对齐（例如 60s 内新旧并存需可观测）。</div>
+        </details>
+      </div>
+
+      <p>发布说明模板应包含：<code>bundle_id</code>、变更工单、影响租户列表、回滚步骤与红队回归结果链接——便于 <span class="term" data-term-id="corpassist-policy" tabindex="0">corpassist policy</span> 变更审计。</p>
+      <p>策略评审会议应出席：应用安全、法务、SRE、双栈负责人；会议输出 signed manifest 与回归用例列表，作为投产门禁附件。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>OPA</strong>：结构化准入用 Rego + 测试；与网关/Admission 集成，默认 deny。</li>
+        <li><strong>规则</strong>：内容/PII/注入用 guard bundle 统一 ID，双栈同版本加载，CI 签名与 diff 门禁。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="security-compliance-engineering_adv02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="rego" /> 能解释 allow/deny 与 test 用例</label></li>
+          <li><label><input type="checkbox" data-id="bundle" /> 能画出 bundle 中 OPA vs Guardrails 分工</label></li>
+          <li><label><input type="checkbox" data-id="ci" /> 能列出 CI 四门禁步骤</label></li>
+          <li><label><input type="checkbox" data-id="audit" /> 知道策略版本如何写入审计</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>OPA</td><td>结构化准入，Rego 必测</td></tr>
+                <tr><td>guard bundle</td><td>CTRL-ID 双栈同版</td></tr>
+                <tr><td>CI gate</td><td>test + 签名 + diff + 红队子集</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-03-third-party">第三方与数据出境</a> — 评估供应商与合同条款。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://www.openpolicyagent.org/docs/latest/" target="_blank" rel="noopener">Open Policy Agent</a></li>
+      <li><a href="https://docs.nvidia.com/nemo/guardrails/latest/" target="_blank" rel="noopener">NeMo Guardrails</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">编写一条 Rego 工具策略与对应测试，并组装最小 guard bundle manifest（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 <code>tool_authz.rego</code> 上为 <code>transfer_funds</code> 增加「必须含 approvers」的 deny 规则。</li>
+      <li>补充 <code>test_deny_transfer_without_approvers</code> 并在本地运行 <code>opa test -v policies/</code>。</li>
+      <li>在 <code>manifest.yaml</code> 为 CTRL-TOOL-03 填写 <code>bundle_id</code> 与签名占位。</li>
+      <li>可选：完成 <code>demos/advanced-02-policy-code-lab/</code> 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）下列 manifest 片段哪项违反策略即代码最佳实践？A) 含 bundle_id B) 无 signature 字段 C) controls 含 CTRL-ID D) 文件路径相对 bundle 根</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>B</strong>。生产 bundle 必须可验证签名；无签名无法防篡改，CI 应 fail。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：OPA 策略包实验室</h4>
+      <p>目录：<code>demos/advanced-02-policy-code-lab/</code>。<strong>验收</strong>：<code>opa test -v policies/</code> 全部 PASS 且 <code>node verify-bundle.mjs</code> 输出 <code>bundle signature ok</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-03-third-party">第三方与数据出境</a></li>
+      <li><a href="https://www.openpolicyagent.org/docs/latest/policy-language/" target="_blank" rel="noopener">Rego 语言指南</a></li>
+    </ul>
+  </div>
+</section>

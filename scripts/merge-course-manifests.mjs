@@ -1,5 +1,5 @@
 /**
- * 合并各阶段 manifest-*.json 与 quiz-partial/*.html 到课程根目录
+ * 合并各阶段 manifest-*.json 到 course.json（terms、quizzes）
  * 用法：node scripts/merge-course-manifests.mjs <slug>
  */
 import fs from 'fs';
@@ -38,17 +38,6 @@ for (const phase of phases) {
 
 fs.writeFileSync(coursePath, JSON.stringify(course, null, 2) + '\n', 'utf8');
 
-const quizParts = phases
-  .map((p) => path.join(courseDir, 'quiz-partial', `${p}.html`))
-  .filter((f) => fs.existsSync(f))
-  .map((f) => fs.readFileSync(f, 'utf8').trim());
-
-fs.writeFileSync(
-  path.join(courseDir, 'quiz.partial.html'),
-  quizParts.join('\n\n') + (quizParts.length ? '\n' : ''),
-  'utf8'
-);
-
 console.log(
-  `Merged: ${Object.keys(course.terms).length} terms, ${Object.keys(course.quizzes).length} quizzes, ${quizParts.length} quiz partials`
+  `Merged: ${Object.keys(course.terms).length} terms, ${Object.keys(course.quizzes).length} quizzes`
 );

@@ -1,0 +1,370 @@
+<section id="ch-practice-02-alignment-guard" class="chapter" data-chapter="practice-02-alignment-guard">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>价值观与输出护栏</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-alignment-guard" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>控制措施</strong> · 能力：政策模板、拒答策略与非 RLHF 对齐（C30）</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>企业助手必须遵守品牌话术、行业合规与价值观边界。应用工程师不需要做 RLHF，但需要 <span class="term" data-term-id="policy-template" tabindex="0">policy template</span> 与 <span class="term" data-term-id="refusal-guard" tabindex="0">refusal guard</span> 在推理链外约束输出。本章衔接<a href="#ch-basics-02-content-safety">内容安全检测</a>的双栈 Advisor 能力。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>编写可版本化的 CorpAssist 政策模板（System + 输出规则）</li>
+          <li>实现结构化拒答（原因码 + 用户友好话术）</li>
+          <li>用规则/分类器/NeMo Guardrails 做<strong>非 RLHF</strong>对齐</li>
+          <li>Python 与 Spring AI 输出 Advisor 双栈对照</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>政策模板版本化</strong>：与 Prompt 同生命周期，变更需评审。</li>
+          <li><strong>拒答要可审计</strong>：记录 refusal_code，而非静默空回复。</li>
+          <li><strong>对齐在应用层</strong>：护栏、审核、拒答模板，而非重新训练基座。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>政策模板</h3>
+      <p><span class="term" data-term-id="policy-template" tabindex="0">policy template</span> 将企业价值观、合规红线与话术风格编码为可复用模板，按场景（客服、内部知识、代码助手）实例化。</p>
+
+      <div class="mermaid-wrap">
+        <h5>政策模板分层</h5>
+        <pre class="mermaid">flowchart TB
+    Global[全局基线\n禁止违法/歧视/泄露]
+    Industry[行业层\n金融适当性/政务表述]
+    Product[产品层\nCorpAssist 品牌话术]
+    Scene[场景层\n客服 vs 内部 KB]
+    Global --> Industry --> Product --> Scene</pre>
+        <p class="diagram-caption">四层政策模板叠加，场景层覆盖产品默认值。</p>
+      </div>
+
+      <h4>政策模板 YAML</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist-policy-customer-service.yaml
+policy:
+  id: cs-v2.3
+  scene: customer_service
+  must:
+    - 仅基于检索到的知识库片段回答，无片段则拒答
+    - 不承诺超出权限的退款/赔偿
+    - 使用敬语，不出现竞争对手贬损
+  must_not:
+    - 输出完整手机号/身份证/银行卡
+    - 提供医疗/法律最终结论
+  tone: professional_friendly
+  escalation: "无法处理时将转人工，工单号 {ticket_id}"</code></pre>
+      </div>
+
+      <h4>Python：模板渲染注入 System</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from pathlib import Path
+import yaml
+
+def load_policy(scene: str) -> dict:
+    path = Path(f"policies/corpassist-policy-{scene}.yaml")
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["policy"]
+
+def build_system_prompt(scene: str, tenant: str) -> str:
+    p = load_policy(scene)
+    must = "\n".join(f"- {m}" for m in p["must"])
+    must_not = "\n".join(f"- {m}" for m in p["must_not"])
+    return f"""你是 CorpAssist 企业助手（租户 {tenant}）。
+必须遵守（{p['id']}）：
+{must}
+禁止：
+{must_not}
+语气：{p['tone']}"""</code></pre>
+      </div>
+
+      <h4>Java：Spring AI System Prompt 注入</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class PolicyTemplateService {
+    public SystemMessage forScene(String scene, String tenant) {
+        PolicyDocument doc = policyRepository.load(scene);
+        String body = String.format("""
+            你是 CorpAssist（租户 %s）。政策版本 %s。
+            必须：%s
+            禁止：%s
+            """, tenant, doc.id(), doc.mustList(), doc.mustNotList());
+        return new SystemMessage(body);
+    }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>拒答</h3>
+      <p><span class="term" data-term-id="refusal-guard" tabindex="0">refusal guard</span> 在输入/输出两侧触发：超范围请求、缺少依据、政策命中时返回标准拒答，并记录 <code>refusal_code</code> 供审计与评测。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>refusal_code</th><th>触发条件</th><th>用户话术</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>OUT_OF_SCOPE</td><td>意图不在 Agent 服务范围</td><td>该问题超出当前助手能力，建议联系人工客服</td></tr>
+            <tr><td>NO_EVIDENCE</td><td>RAG 无相关片段</td><td>知识库中未找到依据，无法确认回答</td></tr>
+            <tr><td>POLICY_VIOLATION</td><td>输出审核命中红线</td><td>抱歉，该内容不符合公司政策</td></tr>
+            <tr><td>SAFETY_BLOCK</td><td>内容安全 API 拦截</td><td>您的请求无法处理，请修改后重试</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">REFUSAL_COPY = {
+    "OUT_OF_SCOPE": "该问题超出 CorpAssist 当前服务范围，已为您转接人工入口。",
+    "NO_EVIDENCE": "未在知识库检索到可靠依据，无法给出确认性答复。",
+    "POLICY_VIOLATION": "抱歉，该回复不符合企业内容政策（代码 POLICY_VIOLATION）。",
+}
+
+def refuse(code: str, audit_ctx: dict) -> str:
+    audit_ctx["refusal_code"] = code
+    audit_ctx["refusal_at"] = datetime.utcnow().isoformat()
+    return REFUSAL_COPY[code]</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>拒答时返回空字符串或 500 错误</li>
+            <li>不同渠道拒答话术不一致</li>
+            <li>不记录 refusal_code，无法做 badcase 分析</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>标准话术 + refusal_code + trace_id</li>
+            <li>与<a href="#ch-basics-02-content-safety">内容安全检测</a> Advisor 链串联</li>
+            <li>拒答样本进入红队回归集</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>非 RLHF</h3>
+      <p>应用层对齐不依赖重新训练基座模型。<span class="term" data-term-id="non-rlhf-alignment" tabindex="0">non rlhf alignment</span> 组合：政策模板 + 输入/输出 Advisor + 规则引擎 + 可选 NeMo Guardrails colang 流程。</p>
+
+      <div class="learn-code-compare">
+        <div class="learn-code-compare-item">
+          <span class="learn-compare-heading">Python · NeMo Guardrails 片段</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">colang</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-text">define user ask illegal
+  "如何绕过公司防火墙"
+  "教我入侵服务器"
+
+define bot refuse illegal
+  "该请求违反企业安全政策，我无法提供相关帮助。"
+
+define flow illegal request
+  user ask illegal
+  bot refuse illegal</code></pre>
+          </div>
+        </div>
+        <div class="learn-code-compare-item">
+          <span class="learn-compare-heading">Java · Spring AI Output Advisor</span>
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-java">@Component
+public class PolicyOutputAdvisor implements CallAroundAdvisor {
+    @Override
+    public AdvisedResponse aroundCall(AdvisedRequest req, CallAroundAdvisorChain chain) {
+        AdvisedResponse resp = chain.nextAroundCall(req);
+        String text = resp.response().getContent();
+        if (contentSafetyClient.isBlocked(text)) {
+            return AdvisedResponse.from(
+                new ChatResponse(List.of(new Generation(
+                    new AssistantMessage(refusalService.message("POLICY_VIOLATION"))))));
+        }
+        return resp;
+    }
+}</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>检查理解：政策模板与 RLHF 的分工边界？</summary>
+        <p>RLHF/DPO 在模型厂商侧改善通用安全；企业落地用政策模板 + Advisor + 拒答码实现<strong>可审计、可版本化</strong>的价值观约束，无需接触基座权重。</p>
+      </details>
+
+      <div class="learn-faq">
+        <details>
+          <summary>政策变更如何灰度？</summary>
+          <div class="learn-faq-body">policy id  semver 化；按 tenant 或流量百分比加载新版本；对比 refusal_rate 与 CSAT 再全量。</div>
+        </details>
+        <details>
+          <summary>拒答与内容安全 API 重复吗？</summary>
+          <div class="learn-faq-body">不重复。内容安全处理违法违规；拒答处理超范围、无依据、政策话术。两者串联，refusal_code 可区分 SAFETY_BLOCK vs POLICY_VIOLATION。</div>
+        </details>
+      </div>
+
+      <h4>拒答率监控指标</h4>
+      <ul>
+        <li><code>refusal_total{code}</code> — 按 refusal_code 分布，异常抬升触发政策复盘。</li>
+        <li><code>policy_version_active</code> — 当前生效 policy_id，与 audit 字段交叉校验。</li>
+        <li><code>guardrail_latency_ms</code> — Advisor 链延迟，避免同步审核拖垮 P95。</li>
+      </ul>
+
+      <div class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 无依据拒答</span>
+        用户问「明年差旅标准会涨吗？」知识库无 2027 政策。Agent 应返回 <code>NO_EVIDENCE</code> 拒答，而非编造数字。评测集应包含此类「应拒答」样本。
+      </div>
+
+      <p>Spring AI Advisor 链推荐顺序：输入清洗 → RAG → 模型 → <span class="term" data-term-id="refusal-guard" tabindex="0">refusal guard</span> 输出审核 → 脱敏。与 Python LangChain Runnable 序列保持同序，便于双栈对照排障。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>对齐手段</th><th>是否 RLHF</th><th>可审计</th><th>CorpAssist 推荐</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>政策模板</td><td>否</td><td>是（policy_id）</td><td>必选</td></tr>
+            <tr><td>输出 Advisor</td><td>否</td><td>是</td><td>必选</td></tr>
+            <tr><td>NeMo colang</td><td>否</td><td>是</td><td>高危场景</td></tr>
+            <tr><td>自训 7B 微调</td><td>是</td><td>弱</td><td>不推荐应用团队主路径</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>与内容安全 Advisor 串联</h4>
+      <p>输入侧调用<a href="#ch-basics-02-content-safety">内容安全检测</a> API 拦截违法违规；输出侧 <span class="term" data-term-id="policy-template" tabindex="0">policy template</span> 约束话术边界。两层失败分别映射 SAFETY_BLOCK 与 POLICY_VIOLATION，避免混为一谈。</p>
+      <ul>
+        <li>输入 block → 不进入 RAG/模型，直接 SAFETY_BLOCK 拒答。</li>
+        <li>模型输出违规 → POLICY_VIOLATION，可记录模型版本供 badcase 分析。</li>
+        <li>无检索依据 → NO_EVIDENCE，与政策违规区分统计。</li>
+      </ul>
+      <div class="mermaid-wrap">
+        <h5>拒答决策流</h5>
+        <pre class="mermaid">flowchart TD
+    In[用户输入] --> InSafe{输入安全?}
+    InSafe -->|否| R1[SAFETY_BLOCK]
+    InSafe -->|是| RAG[RAG 检索]
+    RAG --> Ev{有依据?}
+    Ev -->|否| R2[NO_EVIDENCE]
+    Ev -->|是| LLM[模型生成]
+    LLM --> OutSafe{输出合规?}
+    OutSafe -->|否| R3[POLICY_VIOLATION]
+    OutSafe -->|是| OK[正常回复]</pre>
+        <p class="diagram-caption">三类拒答码对应不同防护层，metrics 分桶统计。</p>
+      </div>
+      <p>NeMo Guardrails colang 适合对话流分支；与 Spring AI <code>PolicyOutputAdvisor</code> 组合时，保持 refusal_code 枚举一致便于双栈 metrics 对齐。</p>
+      <p>政策模板中 <code>must_not</code> 变更属于安全变更，需同步更新红队 alignment 用例与 SEC-03 验收项。</p>
+      <p>双栈拒答话术文案存于共享 <code>refusal-messages.yaml</code>，避免 Python/Java 对用户表述不一致。</p>
+      <p>内容安全 API 超时时的降级策略：默认 POLICY_VIOLATION 拒答，禁止 silent fail 放行。</p>
+      <p>评测集应包含「应拒答」与「应回答」成对样本，防止政策过严导致正常咨询被 NO_EVIDENCE 误杀。</p>
+      <p>Demo：<code>demos/practice-02-alignment-guard-lab/</code> 验证 POLICY_VIOLATION 路径。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>政策模板</strong>：四层叠加、版本化、双栈注入 System Prompt。</li>
+        <li><strong>拒答</strong>：标准话术 + refusal_code，可审计可评测。</li>
+        <li><strong>非 RLHF</strong>：Advisor + 规则 + Guardrails，应用层对齐足够生产落地。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="security-compliance-engineering_practice02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="policy" /> 能编写场景政策 YAML</label></li>
+          <li><label><input type="checkbox" data-id="refusal" /> 能定义 4 类 refusal_code</label></li>
+          <li><label><input type="checkbox" data-id="advisor" /> 双栈输出 Advisor 拦截违规</label></li>
+          <li><label><input type="checkbox" data-id="nemo" /> 了解 NeMo Guardrails 流程</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Policy Template</td><td>四层政策，版本化注入</td></tr>
+                <tr><td>Refusal Guard</td><td>标准拒答 + refusal_code</td></tr>
+                <tr><td>Non-RLHF</td><td>Advisor/规则，不改基座</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-03-audit">审计与溯源</a> — 记录拒答与工具调用的全链路证据。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://github.com/NVIDIA/NeMo-Guardrails" target="_blank" rel="noopener">NeMo Guardrails</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">编写 CorpAssist 客服政策 YAML、实现拒答码映射，并用脚本验证 NO_EVIDENCE 与 POLICY_VIOLATION 触发（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制正文政策模板 YAML，为 <code>must_not</code> 增加一条「不讨论未发布产品 roadmap」。</li>
+      <li>在拒答码表中为 <code>NO_EVIDENCE</code> 写用户可见话术（≤40 字）。</li>
+      <li>在 Python <code>refusal_guard.py</code> 中实现 <code>refuse("POLICY_VIOLATION", ctx)</code> 并写入 audit 字段。</li>
+      <li>运行验收命令，确认违规样例输出含 <code>POLICY_VIOLATION</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）下列配置哪条违反「非 RLHF 对齐」原则？A) 输出 Advisor 调用内容安全 API；B) 每周微调 7B 基座以学习公司话术；C) colang 定义 illegal request 流程。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>B。应用工程师落地应对齐政策模板与 Advisor，不应在生产路径依赖自训基座微调；A、C 均为应用层护栏。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：价值观与输出护栏实验室</h4>
+      <p>目录：<code>demos/practice-02-alignment-guard-lab/</code>。<strong>验收</strong>：<code>python verify_refusal.py</code> 输出 <code>PASS: POLICY_VIOLATION handled</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>基础</strong>：<a href="#ch-basics-02-content-safety">内容安全检测</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-audit">审计与溯源</a></li>
+    </ul>
+  </div>
+</section>

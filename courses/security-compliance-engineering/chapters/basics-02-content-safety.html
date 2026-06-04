@@ -1,0 +1,370 @@
+<section id="ch-basics-02-content-safety" class="chapter" data-chapter="basics-02-content-safety">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>内容安全检测</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-content-safety" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>威胁与模型</strong> · 能力：<strong>C26</strong> 内容安全检测 — 输入输出审核与双栈 Advisor</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 面向 ToB 客户，必须拦截违法违规、仇恨、色情及企业自定义敏感词。仅靠模型自带安全对齐无法通过合规验收。本章落地 <span class="term" data-term-id="content-safety" tabindex="0">content safety</span> 能力 <strong>C26</strong>：在请求前后部署可观测、可配置的审核链。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>区分 <span class="term" data-term-id="input-moderation" tabindex="0">input moderation</span> 与 <span class="term" data-term-id="output-moderation" tabindex="0">output moderation</span> 职责</li>
+          <li>用 Python NeMo Guardrails 与 Spring AI Advisor 搭建双栈对照</li>
+          <li>设计误杀率与漏杀率的权衡及人工兜底</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li>输入审核拦「用户想做什么坏事」；输出审核拦「模型说了什么不该说的」。</li>
+          <li>审核应<strong>确定性优先</strong>：规则 + 小模型，大模型仅作复审。</li>
+          <li>双栈 Advisor 链顺序固定：Input → LLM → Output。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>输入输出审核</h3>
+      <p>能力 <strong>C26</strong> 要求 CorpAssist 对每条消息做分类：安全 / 需拒答 / 转人工。输入侧重点识别越狱、仇恨、违法指令；输出侧防止模型生成未授权承诺、泄露机密或歧视性言论。</p>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 客服拒答审计</span>
+        用户发送仇恨言论，输入 Advisor 返回 <code>refusal_code=HATE</code> 并写入 audit；若仅在前端弹窗提示而未落库，等保测评会判定「安全审计不完整」。
+      </aside>
+      <table class="outline-table">
+        <thead><tr><th>阶段</th><th>检测对象</th><th>典型策略</th><th>失败动作</th></tr></thead>
+        <tbody>
+          <tr><td>输入</td><td>用户 prompt</td><td>关键词 + 分类器</td><td>拒答 + 审计</td></tr>
+          <tr><td>输出</td><td>模型回复</td><td>PII 扫描 + 政策模板</td><td>替换为安全模板</td></tr>
+          <tr><td>流式</td><td>token 流</td><td>滑动窗口检测</td><td>截断并收尾</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>C26 审核流水线</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant I as 输入审核
+    participant L as LLM
+    participant O as 输出审核
+    U->>I: 消息
+    I-->>U: 拒答(若违规)
+    I->>L: 清洁输入
+    L->>O: 草稿回复
+    O-->>U: 安全回复或模板</pre>
+        <p class="diagram-caption">输入与输出审核职责分离，避免「只审输入」导致模型仍生成违规内容。</p>
+      </div>
+      
+      <h4>Python：NeMo Guardrails 输入 rail</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from nemoguardrails import RailsConfig, LLMRails
+config = RailsConfig.from_path("./corpassist_rails")
+rails = LLMRails(config)
+# 输入 colang 规则拦截越狱与违法请求
+response = rails.generate(messages=[{"role":"user","content": user_text}])</code></pre>
+      </div>
+      <h4>Java：Spring AI 输入 / 输出 Advisor</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">ChatClient chat = ChatClient.builder(chatModel)
+    .defaultAdvisors(
+        new RequestAdvisor(inputPolicy),      // 输入：越狱/违法
+        new SafeGuardAdvisor(outputPolicy),   // 输出：敏感词（非输入侧）
+        new AuditAdvisor())
+    .build();</code></pre>
+      </div>
+      <p><code>SafeGuardAdvisor</code> 侧重<strong>生成结果</strong>过滤；输入侧越狱与违法指令应使用自定义 <code>RequestAdvisor</code> 或网关规则，避免与 C26「双端审核」职责混淆。</p>
+      <p><span class="term" data-term-id="moderation-latency" tabindex="0">moderation latency</span> 需纳入 SLO：同步审核增加 50–200ms 时，应使用轻量模型或并行批处理，并对 VIP 租户提供可配置严格度。</p>
+      <h4>C26 输入输出审核检查清单</h4>
+      <ul>
+        <li>违规分类是否覆盖违法、仇恨、越狱、泄密四类？</li>
+        <li>拒答模板是否带 refusal_code 供审计？</li>
+        <li>流式输出是否在违规 token 出现时截断？</li>
+        <li>误杀样本是否进入人工复核队列？</li>
+        <li>策略版本是否与 Java/Python 服务同步发布？</li>
+      </ul>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么输出审核不能省略？</summary>
+        <p>模型可能在「干净输入」下仍生成歧视、泄密或虚假承诺；C26 要求双端闭环。</p>
+      </details>
+      <h4>流式输出审核要点</h4>
+      <table class="outline-table">
+        <thead><tr><th>阶段</th><th>检测窗口</th><th>动作</th><th>审计字段</th></tr></thead>
+        <tbody>
+          <tr><td>首 token</td><td>0–32 tokens</td><td>敏感类命中即截断</td><td>refusal_code, policy_version</td></tr>
+          <tr><td>中段</td><td>滑动 64 tokens</td><td>替换为安全模板</td><td>truncated=true</td></tr>
+          <tr><td>收尾</td><td>完整回复</td><td>PII 扫描 + citation 校验</td><td>output_hash</td></tr>
+        </tbody>
+      </table>
+      <h4>Python：输出侧 Runnable 拦截</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">def output_moderator(msg: dict) -> dict:
+    text = msg.get("content", "")
+    if contains_pii(text):
+        msg["content"] = SAFE_TEMPLATE
+        msg["metadata"]["refusal_code"] = "PII_LEAK"
+    return msg</code></pre>
+      </div>
+      <h4>Java：ResponseAdvisor 模板替换</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">public AdvisedResponse aroundCall(AdvisedRequest req, CallAroundAdvisorChain chain) {
+    AdvisedResponse resp = chain.nextAroundCall(req);
+    if (policyEngine.violates(resp)) {
+        return AdvisedResponse.from(resp).withContent(SAFE_TEMPLATE).build();
+    }
+    return resp;
+}</code></pre>
+      </div>
+      <div class="notice">
+        <strong>生产坑</strong>
+        <ul>
+          <li>仅拦截首句、后半段泄密：流式必须滑动窗口检测。</li>
+          <li>拒答无 refusal_code：等保审计无法分类统计。</li>
+          <li>staging 与 production policy 版本不一致：见 practice-05 SEC-03 验收。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈 Advisor</h3>
+      <p><span class="term" data-term-id="spring-ai-advisor" tabindex="0">spring ai advisor</span> 与 <span class="term" data-term-id="nemo-guardrails" tabindex="0">nemo guardrails</span> 在 CorpAssist 中扮演同构角色：可插拔、可排序、可单测。团队应维护<strong>策略版本号</strong>，使 Python 与 Java 服务拒答文案一致。</p>
+      <table class="outline-table">
+        <thead><tr><th>能力</th><th>Python 栈</th><th>Java 栈</th></tr></thead>
+        <tbody>
+          <tr><td>输入拦截</td><td>Guardrails colang / 自定义 Runnable</td><td>RequestAdvisor / SafeGuardAdvisor</td></tr>
+          <tr><td>输出拦截</td><td>输出 rail + 回调</td><td>ResponseAdvisor</td></tr>
+          <tr><td>可观测</td><td>LangSmith trace</td><td>Micrometer + 审计表</td></tr>
+          <tr><td>配置</td><td>rails/*.co</td><td>application.yml policies</td></tr>
+        </tbody>
+      </table>
+      <h4>Python：LangChain 管道式 moderation</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from langchain_core.runnables import RunnableLambda
+
+# 推荐：管道组合，顺序固定 Input → LLM → Output
+chain = (
+    RunnableLambda(input_moderator)
+    | llm
+    | RunnableLambda(output_moderator)
+)</code></pre>
+      </div>
+      <h4>Java：Advisor 链顺序</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">.defaultAdvisors(
+    inputPolicyAdvisor,
+    chatModelAdvisor,
+    outputPolicyAdvisor
+)</code></pre>
+      </div>
+      <p><span class="term" data-term-id="guardrail-pipeline" tabindex="0">guardrail pipeline</span> 必须与《<a href="../production-prompt-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">生产级 Prompt 与对话工程</span><code class="course-ref-slug">production-prompt-engineering</code></a>》中的拒答模板对齐，避免同一句违规在不同渠道得到不同处理。</p>
+      <div class="mermaid-wrap">
+        <h5>双栈策略版本发布</h5>
+        <pre class="mermaid">flowchart LR
+    P[policy.yaml / colang] --> V[版本号 cs-v3.2]
+    V --> PY[Python 服务]
+    V --> JV[Java 服务]
+    PY --> T[集成测试 50 样本]
+    JV --> T
+    T -->|pass| PROD[生产灰度]</pre>
+        <p class="diagram-caption">策略变更必须双栈同版本号，避免「Java 已拒答、Python 仍放行」。</p>
+      </div>
+      <div class="role-cards" aria-label="Advisor 职责">
+        <article class="role-card">
+          <h4 class="role-card-title">RequestAdvisor</h4>
+          <p class="role-card-desc">输入越狱、违法、仇恨；记录 refusal_code。</p>
+        </article>
+        <article class="role-card">
+          <h4 class="role-card-title">Model</h4>
+          <p class="role-card-desc">仅处理已通过输入审核的上下文。</p>
+        </article>
+        <article class="role-card">
+          <h4 class="role-card-title">ResponseAdvisor</h4>
+          <p class="role-card-desc">PII、泄密、歧视；可截断流式 token。</p>
+        </article>
+      </div>
+      <table class="outline-table">
+        <thead><tr><th>测试样本 ID</th><th>违规类型</th><th>期望 refusal_code</th><th>Python/Java 一致</th></tr></thead>
+        <tbody>
+          <tr><td>CS-001</td><td>仇恨</td><td>HATE</td><td>是</td></tr>
+          <tr><td>CS-002</td><td>越狱</td><td>JAILBREAK</td><td>是</td></tr>
+          <tr><td>CS-003</td><td>泄密</td><td>SECRET_LEAK</td><td>是</td></tr>
+          <tr><td>CS-004</td><td>正常业务</td><td>—</td><td>是</td></tr>
+        </tbody>
+      </table>
+      <h4>双栈 Advisor 对齐检查清单</h4>
+      <ul>
+        <li>Python colang 规则 ID 是否与 Java policy YAML 一一映射？</li>
+        <li>集成测试是否对比同一违规样本的双栈拒答文案？</li>
+        <li>Micrometer/LangSmith 是否记录 advisor_name 与 policy_version？</li>
+        <li>回滚时是否能在 5 分钟内切回上一策略版本？</li>
+        <li>VIP 租户严格度是否可配置且默认安全？</li>
+      </ul>
+      <p>发布前务必用同一批违规样本跑通 Python 与 Java 集成测试，避免双栈拒答文案不一致引发合规质疑。</p>
+      <p>流式场景下建议在首个违规 token 触发时立即截断，并返回统一的 CorpAssist 安全模板。</p>
+      <details class="learn-micro-check">
+        <summary>检查理解：Advisor 顺序反了会怎样？</summary>
+        <p>若输出 Advisor 在输入之前注册，将无法拦截用户侧越狱载荷，且可能重复改写历史消息。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不推荐</span><ul><li>仅依赖模型内置安全</li><li>流式输出不做中途截断</li></ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐</span><ul><li>输入输出双审 + 审计</li><li>策略版本化与 A/B 评测</li></ul></div>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 误杀与漏杀权衡</span>
+        金融租户要求更严：违法咨询拒答率 99.9%，可接受 0.5% 误杀转人工；内部研发租户可放宽至 98% 以提升体验。策略表需按 <code>tenant_tier</code> 加载不同阈值。
+      </aside>
+      <table class="outline-table">
+        <thead><tr><th>指标</th><th>目标</th><th>告警</th><th>处置</th></tr></thead>
+        <tbody>
+          <tr><td>漏杀率</td><td>&lt; 0.1%（抽检）</td><td>周环比 +50%</td><td>回滚 policy + 红队补样</td></tr>
+          <tr><td>误杀率</td><td>&lt; 2%</td><td>客服投诉 spike</td><td>人工复核队列扩容</td></tr>
+          <tr><td>审核延迟 P95</td><td>&lt; 150ms</td><td>&gt; 300ms</td><td>切换轻量分类器</td></tr>
+        </tbody>
+      </table>
+      <h4>拒答模板与 audit 字段</h4>
+      <table class="outline-table">
+        <thead><tr><th>refusal_code</th><th>用户可见文案</th><th>audit 必填</th></tr></thead>
+        <tbody>
+          <tr><td>HATE</td><td>无法处理该请求</td><td>policy_version, tenant_id</td></tr>
+          <tr><td>JAILBREAK</td><td>请换一种方式提问</td><td>matched_rule_id</td></tr>
+          <tr><td>SECRET_LEAK</td><td>无法提供该信息</td><td>trace_id, channel</td></tr>
+        </tbody>
+      </table>
+      <p>与《<a href="#ch-practice-03-audit">审计与溯源</a>》衔接：每次拒答写 <code>event_type=moderation_block</code>，便于等保抽检与误杀分析。</p>
+      <h4>人工复核队列（误杀兜底）</h4>
+      <p>当分类器置信度处于灰区（如 0.45–0.55）时，CorpAssist 将请求路由到人工复核队列，而非直接拒答或放行。队列 SLA 与客服值班表绑定，避免夜间无人处理导致业务中断。</p>
+      <ol>
+        <li>灰区请求打标 <code>review_required=true</code> 并暂停自动回复。</li>
+        <li>复核员在脱敏界面查看原文与命中规则。</li>
+        <li>结论写回 <code>review_outcome</code> 用于后续模型校准。</li>
+      </ol>
+      <table class="outline-table">
+        <thead><tr><th>租户 tier</th><th>灰区策略</th><th>SLA</th></tr></thead>
+        <tbody>
+          <tr><td>金融</td><td>默认拒答 + 人工</td><td>15 分钟</td></tr>
+          <tr><td>标准</td><td>人工或安全模板</td><td>4 小时</td></tr>
+          <tr><td>内部研发</td><td>可放宽至告警</td><td>下一工作日</td></tr>
+        </tbody>
+      </table>
+      <details class="learn-micro-check">
+        <summary>检查理解：灰区一律放行以提升体验是否可行？</summary>
+        <p>金融与政务租户不可行；须拒答或人工复核，并保留 audit 证据链。</p>
+      </details>
+      <p>上线前用 50 条标注样本计算混淆矩阵：漏杀率与误杀率须写入发布说明，并与 <a href="#ch-practice-05-corpassist-sec">实战：CorpAssist 安全基线</a> SEC-03/04 证据一并归档。</p>
+      <div class="learn-faq">
+        <details>
+          <summary>SafeGuardAdvisor 能否替代输入审核？</summary>
+          <div class="learn-faq-body">不能单独替代。它主要过滤模型输出；越狱载荷需在 RequestAdvisor/Guardrails 输入 rail 拦截。</div>
+        </details>
+        <details>
+          <summary>流式回复中途违规如何处理？</summary>
+          <div class="learn-faq-body">在 token 窗口检测到违规类时立即截断，返回统一 refusal 模板并写 audit 事件。</div>
+        </details>
+        <details>
+          <summary>第三方 moderation API 宕机怎么办？</summary>
+          <div class="learn-faq-body">降级为本地规则集 + 默认拒答模板，并告警；禁止静默放行。</div>
+        </details>
+      </div>
+      <div class="notice">
+        <strong>双栈发布检查</strong>
+        <ul>
+          <li>policy 版本号写入 Git tag 与镜像 label。</li>
+          <li>集成测试报告附在 MR 描述中。</li>
+          <li>灰度租户先跑 24h 再全量。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">C26 把内容安全做成可观测、可回滚的工程能力，而非模型黑盒。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>C26</strong> 需要输入/输出分离的 <span class="term" data-term-id="content-safety" tabindex="0">content safety</span> 链路。</li>
+        <li>NeMo Guardrails 与 Spring AI Advisor 可同构映射，便于双栈一致。</li>
+        <li>审核策略要可观测、可回滚，并度量误杀/漏杀。</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="security-compliance-engineering_basics02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="c26" /> 能解释 C26 输入输出职责划分</label></li>
+          <li><label><input type="checkbox" data-id="dual" /> 能对照 Python/Java Advisor 挂载点</label></li>
+          <li><label><input type="checkbox" data-id="demo" /> 已完成 moderation Demo</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>端</th><th>拦什么</th><th>栈</th></tr></thead>
+              <tbody>
+                <tr><td>输入</td><td>越狱/违法/仇恨</td><td>Guardrails / RequestAdvisor</td></tr>
+                <tr><td>输出</td><td>泄密/歧视/承诺</td><td>SafeGuard / ResponseAdvisor</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何度量 CorpAssist 内容安全的误杀与漏杀？</li>
+              <li>Python Guardrails 与 Spring Advisor 如何保证策略版本一致？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一章 <a href="#ch-basics-03-injection">注入与越狱</a>（C27）。</p>
+    </div>
+  </div>
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.nvidia.com/nemo/guardrails/" target="_blank" rel="noopener">NeMo Guardrails</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/advisors.html" target="_blank" rel="noopener">Spring AI Advisors</a></li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现并扩展 CorpAssist moderation 闸门（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「输入输出审核」节的 C26 流水线表，标出 CorpAssist 各触点。</li>
+      <li>运行 <code>moderation_check.py</code> 理解基线用例。</li>
+      <li>在「双栈 Advisor」节对照表中补充你团队的实际类名。</li>
+      <li>新增 3 条企业自定义敏感词并更新测试。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">仅做输入审核、不做输出审核，能否通过等保测评？</p>
+        <div class="learn-practice-answer"><details><summary>参考答案</summary><div class="learn-practice-answer-body"><p><strong>不能</strong>。模型仍可能生成违规或泄密内容，必须双端审核并留痕。</p></div></details></div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：内容安全检测实验室</h4>
+      <p>目录：<code>demos/basics-02-content-safety-lab/</code> · 验收：<code>python moderation_check.py</code></p>
+    </div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-03-injection">注入与越狱</a> — C27 多层防护</li>
+    </ul>
+  </div>
+</section>

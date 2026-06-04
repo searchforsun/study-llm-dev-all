@@ -1,0 +1,367 @@
+<section id="ch-advanced-03-third-party" class="chapter" data-chapter="advanced-03-third-party">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>第三方与数据出境</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-third-party" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>合规交付</strong> · 能力：完成 LLM 供应商评估、DPA 条款与跨境传输合规设计</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 几乎必然依赖第三方模型、Embedding、内容审核或 OCR。ToB 招投标会问：<span class="term" data-term-id="vendor-dpa" tabindex="0">vendor dpa</span> 是否覆盖子处理器？<span class="term" data-term-id="cross-border-transfer" tabindex="0">cross border transfer</span> 走标准合同还是安全评估？本章把法务语言翻译成工程检查表。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>执行 <span class="term" data-term-id="third-party-assessment" tabindex="0">third party assessment</span> 打分卡</li>
+          <li>审阅 <span class="term" data-term-id="data-mapping" tabindex="0">data mapping</span> 与出境路径</li>
+          <li>在合同中要求 <span class="term" data-term-id="exit-clause" tabindex="0">exit clause</span> 与模型权重导出边界</li>
+          <li>识别 <span class="term" data-term-id="llm-vendor-risk" tabindex="0">llm vendor risk</span> 热点（训练数据、日志留存、政府访问）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>先映射数据流</strong>：未画图不谈 DPA。</li>
+          <li><strong>出境需路径</strong>：境内专有云、SCC、安全评估三选一，禁止默认「用就行」。</li>
+          <li><strong>退出要可演练</strong>：换模型/vendor 的 RTO 与数据删除证明写进合同。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>评估</h3>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 选型三家云 LLM</span>
+        采购要求 30 天内完成安全评估：训练数据是否用客户数据、日志是否用于改进、是否支持境内区域、子处理器清单、SOC2/等保测评报告有效期。你需要输出可比较的评分表而非「选最便宜的」。
+      </aside>
+
+      <p><span class="term" data-term-id="third-party-assessment" tabindex="0">third party assessment</span> 建议维度（权重可按行业调整）：</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>维度</th><th>关键问题</th><th>CorpAssist 证据</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>数据用途</td>
+              <td>客户 Prompt 是否用于训练？opt-out 是否默认开启？</td>
+              <td>合同条款 + 控制台截图 + API 头 <code>X-No-Train</code></td>
+            </tr>
+            <tr>
+              <td>驻留与副本</td>
+              <td>推理区域、备份区域、客服人员访问地</td>
+              <td><span class="term" data-term-id="data-mapping" tabindex="0">data mapping</span> 图 + 子区域列表</td>
+            </tr>
+            <tr>
+              <td>安全认证</td>
+              <td>SOC2 Type II / ISO27001 / 等保测评</td>
+              <td>报告编号与有效期（过期视为高风险）</td>
+            </tr>
+            <tr>
+              <td>模型供应链</td>
+              <td>基础模型来源、开源许可证、漏洞响应 SLA</td>
+              <td>SBOM + CVE 通报记录</td>
+            </tr>
+            <tr>
+              <td>事件响应</td>
+              <td>数据泄露 72h 通知、联合演练频率</td>
+              <td>上年度演练纪要</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 第三方数据流（评估用）</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Customer[客户域]
+        U[用户/柜员]
+        CA[CorpAssist]
+        RAG[(向量库)]
+    end
+    subgraph Vendor[第三方]
+        LLM[云 LLM API]
+        MOD[内容审核]
+        EMB[Embedding 服务]
+    end
+    U --> CA
+    CA --> RAG
+    CA -->|Prompt/Completion| LLM
+    CA --> MOD
+    RAG --> EMB
+    LLM -.->|可能跨境| X[境外区域]</pre>
+        <p class="diagram-caption">评估时标红跨境边；境内专有云若仍经境外运维通道，也算传输。</p>
+      </div>
+
+      <h4>评估脚本：自动拉取子处理器</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># vendor_assessment.py — 对比子处理器清单
+import json
+from pathlib import Path
+
+REQUIRED = {"region", "purpose", "data_categories", "dpa_covered"}
+
+def score_vendor(name: str, subprocessors: list[dict]) -> dict:
+    gaps = []
+    for sp in subprocessors:
+        missing = REQUIRED - set(sp.keys())
+        if missing:
+            gaps.append({"sub": sp.get("name"), "missing": sorted(missing)})
+    return {
+        "vendor": name,
+        "score": max(0, 100 - 15 * len(gaps)),
+        "gaps": gaps,
+        "pass": len(gaps) == 0,
+    }
+
+report = score_vendor("cloud-a", json.loads(Path("cloud-a-subs.json").read_text()))
+print(json.dumps(report, ensure_ascii=False, indent=2))</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="subprocessors" tabindex="0">subprocessors</span> 变更应触发增量评估；与 <span class="term" data-term-id="llm-vendor-risk" tabindex="0">llm vendor risk</span> 登记册联动（Owner、复审日、残余风险）。</p>
+
+      <p class="learn-micro-check"><strong>先想 10 秒：</strong>「模型厂商承诺不训练」但日志默认保留 30 天用于排障——这属于哪类风险？评估表填哪一格？</p>
+    </div>
+
+    <div class="section-block">
+      <h3>合同</h3>
+
+      <p><span class="term" data-term-id="vendor-dpa" tabindex="0">vendor dpa</span>（数据处理协议）应覆盖：处理目的、数据类别、保留期、子处理器、跨境机制、审计权、删除与返还、安全事件通知。</p>
+
+      <h4>跨境传输三路径</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>路径</th><th>适用</th><th>工程动作</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>境内处理</td>
+            <td>金融/政务默认</td>
+            <td>路由仅境内 endpoint；网络 ACL 阻断境外 DNS</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="scc-mechanism" tabindex="0">scc mechanism</span></td>
+            <td>集团内跨境、已签署 SCC 的 SaaS</td>
+            <td>合同附录列明字段；传输加密 + 访问日志</td>
+          </tr>
+          <tr>
+            <td>安全评估 / 认证</td>
+            <td>关键信息基础设施、大规模个人信息出境</td>
+            <td>法务主导；工程提供 <span class="term" data-term-id="data-mapping" tabindex="0">data mapping</span> 与影响分析</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p><span class="term" data-term-id="cross-border-transfer" tabindex="0">cross border transfer</span> 在 LLM 场景易被忽略的细节：</p>
+      <ul>
+        <li>支持工单系统可能在境外</li>
+        <li>可观测性 SaaS（trace/log）默认美国区</li>
+        <li>开源模型下载与权重更新 CDN</li>
+        <li>员工境外远程运维</li>
+      </ul>
+
+      <h4>合同必备条款（工程可验收）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># contract-checklist.yaml（摘录）
+mandatory_clauses:
+  - id: NO_TRAIN_DEFAULT
+    text: "客户数据默认不用于模型训练；opt-in 需书面同意"
+  - id: DELETE_ON_EXIT
+    text: "合同终止 30 日内删除推理日志与缓存；提供删除证明"
+  - id: SUBPROCESSOR_NOTICE
+    text: "子处理器变更提前 30 日通知；客户可反对"
+  - id: AUDIT_RIGHT
+    text: "每年一次第三方审计报告或 SOC2 摘要"
+  - id: EXIT_PORTABILITY
+    text: "提供模型接口兼容期 ≥90 天；协助迁移嵌入维度文档"
+exit_clause:
+  rto_days: 14
+  deliverables: [delete_certificate, last_30d_audit_sample, embedding_spec]</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="exit-clause" tabindex="0">exit clause</span> 应与技术 <span class="term" data-term-id="exit-clause" tabindex="0">exit clause</span> 演练一致：每季度做一次「切换备用模型」演练，验证 Prompt 模板、工具 schema、向量维度无需重写。</p>
+
+      <h4>LLM 供应商常见问题清单（尽调访谈）</h4>
+      <div class="learn-faq">
+        <details>
+          <summary>训练数据是否包含我方 Prompt？默认 opt-out 还是 opt-in？</summary>
+          <div class="learn-faq-body">要求书面答复并引用合同条款编号；工程侧验证 API 是否支持 <code>X-No-Train: true</code> 且默认开启。</div>
+        </details>
+        <details>
+          <summary>日志保留多久？谁可以访问？是否用于产品改进？</summary>
+          <div class="learn-faq-body">保留期写入 DPA；访问地列入子处理器；改进用途需单独同意或匿名化。</div>
+        </details>
+        <details>
+          <summary>模型权重或 API 下线时提前多久通知？</summary>
+          <div class="learn-faq-body">合同要求 ≥90 天兼容期；工程维护备用模型与 embedding 维度对照表。</div>
+        </details>
+        <details>
+          <summary>是否支持客户自带密钥（BYOK）与境内 KMS？</summary>
+          <div class="learn-faq-body">金融客户常要求；政务客户常要求密钥不出境。无法支持则标注残余风险。</div>
+        </details>
+      </div>
+
+      <h4>数据出境影响分析（DPIA 工程附件）</h4>
+      <p>向法务提供一页纸摘要：</p>
+      <ul>
+        <li><strong>数据类别</strong>：Prompt、Completion、Embedding、审核日志、工单附件。</li>
+        <li><strong>规模</strong>：日活用户、峰值 QPS、单条最大 token、留存周期。</li>
+        <li><strong>接收方</strong>：模型商、CDN、可观测性 SaaS、外包运维。</li>
+        <li><strong>必要性</strong>：是否可境内替代；替代成本与延迟影响。</li>
+        <li><strong>措施</strong>：加密、脱敏、访问控制、删除与审计。</li>
+      </ul>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 验收：供应商评估实验室
+cd demos/advanced-03-third-party-lab
+python vendor_assessment.py
+test -f assessment-report.json && jq -e '.pass == true' assessment-report.json</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>只签服务协议不签 DPA</li>
+            <li>口头「境内机房」无区域 API 约束</li>
+            <li>无删除证明的「终止合作」</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>子处理器 JSON 机器可读 + CI 校验字段</li>
+            <li>跨境边在架构图与防火墙策略双向一致</li>
+            <li>退出演练报告进投标资料库</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>退出演练交付物清单</h4>
+      <ul>
+        <li>模型 API 兼容期证明与迁移窗口公告</li>
+        <li>向量维度与索引格式说明（避免锁死供应商）</li>
+        <li>删除证书 + 最后 30 日审计抽样</li>
+        <li>子处理器终止服务书面确认</li>
+        <li>备用模型切换 runbook 与 RTO 实测记录</li>
+      </ul>
+      <p>每季度演练切换备用模型，记录 P95 延迟与回答质量差异；演练结论写入 <span class="term" data-term-id="llm-vendor-risk" tabindex="0">llm vendor risk</span> 登记册，作为下年度采购依据。</p>
+      <p>采购合同应明确：客户数据、模型输出、日志三类数据的删除时限与证明格式；工程验收以脚本抓取删除 API 回执为准。</p>
+
+      <h4>子处理器变更通知流程</h4>
+      <ol>
+        <li>厂商提前 30 日邮件通知 + JSON 机器可读 diff。</li>
+        <li>法务评估出境与 DPA 覆盖；工程更新 data mapping 图。</li>
+        <li>客户反对权：触发备用 vendor 或停用相关功能。</li>
+        <li>更新 <code>assessment-report.json</code> 并重新跑 <code>vendor_assessment.py</code>。</li>
+      </ol>
+      <p>投标技术卷附录建议顺序：数据流图 → 评估打分表 → DPA 条款对照 → 退出演练纪要 → 子处理器 JSON。法务审阅签字后再冻结版本号。</p>
+      <h4>评估阶段角色分工</h4>
+      <ul>
+        <li><strong>架构</strong>：data mapping 与跨境边。</li>
+        <li><strong>安全</strong>：打分卡与红队问题清单回复。</li>
+        <li><strong>法务</strong>：DPA/SCC/安评路径。</li>
+        <li><strong>采购</strong>：退出条款与 SLA 违约金。</li>
+      </ul>
+      <p>以上分工写入 RFP 应答表，避免评估期临时抓人。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>评估</strong>：打分卡 + 数据流图 + 子处理器机器可读清单；变更触发复审。</li>
+        <li><strong>合同</strong>：DPA 覆盖训练/日志/审计/删除；出境走境内/SCC/安评；退出可演练。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="security-compliance-engineering_adv03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="scorecard" /> 能填评估表 5 维度</label></li>
+          <li><label><input type="checkbox" data-id="mapping" /> 能标出图中跨境边</label></li>
+          <li><label><input type="checkbox" data-id="dpa" /> 能列举 4 条必备合同条款</label></li>
+          <li><label><input type="checkbox" data-id="exit" /> 能描述退出演练交付物</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>评估</td><td>先 data mapping 再打分</td></tr>
+                <tr><td>出境</td><td>境内 / SCC / 安评 三路径</td></tr>
+                <tr><td>合同</td><td>不训练、可删除、可审计、可退出</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-04-interview">面试：安全案例</a> — 用案例串讲全课。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://owasp.org/www-project-top-10-for-large-language-model-applications/" target="_blank" rel="noopener">OWASP LLM Top 10</a></li>
+      <li><a href="https://www.iso.org/standard/76559.html" target="_blank" rel="noopener">ISO/IEC 27001</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成一家云 LLM 的评估打分与子处理器缺口报告（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>根据本章数据流 Mermaid，画出 CorpAssist + 两家供应商的跨境边（纸面或 draw.io）。</li>
+      <li>用 <code>vendor_assessment.py</code> 对样例 <code>cloud-a-subs.json</code> 运行，记录 <code>gaps</code>。</li>
+      <li>在 <code>contract-checklist.yaml</code> 上勾选你方投标必含的 3 条 clause id。</li>
+      <li>可选：完成 <code>demos/advanced-03-third-party-lab/</code> 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）厂商提供「中国区推理」但支持工程师在印度处理工单。合同应优先补哪类条款？A) 模型蒸馏 B) 子处理器与访问地披露 C) 开源许可证 D) GPU 型号</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>B</strong>。运维访问地构成个人信息跨境或出境风险，须在 DPA 与子处理器清单中披露，并评估是否触发 SCC/安评。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：供应商评估实验室</h4>
+      <p>目录：<code>demos/advanced-03-third-party-lab/</code>。<strong>验收</strong>：<code>python vendor_assessment.py</code> 输出 <code>"pass": true</code> 且生成 <code>assessment-report.json</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-04-interview">面试：安全案例</a></li>
+    </ul>
+  </div>
+</section>
