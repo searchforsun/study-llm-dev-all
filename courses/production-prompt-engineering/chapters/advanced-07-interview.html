@@ -1,0 +1,400 @@
+<section id="ch-advanced-07-interview" class="chapter" data-chapter="advanced-07-interview">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：Prompt 排障案例</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-07-interview" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>生产治理</strong> · 能力：用坏例飞轮、改写策略与指标叙事完成 Prompt debug 面试答辩</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>高级 LLM 应用岗面试很少让你背「什么是 Few-shot」，更常给一条生产 badcase：<strong>cite 丢失、拒答飙升、JSON 破 schema</strong>——要求你在 15 分钟内讲清根因、改写方案与如何验证。<span class="term" data-term-id="prompt-debug-interview" tabindex="0">prompt debug interview</span> 本章把 CorpAssist 真实排障路径压缩成可复述的 <span class="term" data-term-id="interview-defense-template" tabindex="0">interview defense template</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="badcase-analysis" tabindex="0">badcase analysis</span> 框架定位 Prompt / 检索 / 工具三类根因</li>
+          <li>选择 <span class="term" data-term-id="prompt-rewrite" tabindex="0">prompt rewrite</span> 与 <span class="term" data-term-id="ablation-strategy" tabindex="0">ablation strategy</span> 验证假设</li>
+          <li>用 <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span> 叙事证明改动有效且无副作用</li>
+          <li>套用 <span class="term" data-term-id="interview-defense-template" tabindex="0">interview defense template</span> 完成 TOP5 场景答辩</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>先现象后假设</strong>：贴 trace、用户句、模型输出，再谈 Prompt。</li>
+          <li><strong>单变量改写</strong>：一次只改 System / User / 示例 / 检索 之一。</li>
+          <li><strong>指标要对照</strong>：改前改后 + 回归集 +  guard 指标联看。</li>
+          <li><strong>答不完也要闭环</strong>：根因 → 改写 → 验证 → 回滚预案。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>坏例分析</h3>
+      <aside class="learn-scenario" aria-label="面试情境">
+        <span class="learn-scenario-title">CorpAssist · 面试题 S1</span>
+        面试官：「上线 rag-prompt-v2.3 后 cite 覆盖率从 0.82 降到 0.61，用户投诉『答案没出处』。给你 trace_id，你怎么查？」——期望你展示结构化 <span class="term" data-term-id="badcase-analysis" tabindex="0">badcase analysis</span>，而非猜测「模型变差了」。
+      </aside>
+
+      <p>坏例分析的第一步是<strong>冻结上下文</strong>：prompt_version、检索 top-k、chunk 文本、完整 messages 数组、模型输出。CorpAssist 在 <span class="term" data-term-id="flywheel-badcase" tabindex="0">flywheel badcase</span> 平台归档上述字段，并与 <span class="term" data-term-id="root-cause-prompt" tabindex="0">root cause prompt</span> 分类标签绑定。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>根因类别</th><th>典型信号</th><th>CorpAssist 检查点</th><th>非 Prompt 因素</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Prompt 指令</strong></td>
+              <td>模型不输出 [doc_id] 格式</td>
+              <td>System cite 段是否被截断</td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <td><strong>检索</strong></td>
+              <td>CONTEXT 空或 chunk 无 metadata</td>
+              <td>retriever score、chunk_id</td>
+              <td>索引延迟</td>
+            </tr>
+            <tr>
+              <td><strong>组装</strong></td>
+              <td>CONTEXT 在 System 之后被覆盖</td>
+              <td>message 顺序、token 裁剪</td>
+              <td>网关限长</td>
+            </tr>
+            <tr>
+              <td><strong>模型/参数</strong></td>
+              <td>全版本同步下降</td>
+              <td>temperature、模型路由</td>
+              <td>供应商降级</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>Badcase 分析决策流</h5>
+        <pre class="mermaid">flowchart TD
+  Start[收到 badcase] --> Trace[拉 trace + messages]
+  Trace --> Q1{CONTEXT 非空?}
+  Q1 -->|否| Ret[查检索/索引]
+  Q1 -->|是| Q2{cite 指令在 System?}
+  Q2 -->|否| Asm[查组装/裁剪]
+  Q2 -->|是| Q3{输出格式违规?}
+  Q3 -->|是| Prompt[Prompt 改写候选]
+  Q3 -->|否| Model[查模型/参数]
+  Prompt --> Abl[ablation 验证]
+  Ret --> Abl
+  Asm --> Abl</pre>
+        <p class="diagram-caption">先排除检索与组装，再动 Prompt；避免「盲改 System」。</p>
+      </div>
+
+      <h4>badcase 归档 JSONL 字段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "case_id": "BC-RAG-0412",
+  "prompt_version": "rag-prompt-v2.3",
+  "symptom": "cite_coverage_drop",
+  "user_query": "年假如何计算？",
+  "root_cause_tag": "prompt_instruction",
+  "trace_id": "otel-8f3a..."
+}</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="root-cause-prompt" tabindex="0">root cause prompt</span> 是内部分析用模板：让 LLM 根据 trace 输出<strong>结构化假设列表</strong>（仅供工程师参考，不自动改生产 Prompt）。与自动修复不同，分析 Prompt 要求引用 message 序号作为证据。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">面试扣分</span>
+          <ul>
+            <li>不谈 trace，直接说「加强 Prompt」</li>
+            <li>把检索问题全归咎于模型</li>
+            <li>无法复述用户原句与错误输出</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">加分</span>
+          <ul>
+            <li>按表格四类根因逐一排除</li>
+            <li>引用 prompt_version 与 diff</li>
+            <li>提出可执行的下一步实验</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：cite 下降但 faithfulness 仍高，最可疑哪一层？</summary>
+        <p>模型回答仍「像」有据，但未输出规定 cite token——优先查 Prompt 指令是否被 v2.3 改动或 token 裁剪截断 System 中的 cite 格式段，而非检索召回本身。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>改写策略</h3>
+      <p>确认根因落在 Prompt 层后，<span class="term" data-term-id="prompt-rewrite" tabindex="0">prompt rewrite</span> 须遵守<strong>单变量</strong>与<strong>可 diff</strong>：每次 MR 只改一类元素，并在 <code>prompt-diff.txt</code> 标注假设。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>症状</th><th>改写杠杆</th><th>示例改动</th><th>风险</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>无 cite</td><td>System 格式 + Few-shot</td><td>增加「每句末必须 [doc_id:idx]」</td><td>拒答率上升</td></tr>
+            <tr><td>过度拒答</td><td>拒答分支条件</td><td>低置信阈值 0.35→0.28</td><td>幻觉上升</td></tr>
+            <tr><td>JSON 破 schema</td><td>schema 嵌入 + 修复循环</td><td>additionalProperties:false</td><td>延迟</td></tr>
+            <tr><td>注入泄露</td><td>边界声明 + 不可信区</td><td>boundary_instruction 加强</td><td>误杀</td></tr>
+            <tr><td>语调漂移</td><td>style_profile / tone</td><td>补禁用词与示例</td><td>多语言不一致</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><span class="term" data-term-id="ablation-strategy" tabindex="0">ablation strategy</span> 用于面试与实验：依次去掉 Few-shot、缩短 System、替换检索 chunk，观察哪一步指标恢复，从而证明根因。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="改写验证">
+        <input type="radio" name="rewrite-tab" id="rewrite-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="rewrite-tab" id="rewrite-tab-b" class="learn-tab-input" />
+        <label for="rewrite-tab-a">离线 golden</label>
+        <label for="rewrite-tab-b">在线 shadow</label>
+        <div class="learn-tab-panel" id="rewrite-panel-a" role="tabpanel">
+          <ul>
+            <li>对 badcase 集 + 回归集跑 eval</li>
+            <li>对比 cite_coverage、refusal_rate</li>
+            <li>CI 门禁通过再合入</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="rewrite-panel-b" role="tabpanel">
+          <ul>
+            <li>1% 流量 shadow 新 Prompt</li>
+            <li>不暴露用户，只记指标</li>
+            <li>48h 无劣化再放大</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>cite 修复 diff 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">diff</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-diff">--- rag-prompt-v2.3
++++ rag-prompt-v2.4
+@@ System @@
+- 请依据 CONTEXT 作答。
++ 请依据 CONTEXT 作答。每一 factual 句末必须附 [doc_id:chunk_idx]。
++ Single variable: cite format only.</code></pre>
+      </div>
+
+      <p>改写须联动 <a href="#ch-practice-04-ab-test">A/B 与迭代流程</a> 的 single_variable 规则；禁止在同一 MR 里同时改 cite 与拒答阈值，否则 <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span> 无法归因。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>面试中被问「你会加更多 Few-shot 吗？」</summary>
+          <div class="learn-faq-body">先答「取决于 ablation」：若去掉 Few-shot 后 cite 仍差，则非示例问题；若恢复示例即恢复，再讨论示例质量与 token 成本，展示工程化思维而非套路。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>指标变化</h3>
+      <p>面试官要听的不是「指标好了」，而是<strong>改什么、升什么、降什么、如何解释 trade-off</strong>。<span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span> 叙事格式：<code>Δmetric = after − before</code>，附样本量与置信说明。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>指标</th><th>v2.3→v2.4 Δ</th><th>解释</th><th>联看指标</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>cite_coverage</td><td>+0.19 (0.61→0.80)</td><td>cite 格式句生效</td><td>faithfulness</td></tr>
+            <tr><td>refusal_rate</td><td>+0.02</td><td>格式严导致边缘拒答</td><td>hallucination_rate</td></tr>
+            <tr><td>hallucination_rate</td><td>−0.01</td><td>cite 约束抑制编造</td><td>user_csat</td></tr>
+            <tr><td>p95_latency</td><td>+80ms</td><td>输出略长</td><td>token_out</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>指标联看（拒答 vs 幻觉）</h5>
+        <pre class="mermaid">flowchart LR
+  Change[Prompt 改写] --> Cite[cite_coverage ↑]
+  Change --> Ref[refusal_rate ↑]
+  Cite --> Good[用户信任 ↑]
+  Ref --> Risk[覆盖下降风险]
+  Risk --> Hall[须联看 hallucination_rate]
+  Hall --> Gate{发布闸门}
+  Gate -->|通过| Ship[全量]
+  Gate -->|fail| Roll[回滚 v2.3]</pre>
+        <p class="diagram-caption">单一指标改善不足以上线；与 <a href="#ch-practice-04-ab-test">发布闸门</a> 一致。</p>
+      </div>
+
+      <p>答辩时准备一张「before/after 小表」即可，口头补充：<strong>回归集 200 条全绿、badcase BC-RAG-0412 等 12 条已修复</strong>。引用 <span class="term" data-term-id="flywheel-badcase" tabindex="0">flywheel badcase</span> 说明持续迭代，而非一次性补丁。</p>
+
+      <div class="notice">
+        <strong>红线表述（避免）</strong>
+        <ul>
+          <li>「准确率 100%」——无评测口径</li>
+          <li>「用户都说好了」——无 CSAT 样本</li>
+          <li>只报 cite 升、不提 refusal 边际变化</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>答题模板</h3>
+      <p><span class="term" data-term-id="interview-defense-template" tabindex="0">interview defense template</span> 将 15 分钟答辩切成四段，每段 2～4 分钟，确保即使被打断也能独立成块。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>段</th><th>时长</th><th>内容</th><th>CorpAssist 话术锚点</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1 现象</td><td>2 min</td><td>谁投诉、什么指标、哪版 Prompt</td><td>rag-prompt-v2.3、cite 0.61</td></tr>
+            <tr><td>2 分析</td><td>4 min</td><td>trace 排除检索/组装</td><td>BC-RAG-0412、root_cause_tag</td></tr>
+            <tr><td>3 改写</td><td>4 min</td><td>单变量 diff + ablation</td><td>v2.4 cite 句、golden 回归</td></tr>
+            <tr><td>4 验证</td><td>3 min</td><td>metric delta + 回滚</td><td>cite +0.19、refusal +0.02、rollback tag</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>STAR-P 模板（Prompt 版）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">**S**ituation：CorpAssist S1 上线 v2.3 后 cite_coverage 降至 0.61。
+**T**ask：在不升高幻觉的前提下恢复 cite，48h 内 hotfix。
+**A**ction：trace 排除检索；System 增加 cite 格式句（单变量）；golden + 12 badcase 回归。
+**R**esult：cite 0.80（+0.19），refusal +0.02，已 tag v2.4.1。
+**P**rompt：附 prompt-diff 与 eval 报告路径。</code></pre>
+      </div>
+
+      <p>TOP5 面试场景（S1～S5）与 NS 能力对齐：<span class="term" data-term-id="prompt-debug-interview" tabindex="0">prompt debug interview</span> 题库应覆盖 RAG cite、Agent 工具死循环、JSON schema、注入拒答、S5 去重——每题各备一条 STAR-P。</p>
+
+      <div class="learn-code-compare">
+        <h4>弱答（泛泛）</h4>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">text</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code>我们优化了 Prompt，加了示例，效果好了很多。</code></pre>
+        </div>
+        <h4>强答（可验证）</h4>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">text</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code>v2.3→v2.4 仅改 System cite 句；golden cite_coverage +0.19，refusal +0.02 在闸门内；BC-RAG-0412 等 12 条 badcase 关闭；回滚点 git tag rag-prompt-v2.3.2。</code></pre>
+        </div>
+      </div>
+
+      <p>与 <a href="#ch-advanced-04-capstone">实战：CorpAssist Prompt 套件</a> 的 graduation checklist 衔接：答辩材料 = eval manifest + 一条完整 badcase 闭环故事。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>坏例分析</strong>：冻结 trace，按 Prompt/检索/组装/模型四类排除根因。</li>
+        <li><strong>改写策略</strong>：单变量 diff + ablation，离线 golden 再在线 shadow。</li>
+        <li><strong>指标变化</strong>：metric delta 联看 refusal 与 hallucination，避免片面报喜。</li>
+        <li><strong>答题模板</strong>：STAR-P 四段式，现象→分析→改写→验证可独立成块。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="ppe_advanced07">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="badcase" /> 能按决策流排除检索与组装</label></li>
+          <li><label><input type="checkbox" data-id="rewrite" /> 能写出单变量 prompt-diff 示例</label></li>
+          <li><label><input type="checkbox" data-id="metric" /> 能解释 cite 升但 refusal 边际升</label></li>
+          <li><label><input type="checkbox" data-id="star" /> 能口述一条完整 STAR-P</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>ablation</td><td>逐项去掉变体证根因</td></tr>
+                <tr><td>metric delta</td><td>after−before 联看 guard 指标</td></tr>
+                <tr><td>STAR-P</td><td>情境任务行动结果+Prompt 证据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <div class="learn-interview">
+        <details>
+          <summary>答辩题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>（场景）拒答率降了 5 个点但幻觉升 2 个点，你会发布吗？</li>
+              <li>如何用 ablation 向非技术面试官解释「不是模型随机性」？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：完成测验与 Demo；本课 advanced 阶段完结，可回顾 <a href="#ch-advanced-04-capstone">实战：CorpAssist Prompt 套件</a> 做毕业答辩。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/guides/prompt-engineering" target="_blank" rel="noopener">OpenAI — Prompt engineering</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/evaluation.html" target="_blank" rel="noopener">Spring AI — Evaluation</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 BC-RAG-0412 填写 badcase JSONL、撰写 v2.3→v2.4 的 prompt-diff，并用 demo 脚本校验 STAR-P 五段字段与 metric 表齐全。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>根据「坏例分析」表，为 cite 下降 case 选定 <code>root_cause_tag</code> 并写入 <code>badcase-sample.jsonl</code>。</li>
+      <li>按「改写策略」决策表，在 <code>prompt-diff.txt</code> 写单变量 cite 修复 diff（含 Single variable 注释）。</li>
+      <li>把「指标变化」表中的四项 Δ 填入 <code>metric-delta.yaml</code>。</li>
+      <li>用「答题模板」STAR-P 结构完成 <code>star-p-answer.md</code> 五段（S/T/A/R/P）。</li>
+      <li>可选：完成 <code>demos/advanced-07-interview-lab/</code> 验收命令。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）cite 下降但 CONTEXT 为空。应优先改 System cite 句还是查检索？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>查检索/索引</strong>：无 CONTEXT 时模型无据可 cite；改 Prompt 无法解决空检索，决策流 Q1 应走 Ret 分支。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Prompt 排障面试案例实验室</h4>
+      <p>目录：<code>demos/advanced-07-interview-lab/</code>。<strong>验收</strong>：运行 <code>python check_interview_case.py</code>，输出 <code>PASS: interview case pack valid</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-advanced-04-capstone">实战：CorpAssist Prompt 套件</a>：毕业 checklist 与 eval manifest</li>
+      <li><a href="../llm-evaluation-quality/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">LLM 评测与质量</span><code class="course-ref-slug">llm-evaluation-quality</code></a></li>
+      <li><a href="../enterprise-llm-solution-delivery/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">企业 LLM 方案交付</span><code class="course-ref-slug">enterprise-llm-solution-delivery</code></a></li>
+    </ul>
+  </div>
+</section>

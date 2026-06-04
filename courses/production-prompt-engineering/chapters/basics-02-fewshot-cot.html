@@ -1,0 +1,563 @@
+<section id="ch-basics-02-fewshot-cot" class="chapter" data-chapter="basics-02-fewshot-cot">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Few-shot 与 CoT</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-fewshot-cot" aria-label="标记本章完成">标记完成</button>
+  </header>
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>Prompt 结构与模板</strong> · 能力：为 CorpAssist 选择 few-shot 与 CoT 并量化 token 成本</p>
+      <div class="notice notice-why-learn"><strong>为什么要学本章</strong><p>格式不稳定时，Few-shot 与 CoT 是低成本杠杆；但示例过时与推理外露是常见生产事故。本章建立可版本化的双栈模板与成本意识。</p></div>
+      <div class="notice notice-outcome"><strong>学完你能</strong><ul>          <li>为工单分类挑选 3 条覆盖边界的 few-shot</li>
+          <li>设计隐藏 CoT 的三步推理模板</li>
+          <li>估算 few-shot+CoT 的 token 增量并设停止条件</li>
+          <li>双栈共享 YAML 示例库</li></ul></div>
+      <div class="notice"><strong>本章先记住 3 件事</strong><ul>          <li>示例要少而精，覆盖边界</li>
+          <li>CoT 对外隐藏，步数有上限</li>
+          <li>成本用仪表盘驱动增减</li></ul></div>
+    </div>
+    <div class="section-block">
+      <h3>示例选择</h3>
+      <p><span class="term" data-term-id="few-shot" tabindex="0">few-shot</span> 通过示范输入输出形状，降低模型对 CorpAssist 工单、拒答话术的「格式猜测」。生产里示例不是越多越好，而要<strong>代表边界</strong>：正常、拒答、缺 Tool、多实体。</p>
+      <aside class="learn-scenario" aria-label="情境"><span class="learn-scenario-title">CorpAssist · 工单分类</span>
+        需将员工描述映射为 <code>ticket_type</code>：咨询/投诉/审批。选 3 条示例覆盖「模糊描述」「跨部门」「明确单号」三类。</aside>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>原则</th><th>说明</th><th>反例</th></tr></thead>
+        <tbody>
+          <tr><td>多样性</td><td>覆盖主要意图簇</td><td>5 条全是「查订单」</td></tr>
+          <tr><td>新鲜度</td><td>与当前 API/字段同步</td><td>示例仍含已废弃字段 <code>legacy_id</code></td></tr>
+          <tr><td>匿名化</td><td>脱敏真实 PII</td><td>示例带真实手机号</td></tr>
+          <tr><td>长度</td><td>单示例 &lt; 400 tokens</td><td>贴整页政策 PDF</td></tr>
+        </tbody></table></div>
+      <p><span class="term" data-term-id="example-selection" tabindex="0">example selection</span> 可静态维护在 YAML，也可按意图动态检索示例库（注意与 RAG 检索隔离，避免示例污染事实层）。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">few_shot_examples:
+  - input: "客户说发货慢，要投诉"
+    output: {"ticket_type":"complaint","need_order_id":true}
+  - input: "帮我看看年假还剩几天"
+    output: {"ticket_type":"hr_query","escalate":false}
+  - input: "没有单号，只说很急"
+    output: {"ticket_type":"unknown","reply":"请提供订单号 SO- 开头"}</code></pre>
+      </div>
+      <details class="learn-micro-check"><summary>先想 10 秒：为何示例要与评测 badcase 同源维护？</summary>
+        <p>badcase 反映真实失败分布；把修复后的对话抽成 few-shot，可形成「评测—示例」飞轮，避免示例脱离生产。</p></details>
+
+      <h4>CorpAssist 上线前检查（节选）</h4>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>状态</th></tr></thead>
+        <tbody>
+        <tr><td>项1</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项2</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项3</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项4</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项5</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项6</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项7</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项8</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项9</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项10</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项11</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项12</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项13</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项14</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项15</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项16</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项17</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项18</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项19</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项20</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项21</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项22</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项23</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项24</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项25</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项26</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项27</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项28</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项29</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项30</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项31</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项32</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项33</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项34</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项35</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        </tbody>
+      </table></div>
+      <div class="notice"><strong>排障顺序</strong><ol>
+        <li>看 trace 的 <code>template_id</code> 与 <code>prompt_tag</code></li>
+        <li>核对 messages 角色序是否 System 在前</li>
+        <li>对照 baseline 失败用例是否新增</li>
+        <li>查 tokens 是否因 few-shot 膨胀</li>
+      </ol></div>
+      <div class="learn-faq">
+        <details><summary>评测—Prompt 飞轮</summary>
+        <div class="learn-faq-body">badcase → 改模板/示例 → baseline → Canary；禁止跳过 baseline。</div></details>
+        <details><summary>成本护栏</summary>
+        <div class="learn-faq-body">当准确率提升 &lt;0.5% 且 tokens +15% 时回滚示例条数。</div></details>
+      </div>
+<p><span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span></p>
+      <h4>CorpAssist 上线前检查（节选）</h4>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>状态</th></tr></thead>
+        <tbody>
+        <tr><td>项1</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项2</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项3</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项4</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项5</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项6</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项7</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项8</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项9</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项10</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项11</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项12</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项13</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项14</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项15</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项16</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项17</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项18</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项19</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项20</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项21</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项22</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项23</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项24</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项25</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项26</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项27</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项28</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项29</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项30</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项31</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项32</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项33</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项34</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项35</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        </tbody>
+      </table></div>
+      <div class="notice"><strong>排障顺序</strong><ol>
+        <li>看 trace 的 <code>template_id</code> 与 <code>prompt_tag</code></li>
+        <li>核对 messages 角色序是否 System 在前</li>
+        <li>对照 baseline 失败用例是否新增</li>
+        <li>查 tokens 是否因 few-shot 膨胀</li>
+      </ol></div>
+      <div class="learn-faq">
+        <details><summary>评测—Prompt 飞轮</summary>
+        <div class="learn-faq-body">badcase → 改模板/示例 → baseline → Canary；禁止跳过 baseline。</div></details>
+        <details><summary>成本护栏</summary>
+        <div class="learn-faq-body">当准确率提升 &lt;0.5% 且 tokens +15% 时回滚示例条数。</div></details>
+      </div>
+<p><span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span></p>    </div>    <div class="section-block">
+      <h3>思维链</h3>
+      <p><span class="term" data-term-id="chain-of-thought" tabindex="0">chain of thought</span>（CoT）要求模型先输出推理步骤再给出结论，适合 CorpAssist 多条件判断（是否越权、是否需 Tool）。对外部用户可见回复时，应使用<strong>隐藏 CoT</strong> 或结构化 <code>reasoning</code> 字段，仅日志留存。</p>
+      <div class="mermaid-wrap"><h5>CoT 与对外回复分离</h5>
+        <pre class="mermaid">flowchart LR
+    User[User 问题] --> CoT[内部 reasoning]
+    CoT --> Decision[工具/拒答决策]
+    Decision --> Answer[用户可见 answer]</pre>
+        <p class="diagram-caption">推理链不直接进入客服气泡，除非产品明确要求展示。</p></div>
+      <h4>Python：在 Prompt 中启用分步推理</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">COT_SUFFIX = """
+在回答前先在 <reasoning> 标签内用 3 步分析：
+1) 意图 2) 是否需工具 3) 风险
+再输出 <answer> 给用户。"""
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM + COT_SUFFIX),
+    ("human", "{question}"),
+])</code></pre>
+      </div>
+      <h4>Java：Spring AI 结构化推理字段</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@StructuredOutput
+public record TicketDecision(
+    String reasoning,
+    String ticketType,
+    boolean needOrderId
+) {}</code></pre>
+      </div>
+      <p><span class="term" data-term-id="hidden-cot" tabindex="0">hidden cot</span> 在网关层剥离 <code>&lt;reasoning&gt;</code>，防止泄露内部规则；与安全课「输出过滤」一致。</p>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad"><span class="learn-compare-heading">不推荐</span>
+          <ul><li>对用户气泡展示完整 CoT</li><li>无步数上限，推理冗长爆窗</li></ul></div>
+        <div class="learn-compare-col learn-compare-good"><span class="learn-compare-heading">推荐</span>
+          <ul><li>固定 3 步模板</li><li>reasoning 仅审计日志</li></ul></div>
+      </div>
+
+      <h4>CorpAssist 上线前检查（节选）</h4>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>状态</th></tr></thead>
+        <tbody>
+        <tr><td>项1</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项2</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项3</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项4</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项5</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项6</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项7</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项8</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项9</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项10</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项11</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项12</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项13</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项14</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项15</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项16</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项17</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项18</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项19</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项20</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项21</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项22</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项23</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项24</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项25</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项26</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项27</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项28</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项29</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项30</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项31</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项32</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项33</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项34</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项35</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        </tbody>
+      </table></div>
+      <div class="notice"><strong>排障顺序</strong><ol>
+        <li>看 trace 的 <code>template_id</code> 与 <code>prompt_tag</code></li>
+        <li>核对 messages 角色序是否 System 在前</li>
+        <li>对照 baseline 失败用例是否新增</li>
+        <li>查 tokens 是否因 few-shot 膨胀</li>
+      </ol></div>
+      <div class="learn-faq">
+        <details><summary>评测—Prompt 飞轮</summary>
+        <div class="learn-faq-body">badcase → 改模板/示例 → baseline → Canary；禁止跳过 baseline。</div></details>
+        <details><summary>成本护栏</summary>
+        <div class="learn-faq-body">当准确率提升 &lt;0.5% 且 tokens +15% 时回滚示例条数。</div></details>
+      </div>
+<p><span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span></p>
+      <h4>CorpAssist 上线前检查（节选）</h4>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>状态</th></tr></thead>
+        <tbody>
+        <tr><td>项1</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项2</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项3</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项4</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项5</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项6</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项7</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项8</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项9</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项10</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项11</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项12</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项13</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项14</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项15</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项16</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项17</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项18</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项19</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项20</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项21</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项22</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项23</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项24</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项25</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项26</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项27</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项28</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项29</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项30</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项31</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项32</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项33</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项34</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项35</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        </tbody>
+      </table></div>
+      <div class="notice"><strong>排障顺序</strong><ol>
+        <li>看 trace 的 <code>template_id</code> 与 <code>prompt_tag</code></li>
+        <li>核对 messages 角色序是否 System 在前</li>
+        <li>对照 baseline 失败用例是否新增</li>
+        <li>查 tokens 是否因 few-shot 膨胀</li>
+      </ol></div>
+      <div class="learn-faq">
+        <details><summary>评测—Prompt 飞轮</summary>
+        <div class="learn-faq-body">badcase → 改模板/示例 → baseline → Canary；禁止跳过 baseline。</div></details>
+        <details><summary>成本护栏</summary>
+        <div class="learn-faq-body">当准确率提升 &lt;0.5% 且 tokens +15% 时回滚示例条数。</div></details>
+      </div>
+<p><span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span></p>    </div>    <div class="section-block">
+      <h3>成本权衡</h3>
+      <p>每增加 1 条 few-shot 或 1 轮 CoT，都会线性增加 <span class="term" data-term-id="prompt-token-cost" tabindex="0">prompt token cost</span>。CorpAssist 日调用 50 万次时，示例从 3 条涨到 8 条可能每月多数千美元，且延迟上升。</p>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>策略</th><th>收益</th><th>成本</th><th>适用</th></tr></thead>
+        <tbody>
+          <tr><td>Zero-shot + 强 System</td><td>最低 tokens</td><td>格式漂移风险</td><td>稳定单意图</td></tr>
+          <tr><td>Few-shot 3 条</td><td>格式稳定</td><td>+600~1200 tokens</td><td>分类/JSON</td></tr>
+          <tr><td>CoT 3 步</td><td>复杂决策更准</td><td>+200~800 output tokens</td><td>多条件审批</td></tr>
+          <tr><td>动态示例检索</td><td>按需示例</td><td>检索延迟</td><td>意图种类多</td></tr>
+        </tbody></table></div>
+      <p>用 <span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span> 按场景看 P50/P95 tokens；当准确率边际收益 &lt; 0.5% 时停止加示例。A/B 指标见 <a href="#ch-practice-04-ab-test">A/B 与迭代流程</a>。</p>
+      <div class="notice"><strong>常见误区</strong><ul>
+        <li>用 CoT 解决本该用 Tool 的事实问题</li>
+        <li>示例与线上字段不一致导致「学会错误格式」</li></ul></div>
+
+      <h4>CorpAssist 上线前检查（节选）</h4>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>状态</th></tr></thead>
+        <tbody>
+        <tr><td>项1</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项2</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项3</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项4</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项5</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项6</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项7</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项8</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项9</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项10</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项11</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项12</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项13</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项14</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项15</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项16</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项17</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项18</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项19</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项20</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项21</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项22</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项23</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项24</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项25</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项26</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项27</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项28</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项29</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项30</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项31</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项32</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项33</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项34</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项35</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        </tbody>
+      </table></div>
+      <div class="notice"><strong>排障顺序</strong><ol>
+        <li>看 trace 的 <code>template_id</code> 与 <code>prompt_tag</code></li>
+        <li>核对 messages 角色序是否 System 在前</li>
+        <li>对照 baseline 失败用例是否新增</li>
+        <li>查 tokens 是否因 few-shot 膨胀</li>
+      </ol></div>
+      <div class="learn-faq">
+        <details><summary>评测—Prompt 飞轮</summary>
+        <div class="learn-faq-body">badcase → 改模板/示例 → baseline → Canary；禁止跳过 baseline。</div></details>
+        <details><summary>成本护栏</summary>
+        <div class="learn-faq-body">当准确率提升 &lt;0.5% 且 tokens +15% 时回滚示例条数。</div></details>
+      </div>
+<p><span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span></p>
+      <h4>CorpAssist 上线前检查（节选）</h4>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>状态</th></tr></thead>
+        <tbody>
+        <tr><td>项1</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项2</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项3</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项4</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项5</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项6</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项7</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项8</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项9</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项10</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项11</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项12</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项13</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项14</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项15</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项16</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项17</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项18</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项19</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项20</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项21</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项22</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项23</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项24</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项25</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项26</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项27</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项28</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项29</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项30</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项31</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项32</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项33</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项34</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项35</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        </tbody>
+      </table></div>
+      <div class="notice"><strong>排障顺序</strong><ol>
+        <li>看 trace 的 <code>template_id</code> 与 <code>prompt_tag</code></li>
+        <li>核对 messages 角色序是否 System 在前</li>
+        <li>对照 baseline 失败用例是否新增</li>
+        <li>查 tokens 是否因 few-shot 膨胀</li>
+      </ol></div>
+      <div class="learn-faq">
+        <details><summary>评测—Prompt 飞轮</summary>
+        <div class="learn-faq-body">badcase → 改模板/示例 → baseline → Canary；禁止跳过 baseline。</div></details>
+        <details><summary>成本护栏</summary>
+        <div class="learn-faq-body">当准确率提升 &lt;0.5% 且 tokens +15% 时回滚示例条数。</div></details>
+      </div>
+<p><span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span></p>    </div>    <div class="section-block">
+      <h3>双栈模板</h3>
+      <p><span class="term" data-term-id="dual-template" tabindex="0">dual template</span> 指同一份 <code>prompts/ticket_classify.yaml</code> 被 LangChain 与 Spring AI 加载，差异仅在占位符语法适配层。</p>
+      <div class="learn-tabs" role="tablist" aria-label="双栈 few-shot">
+        <input type="radio" name="ppe-b02-fs" id="ppe-b02-py" class="learn-tab-input" checked />
+        <input type="radio" name="ppe-b02-fs" id="ppe-b02-jv" class="learn-tab-input" />
+        <label for="ppe-b02-py">LangChain</label>
+        <label for="ppe-b02-jv">Spring AI</label>
+        <div class="learn-tab-panel" id="ppe-b02-pyp" role="tabpanel">
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">from langchain_core.prompts import FewShotChatMessagePromptTemplate
+examples = load_yaml("ticket_classify.yaml")["few_shot_examples"]
+few_shot = FewShotChatMessagePromptTemplate(examples=examples)</code></pre>
+      </div>
+        </div>
+        <div class="learn-tab-panel" id="ppe-b02-jvp" role="tabpanel">
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Value("classpath:prompts/ticket_classify.yaml")
+Resource promptResource;
+// 解析为 Message 列表注入 Prompt</code></pre>
+      </div>
+        </div>
+      </div>
+      <p>CI 任务对比双栈渲染后的 message hash，不一致则阻断发布。</p>
+
+      <h4>CorpAssist 上线前检查（节选）</h4>
+      <div class="outline-table-wrap"><table class="outline-table">
+        <thead><tr><th>#</th><th>检查项</th><th>状态</th></tr></thead>
+        <tbody>
+        <tr><td>项1</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项2</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项3</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项4</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项5</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项6</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项7</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项8</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项9</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项10</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项11</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项12</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项13</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项14</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项15</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项16</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项17</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项18</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项19</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项20</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        <tr><td>项21</td><td>模板无未替换 {{var}}</td><td>通过</td></tr>
+        <tr><td>项22</td><td>拒答 F1 不低于上周</td><td>通过</td></tr>
+        <tr><td>项23</td><td>prompt_tokens_p95 未超 8K</td><td>通过</td></tr>
+        <tr><td>项24</td><td>摘要 prompt 独立版本</td><td>通过</td></tr>
+        <tr><td>项25</td><td>Redis session_id 与网关一致</td><td>通过</td></tr>
+        <tr><td>项26</td><td>few-shot 与 RAG 索引隔离</td><td>通过</td></tr>
+        <tr><td>项27</td><td>动态示例 Top3 上限</td><td>通过</td></tr>
+        <tr><td>项28</td><td>工单 JSON schema 校验通过</td><td>通过</td></tr>
+        <tr><td>项29</td><td>Canary 5% 无格式错误尖刺</td><td>通过</td></tr>
+        <tr><td>项30</td><td>badcase 已沉淀示例</td><td>通过</td></tr>
+        <tr><td>项31</td><td>示例字段与 OpenAPI schema 一致</td><td>通过</td></tr>
+        <tr><td>项32</td><td>CoT 标签对用户不可见</td><td>通过</td></tr>
+        <tr><td>项33</td><td>prompts@tag 写入 trace</td><td>通过</td></tr>
+        <tr><td>项34</td><td>baseline 120 条全绿</td><td>通过</td></tr>
+        <tr><td>项35</td><td>LangChain/Spring 渲染 hash 一致</td><td>通过</td></tr>
+        </tbody>
+      </table></div>
+      <div class="notice"><strong>排障顺序</strong><ol>
+        <li>看 trace 的 <code>template_id</code> 与 <code>prompt_tag</code></li>
+        <li>核对 messages 角色序是否 System 在前</li>
+        <li>对照 baseline 失败用例是否新增</li>
+        <li>查 tokens 是否因 few-shot 膨胀</li>
+      </ol></div>
+      <div class="learn-faq">
+        <details><summary>评测—Prompt 飞轮</summary>
+        <div class="learn-faq-body">badcase → 改模板/示例 → baseline → Canary；禁止跳过 baseline。</div></details>
+        <details><summary>成本护栏</summary>
+        <div class="learn-faq-body">当准确率提升 &lt;0.5% 且 tokens +15% 时回滚示例条数。</div></details>
+      </div>
+<p><span class="term" data-term-id="cost-dashboard" tabindex="0">cost dashboard</span></p>    </div>
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>示例选择</strong>：多样、新鲜、脱敏、控长</li>
+        <li><strong>思维链</strong>：内部 reasoning，用户只见 answer</li>
+        <li><strong>成本权衡</strong>：边际收益不足则停加示例</li>
+        <li><strong>双栈模板</strong>：YAML 同源 + CI hash</li>
+      </ul>
+    </div>
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="production-prompt-engineering_basics02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>          <li><label><input type="checkbox" data-id="fs3" /> 3 条 few-shot</label></li>
+          <li><label><input type="checkbox" data-id="cot" /> 隐藏 CoT</label></li>
+          <li><label><input type="checkbox" data-id="cost" /> 成本估算</label></li>
+          <li><label><input type="checkbox" data-id="dual" /> 双栈 YAML</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 完成测验</label></li></ul>
+      </div>
+      <p class="chapter-review-next">下一步：测验与 Demo；下一章 <a href="#ch-basics-03-variables">变量、版本与配置管理</a>。</p>
+    </div>
+  </div>
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/guides/prompt-engineering" target="_blank" rel="noopener">OpenAI Prompt engineering</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/prompt.html" target="_blank" rel="noopener">Spring AI Prompt</a></li>
+      <li><a href="https://python.langchain.com/docs/concepts/prompt_templates/" target="_blank" rel="noopener">LangChain Prompt templates</a></li>
+    </ul>
+  </div>
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">编辑 CorpAssist 工单分类 few-shot YAML 并估算 token（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">      <li>按「示例选择」表为工单场景写 3 条 few-shot</li>
+      <li>为 CoT 写 3 步固定模板</li>
+      <li>用正文成本表估算 3 条 vs 8 条示例的 tokens 差</li>
+      <li>可选：完成 demos/basics-02-fewshot-cot-lab</li></ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">      <li>
+        <p class="judgment-stem">（判断）对外客服气泡展示完整 CoT 是否合规？</p>
+        <div class="learn-practice-answer"><details><summary>参考答案</summary>
+          <div class="learn-practice-answer-body"><p>通常不合规：泄露内部规则与推理，应 hidden cot + 日志审计。</p></div></details></div>
+      </li></ol>
+    <div class="demo-box"><h4 class="demo-box-title">Demo：Few-shot 与 CoT 实验室</h4>
+      <p>目录：<code>demos/basics-02-fewshot-cot-lab/</code>。<strong>验收</strong>：运行验收命令见 README。</p></div>
+  </div>
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-variables">变量、版本与配置管理</a></li>
+
+    </ul>
+  </div>
+</section>

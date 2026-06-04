@@ -1,0 +1,374 @@
+<section id="ch-practice-01-rag-prompt" class="chapter" data-chapter="practice-01-rag-prompt">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>RAG 专用 Prompt</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-rag-prompt" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>场景化 Prompt</strong> · 能力：为 CorpAssist S1 知识库问答编写可审计的 RAG Prompt（引用、拒答、grounding、防幻觉）</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>RAG 检索到的 chunk 只是「原料」——模型会不会<strong>只依据上下文</strong>回答、会不会<strong>标注引用</strong>、检索为空时会不会<strong>拒答</strong>，全由 Prompt 决定。CorpAssist HR 知识库上线后，审计方要求「每条结论可追溯到文档片段」；本章把 S1 场景的 Prompt 契约写成可版本化模板。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计统一的 <span class="term" data-term-id="rag-citation-format" tabindex="0">RAG 引用格式</span>（如 [doc_id:chunk_idx]）供前端高亮</li>
+          <li>编写检索为空 / 置信不足时的 <span class="term" data-term-id="refusal-prompt" tabindex="0">拒答 Prompt</span> 分支</li>
+          <li>用「仅依据上下文」约束实现 <span class="term" data-term-id="grounded-only" tabindex="0">grounded-only</span> 回答</li>
+          <li>配置 <span class="term" data-term-id="hallucination-suppression" tabindex="0">幻觉抑制</span> 指令与后置校验钩子</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>引用格式要机器可读</strong>：前端靠结构化 cite token 做跳转，不要只靠「见上文」。</li>
+          <li><strong>拒答是产品能力</strong>：无依据时明确说「不知道」，比编造更保护品牌与合规。</li>
+          <li><strong>Grounding 写进 System</strong>：「不得使用上下文外知识」须与检索块注入顺序一起设计。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>引用格式</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · HR 知识库问答</span>
+        员工问「年假最多可休几天？」——回答末尾须带 <code>[hr-policy-v3:§2.1]</code> 形式引用，便于审计与前端点击跳转至 PDF 对应段落。
+      </aside>
+
+      <p>生产 RAG 的引用不是脚注装饰，而是<strong>可追溯性契约</strong>。<span class="term" data-term-id="rag-citation-format" tabindex="0">RAG 引用格式</span> 需在 Prompt 中固定：每条事实句末附 cite token，token 语法与 metadata 字段一一对应。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>字段</th><th>含义</th><th>示例</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>doc_id</code></td><td>知识库文档稳定 ID</td><td><code>hr-policy-v3</code></td></tr>
+            <tr><td><code>chunk_idx</code></td><td>块序号或章节锚点</td><td><code>§2.1</code> 或 <code>c0042</code></td></tr>
+            <tr><td><code>page</code></td><td>可选 PDF 页码</td><td><code>p12</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>CorpAssist RAG System Prompt 片段（引用规则）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## 引用规则（强制）
+- 每个包含事实的句子末尾必须附引用，格式：[doc_id:chunk_idx]
+- 多来源时并列：[hr-policy-v3:§2.1][leave-faq:c0012]
+- 禁止编造 doc_id；仅使用 CONTEXT 块头 metadata 中的 id
+- 若一句综合多 chunk，列出全部相关 cite
+
+## 输出结构
+1. 直接回答（1-3 句）
+2. 要点列表（可选，每条带 cite）
+3. 引用汇总行（重复列出用到的 [doc_id:chunk_idx]）</code></pre>
+      </div>
+
+      <div class="learn-code-compare">
+        <span class="learn-compare-heading">反例：不可审计的引用</span>
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code>根据公司规定，年假一般为 10-15 天。（详见员工手册）</code></pre>
+        </div>
+        <span class="learn-compare-heading">推荐：结构化 cite token</span>
+        <div class="code-block">
+          <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+          <pre><code>司龄满 1 年可享 10 天带薪年假，满 10 年为 15 天。[hr-policy-v3:§2.1]
+引用：[hr-policy-v3:§2.1]</code></pre>
+        </div>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>只要求「标注来源」</strong> — 模型会写「根据文档」而无 doc_id，前端无法跳转。</li>
+          <li><strong>cite 与 chunk metadata 不一致</strong> — 检索管道改了 id 规则但 Prompt 未同步，审计全失效。</li>
+        </ul>
+      </div>
+
+      <h4>前端 cite 解析契约</h4>
+      <p>CorpAssist Web 端用正则 <code>\[([^:\]]+):([^\]]+)\]</code> 提取 cite，映射到 <code>GET /kb/docs/{doc_id}#chunk={chunk_idx}</code>。Prompt 须禁止模型输出半角/全角混用或圆括号变体，否则解析失败。</p>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead><tr><th>场景</th><th>Prompt 要求</th><th>前端行为</th></tr></thead>
+          <tbody>
+            <tr><td>单来源回答</td><td>每事实句 1 个 cite</td><td>高亮对应 PDF 段落</td></tr>
+            <tr><td>多来源综合</td><td>并列多个 cite</td><td>展示来源列表供用户选择</td></tr>
+            <tr><td>纯寒暄/澄清</td><td>可无 cite</td><td>不显示「来源」栏</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>拒答</h3>
+      <p>检索 TopK 为空、相似度低于阈值、或用户问题超出知识库范围时，CorpAssist 必须走 <span class="term" data-term-id="refusal-prompt" tabindex="0">拒答 Prompt</span> 分支，而不是让模型「尽力回答」。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>触发条件</th><th>拒答类型</th><th>用户可见话术</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>检索 score &lt; 0.72</td><td>低置信</td><td>知识库中未找到足够依据，建议联系 HR 值班号</td></tr>
+            <tr><td>TopK = 0</td><td>空检索</td><td>暂无相关政策文档，请提交工单由人工答复</td></tr>
+            <tr><td>问题含 PII 请求他人数据</td><td>合规拒答</td><td>无法查询他人信息，请本人登录后重试</td></tr>
+            <tr><td>Prompt 注入痕迹</td><td>安全拒答</td><td>无法处理该请求（不解释攻击细节）</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>拒答分支 Prompt 模板</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># prompts/rag-refusal-v2.yaml
+refusal:
+  trigger:
+    min_score: 0.72
+    empty_retrieval: true
+  system_override: |
+    当前 CONTEXT 为空或置信不足。你必须拒答，不得猜测。
+    使用 REFUSAL_TEMPLATE 中的话术，不要补充任何政策细节。
+  templates:
+    low_confidence: |
+      我在企业知识库中未找到足够可靠的依据来回答「{question}」。
+      建议：1) 换关键词重试 2) 联系 HR 服务台 {hr_hotline}
+    empty: |
+      暂无匹配的政策文档。您可通过 CorpAssist 提交 HR 工单。</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：拒答时是否应告诉用户「检索到了 3 条但都不相关」？</summary>
+        <p>生产环境通常<strong>不暴露</strong>内部分数与条数，避免泄露索引范围；仅给出可行动下一步（换词、工单、人工）。</p>
+      </details>
+
+      <h4>拒答与正常回答的 Prompt 路由</h4>
+      <p>应用层在组装 Prompt 前判断检索结果：若触发拒答，则<strong>不注入 CONTEXT</strong>，改用 <code>system_override</code> + 固定模板，避免模型在空 CONTEXT 下仍「编造」政策。</p>
+      <ul>
+        <li><strong>正常路径</strong>：System（含 cite 规则）+ CONTEXT + User</li>
+        <li><strong>拒答路径</strong>：System（拒答专用）+ User（含原问题）+ 禁止 CONTEXT</li>
+        <li><strong>低置信路径</strong>：可注入 CONTEXT 但 System 要求「仅当 score≥阈值 才可引用；否则拒答」</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>仅依据上下文</h3>
+      <p><span class="term" data-term-id="grounded-only" tabindex="0">Grounded-only</span> 约束要求模型把 CONTEXT 块当作唯一事实来源：未出现在 CONTEXT 中的数字、日期、政策名一律不得输出。这是 S1 场景通过合规审查的底线。</p>
+
+      <div class="mermaid-wrap">
+        <h5>RAG Prompt 组装顺序（CorpAssist）</h5>
+        <pre class="mermaid">flowchart TB
+  SYS[System: 角色 + grounded-only 约束]
+  CTX[CONTEXT: 检索 chunk 带 metadata 头]
+  Q[USER: 员工问题]
+  SYS --> CTX --> Q --> LLM[ChatModel]
+  LLM --> OUT[回答 + cite tokens]
+  OUT --> VAL[后置: cite 存在于 CONTEXT?]</pre>
+        <p class="diagram-caption">System 约束在前，CONTEXT 紧挨 User 问题，便于模型「只读块内事实」。</p>
+      </div>
+
+      <h4>CONTEXT 块注入格式（双栈通用）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-text">&lt;&lt;&lt;CONTEXT doc_id=hr-policy-v3 chunk=§2.1 score=0.89&gt;&gt;&gt;
+司龄满一年者享有 10 个工作日带薪年假……
+&lt;&lt;&lt;END&gt;&gt;&gt;
+
+&lt;&lt;&lt;CONTEXT doc_id=leave-faq chunk=c0012 score=0.81&gt;&gt;&gt;
+试用期员工不享受带薪年假……
+&lt;&lt;&lt;END&gt;&gt;&gt;
+
+规则：回答仅可使用上述 CONTEXT 中的信息；若 CONTEXT 不足以回答，触发拒答。</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="双栈 CONTEXT 注入">
+        <input type="radio" name="rag-ctx-tab" id="rag-ctx-py" class="learn-tab-input" checked />
+        <input type="radio" name="rag-ctx-tab" id="rag-ctx-java" class="learn-tab-input" />
+        <label for="rag-ctx-py">Python · LangChain</label>
+        <label for="rag-ctx-java">Java · Spring AI</label>
+        <div class="learn-tab-panel" id="rag-ctx-panel-py" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-python">def format_context_block(doc_id: str, chunk: str, body: str, score: float) -> str:
+    return f"&lt;&lt;&lt;CONTEXT doc_id={doc_id} chunk={chunk} score={score:.2f}&gt;&gt;&gt;\n{body}\n&lt;&lt;&lt;END&gt;&gt;&gt;"</code></pre>
+          </div>
+        </div>
+        <div class="learn-tab-panel" id="rag-ctx-panel-java" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-java">String block = """
+                &lt;&lt;&lt;CONTEXT doc_id=%s chunk=%s score=%.2f&gt;&gt;&gt;
+                %s
+                &lt;&lt;&lt;END&gt;&gt;&gt;
+                """.formatted(docId, chunkId, score, body);</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <p>双栈实现时，LangChain 的 <code>ChatPromptTemplate</code> 与 Spring AI 的 <code>PromptTemplate</code> 均用同一 <code>context_blocks</code> 变量占位符，由检索服务填充，保证 Python/Java 输出字节级一致。</p>
+      <div class="learn-faq">
+        <details>
+          <summary>CONTEXT 块顺序是否影响 grounded-only 效果？</summary>
+          <p>建议按 score 降序排列，最相关块靠前；Lost in the Middle 效应下，中间块可能被弱化——CorpAssist 对超过 5 块的情况做合并摘要后再注入。</p>
+        </details>
+        <details>
+          <summary>能否把检索结果放在 System 而非 User？</summary>
+          <p>可以，但 System 动态膨胀会挤占固定指令空间；CorpAssist 将 CONTEXT 放在 User 前、独立分隔，便于监控 CONTEXT token 占比。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>幻觉抑制</h3>
+      <p>即使写了 grounded-only，模型仍可能「补全」看似合理的政策细节。<span class="term" data-term-id="hallucination-suppression" tabindex="0">幻觉抑制</span> 采用 Prompt 层 + 应用层双层策略：指令禁止臆造、输出后校验 cite 与数字来源。</p>
+
+      <h4>Prompt 层：显式禁止清单</h4>
+      <ul>
+        <li>不得输出 CONTEXT 中未出现的具体天数、金额、百分比</li>
+        <li>不得虚构 doc_id 或 chunk 引用</li>
+        <li>不得将不同 chunk 的信息合并成 CONTEXT 中不存在的结论</li>
+        <li>对比较类问题（「A 和 B 哪个更…」），若 CONTEXT 只覆盖其一，须说明范围限制</li>
+      </ul>
+
+      <h4>应用层：后置校验伪代码</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import re
+
+CITE_PATTERN = re.compile(r"\[([^\]:]+):([^\]]+)\]")
+
+def validate_rag_answer(answer: str, context_doc_ids: set[str]) -> list[str]:
+    errors = []
+    cites = CITE_PATTERN.findall(answer)
+    if not cites and len(answer) > 80:
+        errors.append("MISSING_CITE")
+    for doc_id, _chunk in cites:
+        if doc_id not in context_doc_ids:
+            errors.append(f"UNKNOWN_DOC_ID:{doc_id}")
+    return errors  # 非空则触发重试或拒答</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>校验失败时重试还是直接拒答？</summary>
+          <p>CorpAssist 默认：<strong>1 次</strong>带错误提示的重试（「你引用了不存在的 doc_id，请仅使用 CONTEXT 内 id」），仍失败则降级为拒答模板，并记录 badcase 供 Prompt 迭代。</p>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何向审计经理解释 RAG 回答的可追溯性？cite token 与 chunk metadata 如何对应？</li>
+              <li>拒答率从 8% 降到 3% 但投诉「回答瞎编」增多，你会查 Prompt 哪几处？</li>
+              <li>grounded-only 与「模型通用知识」的边界如何向产品说明？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <h4>幻觉 badcase 登记字段</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead><tr><th>字段</th><th>用途</th></tr></thead>
+          <tbody>
+            <tr><td><code>prompt_version</code></td><td>关联 A/B 与回滚</td></tr>
+            <tr><td><code>missing_cite</code></td><td>是否缺引用</td></tr>
+            <tr><td><code>unknown_doc_id</code></td><td>虚构 doc_id 列表</td></tr>
+            <tr><td><code>context_ids</code></td><td>当次注入的 doc_id 集合</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">S1 RAG Prompt 的核心是把「检索结果」转化为「可审计、可拒答、可 grounding」的生成契约。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>引用格式</strong>：固定 [doc_id:chunk_idx] 语法，与 chunk metadata 对齐，供前端与审计使用。</li>
+        <li><strong>拒答</strong>：空检索、低置信、合规冲突时走独立模板，禁止模型猜测补全。</li>
+        <li><strong>仅依据上下文</strong>：CONTEXT 块结构化注入 + System 约束，构成 grounded-only 回答边界。</li>
+        <li><strong>幻觉抑制</strong>：Prompt 禁止清单 + cite/数字后置校验，失败可有限重试后降级拒答。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="production-prompt-engineering_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="cite-format" /> 能写出 CorpAssist 引用格式规则与反例对比</label></li>
+          <li><label><input type="checkbox" data-id="refusal" /> 能列出 3 种拒答触发条件及对应话术</label></li>
+          <li><label><input type="checkbox" data-id="grounded" /> 能描述 CONTEXT 块注入顺序与 grounded-only 要点</label></li>
+          <li><label><input type="checkbox" data-id="hallucination" /> 能说明后置 cite 校验逻辑</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧「章节测验」</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成下方 Demo 与章节测验；下一章 <a href="#ch-practice-02-agent-prompt">Agent 与工具 Prompt</a> 将编写工具描述与计划步骤模板。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/guides/retrieval" target="_blank" rel="noopener">OpenAI — Retrieval &amp; RAG</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html" target="_blank" rel="noopener">Spring AI — RAG</a></li>
+      <li><a href="https://python.langchain.com/docs/tutorials/rag/" target="_blank" rel="noopener">LangChain — RAG Tutorial</a></li>
+      <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/grounding" target="_blank" rel="noopener">Anthropic — Grounding Best Practices</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-01-rag-prompt-lab/</code> 补全 CorpAssist HR RAG Prompt 模板，并通过 cite 校验脚本验收。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开正文「引用规则」代码块，在 <code>rag-prompt-template.md</code> 中补全 cite 语法与输出结构三节。</li>
+      <li>对照「拒答分支」决策表，为 <code>low_confidence</code> 与 <code>empty</code> 各写一条中文话术（含 HR 热线占位符）。</li>
+      <li>按「CONTEXT 块注入格式」示例，为两条 mock chunk 写出完整 CONTEXT 文本（含 metadata 头）。</li>
+      <li>运行 <code>python validate_cites.py</code>，确保样例回答中所有 <code>[doc_id:chunk]</code> 均出现在 CONTEXT 内。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障）用户反馈「回答看起来对但没有引用」。你会优先检查 Prompt 哪一段与管道哪一环？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>先查 System 是否含<strong>强制 cite 规则</strong>与反例；再查检索注入是否带 <code>doc_id</code> metadata（无 id 则模型无法生成合法 cite）；最后查后置校验是否启用（未启用则 badcase 不会拦截）。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：RAG 专用 Prompt 实验室</h4>
+      <p>目录：<code>demos/practice-01-rag-prompt-lab/</code>。<strong>验收</strong>：<code>python validate_cites.py</code> 输出 <code>OK: all cites grounded</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-agent-prompt">Agent 与工具 Prompt</a> — S2 工具描述与失败恢复</li>
+      <li><a href="../rag-system-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">RAG 系统工程</span><code class="course-ref-slug">rag-system-engineering</code></a> — 检索管道与 Prompt 衔接</li>
+      <li><a href="https://arxiv.org/abs/2305.14251" target="_blank" rel="noopener">论文：Self-RAG — 自适应检索与 cite</a></li>
+    </ul>
+  </div>
+</section>

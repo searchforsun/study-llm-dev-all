@@ -1,0 +1,359 @@
+<section id="ch-practice-02-agent-prompt" class="chapter" data-chapter="practice-02-agent-prompt">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent 与工具 Prompt</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-agent-prompt" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>场景化 Prompt</strong> · 能力：为 CorpAssist S2 Agent 编写工具描述、计划步骤、失败恢复与双栈对齐 Prompt</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Agent 能否正确选工具、按步骤执行、在 API 超时后自救，取决于<strong>工具 Schema 描述</strong>与<strong>Planner System Prompt</strong> 的质量。CorpAssist「帮我查订单并创建 IT 工单」场景涉及 CRM 查询 + 工单系统写入——工具描述含糊会导致错调接口；本章把 S2 的 Prompt 契约写成双栈可复用规范。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>按 OpenAI Function / Spring AI Tool 规范编写 <span class="term" data-term-id="tool-description-spec" tabindex="0">工具描述规范</span></li>
+          <li>设计 ReAct / Plan-and-Execute 风格的 <span class="term" data-term-id="agent-plan-prompt" tabindex="0">计划步骤 Prompt</span></li>
+          <li>配置超时、重试与降级话术组成的 <span class="term" data-term-id="failure-recovery-prompt" tabindex="0">失败恢复 Prompt</span></li>
+          <li>对照 Python LangGraph 与 Spring AI ToolCalling 实现 <span class="term" data-term-id="dual-stack-prompt" tabindex="0">双栈 Prompt</span> 对齐</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>工具描述 = API 文档的 Prompt 版</strong>：参数含义、边界、示例调用缺一不可。</li>
+          <li><strong>计划步骤要可观测</strong>：每步输出 thought + action，便于审计与排障。</li>
+          <li><strong>失败恢复写进 System</strong>：超时/4xx 时禁止无限重试相同参数。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具描述规范</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 订单查询 + 工单创建</span>
+        Agent 持有 <code>query_order</code> 与 <code>create_ticket</code> 两个工具。员工说「订单 8842 没发货，帮我提 IT 工单」——模型须先查订单再建单，且 ticket 的 <code>category</code> 只能取枚举值。
+      </aside>
+
+      <p><span class="term" data-term-id="tool-description-spec" tabindex="0">工具描述规范</span> 要求：name 动词短语、description 说明何时调用、parameters 每个字段有 type + description + enum/required。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>检查项</th><th>合格</th><th>不合格</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>description 首句</td><td>「当用户询问订单状态或物流时调用」</td><td>「查询订单」</td></tr>
+            <tr><td>参数说明</td><td><code>order_id: 数字订单号，不含 # 前缀</code></td><td><code>order_id: string</code></td></tr>
+            <tr><td>互斥工具</td><td>注明「不要用于创建工单」</td><td>（无边界说明）</td></tr>
+            <tr><td>副作用</td><td><code>create_ticket</code> 标注 writes=true</td><td>未标注写操作</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>工具 JSON Schema 示例（query_order）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "name": "query_order",
+  "description": "查询 CorpAssist 商城订单状态与物流。用户提到订单号、发货、物流时使用。不要用于退款或创建工单。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "order_id": {
+        "type": "string",
+        "description": "纯数字订单号，例如 8842，不要包含 # 或 ORD- 前缀"
+      },
+      "tenant_id": {
+        "type": "string",
+        "description": "从会话上下文读取，调用方注入，模型不要猜测"
+      }
+    },
+    "required": ["order_id", "tenant_id"]
+  }
+}</code></pre>
+      </div>
+
+      <div class="notice">
+        <strong>常见误区</strong>
+        <ul>
+          <li><strong>工具过多不分组</strong> — 超过 12 个工具时应按域拆 Agent 或做 retrieval-over-tools。</li>
+          <li><strong>description 与实现不一致</strong> — Prompt 写「支持模糊搜索」但 API 只接受精确 id，必出 hallucinated 参数。</li>
+        </ul>
+      </div>
+
+      <h4>create_ticket 工具 Schema 补全要点</h4>
+      <p>写操作工具须在 description 中声明<strong>需要用户明确授权</strong>，且 <code>category</code> 使用 enum 限制，防止模型发明 <code>urgent-it</code> 等非法值。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "name": "create_ticket",
+  "description": "在 ITSM 创建工单。用户明确要求建单、报障时使用。writes=true。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "category": { "type": "string", "enum": ["network", "hardware", "software", "access", "other"] },
+      "summary": { "type": "string", "description": "10-500 字问题摘要" }
+    },
+    "required": ["category", "summary"]
+  }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>计划步骤</h3>
+      <p>复杂任务需要 <span class="term" data-term-id="agent-plan-prompt" tabindex="0">计划步骤 Prompt</span> 约束推理格式。CorpAssist 采用「简要计划 → 逐步执行 → 汇总」三阶段，兼容 ReAct 与 Plan-and-Execute。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist Agent 计划循环</h5>
+        <pre class="mermaid">flowchart LR
+  U[用户目标] --> P[Plan: 2-4 步]
+  P --> A1[Action: tool_call]
+  A1 --> O1[Observation]
+  O1 --> A2[Action / Finish]
+  A2 --> R[回复用户 + 审计日志]</pre>
+        <p class="diagram-caption">每轮须输出 structured thought；Finish 前不得跳过未完成的写操作确认。</p>
+      </div>
+
+      <h4>Planner System Prompt 核心段落</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">markdown</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-markdown">## 计划规则
+1. 先输出 PLAN（最多 4 步），再逐步执行
+2. 每步格式：Thought / Action / Action Input
+3. 收到 Observation 后，决定下一步或 Finish
+4. 写操作（create_ticket、cancel_order）前必须向用户确认意图（若会话未明确授权）
+
+## 禁止
+- 单步调用超过 3 次相同工具且参数相同
+- 编造 Observation；仅使用工具返回 JSON
+- 在 PLAN 中包含系统未提供的工具</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Plan 写 8 步细计划 vs 2 步粗计划，哪个更适合生产 Agent？</summary>
+        <p>生产宜 <strong>2-4 步粗计划</strong> + 动态调整；过长 Plan 易与工具实际返回脱节，且浪费 token。</p>
+      </details>
+
+      <h4>ReAct 单步输出示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">text</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-text">Thought: 用户提供了订单号 8842，应先查询物流状态。
+Action: query_order
+Action Input: {"order_id": "8842", "tenant_id": "corp-a"}
+
+Observation: {"status": "shipped", "carrier": "SF", "tracking": "SF123"}
+
+Thought: 已发货，无需建单，向用户说明物流。
+Finish: 您的订单 8842 已发货，顺丰单号 SF123……</code></pre>
+      </div>
+      <p>CorpAssist 审计日志保存 Thought/Action/Observation 全链，供合规与排障；对用户仅展示 Finish 段。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>失败恢复</h3>
+      <p>工具调用失败是常态：网络超时、429 限流、业务 404。<span class="term" data-term-id="failure-recovery-prompt" tabindex="0">失败恢复 Prompt</span> 规定重试次数、退避策略与用户可见话术，避免 Agent 陷入死循环。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>错误类型</th><th>Agent 行为</th><th>用户话术</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>TIMEOUT</td><td>同参数重试 1 次，仍失败则降级</td><td>订单系统响应慢，请稍后重试或联系值班</td></tr>
+            <tr><td>404 NOT_FOUND</td><td>禁止重试；询问用户是否输错单号</td><td>未找到该订单，请核对订单号</td></tr>
+            <tr><td>403 FORBIDDEN</td><td>停止工具链；记录审计</td><td>您无权执行此操作</td></tr>
+            <tr><td>429 RATE_LIMIT</td><td>等待 2s 后重试 1 次</td><td>系统繁忙，正在重试…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>失败恢复 Prompt 片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">failure_recovery:
+  max_same_tool_retries: 1
+  on_persistent_failure: |
+    向用户说明已尝试的步骤与失败原因（不含内部 stack trace）。
+    提供可行动选项：1) 修正参数重试 2) 转人工 3) 创建工单由后台处理
+  forbidden:
+    - 无限 loop 调用同一工具
+    - 向用户暴露 API key、内部 URL
+    - 假装工具已成功（伪造 Observation）</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Observation 里应否包含完整 API 响应体？</summary>
+          <p>生产应注入<strong>精简 JSON</strong>（字段白名单 + 截断长文本），完整响应写入 trace；Prompt 中要求模型仅依据 Observation 摘要推理。</p>
+        </details>
+        <details>
+          <summary>429 限流时 Agent 能否换工具绕过？</summary>
+          <p>禁止——应等待退避后重试<strong>同一合法工具</strong>，或降级告知用户；换工具绕过会导致业务逻辑错误。</p>
+        </details>
+      </div>
+
+      <h4>用户可见话术与内部 trace 分离</h4>
+      <ul>
+        <li>用户消息：简洁、无错误码、提供下一步</li>
+        <li>trace：完整 HTTP status、request_id、重试次数</li>
+        <li>Prompt 明确：<strong>Finish 段不得包含内部 URL、API key、stack trace</strong></li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>双栈</h3>
+      <p>CorpAssist Agent 在 Python（LangGraph / LangChain Tools）与 Java（Spring AI ToolCalling）双栈部署时，<span class="term" data-term-id="dual-stack-prompt" tabindex="0">双栈 Prompt</span> 须共享同一份 YAML 源：System、工具 description、失败恢复规则，仅 adapter 层不同。</p>
+
+      <div class="learn-tabs" role="tablist" aria-label="双栈 Tool 注册">
+        <input type="radio" name="agent-dual-tab" id="agent-dual-py" class="learn-tab-input" checked />
+        <input type="radio" name="agent-dual-tab" id="agent-dual-java" class="learn-tab-input" />
+        <label for="agent-dual-py">Python · @tool</label>
+        <label for="agent-dual-java">Java · @Tool</label>
+        <div class="learn-tab-panel" id="agent-dual-panel-py" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-python">from langchain_core.tools import tool
+
+@tool(parse_docstring=True)
+def query_order(order_id: str, tenant_id: str) -> dict:
+    """查询 CorpAssist 商城订单状态与物流。用户提到订单号、发货、物流时使用。"""
+    ...</code></pre>
+          </div>
+        </div>
+        <div class="learn-tab-panel" id="agent-dual-panel-java" role="tabpanel">
+          <div class="code-block">
+            <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+            <pre><code class="language-java">@Tool(description = "查询 CorpAssist 商城订单状态与物流。用户提到订单号、发货、物流时使用。")
+public OrderStatus queryOrder(
+    @ToolParam(description = "纯数字订单号") String orderId,
+    @ToolParam(description = "租户 ID，从会话注入") String tenantId) {
+  ...
+}</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="learn-compare">
+        <div>
+          <span class="learn-compare-heading">应对齐</span>
+          <ul>
+            <li>工具 name / description 原文</li>
+            <li>Planner System Prompt 版本号</li>
+            <li>失败恢复 max_retries</li>
+          </ul>
+        </div>
+        <div>
+          <span class="learn-compare-heading">可差异</span>
+          <ul>
+            <li>trace 字段命名（OpenTelemetry span）</li>
+            <li>Tool 框架特有 annotation</li>
+            <li>会话存储（Redis vs JDBC）</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>双栈 parity 测试：同一 golden 对话脚本，比对 tool_call 序列与最终用户可见回复（允许措辞微差，不允许工具名或参数不同）。</p>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>双栈 Prompt 对齐速查</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>项</th><th>Python</th><th>Java</th></tr></thead>
+              <tbody>
+                <tr><td>工具注册</td><td>@tool / StructuredTool</td><td>@Tool / MethodToolCallback</td></tr>
+                <tr><td>System 源</td><td colspan="2">prompts/agent-v2.yaml</td></tr>
+                <tr><td>parity</td><td colspan="2">golden JSON 脚本 + diff tool_calls</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">S2 Agent Prompt 把「工具 API」翻译为「模型可正确调用的语言」，并约束计划与失败行为。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>工具描述规范</strong>：description 写清何时调用、参数边界与副作用，与 OpenAI Function Schema 对齐。</li>
+        <li><strong>计划步骤</strong>：2-4 步 PLAN + ReAct 循环，写操作前须确认授权。</li>
+        <li><strong>失败恢复</strong>：按错误类型区分重试/降级/拒答，禁止伪造 Observation。</li>
+        <li><strong>双栈</strong>：YAML 单源 Prompt + 双栈 adapter，golden 脚本做 parity 回归。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="production-prompt-engineering_practice02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="tool-spec" /> 能写出含 enum/required 的工具 JSON Schema</label></li>
+          <li><label><input type="checkbox" data-id="plan" /> 能描述 PLAN → Action → Observation 循环</label></li>
+          <li><label><input type="checkbox" data-id="recovery" /> 能按错误类型选择重试或降级策略</label></li>
+          <li><label><input type="checkbox" data-id="dual" /> 能列出双栈必须对齐 vs 可差异项</label></li>
+          <li><label><input type="checkbox" data-id="quiz" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：完成 Demo；下一章 <a href="#ch-practice-03-json-output">结构化输出 Prompt</a> 讲解 JSON Schema 与修复循环。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://platform.openai.com/docs/guides/function-calling" target="_blank" rel="noopener">OpenAI — Function Calling</a></li>
+      <li><a href="https://docs.spring.io/spring-ai/reference/api/tools.html" target="_blank" rel="noopener">Spring AI — Tools</a></li>
+      <li><a href="https://langchain-ai.github.io/langgraph/concepts/agentic_concepts/" target="_blank" rel="noopener">LangGraph — Agent Concepts</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">补全 <code>create_ticket</code> 工具描述与失败恢复 yaml，并用 checklist 脚本验收字段完整度。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照正文工具 Schema 表，在 <code>tool-desc-checklist.md</code> 为 <code>create_ticket</code> 填写 description 与 <code>category</code> enum。</li>
+      <li>写出含 PLAN 规则的 System Prompt 片段（至少 4 条禁止项）。</li>
+      <li>为 TIMEOUT 与 404 各写一条用户可见话术，写入 failure_recovery 配置。</li>
+      <li>运行 <code>python check_tool_desc.py</code>，输出 <code>PASS: 2 tools validated</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）下列工具 description 哪条最可能导致错调？「A) 查询订单 B) 处理用户问题 C) 当用户询问订单状态或物流时调用，不要用于工单 D) CRM 工具」</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>B</strong> — 「处理用户问题」过宽，模型会对几乎所有意图调用该工具；<strong>C</strong> 才是合格边界描述。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Agent 工具 Prompt 实验室</h4>
+      <p>目录：<code>demos/practice-02-agent-prompt-lab/</code>。<strong>验收</strong>：<code>python check_tool_desc.py</code> → <code>PASS: 2 tools validated</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-json-output">结构化输出 Prompt</a></li>
+      <li><a href="../agent-orchestration-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排工程</span><code class="course-ref-slug">agent-orchestration-engineering</code></a></li>
+    </ul>
+  </div>
+</section>

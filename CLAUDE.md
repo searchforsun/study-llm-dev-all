@@ -133,3 +133,4 @@ Do **not** duplicate chapter DOM / quiz HTML templates here — follow the skill
 ## Agent hygiene
 
 - 仅为排障/一次性验证写的脚本（如 `_foo.mjs`）：用完后**删除**，不要提交；要长期保留则正式放入仓库根 `scripts/` 并更新上表。
+- 禁止使用skills脚本同步 ./courses/index.html, 已经偏离skills,只能手动修改
