@@ -243,6 +243,55 @@ public Flux&lt;ServerSentEvent&lt;String&gt;&gt; stream(@RequestBody ChatRequest
           <div class="learn-faq-body">同一模型通常同价；差异在集成方式而非单价。CorpAssist 选型看框架能力（ReactAgent、Graph），不是看计费公式差异。</div>
         </details>
       </div>
+      <h4>请求超时、重试与 429 治理</h4>
+      <p>门户 SSE 路径上，DashScope 偶发 429（配额）或 5xx 会表现为「流式中断」。S3 Agent 应在 <code>WebClient</code> / SDK 层配置<strong>指数退避重试</strong>，且<strong>不对用户可见 chunk 重复推送</strong>；重试仅发生在服务端与百炼之间。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>HTTP 现象</th><th>常见原因</th><th>CorpAssist 处理</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>429</td><td>Key 配额或 QPS 超限</td><td>practice-02 熔断 + 切换 turbo；告警绑 S3 专用 Key</td></tr>
+          <tr><td>504 / 读超时</td><td>长上下文 + 流式慢</td><td>网关 SSE 超时 ≥ 120s；中间发心跳 event</td></tr>
+          <tr><td>401</td><td>Key 过期或环境变量未注入</td><td>启动时 HealthIndicator 探测，拒绝冷启动带病上线</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># 与 DashScope HTTP 客户端对齐（示意）
+spring:
+  ai:
+    dashscope:
+      chat:
+        options:
+          timeout: 90s
+      client:
+        max-retries: 2
+        retry-backoff: 1s,2s</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 月末报销高峰</span>
+        S3 请假/报销 Agent 在月末 QPS 翻倍：Micrometer 按 <code>model</code> 与 <code>http_status</code> 打点；429 率超阈值时自动将<strong>非关键意图</strong>路由到 qwen-turbo，主链路 plus 保留给含 Tool 的多步任务。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：流式重试会不会让用户看到重复段落？</summary>
+        <p>会，若在前端直接重放已收 chunk。正确做法：服务端重试时重置 Flux 订阅，门户收到 <code>event: error</code> 后整段重新请求，或仅展示「正在重试」占位，不拼接半截答案。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无限重试 429，放大账单与延迟</li>
+            <li>把 DashScope request_id 从响应头丢弃，无法对账</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>结构化日志记录 request_id、model、input/output tokens</li>
+            <li>重试上限 + 熔断后返回友好降级文案</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">

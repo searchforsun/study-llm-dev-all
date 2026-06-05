@@ -10,6 +10,7 @@
 
 - Python 3.8+ 或 JDK 17+
 - 可选：安装 tiktoken (`pip install tiktoken`)
+- 本 lab：`pip install -r requirements.txt`（校验预算模板）
 
 ## 步骤
 
@@ -41,6 +42,16 @@
 ## 预期输出
 
 一个可执行的预算计算脚本，能够输出每层 token 分配及总体验证结果。当预算超限时，脚本应打印告警。
+
+## 验收命令
+
+```bash
+cd demos/basics-01-context-anatomy-lab
+pip install -r requirements.txt
+python validate_budget.py
+```
+
+期望输出：`OK: budget split valid`
 
 ## 验收清单
 

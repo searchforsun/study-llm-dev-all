@@ -87,6 +87,31 @@
         </div>
       </div>
       <p><span class="term" data-term-id="plan-execute-react" tabindex="0">plan execute react</span> 选型：LangGraph 的 Plan-and-Execute 模式对应 SAA 的 Plan 节点 + Execute 子图；见 agent-orchestration-java advanced 章。</p>
+
+      <details class="learn-micro-check">
+        <summary>六维逐项：编排维度如何白板讲清？</summary>
+        <div class="learn-faq-body">
+          <p><strong>LangGraph</strong>：<code>StateGraph.add_node</code> + <code>add_conditional_edges</code>；checkpoint 存 <code>thread_id</code>。</p>
+          <p><strong>SAA</strong>：Graph DSL 声明节点类型（llm / tool / human_approval）；<span class="term" data-term-id="react-agent" tabindex="0">ReactAgent</span> 适合动态 ≤10 步。</p>
+          <p><strong>CorpAssist S3</strong>：纪要→Jira 用 ReAct；采购审批用固定 Graph + HITL，禁止混用导致审计缺口。</p>
+        </div>
+      </details>
+
+      <details class="learn-micro-check">
+        <summary>六维逐项：观测与治理为何是 Java 主场？</summary>
+        <div class="learn-faq-body">
+          <table class="outline-table">
+            <thead>
+              <tr><th>能力</th><th>LangGraph 常见做法</th><th>SAA 生产做法</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Trace</td><td>LangSmith 项目级</td><td>OTel traceparent 贯穿 Gateway→Agent→Tool</td></tr>
+              <tr><td>Prompt 变更</td><td>Notebook 手改</td><td>Admin Studio → Git DSL → CI diff</td></tr>
+              <tr><td>租户隔离</td><td>实验 Redis 单库</td><td>prod Redis key 前缀 + RAM 子账号</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
 
     <div class="section-block">
@@ -122,6 +147,35 @@
       <details class="learn-micro-check">
         <summary>LangGraph 能否直接部署为 CorpAssist 生产 Agent？</summary>
         <p>技术上可以，但违背架构：缺少 Spring Security SSO、统一 Advisor 链、Micrometer 与 Admin 治理。若短期 PoC，须标注 non-prod 且写操作 Mock。</p>
+      </details>
+
+      <h4>OpenAPI 契约冻结（双栈协作核心）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist-agent-contract v1.2 — Python 实验轨与 Java 生产轨共用
+paths:
+  /tools/createJiraIssue:
+    post:
+      operationId: createJiraIssue
+      requestBody:
+        required: [summary, projectKey, assignee]
+      responses:
+        "201":
+          schema:
+            properties:
+              issueKey: { type: string }
+              auditRequestId: { type: string }</code></pre>
+      </div>
+      <p>Python LangGraph <code>@tool</code> 与 SAA <code>FunctionTool</code> 均调用同一 Gateway；契约版本 bump 时两侧同步 golden，避免「实验能跑、生产假执行」。</p>
+
+      <details class="learn-micro-check">
+        <summary>双栈 Trace 如何不断链？</summary>
+        <div class="learn-faq-body">
+          <p>门户 SSE 请求携带 <code>traceparent</code>；Python 仿真服务转发同一 header；Java Agent 写 Tool 时注入 <code>auditRequestId</code> 到 span attribute。排障时从用户 session 一键跳到 LangGraph 实验轨迹与 SAA 生产轨迹对照。</p>
+        </div>
       </details>
     </div>
 
@@ -183,6 +237,34 @@ graph:
           <tr><td>评测</td><td>Python golden.pkl</td><td>Java stub 同轨迹 hash</td></tr>
         </tbody>
       </table>
+
+      <h4>LangGraph 节点导出 → SAA DSL 映射（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Python 实验轨：导出节点清单供 DSL diff
+nodes = list(graph.get_graph().nodes.keys())
+# ['plan', 'retrieve_confluence', 'hitl_manager', 'execute_jira']
+export = {
+    "graph_id": "s3-meeting-jira",
+    "nodes": nodes,
+    "conditional_edges": graph.get_graph().edges,
+}
+# CI：与 saa-graph/s3-meeting-jira.yaml 做集合差集，差集非空则 fail</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>迁移中最易漏的 3 个 S3 生产坑？</summary>
+        <div class="learn-faq-body">
+          <ul>
+            <li><strong>步数预算</strong>：LangGraph 原型常无 <code>max_steps</code>；SAA 须加 StepBudgetAdvisor，否则上线后 P95 失控。</li>
+            <li><strong>Tool 截断</strong>：Python mock 返回短 JSON；真实 Confluence 全文 40k 字未 truncate → 记忆与成本双爆。</li>
+            <li><strong>HITL 节点</strong>：实验图可跳过审批；生产采购 Graph 缺 <code>human_approval</code> 节点 → 合规驳回。</li>
+          </ul>
+        </div>
+      </details>
     </div>
 
     <div class="section-block">
@@ -239,6 +321,22 @@ graph:
   Note over LG,SAA: 步数预算两侧必配</pre>
       </div>
       <p>Python 轨 Agent 编排详见 <a href="../agent-orchestration-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排工程（共享方法论）</span><code class="course-ref-slug">agent-orchestration-engineering</code></a>（LangGraph 实验）；Java 生产见 agent-orchestration-java。</p>
+
+      <details class="learn-micro-check">
+        <summary>60 秒话术自检：是否踩了「贬低另一栈」雷区？</summary>
+        <div class="learn-faq-body">
+          <table class="outline-table learn-decision-table">
+            <thead>
+              <tr><th>说法</th><th>评价</th><th>改写</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>「Java AI 比 Python 强」</td><td>✗ 偏见</td><td>「Java 轨承载 SSO、审计与写 Tool SLA」</td></tr>
+              <tr><td>「LangGraph 只是玩具」</td><td>✗ 树敌</td><td>「Python 轨批量仿真与 Prompt 迭代更快」</td></tr>
+              <tr><td>「双栈分工 + OpenAPI 契约」</td><td>✓ 平衡</td><td>附一个 S3 步数偏航 STAR 收尾</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">

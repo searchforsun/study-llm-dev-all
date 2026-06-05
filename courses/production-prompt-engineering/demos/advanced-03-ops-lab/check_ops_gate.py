@@ -2,7 +2,10 @@
 import json
 from pathlib import Path
 
-SPEC = Path(__file__).parent / "prompt-spec.sample.json"
+LAB_DIR = Path(__file__).parent
+SPEC = LAB_DIR / "prompt-spec.local.json"
+if not SPEC.exists():
+    SPEC = LAB_DIR / "prompt-spec.sample.json"
 
 def main():
     spec = json.loads(SPEC.read_text(encoding="utf-8"))

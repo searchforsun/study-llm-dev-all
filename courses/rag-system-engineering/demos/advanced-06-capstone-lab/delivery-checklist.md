@@ -1,4 +1,4 @@
 - [ ] Python 索引 job
-- [ ] Spring /v1/rag/query
+- [ ] Spring /v1/rag/ask
 - [ ] 评测通过
 - [ ] ACL 测试

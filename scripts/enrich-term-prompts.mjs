@@ -134,6 +134,85 @@ const COURSE_CONTEXT = {
   },
 };
 
+/** 按 course.json terms.tip 前缀（章主题）定制 prompt，减少全课同一模板感 */
+const CONTEXT_MEMORY_CHAPTER_HINTS = {
+  '上下文组成与窗口预算': {
+    example: 'CorpAssist 客服 32K 窗口四层 budget split 与 validate_budget.py',
+    stackNote: '说明 budget-template.yaml 各层 ratio 如何映射到实际 prompt 组装',
+    pitfalls: 'window_limit 与代码常量不一致、System 层被 History 挤占',
+  },
+  '截断、摘要与滑动窗口': {
+    example: '客服 15 轮对话后会员等级约束被 FIFO 裁掉',
+    stackNote: '说明 sliding window 与 rolling summary 如何保护约束字段',
+    pitfalls: '摘要链多层失真 lose constraint、FIFO 删除首轮关键信息',
+  },
+  '上下文压缩入门': {
+    example: 'History 层超 80% 触发 compress trigger 与实体保留校验',
+    stackNote: '说明 Python 规则压缩与 SAA ContextCompressAdvisor 触发阈值对齐',
+    pitfalls: '压缩丢 order_id/会员等级、压缩与截断策略冲突',
+  },
+  '上下文污染与注入面': {
+    example: 'RAG chunk 夹带「忽略上文指令」或用户劫持 system prompt',
+    stackNote: '说明 boundary zone 三区隔离与安全课 injection 分工',
+    pitfalls: '仅打 [UNTRUSTED] 标签不做检测、工具输出未截断进上下文',
+  },
+  '工作记忆与会话状态': {
+    example: 'S2 客服「它」指代订单 20240501、人工转接 session handoff',
+    stackNote: '说明 corpassist-session-v1 JSON 与 Spring ChatMemory / LangChain 双栈 key',
+    pitfalls: '双栈双写竞态、session key 不一致导致换栈失忆',
+  },
+  '长期记忆与向量记忆': {
+    example: '从对话提取偏好写入 Milvus，召回带 tenant/user 过滤',
+    stackNote: '说明 fact extract → vector recall → GDPR delete 生命周期',
+    pitfalls: '长期记忆无 TTL/审计、跨用户召回未过滤',
+  },
+  '混合记忆架构': {
+    example: '会话层修正偏好覆盖长期层旧事实（write-through + read-merge）',
+    stackNote: '说明 mem router 问候语跳过长期层、一致性优先级',
+    pitfalls: '三层各自写入无协调、长期层与当轮会话矛盾',
+  },
+  '人在回路与记忆编辑': {
+    example: '置信度 0.75 偏好进审批队列，主管 edit_and_approve 后写入',
+    stackNote: '说明 append-only audit trail 与 mem changelog 分工',
+    pitfalls: '低置信度直写长期库、审计日志可篡改',
+  },
+  '实战：CorpAssist 记忆子系统': {
+    example: 'mem API + MemoryEvalSuite 多轮一致性 ≥95% 发布门禁',
+    stackNote: '说明 /v1/session 与 /v1/memory 如何供 RAG/Agent 课集成',
+    pitfalls: '只有功能测试无 consistency 指标、handoff 文档缺 Redis key',
+  },
+  'Spring AI Alibaba 上下文工程': {
+    example: 'ContextCompressAdvisor + ContextEditingAdvisor + Graph Checkpoint',
+    stackNote: '说明 SAA Advisor 链与 Python 手工压缩/编辑的对照',
+    pitfalls: 'Advisor 顺序错误、graph checkpoint 与 session_id 未对齐',
+  },
+  'Agent 场景记忆': {
+    example: 'LangGraph 中断恢复 + 多 Agent 共享 blackboard',
+    stackNote: '说明 thread_id 与 session_id 对齐、mem scope 私有/共享分离',
+    pitfalls: 'Checkpoint 未持久化、黑板与私有日志混写',
+  },
+  '记忆的成本与延迟': {
+    example: '简单问候跳过长期召回，会话内 fact cache 降 P95',
+    stackNote: '说明 read-write amplification 与 lazy load + recall budget',
+    pitfalls: '每轮全量向量搜索、缓存无 TTL 导致脏读',
+  },
+  '面试：上下文爆窗排障': {
+    example: '20 轮后 History 44%、System 7% 的 overflow case 五步法',
+    stackNote: '说明 WindowOverflowDiagnoser 各层占比正常区间',
+    pitfalls: '未看 token 分布直接换大窗口、双栈重复注入未排查',
+  },
+  '与 RAG/Agent 课集成验收': {
+    example: 'OpenAPI 契约 + RAG 会话连续性 + Agent Checkpoint 集成测试',
+    stackNote: '说明 handoff.md 中 API/Redis key 与 metric bind CI 门禁',
+    pitfalls: '契约漂移未签字、跨课联调缺 mock 环境',
+  },
+};
+
+function chapterKeyFromTip(tip) {
+  const m = (tip ?? '').match(/^([^：]+)：/);
+  return m?.[1] ?? null;
+}
+
 function buildTermPrompt(termId, term, course) {
   const ctx = COURSE_CONTEXT[slug] ?? {
     scene: 'CorpAssist 企业智能助手',
@@ -144,10 +223,20 @@ function buildTermPrompt(termId, term, course) {
   const label = term.label ?? termId;
   const tip = (term.tip ?? '').replace(/\s+/g, ' ').trim().replace(/。$/, '');
   const tipClause = tip ? `简要背景：${tip}。` : '';
+  const chapterKey = chapterKeyFromTip(term.tip);
+  const hint =
+    slug === 'context-memory-engineering' && chapterKey
+      ? CONTEXT_MEMORY_CHAPTER_HINTS[chapterKey]
+      : null;
+  const stackNote = hint?.stackNote ?? ctx.stackNote;
+  const pitfalls = hint?.pitfalls ?? ctx.pitfalls;
+  const exampleClause = hint?.example
+    ? `请围绕「${hint.example}」举一个 CorpAssist 例子，并`
+    : '结合一个 CorpAssist 落地例子，并';
   return (
     `我在学习《${title}》（${ctx.scene}）。请用通俗中文解释「${label}」：它解决什么问题、在工程里通常怎么用。${tipClause}` +
-    `结合一个 CorpAssist 落地例子，并${ctx.stackNote}。` +
-    `最后列出 2 个常见误区或排查项（可参考：${ctx.pitfalls}）。`
+    `${exampleClause}${stackNote}。` +
+    `最后列出 2 个与本章场景最相关的误区或排查项（可参考：${pitfalls}）。`
   );
 }
 

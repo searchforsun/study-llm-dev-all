@@ -4,31 +4,57 @@
 
 ## 目标
 
-使用 LangChain（Python）和 Spring AI（Java）分别实现会话记忆，统一 Redis session key 模式，验证双栈共享会话的连续性。
+使用 Python 写入、Java 读取同一 Redis session key（`corpassist-session-v1` JSON），验证双栈共享会话连续性。完整 Spring AI / LangChain 集成见章节正文；本 lab 提供**可运行最小契约**。
 
 ## 前置准备
 
-- Python 3.8+ 和/或 JDK 17+
-- Redis 实例（本地 docker 或远程）
-- `pip install langchain redis` 或 Spring AI 依赖
+- Python 3.10+
+- JDK 17+、Maven 3.9+（Java 契约测试）
+- Redis（可选：`docker compose up -d`）
 
-## 步骤
+## 目录
 
-1. **实现 Python 会话记忆**：使用 LangChain `ConversationBufferWindowMemory` + `RedisChatMessageHistory`，设定窗口 K=8，TTL 24h。session key 使用 `corpassist:session:{tenant}:{user_id}` 模式。
+| 路径 | 说明 |
+|------|------|
+| `session_store.py` | Python 侧 key + JSON schema |
+| `dual_stack_lab.py` | 对真实 Redis 的 write/read CLI |
+| `test_dual_stack.py` | 离线 pytest（fakeredis） |
+| `java-reader/` | Java 解析同一 JSON 的 `mvn test` |
+| [`session-key.md`](session-key.md) | key 约定速查 |
 
-2. **实现 Java 会话记忆**：使用 Spring AI `RedisChatMemory` + `MessageChatMemoryAdvisor`，使用相同的 session key 模式。
+## 验收命令
 
-3. **双栈验证**：用 Python 写入 3 轮对话，用 Java 读取同一 session key 的会话历史，验证内容一致。
+**离线（无需 Redis）：**
 
-4. **TTL 验证**：写入后检查 Redis TTL，确认 24h 后自动过期。
+```bash
+cd demos/practice-01-short-term-lab
+pip install -r requirements.txt
+pytest -q test_dual_stack.py
+cd java-reader && mvn -q test
+```
 
-## 预期输出
+**联调（需 Redis）：**
 
-Python 和 Java 都能从同一 Redis key 读写会话消息。Python 侧写入的轮次在 Java 侧可读取到完整内容的助理消息列表。
+```bash
+docker compose up -d
+export CORPASSIST_REDIS_URL=redis://localhost:6379/0
+python dual_stack_lab.py write
+python dual_stack_lab.py read
+cd java-reader && mvn -q test
+```
+
+期望：`pytest` 全绿；`read` 输出含订单 `20240501`；`mvn test` 通过契约测试。
+
+## 步骤（扩展）
+
+1. **Python 写入**：`dual_stack_lab.py write` 向 `corpassist:session:acme_corp:user_9527` 写入 3 轮对话，TTL 24h，窗口最多 8 轮。
+2. **Java 读取**：`SessionMessages.parse` 解析 Python JSON（生产环境接 Spring `ChatMemoryRepository`）。
+3. **双栈验证**：Python `read` 与 Java 测试均能看到相同订单上下文。
+4. **TTL**：`test_dual_stack.py::test_ttl_set_on_save` 验证 `EX` 已设置。
 
 ## 验收清单
 
-- [ ] Python 会话记忆实现（窗口 K=8，TTL 24h）
-- [ ] Java 会话记忆实现（同一 session key 模式）
-- [ ] 双栈共享会话验证通过
-- [ ] Redis TTL 正确设置
+- [ ] 离线 pytest 套件通过（见上方验收命令）
+- [ ] java-reader 目录 mvn test 通过
+- [ ] （可选）Redis 联调 `write` + `read` 通过
+- [ ] 理解单一写入方与统一 JSON schema 的必要性

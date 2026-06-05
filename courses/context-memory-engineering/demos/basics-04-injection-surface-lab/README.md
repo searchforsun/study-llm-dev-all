@@ -4,30 +4,43 @@
 
 ## 目标
 
-实现上下文注入检测器、三区隔离模型和安全审计日志，保护 CorpAssist 客服上下文免受污染。
+实现注入检测器、三区隔离模型和审计日志，用 `injection-cases.json` 离线验证 4 种注入模式（生产 Redis/LLM 集成见章节正文；本 lab 为**内存示意**）。
 
 ## 前置准备
 
-- Python 3.8+ 或 JDK 17+
-- 本章提供的注入测试用例
+- Python 3.10+
+- 本 lab 附带的 [`injection-cases.json`](injection-cases.json)（4 种注入模式）
 
-## 步骤
+## 目录
 
-1. **实现 InjectionDetector**：编写注入检测器，至少支持 4 种注入模式检测（忽略指令、输出提示词、格式劫持、角色切换）。
+| 路径 | 说明 |
+|------|------|
+| `injection_detector.py` | 正则注入检测 + sanitize/block |
+| `isolated_context.py` | 可信/半可信/不可信三区组装 |
+| `audit_log.py` | 污染事件审计字段 |
+| `injection-cases.json` | 4 种测试用例 |
+| [`surface-list.md`](surface-list.md) | 注入面速查 |
 
-2. **实现 IsolatedContext**：按可信/半可信/不可信三区组织上下文内容。用户输入和 RAG 检索结果放入不可信区，System Prompt 放入可信区。
+## 验收命令
 
-3. **添加 System Prompt 边界声明**：在可信区中声明区域边界规则，告诉 LLM 不可信区的指令优先级更低。
+```bash
+cd demos/basics-04-injection-surface-lab
+pip install -r requirements.txt
+python -m pytest -q test_injection_lab.py
+```
 
-4. **运行测试用例**：使用提供的注入测试用例验证检测器准确率。审计日志记录每次污染事件的时间、来源、严重程度和处理动作。
+期望：4 项测试全绿；注入识别率 100%（4/4 cases）。
 
-## 预期输出
+## 步骤（扩展）
 
-注入测试结果：4 种注入模式均被检测并替换为安全标记。三区隔离上下文正确组装。审计日志包含全部必要字段。
+1. **InjectionDetector**：读取 `injection-cases.json`，对每条 `input` 调用 `scan()`。
+2. **IsolatedContext**：System Prompt → TRUSTED；RAG chunk → SEMI_TRUSTED；用户输入 → UNTRUSTED。
+3. **边界声明**：`assemble()` 输出含 `[TRUSTED]` 区域规则。
+4. **审计日志**：每次检测命中写入 `AuditLog`，字段含 timestamp/source/severity/action。
 
 ## 验收清单
 
-- [ ] 注入检测器识别率 ≥ 90%（测试用例）
-- [ ] 三区隔离正确组装，顺序正确
-- [ ] 审计日志包含所有必要字段
-- [ ] 理解上下文污染的主要来源和防御策略
+- [ ] pytest 套件通过（见上方验收命令）
+- [ ] 4 种注入模式均被检测
+- [ ] 三区隔离顺序：TRUSTED → SEMI_TRUSTED → UNTRUSTED
+- [ ] 审计日志字段完整

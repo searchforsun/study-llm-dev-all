@@ -31,7 +31,7 @@
     </div>
 
     <div class="section-block">
-      <h3>LangChain Memory：Python 会话记忆</h3>
+      <h3>LangChain Memory：Python <span class="term" data-term-id="working-memory" tabindex="0">working memory</span></h3>
 
       <p><span class="term" data-term-id="langchain-memory" tabindex="0">langchain memory</span> 提供多种会话记忆实现。最常用的包括：</p>
 
@@ -78,6 +78,7 @@
       </div>
 
       <h4>Python：LangChain 会话记忆实现</h4>
+      <p>每轮对话通过 <span class="term" data-term-id="turn-store" tabindex="0">turn-store</span> 写入 Redis，与窗口截断策略配合控制会话层大小。</p>
       <div class="code-block">
         <div class="code-toolbar">
           <span class="lang-tag">python</span>
@@ -122,54 +123,54 @@ class CorpAssistSessionMemory:
       <p><span class="term" data-term-id="spring-chatmemory" tabindex="0">spring chatmemory</span> 是 Spring AI 提供的会话记忆接口，支持多种后端实现。</p>
 
       <h4>Java：Spring AI ChatMemory 实现</h4>
+      <p class="notice"><strong>示意代码</strong>：与《Spring AI 工程》<code>practice-04-chat-memory</code> 对齐，使用 <code>MessageWindowChatMemory.builder()</code> + <code>ChatMemory.CONVERSATION_ID</code>；Redis 持久化可自定义 <code>ChatMemoryRepository</code>。Lab 最小契约见 <code>demos/practice-01-short-term-lab/</code>。</p>
+      <p>生产环境将 <code>ChatMemoryRepository</code> 落到 Redis 时，序列化格式须与 Python LangChain 侧一致（本课 lab 使用 <code>corpassist-session-v1</code> JSON）。键名统一为 <code>corpassist:session:{tenant}:{user_id}</code>，避免 BFF 与 Python 记忆服务各用一套 key 导致「用户明明聊过，换栈后像新会话」。</p>
+      <p>窗口策略上，Java 侧 <code>maxMessages(16)</code> 约等于 8 轮完整对话，与 Python <code>ConversationBufferWindowMemory(k=8)</code> 对齐；超出时由后续章节的截断/压缩 Advisor 接管，本章只保证<strong>会话状态可共享、可过期、可限长</strong>。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>检查项</th><th>Python</th><th>Java</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Session key</td><td colspan="2"><code>corpassist:session:{tenant}:{user_id}</code></td></tr>
+          <tr><td>窗口</td><td>k=8 轮</td><td>maxMessages=16 条</td></tr>
+          <tr><td>TTL</td><td>Redis EX 86400</td><td>Repository 层设置</td></tr>
+          <tr><td>写入方</td><td colspan="2">单一服务写入，另一栈只读或经 BFF 转发</td></tr>
+        </tbody>
+      </table>
       <div class="code-block">
         <div class="code-toolbar">
           <span class="lang-tag">java</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-java">// Spring AI ChatMemory - CorpAssist 客服场景
-import org.springframework.ai.chat.memory.ChatMemory;
-import org.springframework.ai.chat.memory.jdbc.JdbcChatMemory;
-import org.springframework.ai.chat.memory.redis.RedisChatMemory;
-
+        <pre><code class="language-java">// Spring AI ChatMemory — CorpAssist 客服（示意，以官方文档为准）
 @Configuration
 public class CorpAssistChatMemoryConfig {
 
-    @Value("${spring.redis.url}")
-    private String redisUrl;
-
     @Bean
     public ChatMemory chatMemory() {
-        return new RedisChatMemory(redisUrl);
+        return MessageWindowChatMemory.builder()
+            .maxMessages(16)  // 约 8 轮 user+assistant
+            .build();
     }
 
     @Bean
     public MessageChatMemoryAdvisor memoryAdvisor(ChatMemory chatMemory) {
-        return new MessageChatMemoryAdvisor(
-            chatMemory,
-            "corpassist:session:{tenant}:{user_id}",  // session key 模式
-            86400  // TTL 24h
-        );
+        return MessageChatMemoryAdvisor.builder(chatMemory).build();
     }
 }
 
-// 使用示例
 @Service
 public class ChatService {
-    private final MessageChatMemoryAdvisor memoryAdvisor;
-
-    public ChatService(MessageChatMemoryAdvisor memoryAdvisor) {
-        this.memoryAdvisor = memoryAdvisor;
-    }
+    private final ChatClient chatClient;
 
     public String chat(String tenant, String userId, String message) {
-        String sessionKey = String.format(
+        String conversationId = String.format(
             "corpassist:session:%s:%s", tenant, userId);
-
-        return memoryAdvisor.execute(
-            sessionKey,
-            prompt -&gt; chatModel.call( prompt.userText(message) )
-        );
+        return chatClient.prompt()
+            .advisors(a -&gt; a.param(ChatMemory.CONVERSATION_ID, conversationId))
+            .user(message)
+            .call()
+            .content();
     }
 }</code></pre>
       </div>
@@ -283,6 +284,75 @@ class RedisSessionStore:
       <p>压测时建议同时观测 Redis 内存占用与单 key 长度，避免「轮次限制失效」导致单用户 key 膨胀拖垮集群。</p>
     </div>
 
+    <div class="section-block">
+      <h3>S2 客服场景：指代消解与人工转接</h3>
+
+      <p>CorpAssist 智能客服（S2）的两类高频记忆场景：<strong>指代消解</strong>（「它」「那个订单」）与<strong>人工转接</strong>（bot → 人工坐席时携带会话摘要）。工作记忆质量直接决定这两类体验。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>轮次</th><th>用户</th><th>系统需记住</th><th>失败表现</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td><td>查订单 20240501 状态</td><td>实体 order=20240501</td><td>—</td>
+          </tr>
+          <tr>
+            <td>2</td><td>它还能加急吗？</td><td>「它」→ 20240501</td><td>无 session 则答「请问哪个订单」</td>
+          </tr>
+          <tr>
+            <td>3</td><td>我要投诉，转人工</td><td>触发 handoff + 摘要</td><td>人工看不到前两轮则重复询问</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>S2 · 人工转接与会话 handoff</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant Bot as CorpAssist Bot
+    participant Redis as Redis Session
+    participant Agent as 人工坐席
+
+    U->>Bot: 查订单 20240501 / 它还能加急吗
+    Bot->>Redis: append turns (session key)
+    U->>Bot: 转人工客服
+    Bot->>Redis: 读取最近 8 轮 + 实体清单
+    Bot->>Agent: handoff 摘要\n订单 20240501 · 已申请加急
+    Agent->>U: 您好，我看到您在跟进 20240501…</pre>
+        <p class="diagram-caption">转接时从 Redis 会话生成结构化 handoff 摘要，避免人工重复提问；session key 与 bot/坐席控制台共用。</p>
+      </div>
+
+      <aside class="learn-scenario" aria-label="S2 指代消解">
+        <span class="learn-scenario-title">Mini-case · 指代消解</span>
+        用户第 2 轮只说「取消它」——若 <code>load_history</code> 返回空，模型无法绑定实体。修复：保证 Redis 至少保留含订单号的 user turn；评测时用 <code>must_remember: ["20240501"]</code> 断言（见 <code>practice-05</code> eval_scenarios）。
+      </aside>
+
+      <aside class="learn-scenario" aria-label="S2 转接">
+        <span class="learn-scenario-title">Mini-case · 人工转接</span>
+        触发转接时生成 handoff 块：<code>entities</code>（订单/会员等级）+ <code>last_intent</code>（加急/投诉）+ <code>constraints</code>（中文回复）。禁止把完整 20 轮原文塞给坐席——应走与压缩章相同的摘要策略，并保留可点击的 session 链接。
+      </aside>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>每轮只把当前 user 消息送 LLM，不带 history</li>
+            <li>转人工时复制粘贴整段对话给坐席</li>
+            <li>bot 与坐席使用不同 session id</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>Redis 保留最近 N 轮 + 关键实体 pinned</li>
+            <li>handoff 摘要结构化（实体/意图/约束）</li>
+            <li>统一 <code>corpassist:session:{tenant}:{user}</code></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
     <div class="section-block chapter-conclusions-block notice">
       <h3>本章结论</h3>
       <ul class="chapter-conclusions-list">
@@ -354,27 +424,29 @@ class RedisSessionStore:
   <div class="chapter-practice">
     <h3>动手练习</h3>
     <p class="steps-intro">实现双栈会话记忆（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
     <ol class="steps steps-operate">
       <li>Python：使用 LangChain ConversationBufferWindowMemory + Redis 实现会话记忆。</li>
-      <li>Java：使用 Spring AI RedisChatMemory + MessageChatMemoryAdvisor 实现。</li>
+      <li>Java：使用 Spring AI RedisChatMemory + MessageChatMemoryAdvisor 实现（示意 API，以 <a href="https://docs.spring.io/spring-ai/reference/api/chat-memory.html" target="_blank" rel="noopener">官方 ChatMemory 文档</a> 为准）。</li>
       <li>验证双栈使用相同的 session key 可以读取到对方写入的会话。</li>
-    </ol>    <h4 class="practice-section-title">判断练习</h4>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
     <ol class="steps-judgment-list">
       <li>
-        <p class="judgment-stem">本练习若只做 happy path、不做失败分支验证，上线后最可能出什么问题？</p>
+        <p class="judgment-stem">Python 与 Java 使用相同 Redis key，但消息 JSON 字段名不一致（如 <code>content</code> vs <code>text</code>），双栈互读会怎样？</p>
         <div class="learn-practice-answer">
           <details>
             <summary>参考答案</summary>
-            <div class="learn-practice-answer-body"><p>缺少<strong>预算/截断/权限</strong>类负例测试，易在边界流量下触发上下文溢出或注入。</p></div>
+            <div class="learn-practice-answer-body"><p>反序列化失败或读到空消息，表现为<strong>会话断层</strong>。须约定统一消息 schema 与单一写入方，或加兼容层。</p></div>
           </details>
         </div>
       </li>
       <li>
-        <p class="judgment-stem">你会把哪一条观测指标作为本章是否达标的判据？</p>
+        <p class="judgment-stem">两栈同时对 <code>corpassist:session:acme_corp:user_9527</code> 写入，最可能引发什么问题？</p>
         <div class="learn-practice-answer">
           <details>
             <summary>参考答案</summary>
-            <div class="learn-practice-answer-body"><p>除功能通过外，应监控<strong>上下文 token 分布、P95 延迟、违规拦截率</strong>，并与本章实验输出对齐。</p></div>
+            <div class="learn-practice-answer-body"><p><strong>双写竞态</strong>：后写覆盖先写、轮次乱序。生产应指定单一写入方，另一栈只读或通过 BFF 转发。</p></div>
           </details>
         </div>
       </li>
@@ -382,7 +454,7 @@ class RedisSessionStore:
 
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：工作记忆与会话状态</h4>
-      <p>目录：<code>demos/practice-01-short-term-lab/</code>。<strong>验收</strong>：双栈会话读写同一 Redis key。</p>
+      <p>目录：<code>demos/practice-01-short-term-lab/</code>。<strong>验收</strong>：README 中 <code>pytest</code> + <code>mvn test</code>；可选 Redis 联调 <code>dual_stack_lab.py</code> write/read。</p>
     </div>
   </div>
 

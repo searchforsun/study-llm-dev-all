@@ -4,30 +4,39 @@
 
 ## 目标
 
-实现记忆审批队列、记忆编辑服务和 append-only 审计日志，确保关键事实写入前经过人工审核。
+实现记忆审批队列、编辑回滚与 append-only 审计日志，验证置信度阈值分流（SQLite/PostgreSQL 生产实现见章节正文；本 lab 为**内存示意**）。
 
 ## 前置准备
 
-- Python 3.8+ 或 JDK 17+
-- SQLite 或 PostgreSQL
+- Python 3.10+
 
-## 步骤
+## 目录
 
-1. **实现 MemoryApprovalQueue**：支持提交审批（submit_for_review）、批准（approve）、拒绝（reject）、编辑后批准（edit_and_approve）四种操作。置信度 >= 0.9 自动写入，低于 0.9 进入审批队列。
+| 路径 | 说明 |
+|------|------|
+| `human_loop.py` | 审批队列 / 编辑服务 / 审计存储 |
+| [`audit-log.md`](audit-log.md) | 审计字段说明 |
 
-2. **实现 MemoryEditService**：支持事实编辑和回滚。每次编辑保留版本号，记录 before/after 内容。
+## 验收命令
 
-3. **实现 AuditLogStore**：Append-only 审计日志，包含 event_type、fact_id、before_content、after_content、operator、reason、created_at。
+```bash
+cd demos/practice-04-human-loop-lab
+pip install -r requirements.txt
+python -m pytest -q test_human_loop_lab.py
+```
 
-4. **完整流程测试**：LLM 提取事实（置信度 0.75）→ 进入审批队列 → 管理员审核批准 → 写入长期记忆 → 审计日志记录全部操作。
+期望：5 项测试全绿；高置信自动写入、低置信审批、拒绝不写库、编辑可回滚。
 
-## 预期输出
+## 步骤（扩展）
 
-高置信度事实自动写入。低置信度事实进入审批。编辑后保留版本历史。审计日志不可篡改。
+1. **ingest**：置信度 ≥0.9 自动写入；否则进入 `pending` 队列。
+2. **approve / reject / edit_and_approve**：四种审批路径均写审计。
+3. **MemoryEditService**：编辑递增 `version`；`rollback` 恢复上一版本。
+4. **AuditLogStore**：仅 `append`，不可修改历史条目。
 
 ## 验收清单
 
-- [ ] 审批队列支持 4 种操作
-- [ ] 记忆编辑带版本号
-- [ ] 审计日志 append-only
-- [ ] 完整流程端到端通过
+- [ ] pytest 套件通过（见上方验收命令）
+- [ ] 审批队列支持 submit / approve / reject / edit_and_approve
+- [ ] 编辑带 version 且可 rollback
+- [ ] 审计日志 append-only，含 before/after

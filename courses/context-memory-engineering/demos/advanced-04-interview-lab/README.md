@@ -4,31 +4,34 @@
 
 ## 目标
 
-使用 WindowOverflowDiagnoser 诊断爆窗根因，配置爆窗监控告警，用五步法组织面试级回答。
+使用 WindowOverflowDiagnoser 诊断 20 轮爆窗案例，验证修复后 token 分布回归（生产监控见章节正文；本 lab 为**离线示意**）。
 
 ## 前置准备
 
-- Python 3.8+
+- Python 3.10+
 
-## 步骤
+## 目录
 
-1. **实现 WindowOverflowDiagnoser**：分析 token 分布，检测 History 是否 > 35%、System 是否 < 10%、总 token 是否超预算。输出诊断报告。
+| 路径 | 说明 |
+|------|------|
+| `overflow_diagnoser.py` | 诊断器 + 滑动窗口修复示意 |
+| `overflow_case.json` | 健康 vs 爆窗 token 分布 |
+| `alert_rules.yaml` | 告警规则示意 |
+| [`debug-steps.md`](debug-steps.md) | 五步法速查 |
 
-2. **模拟爆窗场景**：生成一个 20 轮对话的 token 分布数据，运行 diagnoser 识别根因。
+## 验收命令
 
-3. **修复验证**：实施修复策略（滑动窗口、缓存、工具截断），验证修复后 token 分布回归正常。
+```bash
+cd demos/advanced-04-interview-lab
+pip install -r requirements.txt
+python -m pytest -q test_overflow_lab.py
+```
 
-4. **配置爆窗告警**：编写告警规则 YAML，包含 window_overflow、history_spike、system_prompt_squeeze 三条规则。
-
-5. **模拟面试练习**：找一个搭档，用五步法（现象→采集→定位→修复→预防）回答「对话变长后 LLM 变慢怎么排查」。
-
-## 预期输出
-
-Diagnoser 正确识别爆窗根因。修复后 token 分布回归健康范围。告警规则配置完整。
+期望：4 项测试全绿。
 
 ## 验收清单
 
-- [ ] Diagnoser 正确识别根因
-- [ ] 修复后 token 分布正常
-- [ ] 告警规则配置完整
-- [ ] 能用五步法清晰组织回答
+- [ ] pytest 套件通过（见上方验收命令）
+- [ ] Diagnoser 识别 history_spike / system_prompt_squeeze
+- [ ] 修复后 History 占比下降
+- [ ] alert_rules.yaml 含三条规则

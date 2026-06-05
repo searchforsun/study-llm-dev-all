@@ -9,14 +9,14 @@
       <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>进阶 RAG</strong> · 能力：Multi-query / HyDE 改写与 A/B 效果对比</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
-        <p>用户口语「年假咋请」与制度原文「年假申请流程」embedding 空间距离远，<a href="#ch-practice-03-hybrid">混合检索</a> 仍可能 miss。查询侧 <span class="term" data-term-id="query-rewrite" tabindex="0">query rewrite</span> 在检索前扩展或改写问句，提升 <span class="term" data-term-id="recall-boost" tabindex="0">recall boost</span>；但每多一次 LLM 调用都有 <span class="term" data-term-id="transform-cost" tabindex="0">transform cost</span>，必须量化对比。</p>
+        <p>用户口语「年假咋请」与制度原文「年假申请流程」embedding 空间距离远，<a href="#ch-practice-03-hybrid">混合检索接入</a> 仍可能 miss。查询侧 <span class="term" data-term-id="query-rewrite" tabindex="0">query rewrite</span> 在检索前扩展或改写问句，提升 <span class="term" data-term-id="recall-boost" tabindex="0">recall boost</span>；但每多一次 LLM 调用都有 <span class="term" data-term-id="transform-cost" tabindex="0">transform cost</span>，必须量化对比。</p>
       </div>
       <div class="notice notice-outcome">
         <strong>学完你能</strong>
         <ul>
           <li>实现 <span class="term" data-term-id="multi-query" tabindex="0">multi query</span> 与结果融合</li>
           <li>配置 HyDE（假设性文档嵌入）链路</li>
-          <li>用 <a href="#ch-practice-05-eval-loop">评测闭环</a> 对比改写前后 context_recall</li>
+          <li>用 <a href="#ch-practice-05-eval-loop">RAG 评测闭环</a> 对比改写前后 context_recall</li>
           <li>在 CorpAssist 双栈中选择 Python 改写或 Spring 网关改写</li>
         </ul>
       </div>
@@ -72,6 +72,54 @@ List&lt;Document&gt; merged = fusionService.reciprocalRankFusion(
       </div>
 
       <p><span class="term" data-term-id="query-expansion" tabindex="0">query expansion</span> 适合<strong>短问、口语、多义词</strong>；专有编号问法（「制度 HR-2024-03 第 2 条」）通常不必改写，以免漂移。</p>
+
+      <h4>改写 Prompt 约束（CorpAssist S1）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown">你是 CorpAssist HR 制度检索助手。将用户问句改写为 3 条检索子问句。
+规则：
+1. 保留原意，不编造制度编号或金额
+2. 输出 JSON 数组，如 ["年假申请流程", "带薪年休假制度", "休假审批步骤"]
+3. 每条 8～20 字，偏制度术语而非口语</code></pre>
+      </div>
+
+      <h4>融合配置：RRF 与去重</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>参数</th><th>推荐值</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>sub_query 数量</td><td>3～5</td><td>过多导致 <span class="term" data-term-id="transform-cost" tabindex="0">transform cost</span> 线性上升</td></tr>
+            <tr><td>每路 top_k</td><td>8</td><td>单路不宜过大，融合后再 rerank</td></tr>
+            <tr><td>融合算法</td><td>RRF k=60</td><td>与 <a href="#ch-practice-03-hybrid">混合检索接入</a> 一致，尺度无关</td></tr>
+            <tr><td>去重键</td><td>chunk_id</td><td>同 chunk 多路命中只保留最高分</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>双栈职责划分</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">双栈各写一套改写</span>
+          <ul>
+            <li>Python 与 Spring 改写 Prompt 不一致</li>
+            <li>评测无法对比 parity</li>
+            <li>生产 A/B 结论不可复现</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">统一改写服务</span>
+          <ul>
+            <li>Python 提供 <code>/v1/query/expand</code> 或共享 Prompt 文件</li>
+            <li>Spring 网关调用同一 endpoint</li>
+            <li><span class="term" data-term-id="parity-test" tabindex="0">parity test</span> 黄金集校验输出一致</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：Multi-query 会放大 ACL 风险吗？</summary>
+        <p>会。每路子问句检索都必须带相同 <span class="term" data-term-id="acl-filter" tabindex="0">acl filter</span>；禁止为「提高召回」在某路子问句去掉 dept 过滤。融合前对每路 hits 做权限校验，与 <a href="#ch-advanced-05-security">RAG 安全</a> 一致。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -110,6 +158,58 @@ List&lt;Document&gt; merged = fusionService.reciprocalRankFusion(
         <summary>先想 10 秒：HyDE 在「条款编号精确查询」上通常有效还是有害？</summary>
         <p>通常<strong>有害或无益</strong>。编号问法应走 BM25 / keyword boost（见混合检索章）；HyDE 可能编造不存在的条款表述，embedding 反而偏离真实文档。</p>
       </details>
+
+      <h4>HyDE Prompt 与假文档边界</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python">HYDE_PROMPT = """根据问题写一段 80～120 字的假设性制度说明段落。
+要求：语气像正式制度条文，但不要编造具体编号、金额、日期。
+问题：{q}
+段落："""
+
+# 假文档仅用于 embed_query；禁止直接进入生成 Prompt 作为「权威答案」
+hypothetical = llm.invoke(HYDE_PROMPT.format(q=question))
+assert "HR-" not in hypothetical or audit_flag("hyde-invented-id")</code></pre>
+      </div>
+
+      <h4>HyDE vs Multi-query 选型</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead><tr><th>维度</th><th>Multi-query</th><th>HyDE</th></tr></thead>
+          <tbody>
+            <tr><td>LLM 调用次数</td><td>1 次生成 N 条</td><td>1 次生成长段落</td></tr>
+            <tr><td>Embedding 次数</td><td>N 次</td><td>1 次</td></tr>
+            <tr><td>擅长问法</td><td>口语短问、多义词</td><td>抽象概念、定义类</td></tr>
+            <tr><td>风险</td><td>子问句漂移</td><td>假文档编造事实</td></tr>
+            <tr><td>CorpAssist 默认</td><td>FAQ 入口类优先</td><td>「什么是…」类试用</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Spring AI：HyDE 检索顾问（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 查询链：hydeExpand → embed → similaritySearch → 标准 RAG 生成
+String hypothetical = hydeClient.expand(userQuestion);
+float[] vec = embeddingModel.embed(hypothetical);
+List&lt;Document&gt; docs = vectorStore.similaritySearch(
+    SearchRequest.builder().query("").embedding(vec).topK(8)
+        .filterExpression(aclFilter.forUser(user)).build());
+// 生成阶段仍用原始 userQuestion + docs，不用假文档作答</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>HyDE 与生成隔离</h5>
+        <pre class="mermaid">flowchart LR
+  Q[用户问句] --> H[LLM 写假文档]
+  H --> E[embed 假文档]
+  E --> V[向量检索]
+  V --> C[真实 chunk]
+  Q --> G[生成 Prompt]
+  C --> G
+  G --> A[带 citation 答案]</pre>
+        <p class="diagram-caption">假文档只参与检索向量；最终答案必须 grounded 于检索到的真实 chunk。</p>
+      </div>
     </div>
 
     <div class="section-block">
@@ -135,6 +235,68 @@ List&lt;Document&gt; merged = fusionService.reciprocalRankFusion(
       </ul>
 
       <p><span class="term" data-term-id="rewrite-prompt" tabindex="0">rewrite prompt</span> 应约束：不编造事实、输出 JSON 数组、保留用户原意。示例见 <code>demos/advanced-01-query-transform-lab/rewrite-example.txt</code>。</p>
+
+      <h4>A/B 实验设计（iter-loop 对齐）</h4>
+      <p>每次实验只改<strong>一个改写策略</strong>，其余参数（chunk、hybrid 权重、rerank）固定。记录到 <span class="term" data-term-id="eval-report" tabindex="0">eval report</span>：</p>
+      <ol>
+        <li><strong>baseline</strong>：无改写，记录 faithfulness / context_recall / P95</li>
+        <li><strong>variant-mq</strong>：仅开启 multi-query ×3</li>
+        <li><strong>variant-hyde</strong>：仅开启 HyDE</li>
+        <li><strong>variant-route</strong>：按 intent 路由（口语→mq，抽象→hyde）</li>
+      </ol>
+
+      <h4>路由配置（按 intent 启用）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># demos/advanced-01-query-transform-lab/query-transform-routing.yaml
+transform:
+  default: none
+  routes:
+    - intent: faq_colloquial   # 「年假咋请」
+      strategy: multi_query
+      max_sub_queries: 3
+    - intent: definition       # 「什么是竞业限制」
+      strategy: hyde
+    - intent: exact_clause     # 「HR-2024-03 第 2 条」
+      strategy: none           # 走 BM25，见混合检索</code></pre>
+      </div>
+
+      <h4>成本—收益决策矩阵</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>信号</th><th>开启改写？</th><th>首选策略</th></tr></thead>
+          <tbody>
+            <tr><td>context_recall &lt; 0.75 且失败用例多为口语</td><td>是</td><td>multi-query</td></tr>
+            <tr><td>失败用例为抽象定义、无编号</td><td>是</td><td>HyDE 试点</td></tr>
+            <tr><td>recall 已 ≥ 0.82，P95 &gt; 2.5s</td><td>否</td><td>优先 cache/route（见性能章）</td></tr>
+            <tr><td>faithfulness 改写后下降 &gt; 3%</td><td>回滚</td><td>检查假文档是否进入生成 Prompt</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">效果对比误区</span>
+          <ul>
+            <li>只测 5 条手工问法就上线</li>
+            <li>改写与 rerank 同时改，无法归因</li>
+            <li>不看 token 成本与 P95</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">可发布对比</span>
+          <ul>
+            <li>黄金集 ≥ 80 条，含 ACL 上下文</li>
+            <li>单变量 + <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span> 记录</li>
+            <li>latency/token 写入 <span class="term" data-term-id="release-gate" tabindex="0">release gate</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：改写后 citation 消失怎么办？</summary>
+        <p>常见原因是 context pack 膨胀或假文档污染生成 Prompt。修复：融合后 strict top_k（如 4）；生成 system 声明「仅引用检索 chunk」；对 HyDE 路径禁止把 hypothetical 拼入 user message。回归测 <span class="term" data-term-id="citation" tabindex="0">citation</span> 字段非空率。</p>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -158,6 +320,35 @@ List&lt;Document&gt; merged = fusionService.reciprocalRankFusion(
           <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
         </ul>
       </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <ul>
+              <li>改写为检索服务：HyDE 假文档只为 embedding，不直接当答案</li>
+              <li>Multi-query：多路检索后 RRF 融合，避免 Prompt 爆炸</li>
+              <li>口语问法「年假咋请」→ 制度原文用语，提升 context_recall</li>
+              <li>成本同测：latency、token 与 recall 写入 eval report</li>
+              <li>路由级启用：按问法类型开关改写，非全量请求都走 HyDE</li>
+            </ul>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist S1 混合检索仍 miss 时，Multi-query 与 HyDE 各适合什么问法？</li>
+              <li>HyDE 多一次 LLM 调用，你如何量化是否值得上线？</li>
+              <li>改写放在 Python 网关还是 Spring BFF，各有什么运维取舍？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一步：完成 Demo；继续 <a href="#ch-advanced-02-graph-rag">GraphRAG 概念与边界</a>。</p>
     </div>
   </div>
@@ -200,7 +391,7 @@ List&lt;Document&gt; merged = fusionService.reciprocalRankFusion(
   <div class="resources content-section">
     <h3>延伸学习</h3>
     <ul>
-      <li><strong>上一章</strong>：<a href="#ch-practice-07-code-rag">代码库 RAG 与研发助手</a></li>
+      <li><strong>上一章</strong>：<a href="#ch-practice-07-code-rag">代码库 RAG 与研发助手（面试场景）</a></li>
       <li><strong>下一章</strong>：<a href="#ch-advanced-02-graph-rag">GraphRAG 概念与边界</a></li>
       <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>：改写策略需进 eval report</li>
     </ul>

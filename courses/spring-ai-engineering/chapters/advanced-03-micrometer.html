@@ -153,28 +153,40 @@ public class ChatService {
       </div>
 
       <h4>TraceIdFilter + RestClient 传播</h4>
+      <p>生产环境应使用 Micrometer Tracing 的 <code>Propagator</code> 注入 W3C <code>traceparent</code>（格式 <code>00-{traceId}-{spanId}-01</code>），勿手写 UUID 充当 traceparent。<code>X-Request-Id</code> 为业务关联 ID，可与分布式 trace 并存。</p>
       <div class="code-block">
         <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
         <pre><code class="language-java">@Component
 public class TraceIdFilter extends OncePerRequestFilter {
+  private final Propagator propagator;
+  private final Tracer tracer;
+
   @Override
   protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res,
       FilterChain chain) throws ServletException, IOException {
-    String traceId = Optional.ofNullable(req.getHeader("traceparent"))
-        .orElse(UUID.randomUUID().toString());
-    MDC.put("traceId", traceId);
-    res.setHeader("X-Request-Id", traceId);
-    try { chain.doFilter(req, res); } finally { MDC.clear(); }
+    Span span = propagator.extract(req, HttpServletRequest::getHeader)
+        .name("http.request").start();
+    try (Tracer.SpanInScope ws = tracer.withSpan(span)) {
+      String requestId = Optional.ofNullable(req.getHeader("X-Request-Id"))
+          .orElse(UUID.randomUUID().toString());
+      MDC.put("traceId", span.context().traceId());
+      res.setHeader("X-Request-Id", requestId);
+      chain.doFilter(req, res);
+    } finally {
+      span.end();
+      MDC.clear();
+    }
   }
 }
 
 @Bean
-RestClient pythonSearchClient(Tracer tracer) {
+RestClient pythonSearchClient(Propagator propagator, Tracer tracer) {
   return RestClient.builder()
       .baseUrl("${corpassist.python.search-url}")
       .requestInterceptor((req, body, exec) -> {
         tracer.currentSpan().ifPresent(span ->
-            req.getHeaders().set("traceparent", span.context().traceId()));
+            propagator.inject(span.context(), req.getHeaders(),
+                (headers, key, value) -> headers.set(key, value)));
         return exec.execute(req, body);
       })
       .build();

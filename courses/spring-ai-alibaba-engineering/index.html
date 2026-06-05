@@ -5338,6 +5338,55 @@ public Flux&lt;ServerSentEvent&lt;String&gt;&gt; stream(@RequestBody ChatRequest
           <div class="learn-faq-body">同一模型通常同价；差异在集成方式而非单价。CorpAssist 选型看框架能力（ReactAgent、Graph），不是看计费公式差异。</div>
         </details>
       </div>
+      <h4>请求超时、重试与 429 治理</h4>
+      <p>门户 SSE 路径上，DashScope 偶发 429（配额）或 5xx 会表现为「流式中断」。S3 Agent 应在 <code>WebClient</code> / SDK 层配置<strong>指数退避重试</strong>，且<strong>不对用户可见 chunk 重复推送</strong>；重试仅发生在服务端与百炼之间。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>HTTP 现象</th><th>常见原因</th><th>CorpAssist 处理</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>429</td><td>Key 配额或 QPS 超限</td><td>practice-02 熔断 + 切换 turbo；告警绑 S3 专用 Key</td></tr>
+          <tr><td>504 / 读超时</td><td>长上下文 + 流式慢</td><td>网关 SSE 超时 ≥ 120s；中间发心跳 event</td></tr>
+          <tr><td>401</td><td>Key 过期或环境变量未注入</td><td>启动时 HealthIndicator 探测，拒绝冷启动带病上线</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># 与 DashScope HTTP 客户端对齐（示意）
+spring:
+  ai:
+    dashscope:
+      chat:
+        options:
+          timeout: 90s
+      client:
+        max-retries: 2
+        retry-backoff: 1s,2s</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 月末报销高峰</span>
+        S3 请假/报销 Agent 在月末 QPS 翻倍：Micrometer 按 <code>model</code> 与 <code>http_status</code> 打点；429 率超阈值时自动将<strong>非关键意图</strong>路由到 qwen-turbo，主链路 plus 保留给含 Tool 的多步任务。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：流式重试会不会让用户看到重复段落？</summary>
+        <p>会，若在前端直接重放已收 chunk。正确做法：服务端重试时重置 Flux 订阅，门户收到 <code>event: error</code> 后整段重新请求，或仅展示「正在重试」占位，不拼接半截答案。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>无限重试 429，放大账单与延迟</li>
+            <li>把 DashScope request_id 从响应头丢弃，无法对账</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>结构化日志记录 request_id、model、input/output tokens</li>
+            <li>重试上限 + 熔断后返回友好降级文案</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -5717,6 +5766,34 @@ spring:
         <summary>自检：单元测试如何不连百炼？</summary>
         <p><code>@SpringBootTest</code> + <code>@MockBean ChatModel</code>，或 <code>@ActiveProfiles("test")</code> 禁用 DashScope AutoConfiguration；与 spring-ai-engineering advanced 测试章一致。</p>
       </details>
+      <h4>条件装配与启动诊断</h4>
+      <p>DashScope AutoConfiguration 通常在「classpath 有 Starter + api-key 非空」时注册 <code>ChatModel</code>。本地忘配 Key 时，应用仍能启动但 Agent Bean 注入失败——应在 <code>ApplicationRunner</code> 或 Actuator 中显式探测。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@Component
+@ConditionalOnProperty("spring.ai.dashscope.api-key")
+class DashScopeReadinessProbe implements HealthIndicator {
+  private final ChatModel chatModel;
+  @Override public Health health() {
+    // 轻量 ping 或仅校验 Bean 存在；勿在每次 health 全量 call LLM
+    return chatModel != null ? Health.up().build() : Health.down().build();
+  }
+}</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · K8s 滚动发布</span>
+        新 Pod 启动时若 Secret 挂载晚于容器 ready，Readiness 应失败避免流量打入；Secret 就绪后 DashScope Bean 可用，再标记 ready。与 spring-ai-engineering 的外部化配置章同一套路。
+      </aside>
+      <table class="outline-table">
+        <thead>
+          <tr><th>症状</th><th>排查</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>无 ChatModel Bean</td><td>检查 extensions-bom、api-key 占位符是否解析</td></tr>
+          <tr><td>双 ChatModel 冲突</td><td>同时引入 openai + dashscope 时需 @Qualifier</td></tr>
+          <tr><td>Profile 未生效</td><td>确认 <code>spring.profiles.active</code> 与 ConfigMap 一致</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -6060,6 +6137,62 @@ VectorStore ingestLeavePolicy(
           <div class="learn-faq-body">可以，且是推荐双栈分工（basics-04）。Python 批处理解析 + 写索引版本；Java extensions 侧保留 Reader 用于小规模热更新或灾备。</div>
         </details>
       </div>
+      <h4>解析质量、切块与增量索引</h4>
+      <p>extensions 解决「从二进制到文本」；切块策略决定 RAG 召回粒度。CorpAssist 制度库统一 <strong>500 Token / 50 overlap</strong>，与 Python 轨 rag-system 对齐，避免 Java 热更新与离线批处理 chunk 不一致。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>质量问题</th><th>表现</th><th>缓解</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>表格断裂</td><td>考勤表行被切成两半</td><td>复杂版式走百炼文档解析 API，或按页切块</td></tr>
+          <tr><td>页眉页脚噪声</td><td>检索命中「第 3 页」重复文本</td><td>Tika 后处理 strip header/footer 规则</td></tr>
+          <tr><td>扫描 PDF 乱码</td><td>Embedding 无意义</td><td>先 OCR/VL 转文本再 Reader，勿直接 Tika</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 增量：仅当 manifest 中 doc_version 变更时 reindex
+if (!manifest.version().equals(cachedVersion(docId))) {
+  List&lt;Document&gt; docs = leavePolicyReader.get();
+  vectorStore.delete(filter("doc_id == " + docId));
+  vectorStore.add(splitter.apply(docs));
+  versionCache.put(docId, manifest.version());
+}</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>制度 PDF 增量索引（extensions + VectorStore）</h5>
+        <pre class="mermaid">flowchart LR
+  HR[HR 上传 PDF] --> MAN[manifest.json]
+  MAN --> JOB[增量 Job]
+  JOB --> READ[Tika / 百炼解析]
+  READ --> CHUNK[TokenTextSplitter]
+  CHUNK --> VS[VectorStore]
+  VS --> AG[S3 searchPolicy Tool]</pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 单页制度热修</span>
+        HR 只改了请假制度第 2 章：增量 Job 仅重解析该 PDF 的 <code>doc_id</code>，不重建全库；S3 Agent 检索 filter <code>policy_version</code> 与 basics-05 索引版本联动。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：extensions Reader 与 Embedding 是否应在同一 JVM？</summary>
+        <p>小规模热更新可在 Java 完成 Reader→Embedding→VectorStore；全量百万 chunk 仍建议 Python 批处理写 PGVector，Java 只读。分工见 basics-04 双栈矩阵。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>每次 Agent 请求路径上同步 Tika 解析 20 页 PDF</li>
+            <li>Java/Python 使用不同 chunk size 却共用一个 collection</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>manifest 驱动增量；dead-letter 队列记录解析失败</li>
+            <li>元数据 <code>doc_version</code>、<code>page_no</code> 支持 citation</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -6391,6 +6524,84 @@ test "$JAVA_MODEL" = "$PY_MODEL" || exit 1</code></pre>
           <summary>双栈都要接 MCP 吗？</summary>
           <div class="learn-faq-body">生产 Tool 执行以 Java Agent 为唯一写路径；Python 评测可 Mock Tool。避免双栈各注册 send_email 导致审计分裂。</div>
         </details>
+      </div>
+      <h4>OpenAPI 契约与索引版本握手</h4>
+      <p>双栈「配置同构」不足以保证行为一致：Python 夜间写完 PGVector 后，须通过 OpenAPI 或 ConfigMap 发布 <code>index_version</code>，Java S3 Agent 检索时带 filter，避免读到半写入向量。</p>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># corpassist-rag-index-service OpenAPI 片段（示意）
+paths:
+  /v1/index/releases/latest:
+    get:
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                properties:
+                  index_version: { type: string }
+                  embedding_model: { type: string }
+                  chunk_policy: { type: string, example: "500/50" }</code></pre>
+      </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>契约字段</th><th>Java 消费方</th><th>Python 生产方</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>index_version</code></td><td>SearchRequest filter</td><td>索引 Job 完成后 bump</td></tr>
+          <tr><td><code>embedding_model</code></td><td>校验与 CORPASSIST_EMBEDDING_MODEL 一致</td><td>manifest 写入</td></tr>
+          <tr><td><code>chunk_policy</code></td><td>文档化，防 Java 热更新 chunk 漂移</td><td>rag-system-py 管道常量</td></tr>
+        </tbody>
+      </table>
+      <div class="mermaid-wrap">
+        <h5>索引发布 → Java Agent 读取</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant PY as Python index Job
+  participant PG as PGVector
+  participant API as index-release API
+  participant JAVA as S3 Agent
+  PY->>PG: batch embed + commit
+  PY->>API: PUT index_version=2026.04.1
+  JAVA->>API: GET latest
+  JAVA->>PG: search filter version</pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 评测与生产对齐</span>
+        评测脚本从同一 <code>index_version</code> 读取向量；若 Python 用 turbo 建库、Java 用 plus 对话，仍可能「检索对、生成偏」。CI 除 model 外应校验 embedding_model 与 index_version 三元组。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不让 Java 直接调 Python 的 DashScope SDK？</summary>
+        <p>在线 Agent 需要 Spring 治理链（Security、Advisor、ReactAgent、审计）；跨语言 RPC 只应用于<strong>索引/评测</strong>等离线能力，而非替代 Java 上的 ChatModel Bean。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Java 写路径、Python 写路径各改 Jira，无统一 audit_id</li>
+            <li>索引未发布 version Java 已滚动 50% Pod</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>单写路径：生产 Tool 仅 Java；Python 只读或仿真</li>
+            <li>蓝绿索引：新版本 PG collection 就绪后再切流量</li>
+          </ul>
+        </div>
+      </div>
+      <div class="role-cards">
+        <article class="role-card">
+          <span class="role-card-title">bridge 课衔接</span>
+          <p class="role-card-desc">跨栈 HTTP/gRPC 与 A2A 见 llm-application-fundamentals bridge 与 agent-orchestration 双轨 practice。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">rag-system-java</span>
+          <p class="role-card-desc">完整 ingest、混合检索、评测集在此课展开；本章只定双栈边界与 env 单表。</p>
+        </article>
+        <article class="role-card">
+          <span class="role-card-title">python-engineering-for-llm</span>
+          <p class="role-card-desc">Python 侧 DashScope 客户端、Notebook 实验与批处理脚本规范。</p>
+        </article>
       </div>
     </div>
 
@@ -6751,6 +6962,55 @@ return reranked;</code></pre>
         <summary>先想 10 秒：S3 创建 Jira 前是否必须先 RAG？</summary>
         <p>视任务：若 Jira 字段映射依赖采购制度，应先 <code>searchPolicy</code> 再写；纯「创建空白任务」可跳过。Router 与 Prompt 应声明何时强制检索，避免幻觉字段。</p>
       </details>
+      <h4>检索观测、成本与 Badcase 闭环</h4>
+      <p>Embedding 与 Rerank 各计一次 API 调用；S3 高频 <code>searchPolicy</code> 应在 Trace 中拆分 span：<code>vector_search</code>、<code>dashscope_rerank</code>、<code>llm_generate</code>，便于判断瓶颈在召回还是生成。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>用途</th><th>告警示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>rerank_latency_p95</td><td>Rerank 拖慢 Tool</td><td>&gt; 800ms 检查 batch 与 topK</td></tr>
+          <tr><td>empty_recall_rate</td><td>向量无命中</td><td>index_version 漂移或 ACL filter 过严</td></tr>
+          <tr><td>rerank_score_gap</td><td>Top1 与 Top5 分差</td><td>分差小说明需调 threshold 或换 embedding</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Tool 返回须可审计（示意）
+record PolicyHit(String docId, String policyVersion, double rerankScore, String excerpt) {}
+
+List&lt;PolicyHit&gt; hits = reranked.stream()
+    .map(d -> new PolicyHit(
+        d.getMetadata().get("doc_id"),
+        d.getMetadata().get("policy_version"),
+        d.getScore(),
+        truncate(d.getText(), 400)))
+    .toList();</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Badcase 飞轮</span>
+        员工反馈「Agent 引用了过期采购制度」：从 Trace 取出 rerank 前后 score 与 <code>doc_id</code>，写入 Badcase 表；若向量为旧版，触发增量 reindex；若 Rerank 误排，调 topK 或加入 metadata 硬过滤 <code>effective_date</code>。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：semantic cache 与 Rerank 能否叠加？</summary>
+        <p>可对「制度问答」类只读 query 在 Rerank 之后缓存最终 Top-5 doc_id 列表；缓存 key 须含 <code>index_version</code> 与 <code>tenantId</code>，版本 bump 时整前缀失效。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Tool 只返回模型摘要，无 doc_id，无法复核</li>
+            <li>为省 Rerank 在采购场景用向量 Top-1</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>响应 + Trace 双写 citation 字段</li>
+            <li>评测集对比「仅向量 / 向量+Rerank」NDCG@5</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -7123,6 +7383,35 @@ git diff --stat archive/  # 供 PR 审阅 Prompt 变更</code></pre>
           <tr><td>Eval</td><td>共用 JSONL 集</td><td>共用 JSONL 集</td></tr>
         </tbody>
       </table>
+      <h4>S3 三 Agent 在 Admin 中的发布矩阵</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>App</th><th>DSL 版本策略</th><th>Tool 白名单</th><th>回滚 SLA</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>corpassist-s3-room</code></td><td>工作日可 patch；周五冻结</td><td>roomAvailability, roomBooking</td><td>≤ 5 min</td></tr>
+          <tr><td><code>corpassist-s3-expense</code></td><td>合规审批后发布</td><td>submitExpense, ocrInvoice</td><td>≤ 5 min</td></tr>
+          <tr><td><code>corpassist-s3-approval</code></td><td>与 OA 流程版本绑定</td><td>queryApproval, escalateApproval</td><td>≤ 10 min</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 大促前 Prompt 冻结</span>
+        双 11 前 72 小时，publisher 将三 App 切到「保守 Prompt v1.1.9」已发布版本；新草稿仅进 staging 试聊。大促结束后再合入运营在 Studio 写的追问优化，避免高峰期未测 DSL 进生产。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：Python 轨改 Dify Prompt 后，Java S3 何时感知？</summary>
+        <p>仅当变更回写 Admin 并 <strong>published</strong> 后，Java 运行时拉取才生效。PoC 阶段可并行 Shadow 对比，但生产真源始终是 Admin 版本号，不是 Dify 导出文件时间戳。</p>
+      </details>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml"># corpassist-agent-s3 拉取 Admin（示意）
+corpassist:
+  admin:
+    apps:
+      - id: corpassist-s3-room
+        refresh-interval: 60s
+        require-published: true</code></pre>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -7234,7 +7523,7 @@ git diff --stat archive/  # 供 PR 审阅 Prompt 变更</code></pre>
   <div class="resources content-section">
     <h3>延伸学习</h3>
     <ul>
-      <li><strong>上一章</strong>：<a href="#ch-basics-04-vs-python">与 Python 通义 SDK 对照</a></li>
+      <li><strong>上一章</strong>：<a href="#ch-basics-05-embedding-rerank">Embedding 与 Rerank（百炼）</a></li>
       <li><strong>下一章</strong>：<a href="#ch-practice-02-resilience">容灾、限流与降级</a></li>
       <li><a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排工程 — ReactAgent 与 Graph 深入</span><code class="course-ref-slug">agent-orchestration-java</code></a></li>
     </ul>
@@ -7504,6 +7793,26 @@ ChatModel resilientPrimary(@Qualifier("dashscopePlus") ChatModel plus,
           </ul>
         </div>
       </div>
+      <table class="outline-table">
+        <thead>
+          <tr><th>S3 路径</th><th>Java（本课）</th><th>Python 对照</th><th>共享契约</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>订会议室 FAQ</td><td>Resilience4j + CacheAdvisor</td><td>tenacity + Redis</td><td>降级文案 <code>X-CorpAssist-Degraded</code></td></tr>
+          <tr><td>报销 OCR</td><td>异步队列 + 独立 breaker</td><td>Celery worker</td><td>taskId 状态机一致</td></tr>
+          <tr><td>审批摘要</td><td>plus → turbo → 模板</td><td>同模型链</td><td>Admin DSL model 字段</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 双栈 429 联动</span>
+        Java 轨熔断 OPEN 后，网关向 Python 实验轨<strong>不应</strong>自动导流——两轨 DashScope Key 可能不同。On-call 应分别查 <code>dashscopeChat</code> 与 Python 侧 quota 告警，再决定是否临时调高百炼 RPM 或扩大语义缓存 TTL。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：语义缓存 Key 要不要带 tenantId？</summary>
+        <p>要。多法人共用 Redis 时，Key 前缀 <code>{tenant}:{appVersion}:{normalizedQuery}</code>，避免 A 事业部的制度 FAQ 被 B 事业部命中。写 Tool 路径仍强制 bypass。</p>
+      </details>
+      <p class="diagram-caption">NS3 成本复盘时，将 <code>corpassist.model.degraded</code> 与百炼账单按日对齐，可区分「真降本」与「质量下滑」。</p>
+      <p>订会议室写路径（<code>roomBooking</code>）永不进入语义缓存；仅 <code>roomAvailability</code> 只读查询可设 TTL ≤ 60s。</p>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -7867,6 +8176,36 @@ corpassist.obs.replay.error-sampling=1.0</code></pre>
             <li>步数 / token / tool error 指标 + error 全采样</li>
           </ul>
         </div>
+      </div>
+      <h4>S3 观测字段双栈对齐表</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>Java（Micrometer/MDC）</th><th>Python（OTel）</th><th>回放 JSON</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>trace_id</code></td><td>W3C traceparent</td><td>同左</td><td>主键关联</td></tr>
+          <tr><td><code>scene</code></td><td>固定 <code>S3</code></td><td>固定 <code>S3</code></td><td>筛选办公 Agent</td></tr>
+          <tr><td><code>tool_name</code></td><td>span 名 <code>tool.*</code></td><td>同命名</td><td>turns[].span</td></tr>
+          <tr><td><code>agent_version</code></td><td>Admin published</td><td>同左</td><td>成本归因</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 跨轨排障</span>
+        员工在门户走 Java S3 Agent，研发在 Python 沙箱复现同一 <code>trace_id</code>：SLS 用 trace 串联 BFF → Java → Tool；staging 用回放 JSON 在 Python 重放 messages，验证 Prompt 修复后再发布 Admin v1.2.2。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：Tool 返回 409 但 LLM 仍说「已预订」，日志应记什么 outcome？</summary>
+        <p><code>outcome=error</code> 且 <code>span=tool.roomBooking</code>；最终 LLM 若未约束成功话术，另记 <code>outcome=degraded</code> 或 <code>hallucination_risk=true</code> 供 badcase 队列抓取。禁止整链记 <code>ok</code>。</p>
+      </details>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">json</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-json">{
+  "trace_id": "abc123",
+  "scene": "S3",
+  "outcome": "error",
+  "tool_name": "roomBooking",
+  "error_code": "OA_CONFLICT_409"
+}</code></pre>
       </div>
     </div>
 
@@ -8233,6 +8572,34 @@ public CompletableFuture&lt;String&gt; askFaq(String normalizedQuery) {
           </ul>
         </div>
       </div>
+      <h4>DashScope Key 配额隔离（S3 在线 vs 批处理）</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>Key</th><th>用途</th><th>连接池</th><th>与 S3 关系</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>prod-online</code></td><td>同步 Chat / SSE</td><td>max-connections 200</td><td>订会议室、FAQ 主路径</td></tr>
+          <tr><td><code>prod-batch</code></td><td>夜间索引 / OCR 批</td><td>独立池 50</td><td>不得挤占在线 429 额度</td></tr>
+          <tr><td><code>staging</code></td><td>压测与 Shadow</td><td>低配额</td><td>验证 singleflight 曲线</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 有效 QPS 复盘</span>
+        早高峰入口 480 QPS，DashScope 账单仅 95 次/秒 Chat：L2 命中率 62%，singleflight 合并 1200 次重复「年假制度」问法。面试叙事用<strong>有效 QPS + 调用比 + 命中率</strong>三联表，而非只报网关计数。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：SSE 订会议室是否应计入「有效 QPS」？</summary>
+        <p>计——以<strong>完成一次多轮闭环</strong>（含必要 Tool）为准，而非首 token 到达。排队中仅返回 <code>202 Accepted</code> 的会话不计入，避免虚高。</p>
+      </details>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">corpassist:
+  s3:
+    metrics:
+      effective-qps: true
+      llm-calls-per-request: true
+      cache-hit-tags: [L1, L2]</code></pre>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -8334,7 +8701,7 @@ public CompletableFuture&lt;String&gt; askFaq(String normalizedQuery) {
     <h3>延伸学习</h3>
     <ul>
       <li><strong>上一章</strong>：<a href="#ch-practice-03-obs">观测与调试</a></li>
-      <li><strong>下一章</strong>：<a href="#ch-advanced-01-interview">面试：通义栈架构题</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-bailian-governance">百炼安全与合规治理</a></li>
       <li><a href="../llm-serving-for-applications/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">推理服务、量化与性能应用</span><code class="course-ref-slug">llm-serving-for-applications</code></a> — Infra 侧扩缩对照</li>
     </ul>
   </div>
@@ -8577,6 +8944,58 @@ meterRegistry.counter("corpassist.llm.tokens",
           <tr><td>跨 tenant 访问尝试</td><td>网关审计日志</td><td>1 年</td></tr>
         </tbody>
       </table>
+      <h4>通义栈视角：S3 合规与成本治理</h4>
+      <p>CorpAssist <strong>S3 办公 Agent</strong> 处理工号、报销金额与审批意见，百炼侧须 RAM 最小权限 + 应用层 tenant 标签 + Prompt 回放脱敏三件套。与 practice-03 观测、practice-04 配额隔离衔接：任何成本 spike 应能定位到 <code>tenant + scene=S3 + agent_version</code>。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>治理项</th><th>S3 落点</th><th>验收信号</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>RAM 在线 Key</td><td><code>prod-online</code> 仅 Chat/Embedding 读</td><td>批处理 Job 无此 AK</td></tr>
+          <tr><td>Key 轮换</td><td>双 Key 重叠 + 滚动发布</td><td>24h 零 401</td></tr>
+          <tr><td>Token 审计</td><td>Micrometer <code>tenant,scene,model</code></td><td>单 tenant &lt; 35% 日 Token</td></tr>
+          <tr><td>多租户 RAG</td><td>VectorStore <code>tenant_id</code> filter</td><td>跨 tenant 检索测试为 0 命中</td></tr>
+          <tr><td>Admin Studio</td><td>仅 staging 沙箱 Key</td><td>prod Key 不进截图/工单</td></tr>
+        </tbody>
+      </table>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 · 事业部独立 Key</span>
+        华东事业部合规要求物理隔离：为其开通独立 RAM 子账号与 DashScope Key，网关 JWT <code>tenant_id=east</code> 路由到对应 <code>ChatModel</code> Bean；长尾 tenant 仍共享 <code>prod-online</code> + 硬 quota。成本报表按 tenant 出账，S3 场景 tag 固定为 <code>S3</code>。
+      </aside>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>S3 Agent 用主账号 AK，泄露影响全站</li>
+            <li>回放库无 tenant 分区，合规抽检失败</li>
+            <li>仅月底看百炼账单，无法关联 roomBooking 循环</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>在线/批处理 Key 分离 + 应用 tag 双保险</li>
+            <li>Trace → 回放 → Admin 版本三位一体审计</li>
+            <li>429 与 Token spike 同一 On-call runbook</li>
+          </ul>
+        </div>
+      </div>
+      <details class="learn-micro-check">
+        <summary>自检：S3 报销 Agent 能否为降本临时关掉 Prompt 回放？</summary>
+        <p>不可以。回放是证明「模型未胡答、Tool 返回为准」的合规与排障依据；可缩短保留期或加强脱敏，但不能因成本关闭 error 路径全采样与回放写入。</p>
+      </details>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// TenantContext → DashScope 调用链（示意）
+public ChatResponse chat(String tenantId, String userMessage) {
+  TenantContext.set(tenantId, "S3");
+  try {
+    return chatClient.prompt().user(userMessage).call();
+  } finally {
+    TenantContext.clear();
+  }
+}</code></pre>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -8685,14 +9104,14 @@ meterRegistry.counter("corpassist.llm.tokens",
     <h3>延伸学习</h3>
     <ul>
       <li><strong>下一章</strong>：<a href="#ch-advanced-01-interview">面试：S3 Agent 五连问</a></li>
-      <li><a href="../spring-ai-engineering/index.html#ch-practice-06-security" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI 工程化 — 安全与护栏</span><code class="course-ref-slug">spring-ai-engineering</code></a></li>
+      <li><a href="../spring-ai-engineering/index.html#ch-advanced-01-advisors-prod" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI 工程化 — 生产 Advisor：安全与护栏</span><code class="course-ref-slug">spring-ai-engineering</code></a></li>
       <li><strong>上一章</strong>：<a href="#ch-practice-04-qps">生产 QPS 与缓存分层</a></li>
     </ul>
   </div>
 </section>
 <section id="ch-advanced-01-interview" class="chapter" data-chapter="advanced-01-interview">
   <header class="chapter-header">
-    <h2><span class="chapter-done-badge">已完成</span>面试：通义栈架构题</h2>
+    <h2><span class="chapter-done-badge">已完成</span>面试：S3 Agent 五连问</h2>
     <button type="button" class="btn-mark-done" data-chapter="advanced-01-interview" aria-label="标记本章完成">标记完成</button>
   </header>
 
@@ -8813,16 +9232,29 @@ meterRegistry.counter("corpassist.llm.tokens",
         </div>
       </details>
 
+      <h3>STAR：60 秒案例模板</h3>
+
+      <p>面试官追问「讲一次 Agent 生产故障」时，用 <strong>STAR</strong>（Situation-Task-Action-Result）控制在 60 秒内，并预留 1 个可量化指标。</p>
+
       <div class="role-cards">
         <article class="role-card">
-          <h4>60 秒 STAR 模板</h4>
+          <h4>STAR 范例 · 步数失控</h4>
           <p><strong>S</strong>：S3 纪要 Agent 步数飙到 15 轮仍未创建 Jira。<strong>T</strong>：24h 内恢复 SLA。<strong>A</strong>：Trace 发现 Confluence 工具返回全文 40k 字；加 truncation + 步数上限 8 + 失败转 HITL。<strong>R</strong>：P95 从 90s 降到 18s，任务完成率 94%。</p>
+        </article>
+        <article class="role-card">
+          <h4>STAR 范例 · 工具假执行</h4>
+          <p><strong>S</strong>：用户反馈「Jira 已创建」但看板无记录。<strong>T</strong>：区分模型幻觉与 API 真失败。<strong>A</strong>：审计对账 + Tool 强制 HTTP 回执 + 结构化 JSON；失败 2 次转 HITL。<strong>R</strong>：假执行投诉归零，HITL 占比 8%。</p>
         </article>
         <article class="role-card">
           <h4>数据背书（可替换为你们指标）</h4>
           <p>月均 1200 办公任务 · 步数中位数 5 · HITL 占比 12% · DashScope 成本/任务 ↓30%（语义缓存 + qwen-turbo 路由）</p>
         </article>
       </div>
+
+      <details class="learn-micro-check">
+        <summary>STAR 口述自检：是否缺 Action 里的工程手段？</summary>
+        <p>合格 Action 须点名<strong>具体工程组件</strong>：StepBudgetAdvisor、Tool truncate、Resilience4j 熔断、HITL 节点、语义缓存——而非「我们优化了 Prompt」。Result 须有前后对比数字（P95、完成率、成本/任务）。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -8830,7 +9262,7 @@ meterRegistry.counter("corpassist.llm.tokens",
     </div>
 
     <div class="section-block">
-      <h3>坑：S3 productionPitfalls 与 defense</h3>
+      <h3>生产坑：S3 productionPitfalls 与 defense</h3>
 
       <p>outline-specs 为 S3 定义四个 <span class="term" data-term-id="production-pitfall-agent" tabindex="0">生产坑</span>。面试时必须能说出<strong>现象 → 根因 → 检测 → 修复</strong>。</p>
 
@@ -8948,6 +9380,25 @@ public class AgentGuardConfig {
         <li><strong>确定性</strong>：HITL、Tool 白名单、结构化输出，不靠「更大模型」</li>
         <li><strong>成本</strong>：模型路由、语义缓存、步数预算，NS3 必答</li>
       </ul>
+
+      <details class="learn-micro-check">
+        <summary>追问：如何证明「通义栈已工程化」而非 Demo？</summary>
+        <div class="learn-faq-body">
+          <p>用<strong>可签字证据</strong>回答，而非功能罗列：</p>
+          <table class="outline-table learn-decision-table">
+            <thead>
+              <tr><th>证据类型</th><th>CorpAssist S3 示例</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>golden 回归</td><td>20 条办公任务轨迹，CI stub 通过率 ≥85%</td></tr>
+              <tr><td>Trace 样本</td><td>步数超限、Tool 失败各 1 条，含 Prompt 回放截图</td></tr>
+              <tr><td>治理</td><td>Admin DSL Git tag + RAM 分账号清单</td></tr>
+              <tr><td>Runbook</td><td>DashScope 429、checkpoint 清理 SOP 链接</td></tr>
+            </tbody>
+          </table>
+          <p><strong>话术</strong>：「我们按 delivery-checklist 四层验收；详见 advanced-03 与 scenario-java-agent-automation。」</p>
+        </div>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -9077,7 +9528,7 @@ public class AgentGuardConfig {
     <h3>延伸学习</h3>
     <ul>
       <li><strong>下一章</strong>：<a href="#ch-advanced-02-langgraph-mapping">LangGraph 与 SAA 对照</a></li>
-      <li><strong>上一章</strong>：<a href="#ch-practice-04-qps">生产 QPS 与缓存分层</a></li>
+      <li><strong>上一章</strong>：<a href="#ch-practice-05-bailian-governance">百炼安全与合规治理</a></li>
       <li><strong>Agent 深化</strong>：<a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排工程 · Spring AI Alibaba 版</span><code class="course-ref-slug">agent-orchestration-java</code></a></li>
       <li><strong>S3 场景交付</strong>：<a href="../scenario-java-agent-automation/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">企业落地 · Agent 自动化</span><code class="course-ref-slug">scenario-java-agent-automation</code></a></li>
       <li><strong>Python 双栈对照</strong>：<a href="../agent-orchestration-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排工程</span><code class="course-ref-slug">agent-orchestration-engineering</code></a>（LangGraph 轨）</li>
@@ -9174,6 +9625,31 @@ public class AgentGuardConfig {
         </div>
       </div>
       <p><span class="term" data-term-id="plan-execute-react" tabindex="0">plan execute react</span> 选型：LangGraph 的 Plan-and-Execute 模式对应 SAA 的 Plan 节点 + Execute 子图；见 agent-orchestration-java advanced 章。</p>
+
+      <details class="learn-micro-check">
+        <summary>六维逐项：编排维度如何白板讲清？</summary>
+        <div class="learn-faq-body">
+          <p><strong>LangGraph</strong>：<code>StateGraph.add_node</code> + <code>add_conditional_edges</code>；checkpoint 存 <code>thread_id</code>。</p>
+          <p><strong>SAA</strong>：Graph DSL 声明节点类型（llm / tool / human_approval）；<span class="term" data-term-id="react-agent" tabindex="0">ReactAgent</span> 适合动态 ≤10 步。</p>
+          <p><strong>CorpAssist S3</strong>：纪要→Jira 用 ReAct；采购审批用固定 Graph + HITL，禁止混用导致审计缺口。</p>
+        </div>
+      </details>
+
+      <details class="learn-micro-check">
+        <summary>六维逐项：观测与治理为何是 Java 主场？</summary>
+        <div class="learn-faq-body">
+          <table class="outline-table">
+            <thead>
+              <tr><th>能力</th><th>LangGraph 常见做法</th><th>SAA 生产做法</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Trace</td><td>LangSmith 项目级</td><td>OTel traceparent 贯穿 Gateway→Agent→Tool</td></tr>
+              <tr><td>Prompt 变更</td><td>Notebook 手改</td><td>Admin Studio → Git DSL → CI diff</td></tr>
+              <tr><td>租户隔离</td><td>实验 Redis 单库</td><td>prod Redis key 前缀 + RAM 子账号</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
 
     <div class="section-block">
@@ -9209,6 +9685,35 @@ public class AgentGuardConfig {
       <details class="learn-micro-check">
         <summary>LangGraph 能否直接部署为 CorpAssist 生产 Agent？</summary>
         <p>技术上可以，但违背架构：缺少 Spring Security SSO、统一 Advisor 链、Micrometer 与 Admin 治理。若短期 PoC，须标注 non-prod 且写操作 Mock。</p>
+      </details>
+
+      <h4>OpenAPI 契约冻结（双栈协作核心）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># corpassist-agent-contract v1.2 — Python 实验轨与 Java 生产轨共用
+paths:
+  /tools/createJiraIssue:
+    post:
+      operationId: createJiraIssue
+      requestBody:
+        required: [summary, projectKey, assignee]
+      responses:
+        "201":
+          schema:
+            properties:
+              issueKey: { type: string }
+              auditRequestId: { type: string }</code></pre>
+      </div>
+      <p>Python LangGraph <code>@tool</code> 与 SAA <code>FunctionTool</code> 均调用同一 Gateway；契约版本 bump 时两侧同步 golden，避免「实验能跑、生产假执行」。</p>
+
+      <details class="learn-micro-check">
+        <summary>双栈 Trace 如何不断链？</summary>
+        <div class="learn-faq-body">
+          <p>门户 SSE 请求携带 <code>traceparent</code>；Python 仿真服务转发同一 header；Java Agent 写 Tool 时注入 <code>auditRequestId</code> 到 span attribute。排障时从用户 session 一键跳到 LangGraph 实验轨迹与 SAA 生产轨迹对照。</p>
+        </div>
       </details>
     </div>
 
@@ -9270,6 +9775,34 @@ graph:
           <tr><td>评测</td><td>Python golden.pkl</td><td>Java stub 同轨迹 hash</td></tr>
         </tbody>
       </table>
+
+      <h4>LangGraph 节点导出 → SAA DSL 映射（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Python 实验轨：导出节点清单供 DSL diff
+nodes = list(graph.get_graph().nodes.keys())
+# ['plan', 'retrieve_confluence', 'hitl_manager', 'execute_jira']
+export = {
+    "graph_id": "s3-meeting-jira",
+    "nodes": nodes,
+    "conditional_edges": graph.get_graph().edges,
+}
+# CI：与 saa-graph/s3-meeting-jira.yaml 做集合差集，差集非空则 fail</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>迁移中最易漏的 3 个 S3 生产坑？</summary>
+        <div class="learn-faq-body">
+          <ul>
+            <li><strong>步数预算</strong>：LangGraph 原型常无 <code>max_steps</code>；SAA 须加 StepBudgetAdvisor，否则上线后 P95 失控。</li>
+            <li><strong>Tool 截断</strong>：Python mock 返回短 JSON；真实 Confluence 全文 40k 字未 truncate → 记忆与成本双爆。</li>
+            <li><strong>HITL 节点</strong>：实验图可跳过审批；生产采购 Graph 缺 <code>human_approval</code> 节点 → 合规驳回。</li>
+          </ul>
+        </div>
+      </details>
     </div>
 
     <div class="section-block">
@@ -9326,6 +9859,22 @@ graph:
   Note over LG,SAA: 步数预算两侧必配</pre>
       </div>
       <p>Python 轨 Agent 编排详见 <a href="../agent-orchestration-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排工程（共享方法论）</span><code class="course-ref-slug">agent-orchestration-engineering</code></a>（LangGraph 实验）；Java 生产见 agent-orchestration-java。</p>
+
+      <details class="learn-micro-check">
+        <summary>60 秒话术自检：是否踩了「贬低另一栈」雷区？</summary>
+        <div class="learn-faq-body">
+          <table class="outline-table learn-decision-table">
+            <thead>
+              <tr><th>说法</th><th>评价</th><th>改写</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>「Java AI 比 Python 强」</td><td>✗ 偏见</td><td>「Java 轨承载 SSO、审计与写 Tool SLA」</td></tr>
+              <tr><td>「LangGraph 只是玩具」</td><td>✗ 树敌</td><td>「Python 轨批量仿真与 Prompt 迭代更快」</td></tr>
+              <tr><td>「双栈分工 + OpenAPI 契约」</td><td>✓ 平衡</td><td>附一个 S3 步数偏航 STAR 收尾</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -9525,6 +10074,29 @@ graph:
         <summary>corpassist-saa-workbench stub 模式在交付清单中占什么位置？</summary>
         <p>作为 CI 门禁与培训环境：stub 全绿是 Layer 1 必要非充分条件；staging live 抽检与 golden 85% 才是签字依据。Workbench Admin DSL 样例应对齐 delivery-checklist 编排项。</p>
       </details>
+
+      <h4>Layer 1 功能交付细项（S3 纪要→Jira 路径）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>子项</th><th>配置要点</th><th>拒绝签字情形</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Confluence 检索 Tool</td><td>只读 API + <span class="term" data-term-id="tool-result-truncation" tabindex="0">truncate 2k</span></td><td>返回原始 HTML 全文</td></tr>
+          <tr><td>createJiraIssue</td><td>Gateway 写路径 + auditRequestId</td><td>模型口头「已创建」无 HTTP 回执</td></tr>
+          <tr><td>采购 HITL</td><td>金额&gt;5 万走 human_approval 节点</td><td>写操作无审批 span</td></tr>
+          <tr><td>步数预算</td><td><span class="term" data-term-id="agent-step-budget" tabindex="0">maxSteps=8</span></td><td>Trace 中位数步数 &gt;10</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 交付前 CI 门禁（示意）
+mvn -f corpassist-saa-workbench test -Dsaa.stub=true
+node scripts/s3-golden-run.mjs --min-pass-rate 0.85
+# 两项均绿才可提交上线评审材料</code></pre>
+      </div>
     </div>
 
     <div class="section-block">
@@ -9556,6 +10128,26 @@ graph:
       <details class="learn-micro-check">
         <summary>S3 Agent 能否直接回答纯制度 FAQ 而不走 S1？</summary>
         <p>可以但浪费步数预算。Router 应把纯 FAQ 导向 S1 ChatClient；S3 仅在需 Tool 写操作时使用。intent 误路由是可测 Badcase。</p>
+      </details>
+
+      <h4>共享与隔离组件对照</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>组件</th><th>S1/S2/S3</th><th>隔离策略</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>制度 VectorStore</td><td>共享只读</td><td>metadata filter：tenantId + doc_type=policy</td></tr>
+          <tr><td>ChatMemory</td><td>分 Agent 实例</td><td>Redis key：<code>s3:{userId}</code> vs <code>s1:{userId}</code></td></tr>
+          <tr><td>写 Tool 白名单</td><td>仅 S3</td><td>S1/S2 Bean 不注入 createJiraIssue</td></tr>
+          <tr><td>DashScope 配额</td><td>分 tenant tag</td><td>S3 高峰不挤占 S2 客服 SLA</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>intent 路由误分类如何进飞轮？</summary>
+        <div class="learn-faq-body">
+          <p>采集信号：用户二次澄清「我只是问制度」；或 S3 轨迹无 tool_calls 且步数&gt;3。标注 <code>misroute_faq_to_s3</code>，golden 补「应走 S1」负样本，Router prompt 或规则层迭代。</p>
+        </div>
       </details>
     </div>
 
@@ -9602,6 +10194,33 @@ acceptance:
         <span class="learn-scenario-title">CorpAssist · 验收复盘</span>
         任务成功率 88% 但步数超限率 12%——说明 Agent 在空转。优先修 StepBudget 与 Tool truncate，而非盲目加模型能力。
       </aside>
+
+      <details class="learn-micro-check">
+        <summary>六指标告警阈值如何设才不「永远红灯」？</summary>
+        <div class="learn-faq-body">
+          <table class="outline-table">
+            <thead>
+              <tr><th>指标</th><th>告警（Pager）</th><th>周报（趋势）</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>任务成功率</td><td>24h 滚动 &lt;80%</td><td>周环比 ↓5pp 调查</td></tr>
+              <tr><td>P95 延迟</td><td>&gt;20s 持续 15min</td><td>按 Tool 分解 Top3</td></tr>
+              <tr><td>429 率</td><td>&gt;2% 5min</td><td>触发 practice-02 熔断复盘</td></tr>
+              <tr><td>HITL 率</td><td>&gt;25% 异常飙升</td><td>5–15% 为合规预期区间</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+
+      <div class="mermaid-wrap">
+        <h5>验收数据流</h5>
+        <pre class="mermaid">flowchart LR
+  Agent[S3 Agent] --> Trace[OTel Trace]
+  Trace --> Grafana[Grafana 看板]
+  Trace --> Golden[离线 golden 评测]
+  Grafana --> Sign[上线签字]
+  Golden --> Sign</pre>
+      </div>
     </div>
 
     <div class="section-block">
@@ -9670,6 +10289,26 @@ acceptance:
       <details class="learn-micro-check">
         <summary>飞轮第一轮应优先修哪类 Badcase？</summary>
         <p>优先「写错数据」类（假执行、错误制度引用）&gt; 纯体验类（措辞）。按 risk × frequency 排序；采购/Jira 写路径样本优先入库 golden。</p>
+      </details>
+
+      <h4>飞轮运营节奏（建议 S3 上线后首月）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>周期</th><th>动作</th><th>产出</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>每日</td><td>从 Trace 抽失败 Top5</td><td>Badcase 池 + pitfall 标签</td></tr>
+          <tr><td>每周</td><td>产品/运营标注 root_cause</td><td>≥3 条进 golden</td></tr>
+          <tr><td>每迭代</td><td>DSL bump + Admin 发布</td><td>发布说明链四坑修复项</td></tr>
+          <tr><td>每月</td><td>对照六指标复盘</td><td>签字项是否仍满足</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>与 advanced-01/02 如何合并答辩？</summary>
+        <div class="learn-faq-body">
+          <p><strong>advanced-01</strong>：S3 五连问 + STAR + 四坑 defense。<strong>advanced-02</strong>：LangGraph↔SAA 六维与双栈边界。<strong>本章</strong>：delivery-checklist 签字 + 六指标 + 飞轮运转证据。Capstone Layer 3 要求三合一 10 分钟答辩：架构（01）→ 选型（02）→ 交付（03）。</p>
+        </div>
       </details>
     </div>
 
@@ -9792,7 +10431,7 @@ acceptance:
     <p class="stem"><strong>0.</strong> （单选）CorpAssist 生产环境 DashScope API Key 应如何管理？</p>
     <ul class="options">
       <li><label><input type="radio" name="saa-b01-q0" value="A"> A) 写入 Git 仓库 application.yml</label></li>
-      <li><label><input type="radio" name="saa-b01-q0" value="B"> B) K8s Secret / 环境变量 DASHSCOPE_API_KEY</label></li>
+      <li><label><input type="radio" name="saa-b01-q0" value="B"> B) K8s Secret / 环境变量 AI_DASHSCOPE_API_KEY</label></li>
       <li><label><input type="radio" name="saa-b01-q0" value="C"> C) 硬编码在 ChatService 常量类</label></li>
       <li><label><input type="radio" name="saa-b01-q0" value="D"> D) 前端 localStorage 供门户调用</label></li>
     </ul>
@@ -10016,7 +10655,7 @@ acceptance:
     <ul class="options">
       <li><label><input type="radio" name="saa-b04-q4" value="A"> A) server.port</label></li>
       <li><label><input type="radio" name="saa-b04-q4" value="B"> B) logging.level</label></li>
-      <li><label><input type="radio" name="saa-b04-q4" value="C"> C) Java 侧 DASHSCOPE_API_KEY / spring.ai.dashscope.api-key</label></li>
+      <li><label><input type="radio" name="saa-b04-q4" value="C"> C) Java 侧 AI_DASHSCOPE_API_KEY / spring.ai.dashscope.api-key</label></li>
       <li><label><input type="radio" name="saa-b04-q4" value="D"> D) Git branch 名</label></li>
     </ul>
     <div class="quiz-actions"><button type="button" class="btn-check">检查</button><button type="button" class="btn-hint">提示</button><button type="button" class="btn-answer">答案</button></div>
@@ -10412,17 +11051,17 @@ acceptance:
     <p class="hint hidden">productionPitfalls 表</p>
     <p class="answer hidden"><strong>答案：</strong>A</p>
   </article>
-  <article class="quiz-item" data-qid="q2" data-answer="B">
-    <p class="stem"><strong>2.</strong> （单选）S3 坑「记忆无限堆积」的首要工程修复？</p>
+  <article class="quiz-item" data-qid="q2" data-answer="A,B,D">
+    <p class="stem"><strong>2.</strong> （多选）S3 面试 defense 中，属于「生产坑」工程修复的做法？</p>
     <ul class="options">
-      <li><label><input type="radio" name="saa-a01-q2" value="A"> A) 换 qwen-max</label></li>
-      <li><label><input type="radio" name="saa-a01-q2" value="B"> B) 记忆预算 + 滑动窗口 + 长期记忆 Top-K</label></li>
-      <li><label><input type="radio" name="saa-a01-q2" value="C"> C) 关闭所有 Tool</label></li>
-      <li><label><input type="radio" name="saa-a01-q2" value="D"> D) 整段会话永久塞 prompt</label></li>
+      <li><label><input type="checkbox" name="saa-a01-q2" value="A"> A) 记忆预算 + 滑动窗口 + 长期记忆 Top-K</label></li>
+      <li><label><input type="checkbox" name="saa-a01-q2" value="B"> B) Tool 层 truncate + 结构化 JSON 回执</label></li>
+      <li><label><input type="checkbox" name="saa-a01-q2" value="C"> C) 工具失败时返回空字符串让模型自行处理</label></li>
+      <li><label><input type="checkbox" name="saa-a01-q2" value="D"> D) 连续工具失败 2 次转 HITL 队列</label></li>
     </ul>
     <div class="quiz-actions"><button type="button" class="btn-check">检查</button><button type="button" class="btn-hint">提示</button><button type="button" class="btn-answer">答案</button></div>
-    <p class="hint hidden">生产坑 · 记忆</p>
-    <p class="answer hidden"><strong>答案：</strong>B</p>
+    <p class="hint hidden">生产坑表 · 反模式对照</p>
+    <p class="answer hidden"><strong>答案：</strong>A、B、D</p>
   </article>
   <article class="quiz-item" data-qid="q3" data-answer="STAR">
     <p class="stem"><strong>3.</strong> （填空）讲述生产故障案例时，推荐使用________原则（四个字母缩写）。</p>
@@ -10473,15 +11112,15 @@ acceptance:
     <p class="answer hidden"><strong>答案：</strong>A、B、C</p>
   </article>
   <article class="quiz-item" data-qid="q2" data-answer="C">
-    <p class="stem"><strong>2.</strong> （单选）从 Dify 迁到 SAA 的主要迁移成本在？</p>
+    <p class="stem"><strong>2.</strong> （单选）从 Python LangGraph 原型迁到 SAA 生产，成本大头通常在？</p>
     <ul class="options">
-      <li><label><input type="radio" name="saa-a02-q2" value="A"> A) 重写 Linux 内核</label></li>
+      <li><label><input type="radio" name="saa-a02-q2" value="A"> A) 复制 Prompt 字符串</label></li>
       <li><label><input type="radio" name="saa-a02-q2" value="B"> B) 更换数据库为 MongoDB</label></li>
-      <li><label><input type="radio" name="saa-a02-q2" value="C"> C) DSL/Tool 映射 + golden 回归 + 治理流程</label></li>
+      <li><label><input type="radio" name="saa-a02-q2" value="C"> C) OpenAPI Tool 契约 + checkpoint 字段 + HITL 节点 + golden 回归</label></li>
       <li><label><input type="radio" name="saa-a02-q2" value="D"> D) 无法迁移</label></li>
     </ul>
     <div class="quiz-actions"><button type="button" class="btn-check">检查</button><button type="button" class="btn-hint">提示</button><button type="button" class="btn-answer">答案</button></div>
-    <p class="hint hidden">迁移成本</p>
+    <p class="hint hidden">迁移成本 · LangGraph→SAA</p>
     <p class="answer hidden"><strong>答案：</strong>C</p>
   </article>
   <article class="quiz-item" data-qid="q3" data-answer="OpenAPI">
@@ -10780,322 +11419,322 @@ acceptance:
     "dashscope-api-key": {
       "label": "DashScope API Key",
       "tip": "百炼开放平台密钥；分环境 Secret 注入，禁止进 Git。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「DashScope API Key」：它解决什么问题、在 CorpAssist S3 Agent 多环境部署里如何管理。简要背景：分 dev/staging/prod Secret，与 Python dashscope SDK 共用策略。结合 Java spring.ai.dashscope.api-key 配置举例，并说明泄露影响面与轮换流程。最后列出 2 个常见误区（如写进 yml 提交 Git、dev/prod 共用 Key）。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「DashScope API Key」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "dashscope-billing": {
       "label": "百炼计费与 Token",
       "tip": "按 Token/模型计费；Agent 步数与工具返回长度直接影响成本。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「百炼计费与 Token」：qwen-max vs qwen-turbo 在 S3 Agent 如何路由降本。简要背景：按输入输出 Token 计费，需 tenantId 打标。结合步数预算与工具 truncate 说明 NS3 成本治理。最后列出 2 个成本反模式。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「百炼计费与 Token」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "saa-extensions": {
       "label": "spring-ai-alibaba-extensions",
       "tip": "可选扩展：文档解析、多模态、社区插件。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「spring-ai-alibaba-extensions」：与 core starter 关系、S3 纪要 PDF 附件如何用。简要背景：按需 Maven 依赖，版本对齐 BOM。结合 extensions 文档解析进 Graph 的数据流，说明与 RAG 索引分工。最后列出 2 个依赖膨胀误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「spring-ai-alibaba-extensions」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "tongyi-dual-stack": {
       "label": "通义双栈对照",
       "tip": "Java SAA 与 Python dashscope/LangGraph 能力矩阵与配置对齐。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「通义双栈对照」：同一百炼模型在 Java/Python 如何对齐 model 名、Key 与 OpenAPI。简要背景：实验在 Python、生产集成在 Java。结合 CorpAssist 配置表示例，说明选型而非二选一。最后列出 2 个双栈漂移案例（401、评测不一致）。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「通义双栈对照」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "semantic-cache-agent": {
       "label": "语义缓存",
       "tip": "相似 query 命中缓存，降本并缓解限流。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「语义缓存」：在 Agent 读路径与 DashScope 429 降级中如何用。简要背景：embedding 相似度 + TTL。结合 CorpAssist 制度问答与办公 Agent 只读查询，说明与精确缓存区别。最后列出 2 个误缓存 writable 操作的风险。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「语义缓存」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "react-agent": {
       "label": "ReactAgent",
       "tip": "SAA 思考-行动-观察循环；适合 S3 步骤 ≤10 的任务。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「ReactAgent」：与固定 DAG Graph 如何选型。简要背景：ReAct 需步数预算。结合 CorpAssist 纪要+单 Jira 任务 vs 多部门周报，对照 LangGraph ReAct。最后列出 2 个无 Execute 节点的偏航坑。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「ReactAgent」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "saa-graph-orchestration": {
       "label": "SAA Graph 编排",
       "tip": "状态机 + checkpoint；强合规场景固定节点 + HITL。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「SAA Graph 编排」：与 LangGraph StateGraph 如何同构、Redis checkpoint 作用。简要背景：采购审批等固定路径。结合 DSL 导出与 Python 实验契约冻结流程。最后列出 2 个 Graph 节点过多无 HITL 的风险。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「SAA Graph 编排」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "langgraph-mapping": {
       "label": "LangGraph 对照",
       "tip": "Python LangGraph 实验 ↔ Java SAA 生产；OpenAPI 对齐 Tool。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「LangGraph 对照」：面试如何答「为什么不全用 Python」。简要背景：双栈分工是治理与 SLA 而非语言优劣。结合六维对照表（编排、工具、模型、观测、治理、场景）各一句 CorpAssist 做法。最后列出 2 个贬低另一栈的面试反模式。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「LangGraph 对照」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "migration-cost-estimate": {
       "label": "迁移成本估算",
       "tip": "LangGraph→SAA：Tool 契约、状态字段、HITL、golden 四块人日。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「迁移成本估算」：从 Python LangGraph 原型迁到 SAA 生产，成本大头在哪四块、为何不是 Prompt 复制。结合 OpenAPI Tool 冻结、Redis checkpoint 字段对齐、HITL 节点补全与 golden 回归举例。最后列出 2 个低估 Tool 契约导致联调延期的坑。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「迁移成本估算」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "s3-acceptance-metrics": {
       "label": "S3 验收指标",
       "tip": "成功率、HITL、P95、步数、Token、429 六指标可签字。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「S3 验收指标」：六项指标各自含义、目标值如何定、采集点在哪（Trace/Admin/计费）。简要背景：NS3 成本与 S3 体验同时达标。结合 CorpAssist Capstone Layer 1 验收举例。最后列出 2 个「感觉能用」无量化指标的上线风险。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「S3 验收指标」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "badcase-flywheel": {
       "label": "Badcase 飞轮",
       "tip": "采集→标注→golden→CI→DSL 发布闭环；映射 S3 四坑。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「Badcase 飞轮」：如何从 Trace 坏例驱动 golden 回归与 DSL 版本发布。简要背景：Capstone Layer 3 TOP5 面试 defense。结合 productionPitfall 四坑各一条可测信号与回归用例。最后列出 2 个只存日志不建 golden 的飞轮断点。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Badcase 飞轮」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "capstone-layer": {
       "label": "Capstone 分层",
       "tip": "L1 轨+场景；L2 契约/Trace/金丝雀；L3 TOP5+飞轮。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「Capstone 分层」：Layer 1–3 各包含什么交付物、S3 办公 Agent 如何勾选。简要背景：毕业规则与 scenario-java-agent-automation 衔接。结合本课 13 章能力映射到 L1 清单举例。最后列出 2 个只做 Demo 未完成 L2 契约的上线风险。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Capstone 分层」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "agent-step-budget": {
       "label": "Agent 步数预算",
       "tip": "maxSteps 超限转 HITL；防 S3 坑「规划偏航」。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「Agent 步数预算」：如何配置 StepBudgetAdvisor、与 Token 预算区别。简要背景：outline-specs S3 超过 3 步无观察易偏航。结合 Trace 检测信号（无 tool_calls）与 STAR 案例。最后列出 2 个只调 max_tokens 不限步数的误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Agent 步数预算」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "tool-result-truncation": {
       "label": "工具返回截断",
       "tip": "Tool 层 max 2k 字符 + 结构化 JSON；防上下文淹没。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「工具返回截断」：Confluence/Jira 工具为何不能返回全文。简要背景：S3 坑「返回过长淹没上下文」。结合 doc_id 引用与摘要策略，说明模型层摘要不能替代 Tool 层截断的原因。最后列出 2 个假执行（未真实 HTTP）的审计对账方法。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「工具返回截断」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "memory-budget-saa": {
       "label": "Agent 记忆预算",
       "tip": "工作/会话/长期三层；滑动窗口 + TTL 防记忆过载。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「Agent 记忆预算」：S3 长会话如何防检索干扰。简要背景：ChatMemory + VectorStore 分层，tenant 隔离。结合 outline-specs「记忆无限堆积」坑，说明与 RAG 制度库索引分离。最后列出 2 个整段会话塞 prompt 的反模式。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Agent 记忆预算」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "s3-office-automation": {
       "label": "S3 办公 Agent",
       "tip": "outline-specs S3：多步规划、工具编排、HITL；本课面试场景。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「S3 办公 Agent」：与 S1 RAG、S2 客服的差异、典型工具链。简要背景：纪要→Jira、采购审批等。结合 ReactAgent/Graph + DashScope + Admin 四层架构口述框架。最后列出 S3 四个 productionPitfall 各一句检测信号。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「S3 办公 Agent」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "production-pitfall-agent": {
       "label": "Agent 生产坑",
       "tip": "S3：偏航、假执行/过长返回、记忆过载、无降级。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「Agent 生产坑」：outline-specs S3 四坑的现象→根因→修复模板。简要背景：面试必须每场景 1 坑 defense。结合通义栈 StepBudget、truncate、熔断、HITL 工程手段。最后列出 2 个「演示能跑生产必炸」的特征。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Agent 生产坑」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "plan-execute-react": {
       "label": "Plan-Execute 与 ReAct",
       "tip": "≤10 步 ReAct；多步批处理 Plan-Execute；强合规固定 DAG。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist 通义栈）。请用通俗中文解释「Plan-Execute 与 ReAct」：CorpAssist S3 如何按步数/实时性/审计选型。简要背景：面试 Q3 任务规划。结合五部门周报 vs 单 Jira 创建举例，对照 LangGraph 与 SAA 实现面。最后列出 2 个 Plan 后无 Execute 的偏航案例。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Plan-Execute 与 ReAct」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "admin-studio": {
       "label": "Admin Studio",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Admin Studio」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Admin Studio」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "agent-dsl": {
       "label": "Agent Dsl",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Agent Dsl」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Agent Dsl」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "async-llm": {
       "label": "Async Llm",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Async Llm」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Async Llm」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "auto-configuration": {
       "label": "Auto Configuration",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Auto Configuration」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Auto Configuration」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "bailian-console": {
       "label": "Bailian Console",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Bailian Console」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Bailian Console」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "capability-matrix": {
       "label": "Capability Matrix",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Capability Matrix」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Capability Matrix」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "chat-model-bean": {
       "label": "Chat Model Bean",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Chat Model Bean」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Chat Model Bean」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "circuit-breaker": {
       "label": "Circuit Breaker",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Circuit Breaker」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Circuit Breaker」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "community-plugin": {
       "label": "Community Plugin",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Community Plugin」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Community Plugin」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "compatible-mode": {
       "label": "Compatible Mode",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Compatible Mode」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Compatible Mode」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "corpassist-agent-module": {
       "label": "Corpassist Agent Module",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Corpassist Agent Module」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Corpassist Agent Module」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "corpassist-config": {
       "label": "Corpassist Config",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Corpassist Config」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Corpassist Config」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "corpassist-knowledge": {
       "label": "Corpassist Knowledge",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Corpassist Knowledge」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Corpassist Knowledge」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "corpassist-s3": {
       "label": "Corpassist S3",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Corpassist S3」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Corpassist S3」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "dashscope-sdk": {
       "label": "Dashscope Sdk",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Dashscope Sdk」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Dashscope Sdk」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "dashscope-starter": {
       "label": "Dashscope Starter",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Dashscope Starter」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Dashscope Starter」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "dify-migration": {
       "label": "Dify Migration",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Dify Migration」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Dify Migration」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "distributed-trace": {
       "label": "Distributed Trace",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Distributed Trace」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Distributed Trace」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "document-parser": {
       "label": "Document Parser",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Document Parser」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Document Parser」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "dual-stack-policy": {
       "label": "Dual Stack Policy",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Dual Stack Policy」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Dual Stack Policy」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "environment-variable": {
       "label": "Environment Variable",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Environment Variable」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Environment Variable」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "extension-bom": {
       "label": "Extension Bom",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Extension Bom」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Extension Bom」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "http-connection-pool": {
       "label": "Http Connection Pool",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Http Connection Pool」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Http Connection Pool」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "java-saa": {
       "label": "Java Saa",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Java Saa」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Java Saa」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "llm-cache": {
       "label": "Llm Cache",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Llm Cache」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Llm Cache」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "model-routing": {
       "label": "Model Routing",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Model Routing」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Model Routing」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "model-studio": {
       "label": "Model Studio",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Model Studio」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Model Studio」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "multi-model-fallback": {
       "label": "Multi Model Fallback",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Multi Model Fallback」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Multi Model Fallback」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "multimodal-vl": {
       "label": "Multimodal Vl",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Multimodal Vl」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Multimodal Vl」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "openapi-gateway": {
       "label": "Openapi Gateway",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Openapi Gateway」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Openapi Gateway」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "peak-shaving": {
       "label": "Peak Shaving",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Peak Shaving」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Peak Shaving」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "profile-switch": {
       "label": "Profile Switch",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Profile Switch」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Profile Switch」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "prompt-replay": {
       "label": "Prompt Replay",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Prompt Replay」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Prompt Replay」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "python-dashscope": {
       "label": "Python Dashscope",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Python Dashscope」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Python Dashscope」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "qwen-model": {
       "label": "Qwen Model",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Qwen Model」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Qwen Model」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "request-id": {
       "label": "Request Id",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Request Id」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Request Id」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "semantic-cache": {
       "label": "Semantic Cache",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Semantic Cache」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Semantic Cache」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "spring-ai-alibaba-admin": {
       "label": "Spring Ai Alibaba Admin",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Spring Ai Alibaba Admin」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Spring Ai Alibaba Admin」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "spring-ai-alibaba-bom": {
       "label": "Spring Ai Alibaba Bom",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Spring Ai Alibaba Bom」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Spring Ai Alibaba Bom」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "spring-ai-dashscope": {
       "label": "Spring Ai Dashscope",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Spring Ai Dashscope」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Spring Ai Dashscope」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "streaming-flux": {
       "label": "Streaming Flux",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Streaming Flux」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Streaming Flux」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "structured-logging": {
       "label": "Structured Logging",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Structured Logging」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Structured Logging」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "studio": {
       "label": "Studio",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Studio」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Studio」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "tika-parser": {
       "label": "Tika Parser",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Tika Parser」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Tika Parser」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "token-billing": {
       "label": "Token Billing",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Token Billing」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Token Billing」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     },
     "vision-rag": {
       "label": "Vision Rag",
       "tip": "见本章正文。",
-      "prompt": "我在学习《Spring AI Alibaba 工程体系》（CorpAssist Spring AI Alibaba（通义/百炼、S3 办公 Agent））。请用通俗中文解释「Vision Rag」：在 CorpAssist S3 办公 Agent 场景中的作用、与 Spring AI Alibaba 1.1.x 的关系。结合本章上下文举例，并列出 2 个常见误区。"
+      "prompt": "我在学习大模型应用开发（CorpAssist Spring AI Alibaba），请解释一下「Vision Rag」，并结合 DashScope/ReactAgent 与 Python 双栈说明。最后列出 2 个常见误区或排查项（结合本课示例业务场景）。"
     }
   },
   "quizzes": {

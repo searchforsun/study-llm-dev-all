@@ -98,7 +98,7 @@ router:
     </div>
 
     <div class="section-block">
-      <h3>权限与租户：acl filter 在检索层</h3>
+      <h3>权限：acl filter 在检索层</h3>
       <p><span class="term" data-term-id="acl-filter" tabindex="0">ACL filter</span> 将用户 JWT 中的 <code>tenant_id</code>、<code>dept_ids</code>、<code>roles</code> 转为向量库/倒排 filter。与 <a href="#ch-basics-06-hallucination">幻觉治理</a> 的拒答互补：<strong>检不到</strong>优于<strong>检到无权限文档</strong>。</p>
 
       <h4>Python：路由 + ACL 片段</h4>
@@ -139,7 +139,33 @@ SearchRequest search = SearchRequest.builder()
     .build();</code></pre>
       </div>
 
-      <p><span class="term" data-term-id="multi-tenant" tabindex="0">Multi-tenant</span> 要求：索引 metadata 必含 <code>tenant_id</code>；禁止跨租户默认库。<span class="term" data-term-id="tenant-isolation" tabindex="0">Tenant isolation</span> 需在 ingest 与 query 双侧校验。</p>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>权限字段</th><th>来源</th><th>检索层表达</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>tenant_id</code></td>
+            <td>JWT / <code>X-Tenant-Id</code></td>
+            <td>等值 filter</td>
+          </tr>
+          <tr>
+            <td><code>kb</code></td>
+            <td>意图路由结果</td>
+            <td>等值 filter，防串库</td>
+          </tr>
+          <tr>
+            <td><code>dept</code></td>
+            <td>HR 主数据同步</td>
+            <td><code>in</code> 列表 filter</td>
+          </tr>
+          <tr>
+            <td><code>roles</code></td>
+            <td>IAM</td>
+            <td>敏感库额外门槛（如 finance）</td>
+          </tr>
+        </tbody>
+      </table>
 
       <details class="learn-faq">
         <summary>FAQ：路由错了怎么办？</summary>
@@ -148,8 +174,108 @@ SearchRequest search = SearchRequest.builder()
     </div>
 
     <div class="section-block">
-      <h3>配置驱动：增库不改代码</h3>
-      <p>新增「法务库」时，理想 diff 仅为 <code>kb-routing.yaml</code> + 新 collection 的 ingest job，而非改 5 个 Java 类。Spring 用 <code>@ConfigurationProperties</code> 绑定；Python 启动时 load yaml。</p>
+      <h3>租户：multi-tenant 隔离</h3>
+      <p><span class="term" data-term-id="multi-tenant" tabindex="0">Multi-tenant</span> 要求：索引 metadata 必含 <code>tenant_id</code>；禁止跨租户默认库。<span class="term" data-term-id="tenant-isolation" tabindex="0">Tenant isolation</span> 需在 ingest 与 query 双侧校验——CorpAssist 为集团多法人场景，<code>corp-a</code> 与 <code>corp-b</code> 的制度库物理或逻辑隔离。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 集团多法人</span>
+        同一套 RAG 服务承载多个子公司租户；查询时必须从网关透传 <code>tenant_id</code>，检索 filter 强制匹配，禁止用「默认租户」吞掉缺失头。
+      </aside>
+
+      <h4>ingest 侧：租户写入 metadata</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def index_chunk(chunk: dict, tenant_id: str, kb: str):
+    meta = {
+        **chunk["meta"],
+        "tenant_id": tenant_id,
+        "kb": kb,
+        "doc_id": chunk["doc_id"],
+    }
+    vector_store.upsert(ids=[chunk["doc_id"]], metadatas=[meta], texts=[chunk["text"]])</code></pre>
+      </div>
+
+      <h4>Spring：拒绝缺失租户</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@PostMapping("/ask")
+AskResponse ask(@RequestBody AskRequest req,
+                @RequestHeader("X-Tenant-Id") String tenantId) {
+  if (tenantId == null || tenantId.isBlank()) {
+    throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "tenant required");
+  }
+  // filter 必须含 tenant_id，禁止 fallback 到全库
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">租户泄漏风险</span>
+          <ul>
+            <li>未传 <code>X-Tenant-Id</code> 仍返回 corp-a 文档</li>
+            <li>ingest 漏写 tenant，查询无法过滤</li>
+            <li>默认库合并多租户 chunk</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">隔离标准</span>
+          <ul>
+            <li>请求无 tenant → 400，不检索</li>
+            <li>metadata 缺 tenant → 索引 job 失败</li>
+            <li>评测集含 <code>acl_context.tenant</code>（practice-05）</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：租户隔离放在 Prompt 里写「请勿泄露其他公司数据」够吗？</summary>
+        <p>不够。LLM 无法阻止已检入的无权限片段；必须在 Retriever / SearchRequest 的 filter 层阻断，并审计越权检索（advanced-05）。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>配置：增库不改代码</h3>
+      <p>新增「法务库」时，理想 diff 仅为 <code>kb-routing.yaml</code> + 新 collection 的 ingest job，而非改 5 个 Java 类。Spring 用 <code>@ConfigurationProperties</code> 绑定；Python 启动时 load yaml。<span class="term" data-term-id="kb-config" tabindex="0">kb config</span> 是真源，代码只实现「读配置 → 选 Retriever → 套 ACL」。</p>
+
+      <h4>Python：加载路由配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import yaml
+from pathlib import Path
+
+def load_routing(path: str = "kb-routing.yaml") -> dict:
+    return yaml.safe_load(Path(path).read_text())
+
+def route_kb(question: str, cfg: dict) -> str:
+    if cfg["router"]["mode"] == "keyword_first":
+        for kb, spec in cfg["knowledge_bases"].items():
+            if any(kw in question for kw in spec.get("keywords", [])):
+                return kb
+    return cfg["default_kb"]</code></pre>
+      </div>
+
+      <h4>Spring：ConfigurationProperties 绑定</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@ConfigurationProperties(prefix = "corpassist.rag")
+public record RagRoutingProperties(
+    String routingConfig,
+    boolean enforceAcl,
+    Map&lt;String, KnowledgeBaseSpec&gt; knowledgeBases
+) {}</code></pre>
+      </div>
 
       <div class="learn-tabs" role="tablist" aria-label="配置加载">
         <input type="radio" name="prac04-cfg-tab" id="prac04-cfg-tab-a" class="learn-tab-input" checked />
@@ -183,6 +309,11 @@ SearchRequest search = SearchRequest.builder()
           </div>
         </div>
       </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：新增法务库最少改哪些文件？</summary>
+        <p>① <code>kb-routing.yaml</code> 增加 <code>legal</code> 条目；② Python ingest 注册新 collection；③ 混合检索 <code>hybrid-config.json</code> 若按库分配置则加一份；④ 黄金集加 5～10 条法务问法（practice-05）。Java Controller <strong>不应</strong>新增 <code>if (legal)</code> 分支。</p>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -208,6 +339,35 @@ SearchRequest search = SearchRequest.builder()
           <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
         </ul>
       </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <ul>
+              <li>先路由后检索：keyword_first 选 HR/IT 库，选错库比算法差更致命</li>
+              <li>kb-routing.yaml 为真源，增库只改配置不改代码分支</li>
+              <li>ACL filter：tenant_id + dept_scope + doc_acl 在检索层 enforcement</li>
+              <li>router chain 在 RAG 链之前，输出 target collection</li>
+              <li>curl 带 X-Tenant-Id 验证 VPN 问题命中 it 库、不串 HR 薪资</li>
+            </ul>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 多库场景下，为何「Prompt 禁止越权」不能替代 metadata filter？</li>
+              <li>keyword_first 路由误判时，你会如何设计 fallback 或人工澄清？</li>
+              <li>新增财务制度库时，索引侧与查询侧各改哪些文件？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一步：<a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>，为路由与混合权重建立回归集。</p>
     </div>
   </div>
@@ -265,8 +425,8 @@ SearchRequest search = SearchRequest.builder()
   <div class="resources content-section">
     <h3>延伸学习</h3>
     <ul>
-      <li><a href="#ch-practice-03-hybrid">混合检索接入</a></li>
-      <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a></li>
+      <li><strong>上一章</strong>：<a href="#ch-practice-03-hybrid">混合检索接入</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-eval-loop">RAG 评测闭环</a></li>
       <li><a href="#ch-advanced-05-security">RAG 安全</a></li>
     </ul>
   </div>

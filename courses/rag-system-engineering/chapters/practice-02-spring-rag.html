@@ -16,7 +16,7 @@
         <ul>
           <li>配置 <span class="term" data-term-id="spring-vectorstore" tabindex="0">VectorStore</span> 连接与 collection 元数据</li>
           <li>用 <span class="term" data-term-id="question-answer-advisor" tabindex="0">QuestionAnswerAdvisor</span> 挂载到 <code>ChatClient</code></li>
-          <li>对照 <a href="#ch-practice-01-python-rag">Python LCEL 链</a> 的字段与 TopK</li>
+          <li>对照 <a href="#ch-practice-01-python-rag">Python：LangChain RAG 实现</a> 的字段与 TopK</li>
           <li>用 <code>mvn test</code> / curl 跑通 <span class="term" data-term-id="corpassist-java-rag" tabindex="0">CorpAssist Java RAG</span> 端点</li>
         </ul>
       </div>
@@ -75,6 +75,39 @@ corpassist:
   PY -.->|同 embedding 模型| VS</pre>
         <p class="diagram-caption">变更 embedding 须双栈 re-embed + <span class="term" data-term-id="parity-test" tabindex="0">parity test</span> 回归。</p>
       </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>检查项</th><th>Python 索引</th><th>Spring 查询</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>collection 名</td>
+            <td><code>corpassist-hr-v2</code> 写入 meta</td>
+            <td><code>corpassist.rag.collection</code> 一致</td>
+          </tr>
+          <tr>
+            <td>embedding 模型</td>
+            <td><code>text-embedding-3-small</code></td>
+            <td>同 model + <code>dimensions: 1536</code></td>
+          </tr>
+          <tr>
+            <td>距离度量</td>
+            <td>cosine（写入时）</td>
+            <td><code>COSINE_DISTANCE</code></td>
+          </tr>
+          <tr>
+            <td>只读约束</td>
+            <td>批处理 upsert</td>
+            <td>禁止 Controller 直接 <code>add()</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：Spring 启动报 dimension mismatch 怎么查？</summary>
+        <p>对照 <code>application.yml</code> 的 <code>dimensions</code> 与 PGVector 表定义；再查 Python 索引 job 写入的 meta。常见根因：换 embedding 模型后只 re-embed 了 Python 侧、Spring yaml 未同步。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -87,7 +120,7 @@ corpassist:
           <span class="lang-tag">java</span>
           <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
         </div>
-        <pre><code class="language-java">// demos/practice-02-spring-rag-lab/SpringRagDemo.java 思路
+        <pre><code class="language-java">// demos/practice-02-spring-rag-lab/src/main/java/.../SpringRagDemo.java 思路
 @Configuration
 class RagConfig {
   @Bean
@@ -137,6 +170,22 @@ class RagController {
           </ul>
         </div>
       </div>
+
+      <h4>AskResponse DTO（与 Python Pydantic 对齐）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">public record SourceRef(String docId, String snippet) {}
+public record AskRequest(String question, String tenantId) {}
+public record AskResponse(String answer, List&lt;SourceRef&gt; sources) {}
+
+// JSON 序列化：Spring 默认 camelCase；若 Python 用 snake_case，
+// 在 @JsonProperty 或全局 ObjectMapper 统一，避免 parity 工具误判</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="dto-align" tabindex="0">dto align</span> 是双栈联调第一关：字段名、空列表语义（<code>sources: []</code> 表示拒答或检索失败）、<code>snippet</code> 截断长度建议双栈均为 200 字符。</p>
     </div>
 
     <div class="section-block">
@@ -175,11 +224,46 @@ class RagController {
         <summary>FAQ：能否 Spring 也做离线索引？</summary>
         <p>可以但不推荐双写。CorpAssist 约定 Python 批处理索引 + Spring 查询，减少两套 ingest 逻辑漂移。若必须 Java ingest，需与 Python 共用同一 pipeline 版本号。</p>
       </details>
+
+      <h4>Python LCEL 等价片段（对照阅读）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># practice-01 最小链 — 与本章 Advisor 语义对应
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt | llm | StrOutputParser()
+)
+# Advisor ≈ retriever + 默认 QA 模板 + ChatModel 一次调用</code></pre>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="双栈差异点">
+        <input type="radio" name="prac02-diff-tab" id="prac02-diff-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="prac02-diff-tab" id="prac02-diff-tab-b" class="learn-tab-input" />
+        <label for="prac02-diff-tab-a">检索参数</label>
+        <label for="prac02-diff-tab-b">可观测性</label>
+        <div class="learn-tab-panel" id="prac02-diff-panel-a" role="tabpanel">
+          <ul>
+            <li>Python：<code>search_kwargs</code> 字典</li>
+            <li>Spring：<code>SearchRequest.builder()</code> + <code>filterExpression</code> 字符串</li>
+            <li>契约：filter 字段名必须与索引 metadata 键一致（<code>tenant_id</code> vs <code>tenantId</code> 是常见坑）</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="prac02-diff-panel-b" role="tabpanel">
+          <ul>
+            <li>Python：LangSmith / 自定义 <code>traced_retrieve</code></li>
+            <li>Spring：Micrometer + MDC <code>trace_id</code></li>
+            <li>联调：同一 <code>question</code> 对比两侧 <code>top_doc_id</code> 日志</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block">
       <h3>本地启动与 curl 验收</h3>
-      <p>与 <a href="#ch-practice-01-python-rag">Python API</a> 对照时，保持<strong>相同测试问题</strong>与 tenant filter，比较 <code>sources[].doc_id</code> 集合（允许顺序不同）。</p>
+      <p>与 <a href="#ch-practice-01-python-rag">Python：LangChain RAG 实现</a> 对照时，保持<strong>相同测试问题</strong>与 tenant filter，比较 <code>sources[].doc_id</code> 集合（允许顺序不同）。</p>
 
       <div class="code-block">
         <div class="code-toolbar">
@@ -212,6 +296,29 @@ mvn -q test -Dtest=RagParityTest</code></pre>
           </div>
         </details>
       </div>
+
+      <h4>RagParityTest 思路（集成测试）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@SpringBootTest(webEnvironment = RANDOM_PORT)
+class RagParityTest {
+  @Test
+  void sameQuestionSameDocIds() {
+    var body = Map.of("question", "年假几天", "tenantId", "corp-a");
+    var resp = rest.postForObject("/v1/rag/ask", body, AskResponse.class);
+    var docIds = resp.sources().stream().map(SourceRef::docId).sorted().toList();
+    assertThat(docIds).contains("hr-policy-2024#sec-3.2"); // 与 Python 黄金集对齐
+  }
+}</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：parity 失败时先改 Prompt 还是先对齐 VectorStore？</summary>
+        <p>先对齐 VectorStore（collection、embedding、filter、topK）。两侧 doc_id 一致后再比 answer 文本；否则是在比较不同检索结果上的生成差异。</p>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -289,7 +396,7 @@ mvn -q test -Dtest=RagParityTest</code></pre>
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：Spring AI RAG</h4>
-      <p>目录：<code>demos/practice-02-spring-rag-lab/</code>（<code>SpringRagDemo.java</code>）。<strong>验收</strong>：curl 返回 sources；与 Python 同题 doc_id 集合一致。</p>
+      <p>目录：<code>demos/practice-02-spring-rag-lab/</code>（Maven 工程 + <code>SpringRagDemo.java</code>）。<strong>验收</strong>：<code>mvn test -Dtest=RagParityTest</code> 通过；<code>mvn spring-boot:run</code> 后 curl <code>/v1/rag/ask</code> 与 Python 同题 <code>doc_id</code> 一致。</p>
     </div>
   </div>
 

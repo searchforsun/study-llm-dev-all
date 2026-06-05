@@ -4,32 +4,41 @@
 
 ## 目标
 
-实现并对比 FIFO 截断、语义截断和滑动窗口三种策略，评估不同策略下的信息保留率和 token 使用效率，为 CorpAssist 客服场景选择最优策略。
+对比 FIFO 截断与滑动窗口策略，验证 token 预算与约束丢失检测（生产 LLM 语义截断见章节正文；本 lab 为**离线示意**）。
 
 ## 前置准备
 
-- Python 3.8+ 或 JDK 17+
-- 一个简单的 LLM 客户端（可选，用于语义截断评分）
+- Python 3.10+
+- 本 lab 附带的 [`conversation-10turn.json`](conversation-10turn.json)（CorpAssist 客服 10 轮样例）
 
-## 步骤
+## 目录
 
-1. **实现 FIFO 截断器**：编写 `FifoTruncation` 类，给定 10 轮对话和 4K token 预算，优先移除最早轮次。
+| 路径 | 说明 |
+|------|------|
+| `truncation.py` | FIFO / SlidingWindow / 约束检测 |
+| `conversation-10turn.json` | 10 轮对话 + 约束列表 |
+| [`trim-compare.md`](trim-compare.md) | 策略对照速查 |
 
-2. **实现滑动窗口**：编写 `SlidingWindow` 类，保留最近 5 轮完整对话，超出时对最旧轮次生成摘要。
+## 验收命令
 
-3. **实现语义截断器**（可选）：使用 embedding 或 LLM 评分，保留语义价值最高的轮次。
+```bash
+cd demos/basics-02-truncation-lab
+pip install -r requirements.txt
+python -m pytest -q test_truncation_lab.py
+```
 
-4. **约束丢失检测**：在截断前后检查关键约束（语言偏好、会员等级、权限声明）是否保留。
+期望：4 项测试全绿；FIFO 不超预算；滑动窗口保留最近 5 轮并生成摘要。
 
-5. **对比输出**：运行三种策略，生成包含保留轮次数、信息完整度评分（1-5）和执行时间的对比表。
+## 步骤（扩展）
 
-## 预期输出
-
-策略对比结果：FIFO 保留 5 轮完整度 3/5，滑动窗口保留 5 轮+摘要完整度 4/5，语义截断保留语义最优轮次完整度 5/5。三种策略 token 使用均在预算内。
+1. **FIFO**：`FifoTruncation(max_tokens=…).trim(turns)` 从最新轮次向前保留。
+2. **滑动窗口**：`SlidingWindow(window_turns=5)` 保留最近 5 轮，旧轮次折叠为 `[SUMMARY]`。
+3. **约束**：`assemble_context` 将 `constraints` 固定置顶；`detect_constraint_loss` 检测被删轮次中的约束关键词。
+4. **对比**：调整 `max_tokens` / `window_turns`，观察保留轮次与约束风险。
 
 ## 验收清单
 
-- [ ] 三种策略均可运行并输出结果
-- [ ] 约束丢失检测正确报告问题
-- [ ] 能为 CorpAssist 场景推荐合适的策略
-- [ ] 理解滑动窗口与 FIFO 的核心差异
+- [ ] pytest 套件通过（见上方验收命令）
+- [ ] FIFO 输出 token 数 ≤ 预算
+- [ ] 滑动窗口保留 5 轮 + 摘要
+- [ ] 约束置顶且丢失检测可报告风险

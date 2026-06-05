@@ -245,6 +245,55 @@ return reranked;</code></pre>
         <summary>先想 10 秒：S3 创建 Jira 前是否必须先 RAG？</summary>
         <p>视任务：若 Jira 字段映射依赖采购制度，应先 <code>searchPolicy</code> 再写；纯「创建空白任务」可跳过。Router 与 Prompt 应声明何时强制检索，避免幻觉字段。</p>
       </details>
+      <h4>检索观测、成本与 Badcase 闭环</h4>
+      <p>Embedding 与 Rerank 各计一次 API 调用；S3 高频 <code>searchPolicy</code> 应在 Trace 中拆分 span：<code>vector_search</code>、<code>dashscope_rerank</code>、<code>llm_generate</code>，便于判断瓶颈在召回还是生成。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>用途</th><th>告警示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>rerank_latency_p95</td><td>Rerank 拖慢 Tool</td><td>&gt; 800ms 检查 batch 与 topK</td></tr>
+          <tr><td>empty_recall_rate</td><td>向量无命中</td><td>index_version 漂移或 ACL filter 过严</td></tr>
+          <tr><td>rerank_score_gap</td><td>Top1 与 Top5 分差</td><td>分差小说明需调 threshold 或换 embedding</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// Tool 返回须可审计（示意）
+record PolicyHit(String docId, String policyVersion, double rerankScore, String excerpt) {}
+
+List&lt;PolicyHit&gt; hits = reranked.stream()
+    .map(d -> new PolicyHit(
+        d.getMetadata().get("doc_id"),
+        d.getMetadata().get("policy_version"),
+        d.getScore(),
+        truncate(d.getText(), 400)))
+    .toList();</code></pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · Badcase 飞轮</span>
+        员工反馈「Agent 引用了过期采购制度」：从 Trace 取出 rerank 前后 score 与 <code>doc_id</code>，写入 Badcase 表；若向量为旧版，触发增量 reindex；若 Rerank 误排，调 topK 或加入 metadata 硬过滤 <code>effective_date</code>。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：semantic cache 与 Rerank 能否叠加？</summary>
+        <p>可对「制度问答」类只读 query 在 Rerank 之后缓存最终 Top-5 doc_id 列表；缓存 key 须含 <code>index_version</code> 与 <code>tenantId</code>，版本 bump 时整前缀失效。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Tool 只返回模型摘要，无 doc_id，无法复核</li>
+            <li>为省 Rerank 在采购场景用向量 Top-1</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>响应 + Trace 双写 citation 字段</li>
+            <li>评测集对比「仅向量 / 向量+Rerank」NDCG@5</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">

@@ -95,6 +95,35 @@ rag_chain = (
   L --> A[answer + sources]</pre>
         <p class="diagram-caption">索引侧见 basics-02～04；本章只实现<strong>查询链 + API</strong>，不写离线 ingest。</p>
       </div>
+
+      <h4>LCEL 与 Spring Advisor 对照（双栈预习）</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>LCEL 组件</th><th>Spring AI（下一章）</th><th>CorpAssist 契约</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>RunnablePassthrough</code> 传 question</td>
+            <td><code>ChatClient.prompt().user()</code></td>
+            <td>用户问句原样进检索与生成</td>
+          </tr>
+          <tr>
+            <td><code>retriever | format_docs</code></td>
+            <td><code>QuestionAnswerAdvisor</code> 内置检索</td>
+            <td>context 拼装发生在 LLM 调用前</td>
+          </tr>
+          <tr>
+            <td><code>.stream()</code> 流式</td>
+            <td><code>ChatClient.stream()</code></td>
+            <td>SSE 场景见 basics-05 <span class="term" data-term-id="sse-rag" tabindex="0">sse rag</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：LCEL 链何时用 <code>.with_config({"run_name": "corp-rag"})</code>？</summary>
+        <p>联调与生产 trace 需要区分「检索 span」与「生成 span」。CorpAssist 在 LangSmith / OpenTelemetry 中为链命名，便于对比 Python 与 Spring 同一问题的延迟分布；Mock LLM 阶段也应保留 run_name，避免上线后 trace 断层。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -128,7 +157,7 @@ for d in docs:
         <tbody>
           <tr>
             <td><code>k</code></td>
-            <td>4～8 起步，配合 <a href="#ch-basics-05-retrieval-gen">rerank</a></td>
+            <td>4～8 起步，配合 <a href="#ch-basics-05-retrieval-gen">检索、重排与生成</a></td>
             <td>过大拖慢 API、挤爆上下文</td>
           </tr>
           <tr>
@@ -148,6 +177,29 @@ for d in docs:
         <summary>FAQ：Retriever 与 VectorStore 谁负责 Embedding？</summary>
         <p>查询时 Retriever 内部用<strong>与索引相同的</strong> embedding 模型做 query vector；模型版本变更必须 re-embed（见 basics-04）。链上不要手写两套 embed 函数。</p>
       </details>
+
+      <h4>包装 sources：与 Spring DTO 同形的后处理</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def rag_chain_with_sources(question: str, *, filter: dict) -> dict:
+    docs = retriever.invoke(question, filter=filter)
+    if not docs:
+        return {"answer": "未在知识库中找到依据。", "sources": []}
+    context = format_docs(docs)
+    answer = (prompt | llm | StrOutputParser()).invoke(
+        {"question": question, "context": context}
+    )
+    sources = [
+        {"doc_id": d.metadata["doc_id"], "snippet": d.page_content[:200]}
+        for d in docs
+    ]
+    return {"answer": answer, "sources": sources}</code></pre>
+      </div>
+
+      <p>Spring 侧 <code>mapSources(...)</code> 应产出相同字段；<span class="term" data-term-id="parity-test" tabindex="0">parity test</span> 比较 <code>doc_id</code> 集合而非 answer 文本（LLM 措辞允许差异）。</p>
     </div>
 
     <div class="section-block">
@@ -195,11 +247,37 @@ python -c "from chain_stub import rag_query; print(rag_query('年假几天'))"
         <summary>先想 10 秒：为何先 Mock LLM 再换真模型？</summary>
         <p>分离检索问题与生成问题：Mock 固定返回可预测文本，若 sources 已错，接真模型只会浪费 token 且难排查。</p>
       </details>
+
+      <h4>结构化 trace 日志（生产最小集）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import logging
+log = logging.getLogger("corpassist.rag")
+
+def traced_retrieve(question: str, filter: dict):
+    docs = retriever.invoke(question, filter=filter)
+    log.info(
+        "retrieve",
+        extra={
+            "question_len": len(question),
+            "filter": filter,
+            "hit_count": len(docs),
+            "top_doc_id": docs[0].metadata.get("doc_id") if docs else None,
+            "top_score": getattr(docs[0], "score", None) if docs else None,
+        },
+    )
+    return docs</code></pre>
+      </div>
+
+      <p>与 Spring MDC（<code>tenant_id</code>、<code>trace_id</code>）对齐后，可在同一日志平台对比双栈检索命中率；排障时优先看 <code>hit_count=0</code> 再查 filter 与 embedding。</p>
     </div>
 
     <div class="section-block">
       <h3>API 暴露：FastAPI 与 Spring 契约对齐</h3>
-      <p>对外 BFF 将由 <a href="#ch-practice-02-spring-rag">Spring AI RAG</a> 承担；Python 服务常用于<strong>索引作业、回归脚本、原型</strong>。无论哪条栈，<span class="term" data-term-id="python-rag-api" tabindex="0">python rag api</span> 响应体应对齐：</p>
+      <p>对外 BFF 将由 <a href="#ch-practice-02-spring-rag">Spring AI：RAG 实现</a> 承担；Python 服务常用于<strong>索引作业、回归脚本、原型</strong>。无论哪条栈，<span class="term" data-term-id="python-rag-api" tabindex="0">python rag api</span> 响应体应对齐：</p>
 
       <div class="code-block">
         <div class="code-toolbar">
@@ -245,6 +323,26 @@ def ask(req: AskRequest):
         <strong>与 Spring 对照预览</strong>
         <p>下一章 <span class="term" data-term-id="question-answer-advisor" tabindex="0">QuestionAnswerAdvisor</span> 在 <span class="term" data-term-id="spring-vectorstore" tabindex="0">VectorStore</span> 上完成同类检索增强；本章 Python API 的 JSON 字段名请与 Java record 一致，便于 <span class="term" data-term-id="parity-test" tabindex="0">parity test</span>。</p>
       </div>
+
+      <h4>双栈 curl 对照脚本</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># 同一问题、同一 tenant — 比较 doc_id 集合（顺序可不同）
+Q='{"question":"年假几天","tenant_id":"corp-a"}'
+py_ids=$(curl -s -X POST http://localhost:8000/v1/rag/ask -H "Content-Type: application/json" -d "$Q" \
+  | jq -r '.sources[].doc_id' | sort)
+sp_ids=$(curl -s -X POST http://localhost:8080/v1/rag/ask -H "Content-Type: application/json" -d "$Q" \
+  | jq -r '.sources[].doc_id' | sort)
+diff &lt;(echo "$py_ids") &lt;(echo "$sp_ids") || echo "parity OK"</code></pre>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：Python 原型 API 何时下线？</summary>
+        <p>Spring BFF 稳定且 parity 连续通过后，Python 服务保留为<strong>索引作业 + 评测批跑</strong>入口，对外查询流量切到 8080。避免长期双写两套鉴权与限流逻辑。</p>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -271,6 +369,35 @@ def ask(req: AskRequest):
           <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
         </ul>
       </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <ul>
+              <li>LCEL：<code>retriever → context → prompt → llm</code> 管道传递 dict</li>
+              <li>契约：<code>answer</code> + <code>sources[]</code>（含 doc_id）与 Spring 对齐</li>
+              <li>Retriever：TopK + tenant filter 在检索层生效，不靠 Prompt 保密</li>
+              <li>调试：sources 为空先查 collection、embedding 维度、filter 三层</li>
+              <li>API：<code>POST /v1/rag/ask</code>，Python 索引侧、Spring 下一章对照</li>
+            </ul>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 为何要求 Python LCEL 链先输出 sources 再接真实 LLM？</li>
+              <li>as_retriever 的 filter 与 Spring SearchRequest filter 如何保持 parity？</li>
+              <li>curl 返回 sources 为空时，你的排查顺序是什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-02-spring-rag">Spring AI：RAG 实现</a>，用 Advisor + VectorStore 对照本章契约。</p>
     </div>
   </div>
@@ -322,7 +449,7 @@ def ask(req: AskRequest):
     </ol>
     <div class="demo-box">
       <h4 class="demo-box-title">Demo：Python LCEL RAG 链</h4>
-      <p>目录：<code>demos/practice-01-python-rag-lab/</code>（<code>chain_stub.py</code>）。<strong>验收</strong>：Retriever-only 有 doc_id；curl <code>/v1/rag/ask</code> 返回非空 sources。</p>
+      <p>目录：<code>demos/practice-01-python-rag-lab/</code>（<code>chain_stub.py</code> + <code>app.py</code>）。<strong>验收</strong>：<code>pytest -q</code> 通过；Retriever-only 有 doc_id；<code>uvicorn app:app</code> 后 curl <code>/v1/rag/ask</code> 返回非空 sources。</p>
     </div>
   </div>
 

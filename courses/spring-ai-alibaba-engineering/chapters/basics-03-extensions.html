@@ -229,6 +229,62 @@ VectorStore ingestLeavePolicy(
           <div class="learn-faq-body">可以，且是推荐双栈分工（basics-04）。Python 批处理解析 + 写索引版本；Java extensions 侧保留 Reader 用于小规模热更新或灾备。</div>
         </details>
       </div>
+      <h4>解析质量、切块与增量索引</h4>
+      <p>extensions 解决「从二进制到文本」；切块策略决定 RAG 召回粒度。CorpAssist 制度库统一 <strong>500 Token / 50 overlap</strong>，与 Python 轨 rag-system 对齐，避免 Java 热更新与离线批处理 chunk 不一致。</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>质量问题</th><th>表现</th><th>缓解</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>表格断裂</td><td>考勤表行被切成两半</td><td>复杂版式走百炼文档解析 API，或按页切块</td></tr>
+          <tr><td>页眉页脚噪声</td><td>检索命中「第 3 页」重复文本</td><td>Tika 后处理 strip header/footer 规则</td></tr>
+          <tr><td>扫描 PDF 乱码</td><td>Embedding 无意义</td><td>先 OCR/VL 转文本再 Reader，勿直接 Tika</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">// 增量：仅当 manifest 中 doc_version 变更时 reindex
+if (!manifest.version().equals(cachedVersion(docId))) {
+  List&lt;Document&gt; docs = leavePolicyReader.get();
+  vectorStore.delete(filter("doc_id == " + docId));
+  vectorStore.add(splitter.apply(docs));
+  versionCache.put(docId, manifest.version());
+}</code></pre>
+      </div>
+      <div class="mermaid-wrap">
+        <h5>制度 PDF 增量索引（extensions + VectorStore）</h5>
+        <pre class="mermaid">flowchart LR
+  HR[HR 上传 PDF] --> MAN[manifest.json]
+  MAN --> JOB[增量 Job]
+  JOB --> READ[Tika / 百炼解析]
+  READ --> CHUNK[TokenTextSplitter]
+  CHUNK --> VS[VectorStore]
+  VS --> AG[S3 searchPolicy Tool]</pre>
+      </div>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 单页制度热修</span>
+        HR 只改了请假制度第 2 章：增量 Job 仅重解析该 PDF 的 <code>doc_id</code>，不重建全库；S3 Agent 检索 filter <code>policy_version</code> 与 basics-05 索引版本联动。
+      </aside>
+      <details class="learn-micro-check">
+        <summary>自检：extensions Reader 与 Embedding 是否应在同一 JVM？</summary>
+        <p>小规模热更新可在 Java 完成 Reader→Embedding→VectorStore；全量百万 chunk 仍建议 Python 批处理写 PGVector，Java 只读。分工见 basics-04 双栈矩阵。</p>
+      </details>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>每次 Agent 请求路径上同步 Tika 解析 20 页 PDF</li>
+            <li>Java/Python 使用不同 chunk size 却共用一个 collection</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>manifest 驱动增量；dead-letter 队列记录解析失败</li>
+            <li>元数据 <code>doc_version</code>、<code>page_no</code> 支持 citation</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">

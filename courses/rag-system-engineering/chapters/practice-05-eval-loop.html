@@ -9,7 +9,7 @@
       <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>双栈实现 CorpAssist 知识库</strong> · 能力：建立 NS1 评测飞轮、双栈回归与发布闸门</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
-        <p><a href="#ch-practice-04-multi-kb">上一章</a> 解决了多库路由与 ACL；上线前若缺少可重复的评测，改 chunk 大小或换 Embedding 模型时无法量化「变好了还是变差了」。CorpAssist <span class="term" data-term-id="corpassist-s1" tabindex="0">corpassist s1</span> 知识库要求<strong>基准 → 迭代 → 报告 → 发布</strong>四步闭环，Python 跑批评测、Spring 侧做发布闸门，形成 NS1 评测飞轮。</p>
+        <p><a href="#ch-practice-04-multi-kb">多知识库与路由</a> 解决了多库路由与 ACL；上线前若缺少可重复的评测，改 chunk 大小或换 Embedding 模型时无法量化「变好了还是变差了」。CorpAssist <span class="term" data-term-id="corpassist-s1" tabindex="0">corpassist s1</span> 知识库要求<strong>基准 → 迭代 → 报告 → 发布</strong>四步闭环，Python 跑批评测、Spring 侧做发布闸门，形成 NS1 评测飞轮。</p>
       </div>
       <div class="notice notice-outcome">
         <strong>学完你能</strong>
@@ -94,6 +94,23 @@ def run_benchmark(cases, retriever, chain):
           </ul>
         </div>
       </div>
+
+      <h4>Spring 侧：同一黄金集 HTTP 批跑</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">java</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-java">@ParameterizedTest
+@MethodSource("goldenCases")
+void springRagGoldenCase(GoldenCase c) {
+  var resp = ragClient.ask(c.question(), c.aclContext().tenant());
+  assertThat(resp.sources().stream().map(SourceRef::docId))
+      .anyMatch(id -> c.expectedDocIds().contains(id));
+}</code></pre>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：黄金集需要多少条才够 S1 发布？</summary>
+        <p>CorpAssist S1 建议<strong>不少于 80 条</strong>覆盖 HR/IT/财务各库与拒答场景；每条含 ACL。少于 30 条时指标波动大，gate 阈值难以稳定。可先从 20 条 smoke 集起步，发布前扩到全量。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -129,6 +146,19 @@ def run_benchmark(cases, retriever, chain):
         <summary>先想 10 秒：同时改 chunk 与 Embedding 模型，实验结论还有效吗？</summary>
         <p>无效。多变量变更无法归因；应分两轮实验，且 Embedding 变更需 <span class="term" data-term-id="re-embed" tabindex="0">re embed</span> 全量索引后再测。</p>
       </details>
+
+      <h4>跑批命令（Python 评测入口）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">bash</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-bash">cd demos/practice-05-eval-loop-lab
+python run_eval.py --suite corp-s1-hr-v1 --out eval-result.json
+python run_eval.py --suite corp-s1-hr-v1 --hybrid-config ../practice-03-hybrid-lab/hybrid-config.json
+
+# 对比两次 metric delta
+jq '.metrics' eval-result.json eval-result-baseline.json</code></pre>
+      </div>
+
+      <p>每次实验只改 <code>hybrid-config.json</code> 或 chunk 参数之一，输出文件名带 <code>exp-id</code>，便于 practice 阶段形成可审计的 <span class="term" data-term-id="iter-loop" tabindex="0">iter loop</span> 记录。</p>
     </div>
 
     <div class="section-block">
@@ -166,6 +196,39 @@ void evalReportMeetsGate() throws Exception {
   assertThat(report.getFailedCases()).hasSizeLessThan(5);
 }</code></pre>
       </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>报告字段</th><th>用途</th><th>双栈谁写入</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>run_id</code></td>
+            <td>单次跑批唯一 ID</td>
+            <td>Python <code>run_eval.py</code></td>
+          </tr>
+          <tr>
+            <td><code>index_alias</code></td>
+            <td>被测索引版本</td>
+            <td>索引 job 输出</td>
+          </tr>
+          <tr>
+            <td><code>eval_bind</code></td>
+            <td>commit + snapshot 绑定</td>
+            <td>CI 注入 git sha</td>
+          </tr>
+          <tr>
+            <td><code>failed_cases</code></td>
+            <td>人工复核队列</td>
+            <td>Python；Spring 读入 gate</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>FAQ：eval_bind 为什么要绑 git commit？</summary>
+        <p>索引管线、路由 yaml、混合权重可能同一次发布变更。仅绑索引版本无法复现「当时代码如何解析 PDF」；绑 commit 后可用 <code>git checkout</code> + 同 snapshot 重跑，支撑合规审计与面试「如何复现一次线上 badcase」。</p>
+      </details>
     </div>
 
     <div class="section-block">
@@ -207,6 +270,36 @@ steps:
       </div>
 
       <p>未过闸门时<strong>禁止</strong>切换 <span class="term" data-term-id="index-alias" tabindex="0">index alias</span>；回滚只需指回上一版 snapshot + 报告。</p>
+
+      <h4>发布检查清单（publish-check）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">markdown</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-markdown">- [ ] eval-result.json faithfulness ≥ 0.85
+- [ ] context_recall ≥ 0.80
+- [ ] parity 抽样 ≥ 95%（Python vs Spring doc_id）
+- [ ] failed_cases 已 triage（修复或登记 accepted risk）
+- [ ] hybrid-config / kb-routing 版本号写入发布说明
+- [ ] 合规问法人工 sign-off（HR 代表）</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">发布反模式</span>
+          <ul>
+            <li>指标刚过线但未看 failed_cases 明细</li>
+            <li>只测 Python 批跑，未抽 Spring API</li>
+            <li>alias 切换无回滚 runbook</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">release gate 标准</span>
+          <ul>
+            <li>双栈同黄金集 + parity</li>
+            <li>报告 + eval_bind 归档</li>
+            <li>灰度 alias 再全量</li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -232,7 +325,36 @@ steps:
           <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
         </ul>
       </div>
-      <p class="chapter-review-next">下一步：完成 Demo 与测验；继续 <a href="#ch-practice-07-code-rag">代码库 RAG 与研发助手（面试场景）</a>，把评测方法迁移到 S4 代码库场景。</p>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <ul>
+              <li>NS1 飞轮：基准集 → 迭代调参 → eval report → release gate 发布</li>
+              <li>黄金集字段：question、expected_doc_ids、faithfulness 标注</li>
+              <li>eval_bind：报告必须绑定索引 alias、embedding 模型、chunk 策略</li>
+              <li>双栈 parity test：Python 与 Spring 对同一套用例比 doc_id 集合</li>
+              <li>release gate：核心指标跌破阈值即阻断 alias 切换</li>
+            </ul>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist S1 没有黄金集时，改 chunk 大小如何证明「变好了」？</li>
+              <li>eval_bind 为何必须写索引版本？不写会导致什么上线风险？</li>
+              <li>release gate 里 faithfulness 与 context_recall 各拦哪类回归？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：完成 Demo 与测验；本课大纲未设 practice-06，继续 <a href="#ch-practice-07-code-rag">代码库 RAG 与研发助手（面试场景）</a>，把评测方法迁移到 S4 代码库场景。</p>
     </div>
   </div>
 

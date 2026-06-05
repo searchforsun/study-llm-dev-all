@@ -4,31 +4,44 @@
 
 ## 目标
 
-实现三层混合记忆的写穿透（write-through）和读合并（read-merge）逻辑，测试会话层覆盖长期层的一致性场景。
+实现三层混合记忆的写穿透（write-through）和读合并（read-merge），验证会话层修正覆盖长期层（Redis/Milvus 生产实现见章节正文；本 lab 为**内存示意**）。
 
 ## 前置准备
 
-- Python 3.8+ 或 JDK 17+
-- Redis 和 Milvus 实例
-- 已完成 practice-01 和 practice-02 的代码
+- Python 3.10+
+- 已阅读 [`practice-01-short-term-lab`](../practice-01-short-term-lab/README.md) 的 session 契约（可选）
+- 长期记忆设计见 [`practice-02-long-term-lab`](../practice-02-long-term-lab/README.md)
 
-## 步骤
+## 目录
 
-1. **实现 HybridMemoryWriter**：编写写穿透逻辑 —— 同步写 Redis 会话，异步提取事实写 Milvus 长期记忆。
+| 路径 | 说明 |
+|------|------|
+| `session_store.py` | 内存会话层 |
+| `fact_store.py` | 内存长期事实库 + superseded 标记 |
+| `hybrid_memory.py` | Writer / Reader / MemRouter |
+| [`layer-table.md`](layer-table.md) | 三层对照表 |
 
-2. **实现 HybridMemoryReader**：编写读合并逻辑 —— 从 Redis 加载会话历史，从 Milvus 召回长期记忆，去重合并后返回。
+## 验收命令
 
-3. **实现 MemRouter**：根据用户输入判断需要访问哪些记忆层。简单问候语只查会话，操作意图查长期记忆。
+```bash
+cd demos/practice-03-hybrid-design-lab
+pip install -r requirements.txt
+python -m pytest -q test_hybrid_lab.py
+```
 
-4. **一致性测试**：用户在对话中说「我之前的偏好错了，应该是邮箱接收报告」。验证会话层的修正覆盖了长期层的旧事实。
+期望：4 项测试全绿；偏好修正后会话覆盖长期层。
 
-## 预期输出
+## 步骤（扩展）
 
-写入时三层数据一致。读取时正确合并去重。用户修正偏好后，会话层覆盖长期层，LLM 使用新的事实。
+1. **HybridMemoryWriter**：同步写 session，提取事实写 long_term。
+2. **HybridMemoryReader**：按 MemRouter 决定读 session / long_term，去重合并。
+3. **MemRouter**：问候语仅查 session；操作/知识类查询触发 long_term。
+4. **一致性**：用户说「偏好错了，改邮箱」→ `mark_superseded` 后长期层仅保留新偏好。
 
 ## 验收清单
 
-- [ ] 写穿透实现：同步+异步写入
-- [ ] 读合并实现：去重合并
-- [ ] MemRouter 正确路由请求
-- [ ] 一致性测试通过
+- [ ] pytest 套件通过（见上方验收命令）
+- [ ] 写穿透：session + long_term 均有数据
+- [ ] 读合并：去重有效
+- [ ] MemRouter：问候语不查 long_term
+- [ ] 一致性：邮箱偏好覆盖短信

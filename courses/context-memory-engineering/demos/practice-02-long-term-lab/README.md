@@ -4,33 +4,45 @@
 
 ## 目标
 
-实现从对话中提取事实并存储到向量数据库，设计用户画像结构和过期策略，实现 GDPR 级联删除。
+从对话中提取结构化事实，写入带租户/用户隔离的事实库，验证召回范围、GDPR 删除与 TTL 过期（Milvus 生产实现见章节正文；本 lab 为**内存示意**）。
 
 ## 前置准备
 
-- Python 3.8+ 和/或 JDK 17+
-- Milvus 向量数据库（本地 docker 或远程）
-- 一个 LLM 客户端（用于事实提取）
+- Python 3.10+
+- 已阅读 [`practice-01-short-term-lab`](../practice-01-short-term-lab/README.md) 的 session 契约（可选）
 
-## 步骤
+## 目录
 
-1. **实现事实提取器**：编写 LLM Prompt，从用户对话中提取偏好、身份和关键事实，输出结构化 JSON。
+| 路径 | 说明 |
+|------|------|
+| `fact_extract.py` | 规则型事实提取（示意） |
+| `fact_store.py` | 内存事实库 + 过滤/TTL/GDPR |
+| `fact_schema.json` | 字段契约 |
+| `sample_dialog.json` | 提取样例对话 |
+| `eval_facts.json` | 评测期望（准确率 ≥80%） |
+| [`fact_schema.md`](fact_schema.md) | 字段说明 |
 
-2. **实现向量事实库**：使用 pymilvus（Python）或 Spring AI MilvusVectorStore（Java），将事实 upsert 到集合，包含 user_id、content、embedding、expires_at 字段。
+## 验收命令
 
-3. **实现用户画像 CRUD**：结构化存储用户偏好，支持精确查询。
+```bash
+cd demos/practice-02-long-term-lab
+pip install -r requirements.txt
+python -m pytest -q test_fact_lab.py
+```
 
-4. **实现 GDPR 删除**：级联删除向量 + 结构化 + 审计日志，验证删除后用户数据不再召回。
+期望：4 项测试全绿；提取准确率 ≥80%。
 
-5. **验证过期策略**：写入 TTL=1min 的事实，等待过期后确认无法召回。
+## 步骤（扩展）
 
-## 预期输出
-
-事实提取器能从对话中正确提取偏好。向量召回时只返回目标用户的相关事实。GDPR 删除后用户数据全部清除。
+1. **事实提取**：阅读 `sample_dialog.json`，运行 `fact_extract.extract_facts_from_dialog`。
+2. **写入事实库**：`InMemoryFactStore.upsert`（生产环境换 Milvus + embedding）。
+3. **召回范围**：`recall` 必须带 `tenant_id` + `user_id` 过滤。
+4. **GDPR 删除**：`gdpr_delete` 后该用户事实不可召回。
+5. **TTL**：`ttl=1min` 写入后 `purge_expired` 验证过期。
 
 ## 验收清单
 
-- [ ] 事实提取准确率 ≥ 80%（测试数据集）
-- [ ] 向量召回正确限定用户范围
-- [ ] 用户画像 CRUD 操作完整
+- [ ] pytest 套件通过
+- [ ] 提取准确率 ≥80%（eval_facts.json）
+- [ ] 召回限定用户范围
 - [ ] GDPR 级联删除验证通过

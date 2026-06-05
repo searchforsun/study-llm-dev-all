@@ -4,34 +4,34 @@
 
 ## 目标
 
-编写记忆子系统 OpenAPI 契约，实现 RAG/Agent 集成测试，验收指标达标并绑定 CI/CD，完成跨课交接文档。
+OpenAPI 契约 + 跨课集成测试 + handoff 文档（CI/CD 绑定见章节正文；本 lab 复用 practice-05 API）。
 
 ## 前置准备
 
-- Python 3.8+ 或 JDK 17+
-- 已完成 practice-05 的 API 端点
-- CI/CD 系统（GitHub Actions 或 Jenkins）
+- Python 3.10+
+- 已跑通 [`practice-05-corpassist-memory-lab`](../practice-05-corpassist-memory-lab/README.md)
 
-## 步骤
+## 目录
 
-1. **编写 OpenAPI 契约**：创建 openapi.yaml 文件，定义 /v1/session、/v1/memory/recall、/v1/memory/facts、/v1/memory/{user} 的请求/响应格式。
+| 路径 | 说明 |
+|------|------|
+| `openapi.yaml` | 记忆 API 契约 |
+| `capstone_integration.py` | RAG 连续性 / GDPR / 延迟 / 一致性 |
+| [`handoff.md`](handoff.md) | 跨课交接文档 |
 
-2. **实现集成测试套件**：编写 3 个集成测试 —— 会话连续性（RAG 集成）、Checkpoint 恢复（Agent 集成）、GDPR 删除（合规）。使用 mock 或测试环境运行。
+## 验收命令
 
-3. **验收指标检查**：运行 MemoryEvalSuite，记录多轮一致性、P95 召回延迟等指标。确认 ≥ 95% 一致性和 ≤ 200ms 延迟。
+```bash
+cd demos/advanced-05-capstone-lab
+pip install -r requirements.txt
+python -m pytest -q test_capstone_lab.py
+```
 
-4. **CI/CD 绑定**：在 CI 配置中添加验收指标检查步骤，指标不达标时阻断部署。
-
-5. **编写交接文档**：创建 handoff.md，包含 API 端点、Redis Key 约定、部署拓扑、FAQ。
-
-## 预期输出
-
-OpenAPI 文档完整。集成测试全部通过。验收指标达标。CI/CD 绑定生效。交接文档清晰完整。
+期望：6 项测试全绿；多轮一致性 ≥95%。
 
 ## 验收清单
 
-- [ ] OpenAPI 契约文件完整
-- [ ] 3 个集成测试通过
-- [ ] 验收指标达标（一致性 ≥ 95%，延迟 ≤ 200ms）
-- [ ] CI/CD 绑定了指标检查
-- [ ] 交接文档包含 API/Key 约定/FAQ
+- [ ] pytest 套件通过（见上方验收命令）
+- [ ] OpenAPI 覆盖核心路径
+- [ ] 集成测试（RAG 连续性、GDPR、延迟）通过
+- [ ] handoff.md 含 API / Redis Key / FAQ

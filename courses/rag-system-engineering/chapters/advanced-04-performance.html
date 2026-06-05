@@ -9,7 +9,7 @@
       <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>进阶 RAG</strong> · 能力：缓存、小模型路由、预计算 · NFR 第 3 层（性能/成本）</p>
       <div class="notice notice-why-learn">
         <strong>为什么要学本章</strong>
-        <p><a href="#ch-advanced-03-graph-rag">上一章</a> 把图谱治理做扎实后，CorpAssist S1 制度问答在高峰时段 QPS 上升，每次请求仍走「Embed → 检索 → 大模型生成」会拖垮延迟与 Token 账单。ToC 场景下约 30% 问法高度重复（年假、报销入口），需要 <span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span>；简单 FAQ 可走 <span class="term" data-term-id="small-model-route" tabindex="0">small model route</span>；热门文档的向量可 <span class="term" data-term-id="precompute-embed" tabindex="0">precompute embed</span> 预热，形成可观测的 <span class="term" data-term-id="cost-optimize" tabindex="0">cost optimize</span> 组合拳。</p>
+        <p><a href="#ch-advanced-03-graph-rag">GraphRAG 与知识库治理衔接</a> 把图谱治理做扎实后，CorpAssist S1 制度问答在高峰时段 QPS 上升，每次请求仍走「Embed → 检索 → 大模型生成」会拖垮延迟与 Token 账单。ToC 场景下约 30% 问法高度重复（年假、报销入口），需要 <span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span>；简单 FAQ 可走 <span class="term" data-term-id="small-model-route" tabindex="0">small model route</span>；热门文档的向量可 <span class="term" data-term-id="precompute-embed" tabindex="0">precompute embed</span> 预热，形成可观测的 <span class="term" data-term-id="cost-optimize" tabindex="0">cost optimize</span> 组合拳。</p>
       </div>
       <div class="notice notice-outcome">
         <strong>学完你能</strong>
@@ -17,7 +17,7 @@
           <li>设计 S1 查询链路的 <span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span> 键与失效策略</li>
           <li>配置 FAQ 类问法的 <span class="term" data-term-id="small-model-route" tabindex="0">small model route</span> 与完整 RAG 回退</li>
           <li>在 Python 索引侧做 <span class="term" data-term-id="precompute-embed" tabindex="0">precompute embed</span> 与 <span class="term" data-term-id="hot-query" tabindex="0">hot query</span> 预热</li>
-          <li>用 <a href="#ch-practice-05-eval-loop">评测闭环</a> 量化 latency/token 收益，避免「缓存掩盖召回退化」</li>
+          <li>用 <a href="#ch-practice-05-eval-loop">RAG 评测闭环</a> 量化 latency/token 收益，避免「缓存掩盖召回退化」</li>
         </ul>
       </div>
       <div class="notice">
@@ -56,6 +56,61 @@ def embed_text(text_hash: str) -> list[float]:
       </div>
 
       <p>制度更新、ACL 变更、embedding 模型切换时必须 <strong>invalidate</strong> 对应 kb 分区；否则 <span class="term" data-term-id="cost-optimize" tabindex="0">cost optimize</span> 会以旧答案为代价。见 <code>demos/advanced-04-performance-lab/perf-tactics.md</code>。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：kb_version 发布时为何要同时 invalidate L1 与 L2？</summary>
+        <p>L1 精确 hash 可能仍命中旧问句的旧答案；L2 semantic cache 按 embedding 相似度命中，制度条款变更后问法相近仍会返回<strong>过期内容</strong>。版本号变更应清空该 kb 下全部缓存层。</p>
+      </details>
+
+      <h4>缓存分层架构</h4>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist S1 三级缓存</h5>
+        <pre class="mermaid">flowchart TB
+  Q[query] --> L1[L1 精确 hash cache]
+  L1 -->|miss| L2[L2 semantic cache]
+  L2 -->|miss| L3[L3 embed cache]
+  L3 --> RAG[完整 RAG]
+  RAG --> W[回写 L2/L1]</pre>
+        <p class="diagram-caption">L1 适合完全相同问句；L2 适合语义相近；L3 降低重复 embed API 调用。</p>
+      </div>
+
+      <h4>invalidate 触发清单</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>事件</th><th>失效范围</th><th>实现</th></tr></thead>
+          <tbody>
+            <tr><td>kb_version 发布</td><td>该 kb 全部 L1/L2</td><td><span class="term" data-term-id="cache-invalidate" tabindex="0">cache invalidate</span> by prefix</td></tr>
+            <tr><td>单文档修订</td><td>含该 doc_id 的缓存项</td><td>倒排索引 cache tag</td></tr>
+            <tr><td>ACL 策略变更</td><td>受影响 dept 分区</td><td>重建 cache key schema</td></tr>
+            <tr><td>embedding 模型切换</td><td>全库 L2/L3</td><td>与 re-embed 同步</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Redis semantic cache 配置片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">corpassist:
+  cache:
+    semantic:
+      similarity_threshold: 0.92
+      ttl_hours: 24
+      key_fields: [kb_id, dept, kb_version]
+      max_entries_per_dept: 10000</code></pre>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：semantic cache 与 <a href="#ch-advanced-01-query-transform">查询改写与 HyDE</a> 如何配合？</summary>
+        <p>改写增加首包延迟；可对<strong>改写后的 canonical query</strong> 做 L2 缓存（存 embedding + 答案），避免同一口语问法重复走 LLM 改写。注意 canonical 仍须含 ACL scope。</p>
+      </details>
+
+      <h4>embed cache 与索引 job 协同</h4>
+      <p>Python 批处理索引时，<span class="term" data-term-id="embed-cache" tabindex="0">embed cache</span> 以 <code>text_hash</code> 为键，避免同一 chunk 在重跑 job 时重复调用 Embedding API。Spring 在线查询只读已索引向量，不重复 embed 文档正文；用户问句 embedding 可走独立的小缓存分区，TTL 短于答案缓存。</p>
+      <ul>
+        <li>索引 job 结束导出 embed_cache 命中率，目标 ≥ 40%（重复 ingest 场景）</li>
+        <li>模型版本变更时清空 embed_cache，与 re-embed 同批次执行</li>
+        <li>禁止在线服务写 embed_cache 污染批处理键空间（分区隔离）</li>
+      </ul>
     </div>
 
     <div class="section-block">
@@ -101,8 +156,40 @@ def embed_text(text_hash: str) -> list[float]:
 
       <details class="learn-micro-check">
         <summary>先想 10 秒：semantic cache 为何必须把 user_dept 放进 cache key？</summary>
-        <p>不同部门可见文档集不同；若只按 query 相似度命中，可能返回<strong>其他部门可见、本用户不可见</strong>的缓存答案，构成隐性 <a href="#ch-advanced-05-security">acl leak</a>。键必须绑定 ACL scope。</p>
+        <p>不同部门可见文档集不同；若只按 query 相似度命中，可能返回<strong>其他部门可见、本用户不可见</strong>的缓存答案，构成隐性 <a href="#ch-advanced-05-security">RAG 安全</a> 风险。键必须绑定 ACL scope。</p>
       </details>
+
+      <h4>路由分类器实现选项</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead><tr><th>方案</th><th>延迟</th><th>准确率</th><th>CorpAssist 建议</th></tr></thead>
+          <tbody>
+            <tr><td>规则 + 关键词</td><td>&lt; 5ms</td><td>中</td><td>入口 FAQ 白名单首选</td></tr>
+            <tr><td>小分类模型</td><td>~50ms</td><td>高</td><td>意图边界模糊时</td></tr>
+            <tr><td>大模型判断</td><td>~500ms</td><td>高</td><td>仅离线标注，不进热路径</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>小模型路由配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">yaml</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-yaml">route:
+  small_model:
+    model: gpt-4o-mini
+    allowed_intents: [faq_entry, portal_link]
+    min_confidence: 0.85
+    fallback: rag-full
+    require_citation: false   # 入口类可模板；制度条款类必须 rag-full</code></pre>
+      </div>
+
+      <h4>回退条件（必须实现）</h4>
+      <ol>
+        <li>分类 confidence &lt; 阈值 → <code>rag-full</code></li>
+        <li>用户消息含「引用」「条款」「第 X 条」→ 强制 <code>rag-full</code></li>
+        <li>多库/跨部门关键词命中 → 强制 <code>rag-full</code></li>
+        <li>小模型输出触发 <span class="term" data-term-id="refusal" tabindex="0">refusal</span> → 回退并记录 metric</li>
+      </ol>
     </div>
 
     <div class="section-block">
@@ -120,6 +207,11 @@ def embed_text(text_hash: str) -> list[float]:
         </table>
       </div>
 
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：precompute-embed 与 semantic-cache 节省的成本类型有何不同？</summary>
+        <p>precompute 主要省<strong>在线 embed API</strong>与 ANN 冷启动；semantic-cache 省<strong>检索 + 大模型生成</strong>。两者可叠加，但热点漂移时 precompute 需 nightly 重算，cache 需 TTL/版本失效。</p>
+      </details>
+
       <h4>hot query 预热 job（Python）</h4>
       <div class="code-block">
         <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
@@ -129,7 +221,76 @@ for q in hot:
     semantic_cache.warm(key=scope_key(q.user_dept), query_vec=vec, answer=rag_pipeline(q))</code></pre>
       </div>
 
-      <p>所有优化需进 <a href="#ch-practice-05-eval-loop">eval report</a>：对比开启前后 faithfulness、context_recall，防止「快了但答错」。</p>
+      <p>所有优化需进 <a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>：对比开启前后 faithfulness、context_recall，防止「快了但答错」。</p>
+
+      <h4>预计算流水线（Python 索引侧）</h4>
+      <div class="code-block">
+        <div class="code-toolbar"><span class="lang-tag">python</span><button type="button" class="btn-copy" aria-label="复制代码">复制</button></div>
+        <pre><code class="language-python"># nightly job：热门 chunk + 热门 query 预计算
+hot_chunks = access_log.top_chunks(kb="corp-hr", days=30, n=2000)
+for c in hot_chunks:
+    if not embed_cache.has(c.id):
+        embed_cache.put(c.id, embedder.embed(c.text))
+
+hot_queries = access_log.top_queries(kb="corp-hr", days=7, n=500)
+for q in hot_queries:
+    precompute_retrieval_cache(q, acl_scope="ALL")  # 不含用户级答案</code></pre>
+      </div>
+
+      <h4>优化组合与观测指标</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead><tr><th>组合</th><th>目标 P95</th><th>必观测</th></tr></thead>
+          <tbody>
+            <tr><td>cache only</td><td>&lt; 800ms（命中）</td><td>hit_rate, faithfulness_delta</td></tr>
+            <tr><td>cache + route</td><td>&lt; 1.2s</td><td>route_precision, fallback_rate</td></tr>
+            <tr><td>cache + route + precompute</td><td>&lt; 1.5s（miss）</td><td>embed_cache_size, <span class="term" data-term-id="latency-cache" tabindex="0">latency cache</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">优化失控</span>
+          <ul>
+            <li>三项全开不做 AB，故障无法定位</li>
+            <li>为 hit_rate 降低 similarity 阈值</li>
+            <li>预热缓存不含 kb_version</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">可控优化</span>
+          <ul>
+            <li>逐项上线 + <span class="term" data-term-id="metric-delta" tabindex="0">metric delta</span></li>
+            <li>金丝雀 5% 流量观察 48h</li>
+            <li>回滚开关：disable_cache / force_rag_full</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：预计算与 semantic cache 区别？</summary>
+        <p><span class="term" data-term-id="precompute-embed" tabindex="0">precompute embed</span> 解决<strong>索引/向量计算</strong>重复；<span class="term" data-term-id="semantic-cache" tabindex="0">semantic cache</span> 缓存<strong>端到端问答结果</strong>。前者不改变答案逻辑；后者命中则跳过检索与生成，失效策略更严格。</p>
+      </details>
+
+      <h4>S1 高峰场景组合推荐</h4>
+      <p>CorpAssist 周一上午 FAQ 高峰推荐顺序：<strong>semantic-cache → small-model-route（入口类）→ precompute-embed</strong>。改写链（advanced-01）在 cache miss 后启用，避免热路径叠加 LLM 调用。目标：P95 ≤ 2.0s，token 成本较纯 RAG 降 35～45%（见 <code>perf-tactics.md</code> 样例）。</p>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead><tr><th>流量占比</th><th>策略</th><th>预期 P95</th></tr></thead>
+          <tbody>
+            <tr><td>~30% 重复 FAQ</td><td>L2 semantic cache</td><td>&lt; 300ms</td></tr>
+            <tr><td>~15% 入口导航</td><td>small-model-route</td><td>&lt; 800ms</td></tr>
+            <tr><td>其余</td><td>完整 RAG</td><td>&lt; 2.5s</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <details class="learn-faq">
+        <summary>FAQ：成本优化后 faithfulness 略降是否可接受？</summary>
+        <p>不可接受若降幅 &gt; 2% 或影响合规 FAQ。可接受若仅入口类 route 略降且已标注无 citation。一切以 eval 黄金集为准，不以线上「体感」放行。</p>
+        <p>建议为 cache hit / miss 各抽样 50 条做 faithfulness 对比，写入 weekly cost-optimize 报告。</p>
+        <p>报告与 <span class="term" data-term-id="publish-check" tabindex="0">publish check</span> 绑定，未附报告不得开启下一项优化。</p>
+      </details>
     </div>
 
     <div class="section-block chapter-conclusions-block notice">
@@ -153,6 +314,35 @@ for q in hot:
           <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
         </ul>
       </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <ul>
+              <li>semantic cache：键含 query embedding + user scope，防跨部门串答</li>
+              <li>small-model-route：FAQ 类走小模型，复杂/合规问法回退完整 RAG</li>
+              <li>precompute-embed：Python 索引侧预热热门文档向量</li>
+              <li>hot-query 预热：高峰前加载 Top 问法缓存，降 P95 latency</li>
+              <li>收益量化：latency/token 写入 eval，防缓存掩盖召回退化</li>
+            </ul>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist S1 约 30% 重复问法，semantic cache 键应含哪些维度？</li>
+              <li>small-model-route 的两条回退条件是什么，为何不能全量替代 RAG？</li>
+              <li>上线缓存后 context_recall 下降，你如何发现是缓存而非模型问题？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
       <p class="chapter-review-next">下一步：完成 Demo；继续 <a href="#ch-advanced-05-security">RAG 安全</a>。</p>
     </div>
   </div>
@@ -197,7 +387,7 @@ for q in hot:
     <ul>
       <li><strong>上一章</strong>：<a href="#ch-advanced-03-graph-rag">GraphRAG 与知识库治理衔接</a></li>
       <li><strong>下一章</strong>：<a href="#ch-advanced-05-security">RAG 安全</a></li>
-      <li><a href="#ch-advanced-01-query-transform">查询改写</a>：改写链增加 token，与缓存/route 联合决策</li>
+      <li><a href="#ch-advanced-01-query-transform">查询改写与 HyDE</a>：改写链增加 token，与缓存/route 联合决策</li>
       <li><a href="#ch-practice-05-eval-loop">RAG 评测闭环</a>：优化策略需过 release gate</li>
     </ul>
   </div>

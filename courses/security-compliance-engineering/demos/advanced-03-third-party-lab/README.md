@@ -14,7 +14,7 @@
 
 1. 查看 `cloud-a-subs.json`，故意缺失的字段应在报告中列出 `gaps`。
 2. 补全子处理器条目必填字段：`region`、`purpose`、`data_categories`、`dpa_covered`。
-3. 运行 `python vendor_assessment.py`，确认 `"pass": true`。
+3. 运行 `vendor_assessment.py`（见下方验收命令），确认 `"pass": true`。
 
 ## 验收命令
 
