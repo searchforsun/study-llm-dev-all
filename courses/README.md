@@ -58,11 +58,11 @@ node scripts/sync.mjs
 | 脚本 | 用途 |
 |------|------|
 | `scripts/sync.mjs` | `outline-specs.json` → `courses.json` |
-| `scripts/bootstrap-course-from-spec.mjs` | 从 spec 初始化单课目录 |
+| `scripts/bootstrap-course-from-spec.mjs` | 从 spec 初始化单课目录（含 `progress.local.json`） |
 | `scripts/enrich-term-prompts.mjs` | 补全 `course.json` 术语 tip / prompt |
-| `scripts/fix-course-ref-links.mjs` | 批量修复跨课链接 markup |
 | `scripts/serve-courses.mjs` | 托管 `courses/` + `PUT /<slug>/progress.local.json` |
-| `scripts/ensure-course-progress-files.mjs` | 为已有课补齐 `progress.local.json` |
+
+`progress.local.json` 由 bootstrap / `assemble-index` 自动创建；缺文件时对单课执行 assemble 即可。
 
 ## 生成单课（programming-html-tutorial）
 

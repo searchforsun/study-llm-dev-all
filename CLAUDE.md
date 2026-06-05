@@ -78,11 +78,9 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 | Script | Purpose |
 |--------|---------|
 | `sync.mjs` | `outline-specs.json` → `courses.json` (always run after spec edits) |
-| `bootstrap-course-from-spec.mjs` | Initialize a new course directory from spec |
-| `enrich-term-prompts.mjs` | Complete term tip/prompt fields in `course.json` |
-| `fix-course-ref-links.mjs` | Batch-fix cross-course link markup in chapters/welcome |
+| `bootstrap-course-from-spec.mjs` | Initialize a new course directory from spec（含 `progress.local.json`） |
+| `enrich-term-prompts.mjs` | Complete term tip/prompt fields in `course.json`（本仓库 CorpAssist 语境） |
 | `serve-courses.mjs` | Dev server for `courses/` + progress file PUT API |
-| `ensure-course-progress-files.mjs` | Create missing `progress.local.json` per course |
 
 ### Quality gates & authoring (skill is SSOT)
 
