@@ -4,7 +4,7 @@
 
 ## 任务
 
-1. 运行 `python scripts/run_rag_eval.py` 查看 baseline hit_rate
+1. 运行 `scripts/run_rag_eval.py` 查看 baseline hit_rate
 2. 用 AI 完善 `app/rag/pipeline.py`（tenant 过滤、空 chunk 过滤）
 3. 扩充 `evals/rag_golden.jsonl` 至 20 条
 4. 填写 `dev-metrics-template.md` 并对比 AI 辅助前后数据

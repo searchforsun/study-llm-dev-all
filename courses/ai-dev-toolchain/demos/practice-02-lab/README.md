@@ -13,7 +13,7 @@ pip install fastapi pydantic uvicorn ruff
 
 1. 为 `app/rag/router.py` 中**缺少 docstring** 的路由用 AI 补全 Google 风格说明
 2. 为 `RagQueryRequest` 添加 `json_schema_extra.examples`
-3. 运行 `python scripts/export_openapi.py` 导出契约
+3. 运行 `scripts/export_openapi.py` 导出契约（在 shell 中：`python` + 空格 + 该脚本路径）
 4. 与 `contracts/baseline-openapi.json` 做 diff（或更新 baseline 并写 ADR）
 
 ## 验收

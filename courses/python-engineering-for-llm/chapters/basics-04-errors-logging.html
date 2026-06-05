@@ -106,6 +106,24 @@ class ValidationAppError(AppError):
         <summary>先想 10 秒：502 和 500 在 CorpAssist 里应如何区分？</summary>
         <p>502 表示<strong>上游 LLM 网关</strong>可预期失败（超时、不可用），可告警与重试；500 表示本服务未处理好的内部错误，需修代码或配置。</p>
       </details>
+
+      <h4>边界转换函数</h4>
+      <p>在 LLM 调用边界统一捕获 httpx 与 Pydantic 异常，避免业务代码重复 try/except：</p>
+      <div class="code-block"><pre><code class="language-python">import httpx
+from pydantic import ValidationError
+
+def wrap_llm_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except httpx.TimeoutException as exc:
+        raise LlmUpstreamError("gateway timeout", details={"cause": str(exc)}) from exc
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise LlmUpstreamError("rate limited", details={"status": 429}) from exc
+        raise LlmUpstreamError("upstream error", details={"status": exc.response.status_code}) from exc
+    except ValidationError as exc:
+        raise ValidationAppError("invalid response schema", details={"errors": exc.errors()}) from exc</code></pre></div>
+      <p>包装器在 <code>corpassist.core.errors</code> 模块集中维护；FastAPI 路由只抛 AppError 子类，handler 统一序列化。</p>
     </div>
 
     <div class="section-block">
@@ -167,6 +185,22 @@ log.error(
       </table>
 
       <p><span class="term" data-term-id="log-level" tabindex="0">日志级别</span> 由 <code>CORPASSIST_LOG_LEVEL</code> 控制，与 Spring <code>logging.level.*</code> 同级概念。</p>
+
+      <h4>中间件绑定 request_id（FastAPI 预告）</h4>
+      <p>每个 HTTP 请求进入时从 header 读取或生成 <code>request_id</code>，写入 structlog contextvars，请求结束清理：</p>
+      <div class="code-block"><pre><code class="language-python">import uuid
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+        request.state.request_id = rid
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(request_id=rid, service="corpassist-python")
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = rid
+        return response</code></pre></div>
+      <p>与 Spring <code>OncePerRequestFilter</code> 注入 MDC 对称；BFF 必须转发同一 <code>X-Request-Id</code>，否则双栈联查断裂。</p>
     </div>
 
     <div class="section-block">
@@ -290,23 +324,6 @@ service:"corpassist-bff" OR service:"corpassist-python"
           <summary>本章速查卡</summary>
           <div class="learn-cheat-body">
             <table>
-              <thead><tr><th>场景</th><th>动作</th></tr></thead>
-              <tbody>
-                <tr><td>上游 LLM 超时</td><td>LlmUpstreamError + code LLM_UPSTREAM</td></tr>
-                <tr><td>打日志</td><td>structlog + request_id + service</td></tr>
-                <tr><td>配置密钥</td><td>env / Secret，不进镜像</td></tr>
-                <tr><td>联查</td><td>Kibana: service + request_id</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </details>
-      </div>
-
-      <div class="learn-cheat-sheet">
-        <details>
-          <summary>本章速查卡</summary>
-          <div class="learn-cheat-body">
-            <table>
               <thead><tr><th>主题</th><th>记住一句</th></tr></thead>
               <tbody>
                 <tr><td>AppError</td><td>稳定 code + http_status</td></tr>
@@ -338,19 +355,7 @@ service:"corpassist-bff" OR service:"corpassist-python"
               <li>为何 structlog 选 JSON 行而不是纯文本？</li>
               <li>502 响应时，日志里应有哪些字段便于 SRE 告警？</li>
               <li>若 BFF 未转发 X-Request-Id，Python 侧应如何处理？</li>
-            </ol>
-          </div>
-        </details>
-      </div>
-
-      <div class="learn-interview">
-        <details>
-          <summary>答辩 / 面试口述题</summary>
-          <div class="learn-interview-body">
-            <ol>
               <li>502 与 500 在 CorpAssist 双栈错误码表中如何区分？</li>
-              <li>为何 request_id 必须由 BFF 传入而非 Python 重新生成？</li>
-              <li>启动时 ConfigError 与请求时 ValidationAppError 各解决什么问题？</li>
             </ol>
           </div>
         </details>

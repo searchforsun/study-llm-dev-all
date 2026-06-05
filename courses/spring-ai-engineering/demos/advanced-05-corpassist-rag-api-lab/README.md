@@ -4,6 +4,10 @@
 
 勾选 delivery-checklist.md，并对照 rag-response.sample.json
 
+
+## 步骤
+
+1. 按上文说明完成阅读或本地操作。
 ## 验收
 
 - [ ] 完成 README 操作/阅读
