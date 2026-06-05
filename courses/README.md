@@ -50,14 +50,13 @@ npx --yes serve .
 node scripts/sync.mjs
 ```
 
-单课生成流水线（bootstrap → 章节/demo → merge → enrich → assemble）见各课 `README.md`；常驻脚本位于仓库根 **`scripts/`**：
+单课生成流水线（bootstrap → 章节/demo → enrich → assemble；`terms`/`quizzes` 只写在 `course.json`）见各课 `README.md`；常驻脚本位于仓库根 **`scripts/`**：
 
 | 脚本 | 用途 |
 |------|------|
 | `scripts/sync.mjs` | `outline-specs.json` → `courses.json` |
 | `scripts/bootstrap-course-from-spec.mjs` | 从 spec 初始化单课目录 |
-| `scripts/merge-course-manifests.mjs` | 合并 manifest-*.json → course.json |
-| `scripts/enrich-term-prompts.mjs` | 补全术语 tip / prompt |
+| `scripts/enrich-term-prompts.mjs` | 补全 `course.json` 术语 tip / prompt |
 | `scripts/fix-course-ref-links.mjs` | 批量修复跨课链接 markup |
 
 ## 生成单课（programming-html-tutorial）

@@ -65,10 +65,9 @@ Each course lives in `courses/<slug>/` with this layout:
 Course content is generated with the `programming-html-tutorial` skill (a Claude Code skill). The pipeline:
 
 1. **Bootstrap**: `node scripts/bootstrap-course-from-spec.mjs <slug>` creates directory + `course.json` from `outline-specs.json`
-2. **Chapter generation**: Write individual `chapters/<id>.html` files via the `programming-html-tutorial` skill or direct Claude generation. Each is a `<section>` fragment with structured sections: intro, body, conclusions, review checklist, cheat sheet, interview Q&A, practice steps, quiz judgment, demos.
-3. **Merge**: `node scripts/merge-course-manifests.mjs` merges multiple `manifest-*.json` into `course.json`
-4. **Enrich**: `node scripts/enrich-term-prompts.mjs` adds term tips/prompts
-5. **Assemble**: The `programming-html-tutorial` skill's `assemble` command stitches `chapters/*.html` + `welcome.partial.html` + `quiz.partial.html` + `theme.css` → `index.html`
+2. **Chapter generation**: Write individual `chapters/<id>.html` files via the `programming-html-tutorial` skill or direct Claude generation. Each is a `<section>` fragment with structured sections: intro, body, conclusions, review checklist, cheat sheet, interview Q&A, practice steps, quiz judgment, demos. **术语与测验**直接写入 `course.json` 的 `terms` / `quizzes`（勿使用 `manifest-*.json`）。
+3. **Enrich**: `node scripts/enrich-term-prompts.mjs` adds term tips/prompts
+4. **Assemble**: The `programming-html-tutorial` skill's `assemble` command stitches `chapters/*.html` + `welcome.partial.html` + `quiz.partial.html` + `theme.css` → `index.html`
 
 **Never hand-edit `index.html` directly** — it's an assembly output. Edit the source fragments instead.
 
@@ -80,8 +79,7 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 |--------|---------|
 | `sync.mjs` | `outline-specs.json` → `courses.json` (always run after spec edits) |
 | `bootstrap-course-from-spec.mjs` | Initialize a new course directory from spec |
-| `merge-course-manifests.mjs` | Merge incremental manifest files into `course.json` |
-| `enrich-term-prompts.mjs` | Complete term tip/prompt fields |
+| `enrich-term-prompts.mjs` | Complete term tip/prompt fields in `course.json` |
 | `fix-course-ref-links.mjs` | Batch-fix cross-course link markup in chapters/welcome |
 
 ### Quality gates & authoring (skill is SSOT)

@@ -185,13 +185,4 @@ const course = JSON.parse(fs.readFileSync(coursePath, 'utf8'));
 const { added, skipped } = enrichTerms(course.terms ?? {}, course);
 fs.writeFileSync(coursePath, JSON.stringify(course, null, 2) + '\n', 'utf8');
 
-for (const name of fs.readdirSync(courseDir)) {
-  if (!name.startsWith('manifest-') || !name.endsWith('.json')) continue;
-  const mPath = path.join(courseDir, name);
-  const manifest = JSON.parse(fs.readFileSync(mPath, 'utf8'));
-  if (!manifest.terms) continue;
-  enrichTerms(manifest.terms, course);
-  fs.writeFileSync(mPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
-}
-
 console.log(`${slug}: added/updated ${added} prompts, skipped ${skipped} (min ${MIN_CHARS} chars)`);
