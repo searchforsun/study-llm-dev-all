@@ -1,4 +1,4 @@
-# CorpAssist 非流式 Chat Completions（OpenAI 兼容）
+﻿# CorpAssist 非流式 Chat Completions（OpenAI 兼容）
 $ErrorActionPreference = "Stop"
 $base = $env:CORPASSIST_LLM_BASE_URL
 $key = $env:CORPASSIST_LLM_KEY
@@ -14,7 +14,7 @@ $body = @{
     @{ role = "user"; content = "用一句话解释 RAG。" }
   )
 } | ConvertTo-Json -Depth 5
-$uri = "$base.TrimEnd('/')/chat/completions"
+$uri = "$($base.TrimEnd('/'))/chat/completions"
 Invoke-RestMethod -Uri $uri -Method Post `
   -Headers @{ Authorization = "Bearer $key"; "Content-Type" = "application/json" } `
   -Body $body

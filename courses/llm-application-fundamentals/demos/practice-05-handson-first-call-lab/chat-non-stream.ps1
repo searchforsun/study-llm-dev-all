@@ -1,4 +1,4 @@
-# CorpAssist 非流式 Chat Completions（OpenAI 兼容）
+﻿# CorpAssist 非流式 Chat Completions（OpenAI 兼容）
 $ErrorActionPreference = "Stop"
 $base = $env:CORPASSIST_LLM_BASE_URL
 $key = $env:CORPASSIST_LLM_KEY

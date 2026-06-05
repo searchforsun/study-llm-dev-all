@@ -11,14 +11,18 @@
 
 ```powershell
 cd demos/practice-05-docker-lab
-docker compose up --build
+docker compose up --build -d
+docker compose ps          # 等待 STATUS 为 healthy
 ```
 
-另开终端：
+另开终端（PowerShell）：
 
 ```powershell
-curl -s http://localhost:8000/health
+Invoke-RestMethod http://localhost:8000/health
+# 或 curl.exe -s http://localhost:8000/health
 ```
+
+> build context 为课程根目录（`../..`），与正文 compose 示例一致；healthcheck 使用 Python `urllib`（slim 镜像无 curl）。
 
 ## 验收
 

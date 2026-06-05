@@ -22,7 +22,11 @@
 
 1. 填写 `data-classification-worksheet.md` 中 S1、S2 两行。
 2. 阅读 `egress-policy.example.yaml`，说明 L4 请求在配置中如何被 `deny`。
-3. 运行 `python log-redaction.example.py`，确认控制台输出无完整手机号。
+3. 运行 `log-redaction.example.py`，确认控制台输出无完整手机号。
+
+```bash
+python log-redaction.example.py
+```
 4. 在 `procurement-checklist.md` 中为通义或 DeepSeek 勾选 ≥6 项并注明证据。
 
 ## 验收

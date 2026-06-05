@@ -1,4 +1,4 @@
-# CorpAssist 流式 SSE（curl 更直观；此处用 curl 若已安装）
+﻿# CorpAssist 流式 SSE（curl 更直观；此处用 curl 若已安装）
 $ErrorActionPreference = "Stop"
 $base = $env:CORPASSIST_LLM_BASE_URL
 $key = $env:CORPASSIST_LLM_KEY
@@ -13,7 +13,7 @@ $json = (@{
     @{ role = "user"; content = "用三句话介绍 CorpAssist 知识库模块。" }
   )
 } | ConvertTo-Json -Compress)
-$uri = "$base.TrimEnd('/')/chat/completions"
+$uri = "$($base.TrimEnd('/'))/chat/completions"
 if (Get-Command curl -ErrorAction SilentlyContinue) {
   curl.exe -N $uri `
     -H "Authorization: Bearer $key" `

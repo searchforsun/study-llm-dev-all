@@ -1,4 +1,4 @@
-# CorpAssist 流式 SSE（需 curl.exe；Windows 10+ 自带）
+﻿# CorpAssist 流式 SSE（需 curl.exe；Windows 10+ 自带）
 $ErrorActionPreference = "Stop"
 $base = $env:CORPASSIST_LLM_BASE_URL
 $key = $env:CORPASSIST_LLM_KEY

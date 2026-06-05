@@ -134,6 +134,130 @@ const COURSE_CONTEXT = {
   },
 };
 
+/** llm-application-fundamentals：按 termId 定制 tip / prompt，避免全课同一模板 */
+const LLM_APPLICATION_TERM_HINTS = {
+  token: {
+    tip: '商用 API 按 Token 计费；输入+输出均计入账单，制度 RAG 场景输入常占 80% 以上。',
+    example: 'CorpAssist 单次制度问答 prompt 3180 + completion 412 Token 的 estimate_cost.py 估算',
+    stackNote: '说明 llm-gateway 统一落库 usage 字段，Python httpx 与 Spring ChatClient 如何读到同一计量',
+    pitfalls: '用汉字个数估费、只估输出忽略检索片段、Agent 工具 schema 未计入预算',
+  },
+  'context-window': {
+    tip: '单次请求可处理的 Token 上限；多轮客服触顶后须截断或摘要，system 指令优先保留。',
+    example: 'CorpAssist 客服 32K 窗口：system 保留 → RAG 片段裁剪 → 历史从新到旧填充',
+    stackNote: '说明编排层 messages 组装与 tiktoken 计数在 Python/Spring 两侧如何对齐截断策略',
+    pitfalls: '静默截断丢关键约束、200 页 PDF 全量进 prompt、未设 max_tokens 上限',
+  },
+  hallucination: {
+    tip: '模型生成看似合理但事实错误的内容；制度问答须 RAG 引用与拒答，不能单靠生成。',
+    example: 'CorpAssist 制度问答无检索命中时应拒答，而非编造年假天数',
+    stackNote: '说明 citation prompt 与 golden set 评测如何在双栈共用同一拒答阈值',
+    pitfalls: '无检索仍强行回答、引用条文 ID 未校验、评测集不覆盖边界问题',
+  },
+  temperature: {
+    tip: '控制采样随机性；客服/制度问答宜低温度，营销创意可略高。',
+    example: 'CorpAssist 客服 temperature=0.2 vs 营销草稿 temperature=0.7 的参数对照表',
+    stackNote: '说明 Spring AI ChatOptions 与 Python 请求体 temperature 字段如何版本化',
+    pitfalls: '制度场景温度过高导致措辞漂移、以为调温度能降 Token 费用',
+  },
+  rag: {
+    tip: '检索增强生成：先查向量库/关键词再生成，带引用溯源；S1 知识库首选方案。',
+    example: 'CorpAssist S1：混合检索 4 条 chunk → 拼装 prompt → 回答附制度条文 ID',
+    stackNote: '说明 Python rag-service 检索 API 与 Spring QuestionAnswerAdvisor 如何共用索引',
+    pitfalls: '脏 PDF 不清洗、检索层无 ACL、纯向量忽略 BM25、无评测就换 Embedding',
+  },
+  agent: {
+    tip: '多步规划+工具调用循环；适合 S3 办公自动化，与 S2 客服「单轮意图」架构不同。',
+    example: 'CorpAssist S3：审批→查库存→发邮件的多步 Agent，须设 max-steps 与工具白名单',
+    stackNote: '说明 Python LangGraph 与 Spring AI Tool 调用在网关侧的步数预算与审计',
+    pitfalls: '无步数预算死循环、工具假执行、记忆无限堆积淹没上下文',
+  },
+  'prompt-engineering': {
+    tip: '可版本化的 system/user 模板；制度话术、引用格式、拒答策略应入库而非硬编码。',
+    example: 'CorpAssist citation prompt v3：要求每条结论附 chunk_id',
+    stackNote: '说明 Spring PromptTemplate 与 Python Jinja 模板如何共用 prompt_version 标签',
+    pitfalls: '只改 user 不改 system、Few-shot 示例过时、无注入防护',
+  },
+  transformer: {
+    tip: '应用层只需理解 Attention「关注上下文」直觉，无需推导公式；选型看窗口与工具能力。',
+    example: 'CorpAssist 选型时看 128K 窗口、function calling、中文政策表述而非参数量',
+    stackNote: '说明应用岗与算法岗职责边界：编排/数据/评测 vs 预训练/CUDA',
+    pitfalls: '误投算法岗面试、用 Transformer 公式代替工程分层讨论',
+  },
+  streaming: {
+    tip: 'SSE 流式返回 delta；BFF 须禁用缓冲，用户感知 TTFT 显著优于非流式。',
+    example: 'CorpAssist BFF curl -N 透传 data: [DONE] 与网关 usage 尾包',
+    stackNote: '说明 Spring WebFlux SSE 与 Python StreamingResponse 如何共用同一 OpenAI 兼容契约',
+    pitfalls: '网关缓冲导致假流式、断线重试重复计费、未解析 delta 拼接',
+  },
+  'fine-tuning': {
+    tip: '领域 SFT/LoRA；CorpAssist 制度问答通常 RAG 优先，微调需评测门禁与合规审批。',
+    example: 'CorpAssist：先 120 条 golden set 评测，未达标不启动 LoRA',
+    stackNote: '说明该 RAG 却微调的决策树在 Python 实验与 Spring 生产路由中的位置',
+    pitfalls: '无评测就微调、语料含 PII 未清洗、微调后未回归 RAG 引用率',
+  },
+  embedding: {
+    tip: '文本转向量用于检索；变更模型须全量 re-embed 并锁 index_version。',
+    example: 'CorpAssist doc-ingest：bge-m3 Embedding → Milvus，与对话模型可不同厂商',
+    stackNote: '说明 Python 索引流水线与 Spring VectorStore 如何共用 embedding_model 版本标签',
+    pitfalls: 'Embedding 与对话不同域混用、索引变更未 re-embed、无 ACL 过滤',
+  },
+  'openai-compatible': {
+    tip: 'POST /chat/completions 等路径与字段；双栈共用 llm-gateway base_url。',
+    example: 'CorpAssist：curl / Python httpx / Spring ChatClient 三端对齐同一网关',
+    stackNote: '说明 CORPASSIST_LLM_BASE_URL 环境变量在 demo 与 Spring application.yml 的对应关系',
+    pitfalls: '业务服务直连厂商 Key、流式字段厂商差异未适配、429 无退避',
+  },
+  s1: {
+    tip: '面试 TOP1：企业知识库 RAG，带引用溯源；落地课 scenario-enterprise-rag-kb。',
+    example: 'CorpAssist 5000 员工 HR/采购制度问答，引用准确率与 P95 为核心指标',
+    stackNote: '说明 rag-system-engineering 能力课与场景课的分工及双栈交付物',
+    pitfalls: '脏 PDF 解析缺失、ACL 未在检索层过滤、无 citation 监控',
+  },
+  s2: {
+    tip: '智能客服：多轮意图、工具查单、人工转接；常消费 S1 检索结果。',
+    example: 'CorpAssist 客服：意图路由 → 可选 RAG → 工具 1～2 次 → 转人工降级',
+    stackNote: '说明 DST 规则+模型双校验在 Spring BFF 与 Python Agent 的协作边界',
+    pitfalls: '纯 LLM 管状态改单、高 QPS 无缓存路由、截图未分级调贵视觉模型',
+  },
+  s3: {
+    tip: 'Agent 办公自动化：多步规划与工具链；比 S2 审计粒度更细。',
+    example: 'CorpAssist 审批+邮件+工单：ReAct 循环 + 步数预算 + 人工审批节点',
+    stackNote: '说明 agent-orchestration-engineering 与 Spring AI Alibaba Graph 的对照',
+    pitfalls: '规划超 3 步无观察循环、工具返回过长淹没上下文、无降级',
+  },
+  s4: {
+    tip: '代码助手：代码库 RAG + 低延迟补全；代码不出内网。',
+    example: 'CorpAssist 内部 Spring 模板与 SQL 规范问答，P95 与 LSP 验证闭环',
+    stackNote: '说明 scenario-enterprise-code-assistant 与 llm-serving 延迟优化的衔接',
+    pitfalls: '整库塞 prompt、FIM 格式错误、私有代码未分级出网',
+  },
+  s5: {
+    tip: '内容生成工坊：风格模板、审核流水线、品牌安全。',
+    example: 'CorpAssist 营销文案：模板变量 + 审核 API + 千人千面个性化',
+    stackNote: '说明 production-prompt-engineering 与多模态路由在 S5 场景中的位置',
+    pitfalls: '营销过度承诺未接库存 API、缺内容安全审核、私域记忆无分层',
+  },
+  'model-selection': {
+    tip: '能力/价格/合规三维矩阵；L3/L4 数据决定私有化或专有云路由。',
+    example: 'CorpAssist L3 制度问答走私有化 Qwen，L2 营销草稿可走公有云',
+    stackNote: '说明 llm-routing.example.yaml 中 dataClass 路由在网关的配置方式',
+    pitfalls: '只看榜单不看合规、L4 仍出公网、Embedding 与对话不同域',
+  },
+  'data-privacy': {
+    tip: 'L1～L4 数据分级、出网路由、日志脱敏、采购检查项。',
+    example: 'CorpAssist L4 财务附件 deny 公网，日志中手机号掩码为 [PHONE]',
+    stackNote: '说明 egress-policy.example.yaml 与 log-redaction.example.py 在双栈审计中的位置',
+    pitfalls: 'PII 进 Jaeger、评测集黄金答案明文落日志、采购合同未核数据驻留',
+  },
+  'api-contracts': {
+    tip: 'BFF→llm-gateway→厂商；流式 SSE、错误码 429 退避、usage 落库。',
+    example: 'CorpAssist BFF 鉴权 SSE 透传，网关统一 Bearer Key 与 requestId 审计',
+    stackNote: '说明 OpenAPI 契约与 practice-05 双栈首次调用实验的验收路径',
+    pitfalls: 'BFF 持厂商 Key、400/429 重试策略错误、流式中断未处理计费',
+  },
+};
+
 /** 按 course.json terms.tip 前缀（章主题）定制 prompt，减少全课同一模板感 */
 const CONTEXT_MEMORY_CHAPTER_HINTS = {
   '上下文组成与窗口预算': {
@@ -291,11 +415,13 @@ function buildTermPrompt(termId, term, course) {
   const tipClause = tip ? `简要背景：${tip}。` : '';
   const chapterKey = chapterKeyFromTip(term.tip);
   const hint =
-    slug === 'context-memory-engineering' && chapterKey
-      ? CONTEXT_MEMORY_CHAPTER_HINTS[chapterKey]
-      : slug === 'python-engineering-for-llm' && chapterKey
-        ? PYTHON_ENGINEERING_CHAPTER_HINTS[chapterKey]
-        : null;
+    slug === 'llm-application-fundamentals' && LLM_APPLICATION_TERM_HINTS[termId]
+      ? LLM_APPLICATION_TERM_HINTS[termId]
+      : slug === 'context-memory-engineering' && chapterKey
+        ? CONTEXT_MEMORY_CHAPTER_HINTS[chapterKey]
+        : slug === 'python-engineering-for-llm' && chapterKey
+          ? PYTHON_ENGINEERING_CHAPTER_HINTS[chapterKey]
+          : null;
   const stackNote = hint?.stackNote ?? ctx.stackNote;
   const pitfalls = hint?.pitfalls ?? ctx.pitfalls;
   const exampleClause = hint?.example
@@ -313,6 +439,13 @@ function enrichTermEntry(termId, term, course) {
   let tipFixed = false;
   if (slug === 'python-engineering-for-llm') {
     tipFixed = maybeFixPythonPlaceholderTip(term);
+  }
+  if (slug === 'llm-application-fundamentals' && LLM_APPLICATION_TERM_HINTS[termId]?.tip) {
+    const want = LLM_APPLICATION_TERM_HINTS[termId].tip;
+    if (term.tip !== want) {
+      term.tip = want;
+      tipFixed = true;
+    }
   }
   const existing = term.prompt?.trim() ?? '';
   if (existing.length >= MIN_CHARS && !force && !tipFixed) return false;
