@@ -5,6 +5,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { ensureCourseProgressFile } from '../.cursor/skills/programming-html-tutorial/scripts/lib/progress-file.mjs';
 
 const coursesRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'courses');
 const slug = process.argv[2];
@@ -79,6 +80,8 @@ fs.writeFileSync(
   JSON.stringify(courseJson, null, 2) + '\n',
   'utf8'
 );
+
+ensureCourseProgressFile(courseDir, slug);
 
 const accent = { light: '#2e7d32', dark: '#81c784' };
 fs.writeFileSync(
@@ -170,7 +173,7 @@ fs.writeFileSync(
 
 fs.writeFileSync(
   path.join(courseDir, 'README.md'),
-  `# ${entry.title}\n\n\`\`\`bash\ncd courses\nnpx serve .\n# 打开 http://localhost:3000/${slug}/\n\`\`\`\n\n源文件：\`chapters/*.html\` → assemble → \`index.html\`\n`,
+  `# ${entry.title}\n\n\`\`\`bash\n# 仓库根目录\nnode scripts/serve-courses.mjs\n# 打开 http://localhost:3000/${slug}/\n\`\`\`\n\n进度文件：\`progress.local.json\`（bootstrap 时创建，学习时自动更新）\n\n源文件：\`chapters/*.html\` → assemble → \`index.html\`\n`,
   'utf8'
 );
 

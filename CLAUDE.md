@@ -11,17 +11,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **33-course interactive HTML tutorial site** for LLM application development, built as a dual-track curriculum: Python and Spring AI (Java). All courses orbit a unified case study called **CorpAssist** (enterprise intelligent assistant). Target audience: engineers with 3–5 years of Java distributed/microservices experience transitioning to LLM app development.
 
-The site is purely **static HTML + JS + CSS** — no framework, no build step. It's served with `npx serve .` from `courses/`.
+The site is purely **static HTML + JS + CSS** — no framework, no build step. Local dev uses **`node scripts/serve-courses.mjs`** from the repo root (static + `PUT /<slug>/progress.local.json`).
 
 ## Run it
 
 ```bash
-cd courses
-npx --yes serve .
-# Opens at http://localhost:3000 → course portal
+# repo root
+node scripts/serve-courses.mjs
+# http://localhost:3000 → course portal
 ```
 
-**Must serve from `courses/`** — the portal `fetch`es `courses.json` and the index loader uses a relative base path (`./`).
+**Do not** use plain `npx serve` if you want progress auto-written to `courses/<slug>/progress.local.json` (PUT unsupported). Portal still `fetch`es `courses.json` under `courses/`.
 
 ## Architecture
 
@@ -81,6 +81,8 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 | `bootstrap-course-from-spec.mjs` | Initialize a new course directory from spec |
 | `enrich-term-prompts.mjs` | Complete term tip/prompt fields in `course.json` |
 | `fix-course-ref-links.mjs` | Batch-fix cross-course link markup in chapters/welcome |
+| `serve-courses.mjs` | Dev server for `courses/` + progress file PUT API |
+| `ensure-course-progress-files.mjs` | Create missing `progress.local.json` per course |
 
 ### Quality gates & authoring (skill is SSOT)
 

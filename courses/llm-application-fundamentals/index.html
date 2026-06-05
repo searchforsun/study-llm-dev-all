@@ -13251,7 +13251,7 @@ gates:
         "advanced": "多模态入门、国产化选型、面试高频架构题"
       }
     },
-    "shellVersion": "2.10.3"
+    "shellVersion": "2.10.6"
   },
   "outline": [
     {
@@ -14494,6 +14494,16 @@ gates:
   const courseDataEl = document.getElementById('course-data');
   window.COURSE_DATA = JSON.parse(courseDataEl.textContent);
   const slug = COURSE_DATA.meta.slug;
+  const PROGRESS_SYNC_CFG = Object.assign(
+    {
+      enabled: true,
+      intervalMs: 60000,
+      debounceMs: 3000,
+      defaultFileName: 'progress.local.json',
+    },
+    {"enabled":true,"intervalMs":60000,"debounceMs":3000,"defaultFileName":"progress.local.json","loadOnStart":true,"importWritesFile":true},
+    COURSE_DATA.meta.progressAutoSync || {}
+  );
   const KEY_DONE = slug + '_completed';
   const KEY_VISITED = slug + '_visited';
   const KEY_THEME = slug + '_theme';
@@ -14503,6 +14513,11 @@ gates:
   const KEY_SCROLL = slug + '_scroll';
   const KEY_CHAPTER_TOC_OPEN = slug + '_chapter_toc_open';
   var PROGRESS_STORAGE_RESERVED = [KEY_DONE, KEY_VISITED, KEY_SCROLL, KEY_CHAPTER_TOC_OPEN];
+  var KEY_PROGRESS_SYNC_AT = slug + '_progress_sync_at';
+  var courseProgressApiActive = false;
+  var progressSyncTimer = null;
+  var progressSyncDebounceTimer = null;
+  var progressSyncPaused = false;
   var markCompleteHintShown = {};
   var chapterTocObserver = null;
   var chapterTocTopObserver = null;
@@ -14594,15 +14609,24 @@ gates:
       try {
         sessionStorage.setItem(key, value);
       } catch (e2) { /* ignore */ }
+      scheduleProgressFileSyncDebounced(key);
       return true;
     } catch (e) {
       try {
         sessionStorage.setItem(key, value);
+        scheduleProgressFileSyncDebounced(key);
         return true;
       } catch (e3) {
         return false;
       }
     }
+  }
+
+  function isProgressSyncKey(key) {
+    if (!key) return false;
+    if (key === GLOBAL_THEME_KEY || key === GLOBAL_UI_STYLE_KEY) return true;
+    if (key.indexOf(slug + '_') !== 0) return false;
+    return PROGRESS_STORAGE_RESERVED.indexOf(key) < 0 || key === KEY_DONE || key === KEY_VISITED;
   }
 
   function syncUiStyleMenu(style) {
@@ -15816,17 +15840,43 @@ gates:
     rerenderActiveMermaid();
   }
 
-  function exportProgress() {
-    const data = {
+  function buildProgressPayload() {
+    return {
       courseId: slug,
       exportedAt: new Date().toISOString(),
       completedChapters: getCompleted(),
       visitedChapters: getVisited(),
       storage: collectExtraStorage(),
       theme: document.documentElement.getAttribute('data-theme'),
-      uiStyle: document.documentElement.getAttribute('data-ui-style')
+      uiStyle: document.documentElement.getAttribute('data-ui-style'),
     };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  }
+
+  function applyProgressPayload(data, options) {
+    options = options || {};
+    if (!data || typeof data !== 'object') return false;
+    progressSyncPaused = true;
+    try {
+      if (data.completedChapters) setCompleted(data.completedChapters);
+      if (data.visitedChapters) setVisited(data.visitedChapters);
+      if (data.storage) applyExtraStorage(data.storage);
+      if (data.theme) applyTheme(data.theme);
+      if (data.uiStyle) applyUiStyle(data.uiStyle);
+      syncAllProgressUI();
+      return true;
+    } finally {
+      progressSyncPaused = false;
+      if (!options.skipFileSync) {
+        if (options.forceFileSync) writeProgressToStorageFile();
+        else scheduleProgressFileSyncDebounced('import');
+      }
+    }
+  }
+
+  function exportProgress() {
+    const blob = new Blob([JSON.stringify(buildProgressPayload(), null, 2)], {
+      type: 'application/json',
+    });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'progress.json';
@@ -15838,18 +15888,128 @@ gates:
     reader.onload = function () {
       try {
         const data = JSON.parse(reader.result);
-        if (data.completedChapters) setCompleted(data.completedChapters);
-        if (data.visitedChapters) setVisited(data.visitedChapters);
-        if (data.storage) applyExtraStorage(data.storage);
-        if (data.theme) applyTheme(data.theme);
-        if (data.uiStyle) applyUiStyle(data.uiStyle);
-        syncAllProgressUI();
-        alert('进度已导入');
+        if (applyProgressPayload(data, { forceFileSync: true })) {
+          alert('进度已导入');
+        }
       } catch (err) {
         alert('导入失败：JSON 格式无效');
       }
     };
     reader.readAsText(file);
+  }
+
+  function suggestedProgressFileName() {
+    return (
+      (COURSE_DATA.meta && COURSE_DATA.meta.progressFileName) ||
+      PROGRESS_SYNC_CFG.defaultFileName ||
+      'progress.local.json'
+    );
+  }
+
+  function courseProgressFileUrl() {
+    return suggestedProgressFileName();
+  }
+
+  function detectCourseProgressApi() {
+    return fetch('.well-known/html-tutorial-progress', { method: 'HEAD' })
+      .then(function (r) {
+        courseProgressApiActive = r.ok;
+        return courseProgressApiActive;
+      })
+      .catch(function () {
+        courseProgressApiActive = false;
+        return false;
+      });
+  }
+
+  function loadProgressFromCourseFile() {
+    return fetch(courseProgressFileUrl())
+      .then(function (r) {
+        if (!r.ok) return null;
+        return r.json();
+      })
+      .catch(function () {
+        return null;
+      });
+  }
+
+  function mergeProgressOnStart(data) {
+    if (!data || PROGRESS_SYNC_CFG.loadOnStart === false) return Promise.resolve(false);
+    var fileAt = data.exportedAt || '';
+    var localAt = storageGet(KEY_PROGRESS_SYNC_AT) || '';
+    if (!localAt || fileAt >= localAt) {
+      return Promise.resolve(applyProgressPayload(data, { skipFileSync: true }));
+    }
+    return writeProgressToStorageFile();
+  }
+
+  function writeProgressToStorageFile() {
+    if (progressSyncPaused || PROGRESS_SYNC_CFG.enabled === false || !courseProgressApiActive) {
+      return Promise.resolve(false);
+    }
+    return fetch(courseProgressFileUrl(), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildProgressPayload(), null, 2),
+    })
+      .then(function (r) {
+        if (!r.ok) return false;
+        storageSet(KEY_PROGRESS_SYNC_AT, new Date().toISOString());
+        return true;
+      })
+      .catch(function (err) {
+        console.warn('course progress PUT failed', err);
+        return false;
+      });
+  }
+
+  function canAutoSyncProgress() {
+    return courseProgressApiActive;
+  }
+
+  function scheduleProgressFileSyncDebounced(key) {
+    if (progressSyncPaused || !PROGRESS_SYNC_CFG.enabled || !canAutoSyncProgress()) return;
+    if (key === KEY_PROGRESS_SYNC_AT) return;
+    if (key && key !== 'import' && !isProgressSyncKey(key)) return;
+    clearTimeout(progressSyncDebounceTimer);
+    progressSyncDebounceTimer = setTimeout(function () {
+      writeProgressToStorageFile();
+    }, PROGRESS_SYNC_CFG.debounceMs || 3000);
+  }
+
+  function startProgressFileIntervalSync() {
+    clearInterval(progressSyncTimer);
+    if (PROGRESS_SYNC_CFG.enabled === false || !canAutoSyncProgress()) return;
+    var ms = PROGRESS_SYNC_CFG.intervalMs || 60000;
+    if (ms < 5000) ms = 5000;
+    progressSyncTimer = setInterval(function () {
+      writeProgressToStorageFile();
+    }, ms);
+  }
+
+  function initProgressFileSync() {
+    return detectCourseProgressApi()
+      .then(function () {
+        var chain = Promise.resolve();
+        if (PROGRESS_SYNC_CFG.loadOnStart !== false) {
+          chain = loadProgressFromCourseFile().then(mergeProgressOnStart);
+        }
+        return chain.then(function () {
+          if (!courseProgressApiActive) return;
+          startProgressFileIntervalSync();
+          return writeProgressToStorageFile();
+        });
+      })
+      .catch(function (err) {
+        console.warn('init progress sync failed', err);
+      });
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') writeProgressToStorageFile();
+    });
+    window.addEventListener('pagehide', function () {
+      writeProgressToStorageFile();
+    });
   }
 
   function closeTermModal() {
@@ -16213,6 +16373,7 @@ gates:
     initMermaid();
     highlightIn(document);
     syncAllProgressUI();
+    initProgressFileSync();
     var hashId = chapterIdFromHash(location.hash);
     var lastScroll = storageGet(KEY_SCROLL);
     if (hashId && document.getElementById('ch-' + hashId)) {
@@ -16236,7 +16397,6 @@ gates:
   document.getElementById('import-progress').addEventListener('change', function (e) {
     if (e.target.files[0]) importProgress(e.target.files[0]);
   });
-
   window.toggleComplete = toggleComplete;
   window.afterChapterInserted = function (sectionEl) {
     highlightIn(sectionEl);
