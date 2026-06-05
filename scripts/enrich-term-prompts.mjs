@@ -209,8 +209,74 @@ const CONTEXT_MEMORY_CHAPTER_HINTS = {
 };
 
 function chapterKeyFromTip(tip) {
+  const placeholder = (tip ?? '').match(/^(.+) 相关术语：/);
+  if (placeholder) return placeholder[1];
   const m = (tip ?? '').match(/^([^：]+)：/);
   return m?.[1] ?? null;
+}
+
+/** python-engineering-for-llm：按章主题定制 prompt/tip，替换「{章} 相关术语：{slug}」占位 */
+const PYTHON_ENGINEERING_CHAPTER_HINTS = {
+  'asyncio 与并发': {
+    example: 'CorpAssist 流式 RAG 与 LLM Semaphore 并发限制',
+    stackNote: '说明 async 路由、SSE 与 httpx AsyncClient lifespan 如何配合',
+    pitfalls: 'async 路由里阻塞 IO、Semaphore 每请求新建、SSE Content-Type 写错',
+  },
+  '测试策略': {
+    example: 'pytest + ASGITransport 测 /health，MockTransport 模拟 LLM',
+    stackNote: '说明 CI 零外网、OpenAPI 快照与 Java 消费方契约对齐',
+    pitfalls: '测试直连真实 LLM、dependency_overrides 未清理导致 flaky',
+  },
+  '中间件、鉴权与 CORS': {
+    example: 'API Key/JWT 校验与 X-Request-Id 中间件贯穿 Spring MDC',
+    stackNote: '说明 /health 探针与 /v1/rag/query 鉴权分层、生产 CORS 由 BFF 处理',
+    pitfalls: 'JWT 只 decode 不验签、504 与上游 timeout 混淆、固定 demo-id 非 UUID',
+  },
+  '容器化与本地 compose': {
+    example: '多阶段 Dockerfile + compose 联调 Spring BFF',
+    stackNote: '说明 non-root、healthcheck 与 uv sync 在镜像构建中的位置',
+    pitfalls: '密钥 bake 进镜像、root 运行、healthcheck 探测业务路由',
+  },
+  '性能与资源': {
+    example: 'cProfile 定位热点、Embedding 批处理降 RPC',
+    stackNote: '说明 httpx 连接池 Limits 与索引任务内存驻留策略',
+    pitfalls: '未 profiling 就加缓存、连接池每请求新建、批大小无上限 OOM',
+  },
+  '后台任务与队列': {
+    example: 'Spring 触发 RAG 索引，Python 返回 202 + ARQ/Celery 选型',
+    stackNote: '说明 doc_set_version 幂等键与 MQ 桥接 Spring 事件',
+    pitfalls: '长任务放 sync 路由、无 pending→succeeded 状态、重复投递重复索引',
+  },
+  '打包、版本与发布': {
+    example: 'semver 发版、uv publish 内部 PyPI、CI lock 校验',
+    stackNote: '说明 pyproject version 与 Docker tag、openapi info.version 三处一致',
+    pitfalls: '破坏性变更只 bump MINOR、lock 未提交、CHANGELOG 与 tag 不同步',
+  },
+  '实战：CorpAssist Python 服务 API': {
+    example: 'OpenAPI 导出 + schema diff + 交付检查单 handoff',
+    stackNote: '说明 practice /v1/rag/query 与交付 /api/v1/rag/search 的路径演进',
+    pitfalls: '契约未双签、集成测试未覆盖 422/502、version 三处不一致',
+  },
+  '双栈协作规范': {
+    example: '错误码表、snake_case DTO 与联调冒烟清单',
+    stackNote: '说明 Python JSON 日志 code 字段与 Java ProblemDetail 映射',
+    pitfalls: '错误码不对齐、DTO 命名混用、联调路径与 OpenAPI 定稿不一致',
+  },
+};
+
+const PLACEHOLDER_TIP_RE = /^(.+) 相关术语：.+$/;
+
+function maybeFixPythonPlaceholderTip(term) {
+  if (!PLACEHOLDER_TIP_RE.test(term.tip ?? '')) return false;
+  const chapterKey = chapterKeyFromTip(term.tip);
+  const label = term.label ?? '';
+  const hint = PYTHON_ENGINEERING_CHAPTER_HINTS[chapterKey];
+  if (hint) {
+    term.tip = `「${label}」— ${hint.example}（${chapterKey}）。`;
+  } else {
+    term.tip = `「${label}」在 CorpAssist Python 服务「${chapterKey}」中的工程要点。`;
+  }
+  return true;
 }
 
 function buildTermPrompt(termId, term, course) {
@@ -227,7 +293,9 @@ function buildTermPrompt(termId, term, course) {
   const hint =
     slug === 'context-memory-engineering' && chapterKey
       ? CONTEXT_MEMORY_CHAPTER_HINTS[chapterKey]
-      : null;
+      : slug === 'python-engineering-for-llm' && chapterKey
+        ? PYTHON_ENGINEERING_CHAPTER_HINTS[chapterKey]
+        : null;
   const stackNote = hint?.stackNote ?? ctx.stackNote;
   const pitfalls = hint?.pitfalls ?? ctx.pitfalls;
   const exampleClause = hint?.example
@@ -242,8 +310,12 @@ function buildTermPrompt(termId, term, course) {
 
 function enrichTermEntry(termId, term, course) {
   if (!term || typeof term !== 'object') return false;
+  let tipFixed = false;
+  if (slug === 'python-engineering-for-llm') {
+    tipFixed = maybeFixPythonPlaceholderTip(term);
+  }
   const existing = term.prompt?.trim() ?? '';
-  if (existing.length >= MIN_CHARS && !force) return false;
+  if (existing.length >= MIN_CHARS && !force && !tipFixed) return false;
   term.prompt = buildTermPrompt(termId, term, course);
   return true;
 }

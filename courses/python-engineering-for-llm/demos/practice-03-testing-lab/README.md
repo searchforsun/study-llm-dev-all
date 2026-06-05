@@ -4,19 +4,22 @@
 
 ## 目标
 
-- 用 pytest + TestClient 测试 FastAPI 健康检查路由
-- 理解 Mock LLM 与无网络单测的写法
+- 用 pytest + ASGITransport 测试 FastAPI `/health`
+- 用 MockTransport 模拟 LLM JSON 响应（零外网）
+- 断言 OpenAPI 快照含 `/health` 与 `/v1/rag/query`
 
 ## 步骤
 
 ```powershell
-pip install pytest pytest-asyncio httpx fastapi
+uv pip install pytest pytest-asyncio httpx fastapi
 cd demos/practice-03-testing-lab
-pytest -q
+python -m pytest -q
 ```
 
 ## 验收
 
-- [ ] `pytest -q` 全部通过（exit code 0）
+- [ ] `python -m pytest -q` 全部通过（至少 3 passed）
+- [ ] `test_mock_llm.py` 断言 `content == "mock answer"`
+- [ ] `test_openapi_paths.py` 断言 `/v1/rag/query` 在 schema 中
 - [ ] 测试未发起真实 LLM 网络请求
 - [ ] 完成章节测验
