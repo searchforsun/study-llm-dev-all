@@ -6,4 +6,4 @@ npx serve .
 # 打开 http://localhost:3000/enterprise-llm-solution-delivery/
 ```
 
-源文件：`chapters/*.html` → assemble → `index.html`
+源文件：`chapters/*.html`、`course.json`（术语/测验）→ assemble → `index.html`

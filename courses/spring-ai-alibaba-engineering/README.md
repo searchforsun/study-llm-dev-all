@@ -14,5 +14,5 @@ npx --yes serve .
 
 ## 维护
 
-- 改章节：`chapters/*.html` → `node ../path-to-skill/scripts/assemble-index.mjs --dir .`
+- 改章节：`chapters/*.html`；术语/测验写入 `course.json`（勿用 `manifest-*.json`）→ assemble 生成 `index.html`
 - 勿手改 `index.html` 正文

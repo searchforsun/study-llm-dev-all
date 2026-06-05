@@ -25,7 +25,7 @@ npx serve .
 
 ## 维护
 
-源文件：`chapters/*.html`、`welcome.partial.html`、`quiz.partial.html` → assemble → `index.html`（勿手改正文）
+源文件：`chapters/*.html`、`course.json`（术语/测验）、`welcome.partial.html`、`quiz.partial.html` → assemble → `index.html`（勿手改正文）
 
 ```bash
 node .cursor/skills/programming-html-tutorial/scripts/assemble-index.mjs --dir courses/security-compliance-engineering
