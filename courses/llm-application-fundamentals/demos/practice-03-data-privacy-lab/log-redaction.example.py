@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""CorpAssist 日志脱敏示例 — practice-03-privacy-lab"""
+﻿#!/usr/bin/env python3
+"""CorpAssist 日志脱敏示例 — practice-03-data-privacy-lab"""
 
 from __future__ import annotations
 

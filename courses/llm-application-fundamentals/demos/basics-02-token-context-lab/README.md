@@ -1,4 +1,4 @@
-# Demo：Token 预算与截断策略
+﻿# Demo：Token 预算与截断策略
 
 对应章节：[Token、上下文窗口与费用](../../index.html#ch-basics-02-token-context)
 
@@ -17,7 +17,7 @@
 ## 运行估算脚本
 
 ```powershell
-cd demos/basics-02-token-budget
+cd demos/basics-02-token-context-lab
 python estimate_cost.py
 python estimate_cost.py --prompt 12000 --completion 800 --model corpassist-fast
 ```

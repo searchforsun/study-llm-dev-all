@@ -1,4 +1,4 @@
-# Demo：首次打通模型调用
+﻿# Demo：首次打通模型调用
 
 对应章节：[实战：首次打通模型调用](../../index.html#ch-practice-05-handson-first-call)
 
@@ -23,7 +23,7 @@
 ## 快速开始（PowerShell）
 
 ```powershell
-cd demos/practice-05-first-call-lab
+cd demos/practice-05-handson-first-call-lab
 Copy-Item .env.example .env
 # 编辑 .env 填入真实 KEY 与 BASE_URL
 Get-Content .env | ForEach-Object {
@@ -41,7 +41,7 @@ python ask_openai_sdk.py
 ## Bash
 
 ```bash
-cd demos/practice-05-first-call-lab
+cd demos/practice-05-handson-first-call-lab
 cp .env.example .env
 # 编辑 .env 后 source（或 export 各变量）
 set -a && source .env && set +a

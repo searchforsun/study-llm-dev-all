@@ -1,4 +1,4 @@
-# Demo：CorpAssist 五模块与双栈配置
+﻿# Demo：CorpAssist 五模块与双栈配置
 
 对应章节：[从大模型到应用工程](../../index.html#ch-basics-01-llm-app-landscape)
 
@@ -34,4 +34,4 @@
 
 ## 下一章
 
-[Token、上下文窗口与费用](../../index.html#ch-basics-02-token-context) · Demo：[basics-02-token-budget](../basics-02-token-budget/)
+[Token、上下文窗口与费用](../../index.html#ch-basics-02-token-context) · Demo：[basics-02-token-context-lab](../basics-02-token-context-lab/)
