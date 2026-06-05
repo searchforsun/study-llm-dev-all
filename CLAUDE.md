@@ -84,20 +84,19 @@ Course content is generated with the `programming-html-tutorial` skill (a Claude
 | `enrich-term-prompts.mjs` | Complete term tip/prompt fields |
 | `fix-course-ref-links.mjs` | Batch-fix cross-course link markup in chapters/welcome |
 
-### Reference example & quality gates (skill is SSOT)
+### Quality gates & authoring (skill is SSOT)
 
-Do **not** duplicate chapter DOM / quiz HTML templates here — follow the skill package:
+Do **not** duplicate Gate tables, practice DOM, or quiz templates here. Use:
 
-| Topic | Where |
-|-------|--------|
-| Example course (structure & density) | `.cursor/skills/programming-html-tutorial/example/java-distributed-architecture/` |
-| Chapter count / outline | `courses/outline-specs.json` → this course's `course.json` → `outline` |
-| Authoring & required blocks | skill `reference/chapter-authoring.md`, `chapter-blocks-policy.md` |
-| Gate 2 numeric thresholds | skill `config/chapter-quality.json` (**JSON wins** over prose) |
-| Gate 3 semantic review | skill `reference/chapter-quality-rubric.md` |
-| Cursor commands | `/course-gate`, `/course-review`, `/course-fix`, `/course-pipeline` (see `.cursor/commands/`) |
+- **Gate 总表 + 命令**：skill `reference/delivery-review.md`
+- **动手练习 DOM**：skill `reference/chapter-practice-dom.md`
+- **章节写作 / 块策略**：`reference/chapter-authoring.md`, `chapter-blocks-policy.md`
+- **Gate 2 阈值**：`config/chapter-quality.json`（JSON wins）
+- **Gate 3**：`reference/chapter-quality-rubric.md`
+- **样例密度**：`example/SAMPLE-POINTERS.md`（不必读全量 `demos/`）
+- **Cursor**：`/course-gate`, `/course-review`, `/course-fix`, `/course-pipeline`
 
-**`<skill-root>` resolution** (same order as `/course-gate`): workspace `.cursor/skills/programming-html-tutorial` → env `PROGRAMMING_HTML_TUTORIAL_SKILL` → `~/.cursor/skills/programming-html-tutorial` → `~/.claude/skills/programming-html-tutorial`.
+Outline & catalog: `courses/outline-specs.json` → `course.json` / `courses.json`. `<skill-root>`：工作区 `.cursor/skills/programming-html-tutorial` → `PROGRAMMING_HTML_TUTORIAL_SKILL` → `~/.cursor/skills/...` → `~/.claude/skills/...`。
 
 ### Content rules
 

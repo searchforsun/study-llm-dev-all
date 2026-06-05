@@ -6,7 +6,7 @@
 ## 前置
 
 1. `programming-html-tutorial/SKILL.md`
-2. `reference/quality-policy.md`、`reference/delivery-review.md`
+2. `reference/delivery-review.md`（§Gate 总表 SSOT）、`reference/quality-policy.md`
 3. 阈值 **仅以** `<skill-root>/config/chapter-quality.json`（v3 单一策略，无 `--profile`）
 4. `--dir` = `courses/<slug>/`
 
