@@ -99,6 +99,7 @@ highlight.js、Mermaid 10.x、Google Fonts（JetBrains Mono + Noto Sans SC）。
 - 章节作者：`.mermaid-wrap` = `h5`（可选）→ `pre.mermaid` → `p.diagram-caption`（可选）。
 - **勿**手写 `.mermaid-toolbar` / `.mermaid-diagram`（壳在渲染后注入）。
 - 全屏目标为 **`.mermaid-diagram`**（非整块 `.mermaid-wrap`）；`h5` / caption 留在外。
+- 全屏内支持缩放与平移：缩放改 SVG 实际尺寸（矢量清晰，25%～800%）、`translate` 平移、滚轮以指针为中心缩放；工具栏 `−` / `+` / `1:1`；退出全屏自动重置。
 - 原生 `requestFullscreen` 失败 → `.is-pseudo-fullscreen`；`Esc` / 主题切换时关闭并重绘。
 
 ### hljs 亮暗

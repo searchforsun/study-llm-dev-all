@@ -1089,20 +1089,205 @@
     return diagram;
   }
 
+  var MERMAID_ZOOM_MIN = 0.25;
+  var MERMAID_ZOOM_MAX = 8;
+  var MERMAID_ZOOM_STEP = 0.25;
+
+  function ensureMermaidViewport(diagram) {
+    if (!diagram || diagram.querySelector('.mermaid-viewport')) return;
+    var content = diagram.querySelector(':scope > pre.mermaid, :scope > div.mermaid');
+    if (!content) return;
+    var viewport = document.createElement('div');
+    viewport.className = 'mermaid-viewport';
+    var stage = document.createElement('div');
+    stage.className = 'mermaid-stage';
+    diagram.insertBefore(viewport, content);
+    stage.appendChild(content);
+    viewport.appendChild(stage);
+  }
+
+  function initMermaidView(diagram) {
+    diagram._mermaidView = { zoom: 1, panX: 0, panY: 0 };
+  }
+
+  function getMermaidZoom(diagram) {
+    return diagram._mermaidView ? diagram._mermaidView.zoom : 1;
+  }
+
+  function getMermaidViewportCenter(diagram) {
+    var viewport = diagram.querySelector('.mermaid-viewport');
+    if (!viewport) return null;
+    var rect = viewport.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+
+  function captureMermaidBaseSize(diagram) {
+    var svg = diagram.querySelector('svg');
+    var pre = diagram.querySelector('pre.mermaid, div.mermaid');
+    if (!svg) return null;
+    svg.style.width = '';
+    svg.style.height = '';
+    svg.style.maxWidth = '';
+    svg.style.maxHeight = '';
+    if (pre) {
+      pre.style.width = '';
+      pre.style.maxWidth = '';
+    }
+    var rect = svg.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+      var vb = svg.viewBox && svg.viewBox.baseVal;
+      if (vb && vb.width && vb.height) {
+        var fitW = Math.min(window.innerWidth * 0.96, 1400);
+        diagram._mermaidBaseSize = { w: fitW, h: fitW * (vb.height / vb.width) };
+        return diagram._mermaidBaseSize;
+      }
+      return null;
+    }
+    diagram._mermaidBaseSize = { w: rect.width, h: rect.height };
+    return diagram._mermaidBaseSize;
+  }
+
+  function applyMermaidViewTransform(diagram) {
+    var stage = diagram.querySelector('.mermaid-stage');
+    var svg = diagram.querySelector('svg');
+    var pre = diagram.querySelector('pre.mermaid, div.mermaid');
+    var view = diagram._mermaidView || { zoom: 1, panX: 0, panY: 0 };
+    var base = diagram._mermaidBaseSize;
+
+    if (stage) {
+      stage.style.transform = (view.panX || view.panY)
+        ? 'translate(' + view.panX + 'px, ' + view.panY + 'px)'
+        : '';
+    }
+
+    if (svg && base) {
+      var w = base.w * view.zoom;
+      var h = base.h * view.zoom;
+      svg.style.width = w + 'px';
+      svg.style.height = h + 'px';
+      svg.style.maxWidth = 'none';
+      svg.style.maxHeight = 'none';
+      if (pre) {
+        pre.style.width = w + 'px';
+        pre.style.maxWidth = 'none';
+      }
+      diagram.classList.toggle('has-mermaid-zoom', view.zoom !== 1 || !!view.panX || !!view.panY);
+    }
+
+    var label = diagram.querySelector('.mermaid-zoom-label');
+    if (label) label.textContent = Math.round(view.zoom * 100) + '%';
+    var zoomOut = diagram.querySelector('.mermaid-zoom-out-btn');
+    var zoomIn = diagram.querySelector('.mermaid-zoom-in-btn');
+    if (zoomOut) zoomOut.disabled = view.zoom <= MERMAID_ZOOM_MIN + 1e-6;
+    if (zoomIn) zoomIn.disabled = view.zoom >= MERMAID_ZOOM_MAX - 1e-6;
+  }
+
+  function setMermaidZoom(diagram, zoom, focal) {
+    if (!diagram._mermaidView) initMermaidView(diagram);
+    var view = diagram._mermaidView;
+    var oldZoom = view.zoom;
+    zoom = Math.min(MERMAID_ZOOM_MAX, Math.max(MERMAID_ZOOM_MIN, zoom));
+    if (focal && Math.abs(oldZoom - zoom) > 1e-6) {
+      var viewport = diagram.querySelector('.mermaid-viewport');
+      if (viewport) {
+        var rect = viewport.getBoundingClientRect();
+        var mx = focal.x - (rect.left + rect.width / 2);
+        var my = focal.y - (rect.top + rect.height / 2);
+        var ratio = zoom / oldZoom;
+        view.panX = mx - (mx - view.panX) * ratio;
+        view.panY = my - (my - view.panY) * ratio;
+      }
+    }
+    view.zoom = zoom;
+    applyMermaidViewTransform(diagram);
+  }
+
+  function resetMermaidZoom(diagram) {
+    initMermaidView(diagram);
+    applyMermaidViewTransform(diagram);
+  }
+
+  function clearMermaidZoom(diagram) {
+    var stage = diagram.querySelector('.mermaid-stage');
+    var svg = diagram.querySelector('svg');
+    var pre = diagram.querySelector('pre.mermaid, div.mermaid');
+    if (stage) stage.style.transform = '';
+    if (svg) {
+      svg.style.width = '';
+      svg.style.height = '';
+      svg.style.maxWidth = '';
+      svg.style.maxHeight = '';
+    }
+    if (pre) {
+      pre.style.width = '';
+      pre.style.maxWidth = '';
+    }
+    diagram.classList.remove('has-mermaid-zoom');
+    delete diagram._mermaidView;
+    delete diagram._mermaidBaseSize;
+    var label = diagram.querySelector('.mermaid-zoom-label');
+    if (label) label.textContent = '100%';
+    var zoomOut = diagram.querySelector('.mermaid-zoom-out-btn');
+    var zoomIn = diagram.querySelector('.mermaid-zoom-in-btn');
+    if (zoomOut) zoomOut.disabled = false;
+    if (zoomIn) zoomIn.disabled = false;
+  }
+
+  function syncMermaidZoomToolbar(diagram) {
+    var on = document.fullscreenElement === diagram || isPseudoFs(diagram);
+    var zoomGroup = diagram.querySelector('.mermaid-zoom-group');
+    if (zoomGroup) zoomGroup.hidden = !on;
+  }
+
+  function onMermaidFullscreenOpened(diagram) {
+    ensureMermaidViewport(diagram);
+    requestAnimationFrame(function () {
+      captureMermaidBaseSize(diagram);
+      resetMermaidZoom(diagram);
+      syncMermaidZoomToolbar(diagram);
+    });
+  }
+
+  function onMermaidFullscreenClosed(diagram) {
+    clearMermaidZoom(diagram);
+    syncMermaidZoomToolbar(diagram);
+  }
+
+  function createMermaidToolbarBtn(text, label, className) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'mermaid-fs-btn' + (className ? ' ' + className : '');
+    btn.textContent = text;
+    btn.setAttribute('aria-label', label);
+    return btn;
+  }
+
   function injectMermaidFullscreenUi(root) {
     var scope = root || document;
     if (!scope.querySelectorAll) return;
     scope.querySelectorAll('.mermaid-wrap').forEach(function (wrap) {
       var diagram = getMermaidDiagramHost(wrap);
       if (!diagram) return;
+      ensureMermaidViewport(diagram);
       if (diagram.querySelector('.mermaid-toolbar')) return;
       var bar = document.createElement('div');
       bar.className = 'mermaid-toolbar';
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'mermaid-fs-btn';
-      btn.textContent = '全屏';
-      btn.setAttribute('aria-label', '图表全屏');
+      var zoomGroup = document.createElement('div');
+      zoomGroup.className = 'mermaid-zoom-group';
+      zoomGroup.hidden = true;
+      var zoomOut = createMermaidToolbarBtn('−', '缩小图表', 'mermaid-zoom-out-btn');
+      var zoomLabel = document.createElement('span');
+      zoomLabel.className = 'mermaid-zoom-label';
+      zoomLabel.textContent = '100%';
+      zoomLabel.setAttribute('aria-hidden', 'true');
+      var zoomIn = createMermaidToolbarBtn('+', '放大图表', 'mermaid-zoom-in-btn');
+      var zoomReset = createMermaidToolbarBtn('1:1', '重置缩放', 'mermaid-zoom-reset-btn');
+      zoomGroup.appendChild(zoomOut);
+      zoomGroup.appendChild(zoomLabel);
+      zoomGroup.appendChild(zoomIn);
+      zoomGroup.appendChild(zoomReset);
+      bar.appendChild(zoomGroup);
+      var btn = createMermaidToolbarBtn('全屏', '图表全屏', 'mermaid-fullscreen-btn');
       btn.setAttribute('aria-expanded', 'false');
       bar.appendChild(btn);
       diagram.appendChild(bar);
@@ -1115,6 +1300,7 @@
 
   function closePseudoFs(diagram) {
     diagram.classList.remove('is-pseudo-fullscreen');
+    onMermaidFullscreenClosed(diagram);
     if (!document.querySelector('.mermaid-diagram.is-pseudo-fullscreen')) {
       document.body.style.overflow = '';
     }
@@ -1129,6 +1315,7 @@
     });
     diagram.classList.add('is-pseudo-fullscreen');
     document.body.style.overflow = 'hidden';
+    onMermaidFullscreenOpened(diagram);
   }
 
   function syncFsButton(diagram, btn) {
@@ -1146,7 +1333,7 @@
     }
     document.querySelectorAll('.mermaid-diagram.is-pseudo-fullscreen').forEach(function (diagram) {
       closePseudoFs(diagram);
-      var btn = diagram.querySelector('.mermaid-fs-btn');
+      var btn = diagram.querySelector('.mermaid-fullscreen-btn');
       if (btn) syncFsButton(diagram, btn);
     });
   }
@@ -1157,7 +1344,7 @@
     scope.querySelectorAll('.mermaid-wrap').forEach(function (wrap) {
       var diagram = getMermaidDiagramHost(wrap);
       if (!diagram) return;
-      var btn = diagram.querySelector('.mermaid-fs-btn');
+      var btn = diagram.querySelector('.mermaid-fullscreen-btn');
       if (!btn || diagram.dataset.fsBound) return;
       diagram.dataset.fsBound = '1';
       btn.addEventListener('click', function () {
@@ -1169,20 +1356,24 @@
         var native = document.fullscreenElement === diagram;
         var pseudo = isPseudoFs(diagram);
         if (native || pseudo) {
-          if (native) document.exitFullscreen().catch(function () {});
+          if (native) {
+            document.exitFullscreen().catch(function () {});
+            onMermaidFullscreenClosed(diagram);
+          }
           if (pseudo) closePseudoFs(diagram);
           syncFsButton(diagram, btn);
           return;
         }
         document.querySelectorAll('.mermaid-diagram.is-pseudo-fullscreen').forEach(function (d) {
           closePseudoFs(d);
-          var b = d.querySelector('.mermaid-fs-btn');
+          var b = d.querySelector('.mermaid-fullscreen-btn');
           if (b) syncFsButton(d, b);
         });
         var req = diagram.requestFullscreen || diagram.webkitRequestFullscreen;
         if (typeof req === 'function') {
           Promise.resolve(req.call(diagram)).then(function () {
             syncFsButton(diagram, btn);
+            onMermaidFullscreenOpened(diagram);
           }).catch(function () {
             openPseudoFs(diagram);
             syncFsButton(diagram, btn);
@@ -1192,15 +1383,82 @@
           syncFsButton(diagram, btn);
         }
       });
+      var zoomOut = diagram.querySelector('.mermaid-zoom-out-btn');
+      var zoomIn = diagram.querySelector('.mermaid-zoom-in-btn');
+      var zoomReset = diagram.querySelector('.mermaid-zoom-reset-btn');
+      if (zoomOut) {
+        zoomOut.addEventListener('click', function () {
+          setMermaidZoom(diagram, getMermaidZoom(diagram) - MERMAID_ZOOM_STEP, getMermaidViewportCenter(diagram));
+        });
+      }
+      if (zoomIn) {
+        zoomIn.addEventListener('click', function () {
+          setMermaidZoom(diagram, getMermaidZoom(diagram) + MERMAID_ZOOM_STEP, getMermaidViewportCenter(diagram));
+        });
+      }
+      if (zoomReset) {
+        zoomReset.addEventListener('click', function () {
+          resetMermaidZoom(diagram);
+        });
+      }
+      bindMermaidPanZoom(diagram);
     });
+  }
+
+  function bindMermaidPanZoom(diagram) {
+    ensureMermaidViewport(diagram);
+    var viewport = diagram.querySelector('.mermaid-viewport');
+    if (!viewport || viewport.dataset.panBound) return;
+    viewport.dataset.panBound = '1';
+    var drag = null;
+
+    viewport.addEventListener('wheel', function (e) {
+      if (document.fullscreenElement !== diagram && !isPseudoFs(diagram)) return;
+      e.preventDefault();
+      var delta = e.deltaY < 0 ? MERMAID_ZOOM_STEP : -MERMAID_ZOOM_STEP;
+      setMermaidZoom(diagram, getMermaidZoom(diagram) + delta, { x: e.clientX, y: e.clientY });
+    }, { passive: false });
+
+    viewport.addEventListener('pointerdown', function (e) {
+      if (document.fullscreenElement !== diagram && !isPseudoFs(diagram)) return;
+      if (e.button !== 0) return;
+      if (e.target.closest('.mermaid-toolbar')) return;
+      drag = { x: e.clientX, y: e.clientY, pid: e.pointerId };
+      viewport.classList.add('is-panning');
+      if (viewport.setPointerCapture) viewport.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+
+    viewport.addEventListener('pointermove', function (e) {
+      if (!drag || drag.pid !== e.pointerId) return;
+      if (!diagram._mermaidView) initMermaidView(diagram);
+      diagram._mermaidView.panX += e.clientX - drag.x;
+      diagram._mermaidView.panY += e.clientY - drag.y;
+      drag.x = e.clientX;
+      drag.y = e.clientY;
+      applyMermaidViewTransform(diagram);
+    });
+
+    function endPan(e) {
+      if (!drag || (e && drag.pid !== e.pointerId)) return;
+      drag = null;
+      viewport.classList.remove('is-panning');
+    }
+
+    viewport.addEventListener('pointerup', endPan);
+    viewport.addEventListener('pointercancel', endPan);
   }
 
   function syncAllMermaidFsButtons() {
     document.querySelectorAll('.mermaid-wrap').forEach(function (wrap) {
       var diagram = wrap.querySelector('.mermaid-diagram');
       if (!diagram) return;
-      var btn = diagram.querySelector('.mermaid-fs-btn');
+      var btn = diagram.querySelector('.mermaid-fullscreen-btn');
       if (btn) syncFsButton(diagram, btn);
+      syncMermaidZoomToolbar(diagram);
+      if (document.fullscreenElement !== diagram && !isPseudoFs(diagram)) {
+        onMermaidFullscreenClosed(diagram);
+      }
     });
   }
 
@@ -1216,7 +1474,7 @@
       if (e.key !== 'Escape') return;
       document.querySelectorAll('.mermaid-diagram.is-pseudo-fullscreen').forEach(function (diagram) {
         closePseudoFs(diagram);
-        var btn = diagram.querySelector('.mermaid-fs-btn');
+        var btn = diagram.querySelector('.mermaid-fullscreen-btn');
         if (btn) syncFsButton(diagram, btn);
       });
     });
