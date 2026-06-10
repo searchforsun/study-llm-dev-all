@@ -1,8 +1,10 @@
-"""HITL 审批 Demo — 模拟 ASK 流程与审计."""
+"""HITL 审批 Demo — 模拟 ASK 流程与审计（CLI stub）。"""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import os
 
 from audit import audit_hitl
 
@@ -11,16 +13,20 @@ async def send_email(to: str, subject: str, body: str) -> str:
     return f"邮件已发送至 {to}，主题：{subject}"
 
 
-async def simulate_hitl_flow() -> None:
+async def simulate_hitl_flow(decision: str | None = None) -> None:
     """模拟 RequireUserConfirmEvent 处理（教学 stub，非完整 AgentScope 运行时）。"""
     original_args = {"to": "partner@external.com", "subject": "内部文档", "body": "..."}
     print("待审批工具: send_email")
     print("原参数:", json.dumps(original_args, ensure_ascii=False))
-    decision = input("决裁 ALLOW/MODIFY/DENY [A/m/d]: ").strip().lower() or "a"
+
+    if decision is None:
+        decision = input("决裁 ALLOW/MODIFY/DENY [A/m/d]: ").strip().lower() or "a"
+    else:
+        decision = decision.lower()
 
     modified = None
     if decision in ("m", "modify"):
-        new_to = input("新收件人: ").strip() or original_args["to"]
+        new_to = original_args["to"]
         modified = {**original_args, "to": new_to}
         decision_label = "MODIFY"
         result_args = modified
@@ -44,7 +50,17 @@ async def simulate_hitl_flow() -> None:
 
 
 async def main() -> None:
-    await simulate_hitl_flow()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--decision",
+        choices=["allow", "modify", "deny", "a", "m", "d"],
+        help="非交互决裁（验收/CI 用）",
+    )
+    args = parser.parse_args()
+    decision = args.decision
+    if decision is None and os.environ.get("CORPASSIST_MOCK", "").lower() in ("1", "true", "yes"):
+        decision = "allow"
+    await simulate_hitl_flow(decision=decision)
 
 
 if __name__ == "__main__":

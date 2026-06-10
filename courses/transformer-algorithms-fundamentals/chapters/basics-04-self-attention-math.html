@@ -1,0 +1,394 @@
+<section id="ch-basics-04-self-attention-math" class="chapter" data-chapter="basics-04-self-attention-math">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Self-Attention 矩阵视角</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-self-attention-math" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>序列建模与 Attention 基座</strong> · 能力：用矩阵形状推理 Self-Attention，估算长文档算力代价</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-02-attention-qkv">Q/K/V 公式</a> 与 <a href="#ch-basics-03-transformer-block">Transformer 块</a> 已就位；本章用<strong>矩阵形状与复杂度</strong>把直觉钉死：为何 CorpAssist 塞入 200 页制度 PDF 会拖垮 <span class="term" data-term-id="latency" tabindex="0">延迟</span> 与 <span class="term" data-term-id="gpu-memory" tabindex="0">显存</span>，以及面试手写 Attention 该写到哪一步。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>对单头 Self-Attention 逐步标注 (n,d)、(n,n) 张量形状</li>
+          <li>解释 <span class="term" data-term-id="quadratic-complexity" tabindex="0">O(n²)</span> 对时间与显存的影响</li>
+          <li>把复杂度与 CorpAssist 上下文裁剪、RAG 分块策略挂钩</li>
+          <li>完成 3×3 迷你序列手算例题</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>Self-Attention：Q、K、V 同源</strong>，均来自同一序列嵌入 X。</li>
+          <li><strong>瓶颈矩阵是 (n,n)</strong>：n 为序列长度；层数 L 线性放大，n 平方放大。</li>
+          <li><strong>显存 ∝ n²</strong>：训练存注意力分数；推理可用 Flash Attention 等 IO 优化。</li>
+          <li><strong>工程解法是控 n</strong>：RAG Top-K、摘要、滑动窗口——算法认知指导应用架构。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>单头注意力矩阵运算</h3>
+      <p><span class="term" data-term-id="self-attention" tabindex="0">Self-Attention</span> 即 Q、K、V 均由同一输入 X 投影：X ∈ ℝ<sup>n×d<sub>model</sub></sup>。单头时 d<sub>k</sub>=d<sub>v</sub>=d<sub>model</sub>（多头时见 <a href="#ch-basics-05-multi-head-mask">下一章</a>）。</p>
+
+      <p>下列推导默认 batch=1；n 为序列 <span class="term" data-term-id="token" tabindex="0">Token</span> 数。面试白板建议先写形状再填数字，避免矩阵乘维度对错。</p>
+
+      <h4>形状追踪表</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>步骤</th><th>运算</th><th>输出形状</th><th>含义</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>输入</td>
+              <td>X</td>
+              <td>(n, d_model)</td>
+              <td>n 个 Token，各 d_model 维</td>
+            </tr>
+            <tr>
+              <td>投影</td>
+              <td>Q=XW<sub>Q</sub>, K=XW<sub>K</sub>, V=XW<sub>V</sub></td>
+              <td>各 (n, d_k)</td>
+              <td>同序列三种角色</td>
+            </tr>
+            <tr>
+              <td>打分</td>
+              <td>S = QK<sup>T</sup>/√d<sub>k</sub></td>
+              <td>(n, n)</td>
+              <td>每对位置相似度</td>
+            </tr>
+            <tr>
+              <td>权重</td>
+              <td>A = softmax(S)</td>
+              <td>(n, n)</td>
+              <td>行随机矩阵</td>
+            </tr>
+            <tr>
+              <td>输出</td>
+              <td>O = AV</td>
+              <td>(n, d_v)</td>
+              <td>更新后的序列表示</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>矩阵视角：一次「全连接阅读」</h4>
+      <p>把 A 想成 n 个 Query 各读一遍 n 个 Key 的<strong>软查表</strong>；O 的每一行是 V 的 n 行按 A 对应行权重混合。对 CorpAssist 制度问答，n 包含 system + 检索 chunk + 用户问题 + 已生成回答——<strong>所有 Token 两两可互看</strong>（Decoder 生成时另有因果 Mask）。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Self-Attention 矩阵乘法链</h5>
+        <pre class="mermaid">flowchart LR
+  X["X (n×d)"] --> Q["Q (n×d_k)"]
+  X --> K["K (n×d_k)"]
+  X --> V["V (n×d_v)"]
+  Q --> S["S=QK^T (n×n)"]
+  K --> S
+  S --> A["softmax → A (n×n)"]
+  A --> O["O=AV (n×d_v)"]
+  V --> O</pre>
+        <p class="diagram-caption">L 层堆叠时，每层重复；总计算量大致 ∝ L·n²·d。</p>
+      </div>
+
+      <h4>向量化实现（批维 B）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># X: (B, n, d_model) — B 条 CorpAssist 请求 batch
+Q = X @ W_q          # (B, n, d_k)
+K = X @ W_k
+V = X @ W_v
+scores = Q @ K.transpose(0, 2, 1) / math.sqrt(d_k)  # (B, n, n)
+attn = softmax(scores, dim=-1)
+out = attn @ V       # (B, n, d_v)</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>复杂度 O(n²) 含义</h3>
+      <p>计算 QK<sup>T</sup> 需对 n×n 个元素各做 d<sub>k</sub> 次乘加 → 时间 <span class="term" data-term-id="quadratic-complexity" tabindex="0">O(n²·d)</span>。存储中间 S 或 A 需 O(n²) 显存（训练时尤为明显）。层数 L 线性乘上，但<strong>长度 n 平方放大</strong>是长上下文的首要敌人。</p>
+
+      <h4>长度翻倍代价示意</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>序列长度 n</th><th>注意力矩阵元素 n²</th><th>相对 2K 基线</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>2,048</td><td>~4.2M</td><td>1×</td></tr>
+            <tr><td>8,192</td><td>~67M</td><td>16×</td></tr>
+            <tr><td>32,768</td><td>~1.07G</td><td>256×</td></tr>
+            <tr><td>128,000</td><td>~16.4G</td><td>~4000×</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>这也解释为何「上下文窗口从 8K 提到 128K」不仅是营销：同等 batch 下算力与 <span class="term" data-term-id="gpu-memory" tabindex="0">GPU 显存</span> 需求可差两个数量级以上。优化方向包括 Flash Attention（IO 感知）、稀疏注意力、KV Cache（推理）、<a href="#ch-advanced-03-long-context">长上下文技术</a>。</p>
+
+      <h4>prefill vs decode 两阶段（与延迟挂钩）</h4>
+      <ul>
+        <li><strong>prefill</strong>：首次吃进整段 prompt，须算完整 n×n Attention → TTFT 敏感，<span class="term" data-term-id="latency" tabindex="0">延迟</span> ∝ n²。</li>
+        <li><strong>decode</strong>：每步只新增 1 Token，配合 KV Cache 可复用历史 K/V → 单步代价 ∝ n，但步数 = 生成长度。</li>
+      </ul>
+      <p>CorpAssist 网关若只优化 decode 而放任 32K RAG 前缀，用户仍会在「首字出现前」长时间等待——<strong>控 prompt n 比调 temperature 更影响 TTFT</strong>。</p>
+
+      <h4>与 RNN O(n) 的对比（口述）</h4>
+      <ul>
+        <li>RNN：时间步串行 O(n)，每步隐状态维固定，难并行但内存 O(n)。</li>
+        <li>Transformer：层内并行，但 n×n 矩阵 O(n²) 时间与内存。</li>
+        <li>权衡：GPU 时代选中 Transformer，但<strong>应用层必须控 n</strong>。</li>
+      </ul>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：层数 L 从 32 增到 64，与 n 从 4K 增到 8K，哪个对延迟打击更大？</summary>
+        <p>通常 <strong>n 翻倍</strong>打击更大：Attention 项 ∝ L·n²，n 翻倍带来 4× Attention 代价，而 L 翻倍仅 2×。CorpAssist 网关限流应优先监控<strong>输入 Token 总量</strong>，而非只数 API 调用次数。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>与 CorpAssist 长文档代价</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度全文灌入</span>
+        PM 要求「把 200 页《员工手册》PDF 整本塞进 prompt，让模型自己找」——单次 n≈120K Token，Attention 矩阵元素 ~14×10⁹ 量级，p95 延迟与账单同时爆炸。
+      </aside>
+
+      <h4>工程对策（算法认知 → 应用决策）</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">增大 n（硬灌全文）</span>
+          <ul>
+            <li>O(n²) 算力与显存暴涨</li>
+            <li>无关段落稀释 Attention 有效信号</li>
+            <li>商用 API 按 Token 计费线性上升</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">控制有效 n</span>
+          <ul>
+            <li>RAG Top-K 只送 4～8 段 chunk</li>
+            <li>超长纪要先摘要再问答</li>
+            <li>网关 max_input_tokens 硬限 + 告警</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>网关侧监控指标建议</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "request_id": "ca-2026-0412-8831",
+  "prompt_tokens": 6840,
+  "completion_tokens": 412,
+  "attention_cost_tier": "high",
+  "notes": "prompt_tokens &gt; 6k → p95 延迟预警；建议触发 RAG 裁剪"
+}</code></pre>
+      </div>
+      <p>懂 O(n²) 后，与 Java 后端同事沟通 SLA 时可以说清：<strong>不是「模型变慢了」，而是序列长度平方级放大</strong>；解法在架构（检索、摘要、限长）而非单纯升配 GPU。</p>
+
+      <h4>限长策略清单（可直接写进网关配置说明）</h4>
+      <ol>
+        <li><code>max_input_tokens</code> 硬顶（如 8192），超限拒收或触发摘要。</li>
+        <li>RAG <code>top_k</code> 与 <code>max_chunk_tokens</code> 双限。</li>
+        <li>多轮对话滑动窗口：保留 system + 最近 K 轮。</li>
+        <li>异步「长文深度阅读」任务，在线问答走短上下文。</li>
+      </ol>
+      <p>以上策略的共同目标：<strong>压低有效 n</strong>，使 <span class="term" data-term-id="self-attention" tabindex="0">Self-Attention</span> 的 n² 项可控——这比单纯购买更大窗口模型更符合 CorpAssist SLA。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>手算迷你例题</h3>
+      <p>面试白板常考 n=3、d_k=2 的 Self-Attention。下列数字已四舍五入便于手算。</p>
+
+      <h4>已知</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">序列 3 个 Token（已含嵌入+位置），d_k = 2
+
+Q = [[1, 0],
+     [0, 1],
+     [1, 1]]
+
+K = [[1, 0],
+     [0, 1],
+     [1, 0]]
+
+V = [[1, 0],
+     [0, 1],
+     [2, 2]]
+
+sqrt(d_k) = sqrt(2) ≈ 1.414</code></pre>
+      </div>
+
+      <h4>步骤 1：S = QK^T / sqrt(2)</h4>
+      <p>QK<sup>T</sup> 第 (0,0) 元 = 1×1+0×0 = 1；(0,1)=0；(0,2)=1。完整 S ≈</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">S_raw = [[1, 0, 1],
+         [0, 1, 1],
+         [1, 1, 2]]
+
+S = S_raw / 1.414 ≈ [[0.71, 0, 0.71],
+                      [0, 0.71, 0.71],
+                      [0.71, 0.71, 1.41]]</code></pre>
+      </div>
+
+      <h4>步骤 2：对第 0 行 softmax</h4>
+      <p>exp(0.71)≈2.03, exp(0)≈1, exp(0.71)≈2.03 → 和≈5.06。A<sub>0</sub>≈[0.40, 0.20, 0.40]（行和=1）。</p>
+
+      <h4>步骤 3：O 第 0 行 = A<sub>0</sub> @ V</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">O_0 = 0.40*[1,0] + 0.20*[0,1] + 0.40*[2,2]
+    ≈ [0.40+0+0.80, 0+0.20+0.80]
+    ≈ [1.20, 1.00]</code></pre>
+      </div>
+      <p>完整手算应逐行完成；验收标准：每行 softmax 和为 1，O 形状 (3,2)。<a href="#ch-practice-05-numpy-attention-lab">NumPy 实验章</a> 用代码验证。</p>
+
+      <h4>手算检查清单</h4>
+      <ul>
+        <li>QK<sup>T</sup> 维度是否为 (3,3)</li>
+        <li>除以 √d<sub>k</sub> 后数值是否在 0～2 附近（非几十）</li>
+        <li>每行 exp 和是否归一化为 1</li>
+        <li>O 行向量是否为 V 行的凸组合（权重非负且和 1）</li>
+      </ul>
+      <p>与 <span class="term" data-term-id="quadratic-complexity" tabindex="0">O(n²)</span> 对照：n=3 时矩阵仅 9 元；n=8192 时约 6700 万元素——量级直觉比背公式更重要。</p>
+
+      <div class="learn-tabs" id="b04-math-tabs" role="tablist" aria-label="手算与代码">
+        <input type="radio" name="b04-math-tab" id="b04-math-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="b04-math-tab" id="b04-math-tab-b" class="learn-tab-input" />
+        <label for="b04-math-tab-a">面试白板</label>
+        <label for="b04-math-tab-b">工程估算</label>
+        <div id="b04-math-panel-a" class="learn-tab-panel" role="tabpanel">
+          <p>写到 S、一行 softmax、O 一行即可；强调形状 (n,n) 与行和为 1。</p>
+        </div>
+        <div id="b04-math-panel-b" class="learn-tab-panel" role="tabpanel">
+          <p>用 n² 表估算 prompt 从 8K→32K 时 Attention 代价倍数；指导 CorpAssist 限长策略。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，用于评审前 30 秒复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>矩阵运算</strong>：Self-Attention 核心 (n,n) 权重矩阵；形状追踪是手写基本功。</li>
+        <li><strong>O(n²)</strong>：时间与显存随长度平方涨；L 线性、n 平方。</li>
+        <li><strong>CorpAssist 代价</strong>：长文档硬灌不可行；RAG/摘要/限长是算法驱动的工程解。</li>
+        <li><strong>手算例题</strong>：QK<sup>T</sup>→softmax→AV；行和为 1 是验算要点。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_basics04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="shape-trace" /> 能默写单头 Self-Attention 五步形状</label></li>
+          <li><label><input type="checkbox" data-id="on2" /> 能解释 n 翻倍为何约 4× Attention 代价</label></li>
+          <li><label><input type="checkbox" data-id="corp-cost" /> 能举 CorpAssist 控 n 的 2 条工程策略</label></li>
+          <li><label><input type="checkbox" data-id="hand-calc" /> 能完成 3×3 手算至少一行 softmax</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>量</th><th>阶</th></tr></thead>
+              <tbody>
+                <tr><td>QK^T</td><td>O(n²·d)</td></tr>
+                <tr><td>存 A</td><td>O(n²)</td></tr>
+                <tr><td>L 层</td><td>×L</td></tr>
+                <tr><td>控 n</td><td>RAG / 摘要 / 限长</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>Self-Attention 时间复杂度？空间复杂度？</li>
+              <li>CorpAssist 为何应用 RAG 而非 128K 全文灌入？从 O(n²) 角度答。</li>
+              <li>手写 Attention 时，哪一步保证输出是 Value 的凸组合？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-basics-05-multi-head-mask">多头注意力与 Mask</a> 补齐多头与三类 Mask。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need — 复杂度讨论</a></li>
+      <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention（IO 感知精确注意力）</a></li>
+      <li><a href="https://numpy.org/doc/stable/reference/generated/numpy.matmul.html" target="_blank" rel="noopener">NumPy matmul — 批量矩阵乘</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用形状追踪表与 n² 代价表，为 CorpAssist 一次真实请求估算 Attention 量级，并完成手算例题第 0 行。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>假设 prompt_tokens=8192、L=32、d=4096，用「长度翻倍代价表」说明相对 2K 时 n² 倍数（8192/2048=4，n²=16×）。</li>
+      <li>按「手算迷你例题」完成第 0 行 softmax 与 O<sub>0</sub>，用计算器验算行和≈1。</li>
+      <li>对照「矩阵乘法链」Mermaid，写出 batch 维 B 加入后 Q、scores、out 的形状。</li>
+      <li>从「工程对策」对比列写 2 条 CorpAssist 网关规则（如 max_input_tokens 与 RAG 强制开关）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（权衡）产品坚持 128K 全文进 prompt「提升准确率」，运维抱怨 GPU OOM。从 O(n²) 出发，给出一页内可落地的折中方案（不必降窗口）。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>默认 RAG Top-K + 可选「深度阅读」异步任务</strong>：在线问答保持 n≈4～8K；全文 128K 走离线摘要/分层索引，用户显式触发时再加载相关章节约 16～32K。并启用 Flash Attention / 分页 KV 降显存。避免每次在线请求 n=128K 导致 16×10⁹ 级 n² 元素。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：n² 代价计算器</h4>
+      <p>目录：<code>demos/basics-04-self-attention-math-lab/</code>（表格模板 + 手算验算表）。<strong>验收</strong>：填入 n=8192 时 n² 与 16× 倍数正确；手算例题 A<sub>0</sub> 三项之和与 1 误差 &lt;0.05。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-03-transformer-block">Transformer 块：层归一化与 FFN</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-05-multi-head-mask">多头注意力与 Mask</a></li>
+      <li><a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a> — 推理侧优化</li>
+    </ul>
+  </div>
+</section>

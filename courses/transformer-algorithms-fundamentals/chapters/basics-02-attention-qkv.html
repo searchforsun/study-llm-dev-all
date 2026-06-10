@@ -1,0 +1,396 @@
+<section id="ch-basics-02-attention-qkv" class="chapter" data-chapter="basics-02-attention-qkv">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>注意力机制：Q/K/V 与缩放点积</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-attention-qkv" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>序列建模与 Attention 基座</strong> · 能力：口述 Q/K/V 直觉，写出 Scaled Dot-Product 公式并类比向量检索</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-01-seq-modeling">序列建模演进：RNN 到 Transformer</a> 说明了「为何需要 Attention」；本章给出<strong>可计算的注意力</strong>：<span class="term" data-term-id="query-key-value" tabindex="0">Query / Key / Value</span> 三矩阵从何而来，<span class="term" data-term-id="scaled-dot-product" tabindex="0">缩放点积</span> 如何产生权重，以及它与 CorpAssist <span class="term" data-term-id="vector-retrieval" tabindex="0">向量检索</span> 的惊人相似。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用「查资料」类比解释 Q 问什么、K 标什么、V 取什么</li>
+          <li>写出 Attention(Q,K,V) = softmax(QK<sup>T</sup>/√d<sub>k</sub>)V 并说明缩放因子作用</li>
+          <li>读懂注意力权重热力图的行列含义</li>
+          <li>把点积相似度与 RAG cosine 检索对照，为 <a href="#ch-basics-04-self-attention-math">矩阵视角</a> 打底</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>Q/K/V 都是学出来的投影</strong>：同一嵌入 X 乘以不同权重矩阵 W<sub>Q</sub>, W<sub>K</sub>, W<sub>V</sub>。</li>
+          <li><strong>相似度 = Q 与 K 的点积</strong>：越大表示「更相关」，再经 softmax 变概率分布。</li>
+          <li><strong>输出 = 权重的 V 加权和</strong>：相当于按相关性从「内容库」里取料。</li>
+          <li><strong>除以 √d<sub>k</sub> 防梯度爆炸</strong>：维度高时点积方差大，softmax 易极端化。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>查询-键-值直觉</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度问答</span>
+        用户问「驻外补贴能否与差旅叠加？」模型在组织每个新 Token 的答案时，需要决定：上下文里<strong>哪几句制度</strong>更值得参考。Attention 把这一过程变成可微分的矩阵运算。
+      </aside>
+      <p><span class="term" data-term-id="attention" tabindex="0">注意力（Attention）</span> 的核心抽象来自<strong>键值存储（Key-Value Store）</strong>：</p>
+      <ul>
+        <li><strong>Query（查询）</strong>：当前位置「想问什么」——例如正在生成「叠加」一词时，对上下文的提问向量。</li>
+        <li><strong>Key（键）</strong>：每个上下文位置贴的「索引标签」——用于与 Query 算相似度。</li>
+        <li><strong>Value（值）</strong>：每个位置实际携带的「内容」——相似度高则多取一些。</li>
+      </ul>
+
+      <h4>图书馆类比</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Attention ≈ 软检索</span>
+          <ul>
+            <li>Q = 你手里的问题卡片</li>
+            <li>K = 书架上每本书的标题/标签</li>
+            <li>相似度 = Q·K<sup>T</sup>（点积）</li>
+            <li>V = 书的内容片段；输出 = 按相似度加权拼读</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">硬检索（RAG 工程层）</span>
+          <ul>
+            <li>Query = 用户问题 Embedding</li>
+            <li>Key = 向量库文档 Embedding</li>
+            <li>Top-K 硬选 K 条 chunk</li>
+            <li>无梯度、在模型<strong>外部</strong>完成</li>
+          </ul>
+        </div>
+      </div>
+      <p>CorpAssist 的 RAG 在<strong>模型外</strong>做硬 Top-K；Transformer 内部每层都在做<strong>软</strong> Attention——对所有 Token 赋予连续权重，且端到端可训练。</p>
+
+      <h4>三矩阵形状速记（面试白板）</h4>
+      <ul>
+        <li>输入 X：(n, d_model)</li>
+        <li>Q、K：(n, d_k)；V：(n, d_v)</li>
+        <li>权重 A：(n, n)，<strong>每行和 = 1</strong></li>
+        <li>输出 O：(n, d_v)，常令 d_v = d_model</li>
+      </ul>
+      <p>若面试官追问「Q 和 K 能否相同」：矩阵可相同但<strong>语义角色不同</strong>——Q 问「我要什么」，K 答「我有什么标签」；权重由二者<strong>交互</strong>产生，不是简单复制 X。</p>
+
+      <p>下列三点是阅读后续公式的锚点：<strong>①</strong> Q/K/V 同源不同投影；<strong>②</strong> 相似度 = 点积；<strong>③</strong> 输出 = Value 的凸组合。</p>
+
+      <h4>从嵌入到 Q/K/V 的线性投影</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># X: (seq_len, d_model) — 嵌入 + 位置编码后的序列
+Q = X @ W_q   # (seq_len, d_k)
+K = X @ W_k   # (seq_len, d_k)
+V = X @ W_v   # (seq_len, d_v)
+# W_q, W_k, W_v 为可学习参数；d_k 常取 d_model / num_heads</code></pre>
+      </div>
+      <p>同一 Token 向量 X 经不同矩阵「扮演」不同角色——这是 <span class="term" data-term-id="query-key-value" tabindex="0">Q/K/V</span> 与 RAG 里「问题向量 / 文档向量」共用同一 Embedding 模型但用途不同的对照点。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>Scaled Dot-Product 公式</h3>
+      <p>原论文给出的 <span class="term" data-term-id="scaled-dot-product" tabindex="0">缩放点积注意力</span> 是 Transformer 的默认注意力核：</p>
+
+      <h4>核心公式（手写板版本）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">latex</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">Attention(Q, K, V) = softmax( Q @ K^T / sqrt(d_k) ) @ V
+
+形状：
+  Q: (n, d_k)   — n 个查询，每个 d_k 维
+  K: (n, d_k)   — n 个键
+  V: (n, d_v)   — n 个值
+  Q @ K^T: (n, n) — 每对位置的相似度
+  softmax 沿最后一维（对每个 Query 看所有 Key）
+  输出: (n, d_v)</code></pre>
+      </div>
+
+      <h4>分步拆解</h4>
+      <ol>
+        <li><strong>打分</strong>：S = QK<sup>T</sup>，S<sub>ij</sub> 表示第 i 个 Query 对第 j 个 Key 的相关性。</li>
+        <li><strong>缩放</strong>：S' = S / √d<sub>k</sub>。当 d<sub>k</sub>=64 时除以 8，防止点积过大使 softmax 饱和。</li>
+        <li><strong>归一化</strong>：A = softmax(S')，每行和为 1，得到注意力权重矩阵。</li>
+        <li><strong>聚合</strong>：输出 = AV，按权重对 Value 行向量加权求和。</li>
+      </ol>
+
+      <div class="mermaid-wrap">
+        <h5>Scaled Dot-Product 数据流</h5>
+        <pre class="mermaid">flowchart LR
+  X[嵌入 X] --> WQ[W_q]
+  X --> WK[W_k]
+  X --> WV[W_v]
+  WQ --> Q[Query]
+  WK --> K[Key]
+  WV --> V[Value]
+  Q --> DOT["Q @ K^T / sqrt(d_k)"]
+  K --> DOT
+  DOT --> SM[softmax 得权重 A]
+  SM --> OUT["A @ V → 输出"]
+  V --> OUT</pre>
+        <p class="diagram-caption">Self-Attention 时 Q、K、V 同源序列 X；Cross-Attention 时 Q 来自解码器、K/V 来自编码器（见 <a href="#ch-basics-05-multi-head-mask">多头与 Mask</a>）。</p>
+      </div>
+
+      <h4>NumPy 最小实现</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import numpy as np
+
+def scaled_dot_product_attention(Q, K, V):
+    d_k = Q.shape[-1]
+    scores = Q @ K.T / np.sqrt(d_k)          # (n, n)
+    weights = softmax(scores, axis=-1)       # 每行和为 1
+    return weights @ V, weights
+
+def softmax(x, axis=-1):
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：若去掉 sqrt(d_k) 缩放，训练初期可能出现什么现象？</summary>
+        <p>点积方差随 d<sub>k</sub> 增大而增大，softmax 输出接近 one-hot，梯度几乎只流向个别位置，<strong>注意力过于尖锐、难以学习多样对齐</strong>。缩放把分数拉回合理量级，使梯度更稳定。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>注意力权重可视化</h3>
+      <p>权重矩阵 A ∈ ℝ<sup>n×n</sup> 是理解模型「在看哪里」的最直观产物。行 i 表示<strong>第 i 个 Token 作为 Query 时，对全文各位置的注意力分布</strong>。</p>
+
+      <h4>热力图读法</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>轴</th><th>含义</th><th>CorpAssist 例</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>行（Query 位置）</td>
+              <td>正在处理 / 生成的 Token</td>
+              <td>生成「叠加」时那一行</td>
+            </tr>
+            <tr>
+              <td>列（Key 位置）</td>
+              <td>被参考的上下文 Token</td>
+              <td>「驻外补贴」「差旅报销」列权重高</td>
+            </tr>
+            <tr>
+              <td>颜色深浅</td>
+              <td>权重 0～1</td>
+              <td>深色 = 模型认为更相关</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>可视化注意事项</h4>
+      <ul>
+        <li>单层单头热力图只是<strong>近似解释</strong>，多层多头叠加后人类难以完全还原决策。</li>
+        <li>权重高 ≠ 因果证明；制度合规审计仍以 RAG 引用与人工复核为准。</li>
+        <li>调试 CorpAssist badcase 时，可视化可辅助发现「模型是否关注到检索片段」——若权重全在 user 问题而忽略 chunk，可能是拼接或 Mask 配置错误。</li>
+      </ul>
+
+      <h4>调试 CorpAssist badcase 时的读图步骤</h4>
+      <ol>
+        <li>确认检索 chunk 是否已进入 prompt（RAG 链路）。</li>
+        <li>打开最后一层或指定层热力图，看生成关键 Token 对应行。</li>
+        <li>若权重集中在 user 问题而制度列接近 0 → 检查拼接顺序、<span class="term" data-term-id="padding-mask" tabindex="0">Mask</span> 或截断。</li>
+        <li>若权重分散均匀 → 可能 chunk 过长无关内容多，需收紧 Top-K 或改写 system。</li>
+      </ol>
+
+      <div class="learn-faq">
+        <details>
+          <summary>能否用注意力权重直接做合规审计证据？</summary>
+          <p>不建议。权重是内部浮点、随 checkpoint 变化；合规应依赖<strong>检索命中记录、引用条文 ID、回答文本</strong>。权重可视化仅用于研发排障。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与检索相似度类比</h3>
+      <p>CorpAssist RAG 用 <span class="term" data-term-id="vector-retrieval" tabindex="0">向量检索</span>：query_embedding 与 doc_embedding 算 cosine 或内积，取 Top-K。Attention 打分 QK<sup>T</sup> 在数学上同为<strong>内积相似度</strong>（向量 L2 归一化后即 cosine 相关）。</p>
+
+      <h4>对照表</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>维度</th><th>RAG 向量检索</th><th>Transformer Attention</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>发生位置</td>
+              <td>模型外、检索服务</td>
+              <td>模型内、每层每头</td>
+            </tr>
+            <tr>
+              <td>选择方式</td>
+              <td>Top-K 硬截断</td>
+              <td>softmax 软权重（全序列）</td>
+            </tr>
+            <tr>
+              <td>Q/K 来源</td>
+              <td>独立 Embedding 模型</td>
+              <td>同一前向中的 W<sub>Q</sub>, W<sub>K</sub></td>
+            </tr>
+            <tr>
+              <td>训练</td>
+              <td>对比学习 / 双塔</td>
+              <td>与下游任务端到端反传</td>
+            </tr>
+            <tr>
+              <td>CorpAssist 角色</td>
+              <td>缩小进 prompt 的素材</td>
+              <td>生成时动态融合已进上下文 Token</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>双塔检索 vs 单塔 Attention（口述）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">RAG 双塔（离线）:
+  score_i = cosine(Embed_query(q), Embed_doc(d_i))
+  取 Top-K → 拼入 prompt
+
+Self-Attention（在线、每层）:
+  score_ij = Q_i · K_j / sqrt(d_k)
+  softmax 得权重 → 加权 V_j
+
+工程组合：RAG 负责「库外知识进上下文」；Attention 负责「上下文内动态融合」。</code></pre>
+      </div>
+
+      <p>理解这层类比后，面试题「Attention 与 RAG 有何异同」可答：<strong>数学上都是相似度加权，工程上分工不同、应组合使用</strong>。下一章 <a href="#ch-basics-03-transformer-block">Transformer 块</a> 把 Attention 嵌入完整层结构。</p>
+
+      <h4>组合策略（CorpAssist 制度问答推荐）</h4>
+      <div class="notice">
+        <strong>双层检索阅读</strong>
+        <p>外层 RAG：向量+BM25 硬选 4～8 段进上下文；内层每层 Self-Attention：在已进上下文的 Token 间软融合。缺外层则知识进不来；缺内层则模型无法动态组织已给材料的措辞。</p>
+      </div>
+      <p>记住 <span class="term" data-term-id="scaled-dot-product" tabindex="0">缩放点积</span> 四步：投影 Q/K/V → 打分 → softmax → 加权 V；面试手写到此即可，细节见 <a href="#ch-basics-04-self-attention-math">矩阵视角</a> 与 <a href="#ch-practice-05-numpy-attention-lab">NumPy 实验</a>。</p>
+      <p>对 Java 后端：你实现的是 RAG 检索排序与 prompt 拼装；<span class="term" data-term-id="attention" tabindex="0">Attention</span> 在 GPU 上的 matmul 由推理框架完成——但<strong>懂公式才能解释延迟与 badcase</strong>。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，用于评审前 30 秒复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Q/K/V 直觉</strong>：Query 提问、Key 索引、Value 内容；均由 X 线性投影得到。</li>
+        <li><strong>Scaled Dot-Product</strong>：softmax(QK<sup>T</sup>/√d<sub>k</sub>)V；缩放稳定 softmax 梯度。</li>
+        <li><strong>可视化</strong>：权重矩阵行列对应 Query/Key 位置；用于排障非合规证据。</li>
+        <li><strong>检索类比</strong>：内积相似度同源；RAG 硬检索在外、Attention 软融合在内。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_basics02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="qkv-intuition" /> 能用图书馆类比解释 Q/K/V</label></li>
+          <li><label><input type="checkbox" data-id="formula" /> 能手写 Scaled Dot-Product 公式并说明 √d_k 作用</label></li>
+          <li><label><input type="checkbox" data-id="heatmap" /> 能说明热力图行列含义</label></li>
+          <li><label><input type="checkbox" data-id="rag-compare" /> 能对比 RAG 检索与 Attention 的 2 点异同</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>符号</th><th>含义</th></tr></thead>
+              <tbody>
+                <tr><td>Q</td><td>查询向量矩阵</td></tr>
+                <tr><td>K</td><td>键向量矩阵</td></tr>
+                <tr><td>V</td><td>值向量矩阵</td></tr>
+                <tr><td>d_k</td><td>Q/K 头维度；缩放因子 √d_k</td></tr>
+                <tr><td>A</td><td>softmax 后权重，行和为 1</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 Attention 输出要写成加权和而不是只取 argmax 的 Value？</li>
+              <li>CorpAssist RAG 已做 Top-K，模型里还需要 Attention 吗？为什么？</li>
+              <li>softmax 放在 QK<sup>T</sup> 之后而不是之前的理由？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-basics-03-transformer-block">Transformer 块：层归一化与 FFN</a> 拼装完整层。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need — §3 Scaled Dot-Product Attention</a></li>
+      <li><a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch — scaled_dot_product_attention</a></li>
+      <li><a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">The Illustrated Transformer（Jay Alammar）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用 NumPy 对 3×4 迷你序列手算一步 Attention，并对照「RAG vs Attention」表写 CorpAssist 组合策略。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>设 n=3、d_k=2，随机初始化 Q、K、V（或用手算小数），按公式算 S=QK<sup>T</sup>/√d_k 与 softmax 后第一行权重，验证行和≈1。</li>
+      <li>对照「Scaled Dot-Product 数据流」Mermaid，标出 softmax 前后张量形状变化。</li>
+      <li>从「RAG vs Attention 对照表」选 2 行，各写一句 CorpAssist 工程实践（检索服务 vs 模型内融合）。</li>
+      <li>阅读 NumPy 最小实现，说明若把 <code>softmax</code> 换成 <code>argmax</code> 为何无法反传训练。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）实习生实现 Attention 时写 <code>scores = Q @ K.T</code> 省略了 <code>/ sqrt(d_k)</code>，且抱怨「注意力全挤在第一个 Token」。最可能原因与修复？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>未缩放使 logits 过大，softmax 饱和为近似 one-hot</strong>，梯度几乎只更新单一位置。修复：恢复除以 √d<sub>k</sub>；并检查 Q/K 初始化是否过大。这与本章「缩放因子」动机一致。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Q/K/V 手算工作纸</h4>
+      <p>目录：<code>demos/basics-02-attention-qkv-lab/</code>（3×3 手算模板 + 热力图涂色格）。<strong>验收</strong>：S 矩阵、第一行 softmax、输出向量三步数值齐全；热力图标注「驻外」「差旅」两列权重最高。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-01-seq-modeling">序列建模演进：RNN 到 Transformer</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-transformer-block">Transformer 块：层归一化与 FFN</a></li>
+      <li><a href="https://e2eml.school/transformers.html" target="_blank" rel="noopener">e2eml — Transformers from scratch</a></li>
+    </ul>
+  </div>
+</section>

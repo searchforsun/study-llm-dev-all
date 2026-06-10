@@ -1,0 +1,374 @@
+<section id="ch-practice-03-llm-arch-compare" class="chapter" data-chapter="practice-03-llm-arch-compare">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>LLaMA/Qwen/DeepSeek 架构对照</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-llm-arch-compare" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>架构变体与工程映射</strong> · 能力：速读开源权重结构，建立 CorpAssist 模型选型面试框架</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 网关常同时路由 <strong>Qwen、DeepSeek、LLaMA 系</strong> 私有化或厂商 API。它们同属 <span class="term" data-term-id="decoder-only" tabindex="0">Decoder-only</span>，但 <span class="term" data-term-id="rmsnorm" tabindex="0">RMSNorm</span>、<span class="term" data-term-id="swiglu" tabindex="0">SwiGLU</span>、<span class="term" data-term-id="gqa" tabindex="0">GQA</span>、RoPE 等变体直接影响<strong>显存、吞吐与长上下文</strong>。应用工程师不必训模型，但要能读 <code>config.json</code> 并答「为何 70B 比 7B p95 高一个量级」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>对照 LLaMA、Qwen、DeepSeek 的 Norm、FFN、Attention 差异</li>
+          <li>解释 GQA 如何降低 KV Cache 显存</li>
+          <li>打开 Hugging Face <code>config.json</code> 说出关键字段含义</li>
+          <li>用五段式框架回答 CorpAssist 模型选型面试题</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>LLaMA 范式</strong>：RMSNorm + SwiGLU FFN + RoPE + 无 bias，成为开源 Decoder 事实标准。</li>
+          <li><strong>GQA/MQA</strong>：减少 K/V 头数，推理 KV Cache 更小，略损表达力。</li>
+          <li><strong>Qwen/DeepSeek</strong>：在 LLaMA 骨架上改 hidden、头数、MoE（DeepSeek-V2/V3）等。</li>
+          <li><strong>选型看 SLA</strong>：7B 低延迟、32B+ 质量、MoE 激活参数 vs 总参数。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>RMSNorm 与 SwiGLU</h3>
+      <p>原始 Transformer 用 LayerNorm；LLaMA 改用 <span class="term" data-term-id="rmsnorm" tabindex="0">RMSNorm</span>（Root Mean Square Layer Normalization）：不中心化，只按均方根缩放，计算更省。FFN 从「两层 GELU」改为 <span class="term" data-term-id="swiglu" tabindex="0">SwiGLU</span>：三路投影 <code>W1, W3</code> 与门控 <code>σ(W1x) ⊙ (W3x)</code> 再经 <code>W2</code>，参数量与 expressivity 提升。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>组件</th><th>原始 Transformer / BERT</th><th>LLaMA / Qwen / DeepSeek 主流</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>归一化</td>
+            <td>LayerNorm（Pre-LN 或 Post-LN）</td>
+            <td>RMSNorm（多为 Pre-Norm）</td>
+          </tr>
+          <tr>
+            <td>FFN</td>
+            <td>Linear → GELU → Linear</td>
+            <td>SwiGLU 门控 FFN</td>
+          </tr>
+          <tr>
+            <td>位置</td>
+            <td>绝对正弦 / 可学习</td>
+            <td>RoPE（见 advanced 位置编码章）</td>
+          </tr>
+          <tr>
+            <td>Linear bias</td>
+            <td>通常有</td>
+            <td>多无 bias（LLaMA 传统）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>SwiGLU FFN 形状（概念）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 单层 Decoder Block 内 FFN（示意，非完整 forward）
+def swiglu_ffn(x, w_gate, w_up, w_down):
+    # x: (batch, seq, hidden)
+    gate = silu(x @ w_gate)      # silu = x * sigmoid(x)
+    up = x @ w_up
+    return (gate * up) @ w_down  # 中间维常为 8/3 * hidden 或 4*hidden</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">面试误区</span>
+          <ul>
+            <li>「SwiGLU 是激活函数名字」—— 是 FFN 结构</li>
+            <li>「RMSNorm 与 LayerNorm 完全一样」—— 少减均值步骤</li>
+            <li>「Norm 位置不影响训练」—— Pre-Norm 更稳深栈</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">工程关联</span>
+          <ul>
+            <li>FFN 占参数量大头 → 量化 FFN 收益大</li>
+            <li>Pre-Norm 便于堆深 → 层数↑影响延迟</li>
+            <li>读 config 看 <code>intermediate_size</code></li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：CorpAssist 换 Qwen2.5-32B 比 7B，FFN 哪部分算力涨最多？</summary>
+        <p><strong>FFN 与 Attention 均随 hidden 与 intermediate 涨</strong>；32B 的 <code>hidden_size</code>、<code>num_hidden_layers</code>、<code>intermediate_size</code> 均更大，单 token FLOPs 显著高于 7B。网关应配路由：简单 FAQ → 7B，复杂推理 → 32B。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Grouped-Query Attention</h3>
+      <p>标准 MHA：Q、K、V 头数相同。MQA：K/V 仅 1 组头；<span class="term" data-term-id="gqa" tabindex="0">GQA（Grouped-Query Attention）</span>：K/V 头数少于 Q，多 Q 头共享一组 K/V。推理时 KV Cache 大小 ∝ K/V 头数，GQA 在<strong>显存与速度</strong>上显著优于 MHA，LLaMA-2/3、Qwen2、DeepSeek 等广泛采用。</p>
+
+      <div class="mermaid-wrap">
+        <h5>MHA vs GQA（K/V 头数）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph mha [MHA num_kv_heads = num_heads]
+    Q1[Q heads x8]
+    K1[K heads x8]
+    V1[V heads x8]
+  end
+  subgraph gqa [GQA num_kv_heads = 2]
+    Q2[Q heads x8]
+    K2[K heads x2 shared]
+    V2[V heads x2 shared]
+  end</pre>
+        <p class="diagram-caption">GQA：8 个 Q 头映射到 2 组 K/V，KV Cache 约为 MHA 的 1/4（此例）。</p>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>Attention 类型</th><th>KV Cache（相对）</th><th>典型场景</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>MHA</td>
+            <td>基准 1x</td>
+            <td>早期 GPT-3、部分 BERT</td>
+          </tr>
+          <tr>
+            <td>GQA</td>
+            <td>约 num_kv_heads/num_heads</td>
+            <td>LLaMA-2 70B、Qwen2、DeepSeek-V2</td>
+          </tr>
+          <tr>
+            <td>MQA</td>
+            <td>最小</td>
+            <td>部分推理优化模型；表达力可能降</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>config.json 中 GQA 字段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "model_type": "qwen2",
+  "hidden_size": 3584,
+  "num_attention_heads": 28,
+  "num_key_value_heads": 4,
+  "num_hidden_layers": 28,
+  "intermediate_size": 18944,
+  "max_position_embeddings": 32768,
+  "rms_norm_eps": 1e-6,
+  "hidden_act": "silu"
+}</code></pre>
+      </div>
+      <p><code>num_key_value_heads: 4</code> 且 <code>num_attention_heads: 28</code> → GQA，每组 KV 被 7 个 Q 头共享。CorpAssist 长对话占显存主因之一是 KV Cache；选 GQA 模型同等上下文更省显存（见 <a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a>）。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>开源权重结构速读</h3>
+      <p>拿到 Hugging Face 模型目录，优先读 <code>config.json</code> + <code>tokenizer_config.json</code>。下列字段决定 CorpAssist 路由与容量规划：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>含义</th><th>工程影响</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>num_hidden_layers</code></td>
+            <td>Decoder 层数</td>
+            <td>深度 ↑ → 延迟 ↑、能力 ↑</td>
+          </tr>
+          <tr>
+            <td><code>hidden_size</code></td>
+            <td>隐藏维</td>
+            <td>与参数量、KV 维数正相关</td>
+          </tr>
+          <tr>
+            <td><code>num_attention_heads</code></td>
+            <td>Q 头数</td>
+            <td>与 head_dim = hidden/heads 相关</td>
+          </tr>
+          <tr>
+            <td><code>num_key_value_heads</code></td>
+            <td>KV 头数（GQA）</td>
+            <td>推理显存关键</td>
+          </tr>
+          <tr>
+            <td><code>max_position_embeddings</code></td>
+            <td>训练上下文上限</td>
+            <td>编排层 prompt 预算</td>
+          </tr>
+          <tr>
+            <td><code>vocab_size</code></td>
+            <td>词表大小</td>
+            <td>中文模型常扩词表</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>三族对照（典型开源版本，概念级）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">| 系列      | 骨干特点                          | CorpAssist 常见用途        |
+|-----------|-----------------------------------|----------------------------|
+| LLaMA 3   | RMSNorm+SwiGLU+GQA+RoPE           | 私有化英文/通用基座          |
+| Qwen2.5   | 同上，中文词表与长上下文优化        | 国内厂商 API、私有化中文助手 |
+| DeepSeek  | Dense 或 MoE；V2/V3 强 GQA+MLA 等   | 高性价比 API、代码/推理场景  |</code></pre>
+      </div>
+
+      <p>DeepSeek-V2/V3 等还引入 <strong>MLA（Multi-head Latent Attention）</strong> 等压缩 KV 的技术，面试可答「进一步减 KV Cache、提长上下文效率」；细节属 advanced，应用岗知道<strong>对 p95 与显存有利</strong>即可。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>如何快速估算 7B vs 32B 在线并发？</summary>
+          <div class="learn-faq-body">
+            粗算：参数量 × 精度字节（FP16 约 2B）+ KV Cache（与层数、hidden、seq、batch 相关）。同等 GPU，32B 并发远低于 7B。CorpAssist 网关按模型设 <code>max_concurrent</code> 与队列，避免 p95 抖动。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>选型面试答题框架</h3>
+      <p>CorpAssist 模型选型面试推荐 <strong>S-C-T-L-M</strong> 五段式（场景 → 约束 → 技术对照 → _latency → 决策）：</p>
+      <ol>
+        <li><strong>Scenario</strong>：S1 制度 RAG 问答 vs S3 Agent 工具 vs 代码助手</li>
+        <li><strong>Constraints</strong>：p95 目标、数据出域、中文、上下文长度、预算</li>
+        <li><strong>Compare</strong>：7B/14B/32B 或 Qwen vs DeepSeek；GQA、上下文窗口</li>
+        <li><strong>Latency</strong>：TTFT/ITL、KV Cache、批大小、是否 Flash Attention</li>
+        <li><strong>Move</strong>：默认路由 + 升级路径 + 评测 golden set 验证</li>
+      </ol>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 网关模型路由（概念）</h5>
+        <pre class="mermaid">flowchart TD
+  REQ[请求] --> RT{路由策略}
+  RT -->|简单 FAQ| M7B[Qwen2.5-7B]
+  RT -->|复杂推理| M32B[Qwen2.5-32B]
+  RT -->|代码| DS[DeepSeek-Coder]
+  M7B --> GW[llm-gateway]
+  M32B --> GW
+  DS --> GW</pre>
+        <p class="diagram-caption">架构认知支撑「何时升档模型」—— 不是越大越好，而是 SLA 与质量平衡。</p>
+      </div>
+
+      <h4>面试口述示例（节选）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">问：CorpAssist 制度问答选 Qwen2.5-7B 还是 32B？
+答：S1 场景要 p95&lt;3s、引用准确。7B GQA 省 KV，适合 80% 简单 FAQ；
+32B 用于多段交叉推理。网关按 query 复杂度或检索 confidence 路由；
+golden set 上对比 Recall 引用命中率与 TTFT，再定默认档。</code></pre>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>追加题：GQA 为什么能降显存？</summary>
+          <div class="learn-interview-body">
+            <p>推理 KV Cache 存储每层每 token 的 K/V 向量。GQA 减少 K/V 头数，Cache 体积按比例下降；Q 头仍多，表达力损失小于 MQA。结合 Flash Attention 与量化，可撑更长上下文或更大 batch。</p>
+          </div>
+        </details>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>CorpAssist 场景</th><th>推荐模型档</th><th>关键 config 字段</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>在线 FAQ</td>
+            <td>Qwen2.5-7B-Instruct（GQA）</td>
+            <td>max_position_embeddings ≥ 32k</td>
+          </tr>
+          <tr>
+            <td>多段交叉推理</td>
+            <td>Qwen2.5-32B 或 DeepSeek-V3</td>
+            <td>num_hidden_layers、intermediate_size</td>
+          </tr>
+          <tr>
+            <td>代码工具 Agent</td>
+            <td>DeepSeek-Coder 系列</td>
+            <td>vocab 与工具 JSON 格式对齐</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>RMSNorm + SwiGLU</strong>：开源 Decoder 标配，影响参数量与 FFN 算力。</li>
+        <li><strong>GQA</strong>：减 KV 头，降 Cache 显存，LLaMA/Qwen/DeepSeek 广泛采用。</li>
+        <li><strong>config 速读</strong>：layers、hidden、heads、kv_heads、max_position 决定容量与 SLA。</li>
+        <li><strong>选型框架</strong>：场景-约束-对照-延迟-决策，结合网关路由与 golden set。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_practice03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="rms-swiglu" /> 能说明 RMSNorm 与 SwiGLU 相对原始 Transformer 的变化</label></li>
+          <li><label><input type="checkbox" data-id="gqa" /> 能解释 GQA 与 KV Cache 关系</label></li>
+          <li><label><input type="checkbox" data-id="config" /> 能从 config 说出 4 个关键字段</label></li>
+          <li><label><input type="checkbox" data-id="framework" /> 能用 S-C-T-L-M 答一道选型题</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a>，把架构变体与 CorpAssist p95 量化挂钩。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2302.13971" target="_blank" rel="noopener">LLaMA: Open and Efficient Foundation Language Models</a></li>
+      <li><a href="https://qwenlm.github.io/" target="_blank" rel="noopener">Qwen 官方</a></li>
+      <li><a href="https://github.com/deepseek-ai/DeepSeek-V3" target="_blank" rel="noopener">DeepSeek-V3 GitHub</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/main/model_doc/llama" target="_blank" rel="noopener">Hugging Face LLaMA 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">打开任一 Qwen2 config.json（或本章 JSON 样例），完成 GQA 比例计算与 CorpAssist 路由表草稿。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>根据正文 JSON 样例，计算 Q 头与 KV 头比例 <code>28/4=7</code>，说明 KV Cache 相对 MHA 的理论缩放倍数。</li>
+      <li>填写「三族对照」表：为你司实际使用的模型补一列「max_position_embeddings」与「是否 GQA」。</li>
+      <li>用 SwiGLU 伪代码，口述门控与 up 投影相乘的作用（为何比单 GELU FFN 表达力强）。</li>
+      <li>按 S-C-T-L-M 框架，为 CorpAssist「夜间批摘要」写 5 句选型答案（可假设仅 DeepSeek/Qwen 可选）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（权衡）为降 p95 把 32B MHA 老模型换 7B GQA，引用准确率略降但延迟达标。是否可上线为默认档？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>可作<strong>默认档</strong>若 golden set 引用命中率仍达标；复杂 query 保留<strong>升档路由</strong>到 32B。GQA 本身不是质量下降主因，需用 A/B 测 Recall 与 p95，而非只看参数量。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a></li>
+      <li><a href="#ch-advanced-01-positional-encoding">位置编码演进：绝对/相对/RoPE</a></li>
+      <li><a href="#ch-advanced-02-moe-sparse">MoE 与稀疏激活（概念级）</a></li>
+    </ul>
+  </div>
+</section>

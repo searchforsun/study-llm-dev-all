@@ -29,7 +29,7 @@ mvn -q exec:java -Dexec.args="--dry-run --background"
 ## 练习
 
 ### 练习 1：Markdown 声明
-补全 `mail-worker.md` front matter 的 tools 列表。
+补全 `workspace/subagents/mail-worker.md` front matter 的 tools 列表。
 **验收标准**：spawn mail-worker 时工具名与 Toolkit 注册一致。
 
 ### 练习 2：同步 vs 后台
@@ -40,7 +40,7 @@ mvn -q exec:java -Dexec.args="--dry-run --background"
 
 - [ ] `mvn -q exec:java -Dexec.args="--dry-run"` 输出 calendar → mail 顺序 spawn 摘要
 - [ ] `--background` 时 mail 任务显示 task_id 而非同步结果
-- [ ] `workspace/subagents/*.md` 文件名与 agent_id 一致
+- [ ] calendar-worker.md 与 mail-worker.md 文件名与 agent_id 一致
 - [ ] 完成对应章节测验
 
 ## 下一章

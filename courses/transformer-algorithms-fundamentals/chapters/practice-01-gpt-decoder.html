@@ -1,0 +1,435 @@
+<section id="ch-practice-01-gpt-decoder" class="chapter" data-chapter="practice-01-gpt-decoder">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>GPT 系列：Decoder-only 与自回归</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-gpt-decoder" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>架构变体与工程映射</strong> · 能力：理解 Decoder-only 栈、Next-Token 训练与 Chat API 生成链路</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 的对话、摘要、Agent 回复几乎全部走 <span class="term" data-term-id="decoder-only" tabindex="0">Decoder-only</span> 大模型（GPT、Qwen、LLaMA 等）。你在应用层调用的 <code>/v1/chat/completions</code> 背后，是<strong>仅解码器栈 + 因果掩码 + 逐 token 自回归</strong>。不懂这一路线，就无法解释「为什么流式首 token 慢」「为什么上下文越长 p95 越高」——这些正是网关与编排层的 SLA 指标。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>画出 GPT 类模型的 Decoder 栈，并标注 <span class="term" data-term-id="causal-mask" tabindex="0">Causal Mask</span> 作用位置</li>
+          <li>说明 <span class="term" data-term-id="next-token-prediction" tabindex="0">Next-Token 预测</span> 训练目标与 Chat 推理的对应关系</li>
+          <li>从算法视角解释 temperature、top-p 如何改变采样分布（不写训练代码）</li>
+          <li>将 CorpAssist 流式生成与 Decoder-only 自回归逐步对应起来</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>只看过去</strong>：Decoder 自注意力带因果掩码，位置 <em>t</em> 只能 attend 到 ≤ <em>t</em> 的 token。</li>
+          <li><strong>训练=猜下一个</strong>：给定前缀，最大化下一 token 的对数似然；无独立 Encoder。</li>
+          <li><strong>推理=循环解码</strong>：每步 append 一个 token，KV 可缓存（见 <a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a>）。</li>
+          <li><strong>Chat ≠ 原始 GPT</strong>：API 侧的 messages 模板、system 指令是对齐训练后的<strong>使用契约</strong>，不改变底层自回归本质。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>仅解码器栈</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度问答流式回复</span>
+        员工提问后，<code>dialog-orchestrator</code> 将 RAG 引用与 user 消息拼成 token 序列，经 <code>llm-gateway</code> 调用 Qwen/GPT 类模型。模型内部是 <strong>N 层 Decoder Block</strong> 堆叠：每层 = 因果 Self-Attention + FFN + 残差与归一化。没有单独的 Encoder 读完整文档——文档内容已在 prompt 里以 token 形式「一次性读入」前缀。
+      </aside>
+
+      <p>原始 Transformer 含 Encoder 与 Decoder 两栈；<span class="term" data-term-id="decoder-only" tabindex="0">GPT 路线</span> 保留<strong>仅 Decoder</strong>：去掉 Cross-Attention，只保留带 <span class="term" data-term-id="causal-mask" tabindex="0">因果掩码</span> 的自注意力。这与 <a href="#ch-basics-03-transformer-block">Transformer 块：层归一化与 FFN</a> 中的块结构一致，但掩码策略不同。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Decoder-only 栈（GPT / LLaMA / Qwen 对话骨干）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph input [输入]
+    TOK[Token Embedding + 位置编码]
+  end
+  subgraph stack [N x Decoder Block]
+    MHA[Causal Multi-Head Self-Attention]
+    FFN[FFN 通常 SwiGLU]
+    LN[RMSNorm / LayerNorm]
+    MHA --> FFN --> LN
+  end
+  subgraph head [输出头]
+    LM[Linear 到词表 logits]
+    SM[Softmax 得下一 token 分布]
+  end
+  TOK --> stack
+  stack --> LM --> SM
+  SM -->|append token| TOK</pre>
+        <p class="diagram-caption">推理时自回归环：新 token 拼回序列，再进下一层（配合 KV Cache 避免重复算历史 K/V）。</p>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>组件</th><th>Decoder-only 中的角色</th><th>CorpAssist 工程触点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Token + 位置编码</td>
+            <td>将 messages 模板化后的文本变为向量序列</td>
+            <td>编排层控制 prompt 长度，影响首 token 延迟</td>
+          </tr>
+          <tr>
+            <td>因果 Self-Attention</td>
+            <td>每个位置只看左侧上下文</td>
+            <td>长 system + RAG 引用 → 注意力矩阵更大</td>
+          </tr>
+          <tr>
+            <td>FFN</td>
+            <td>逐 token 非线性变换，参数量占比高</td>
+            <td>模型越大，单 token 算力越高</td>
+          </tr>
+          <tr>
+            <td>LM Head</td>
+            <td>词表维度 logits，供采样</td>
+            <td>网关 <code>logprobs</code>、评测对齐</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">常见误解</span>
+          <ul>
+            <li>「Chat 模型有独立 Encoder 读 PDF」—— 文档在 prompt 里，仍走 Decoder</li>
+            <li>「流式是一个 token 一个 HTTP 请求」—— 通常一次连接内多次 decode 步</li>
+            <li>「因果掩码只在训练时用」—— 推理同样必须，否则泄露未来</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">正确心智</span>
+          <ul>
+            <li>Encoder 路线见 <a href="#ch-practice-02-bert-encoder">BERT 与表示学习</a>，与 GPT 分工不同</li>
+            <li>流式 = 同一生成任务逐步返回 delta</li>
+            <li>前缀越长，每步 attention 成本越高（未优化前 O(n²)）</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：RAG 检索到的 6 段制度文本，是在模型「Encoder」里编码的吗？</summary>
+        <p><strong>不是独立 Encoder 栈</strong>。编排层把片段拼进 prompt 字符串，Tokenizer 后作为 Decoder 的<strong>前缀 token</strong> 一次性参与因果注意力。检索质量取决于 embedding 模型（常为 Encoder），生成仍由 Decoder-only 完成。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Next-Token 训练目标</h3>
+      <p><span class="term" data-term-id="next-token-prediction" tabindex="0">Next-Token 预测</span>（也称因果语言建模 CLM）是 GPT 预训练的核心：对序列 <code>x_1, …, x_T</code>，模型在每个位置 <code>t</code> 预测 <code>x_{t+1}</code>，损失为交叉熵之和。因因果掩码，位置 <code>t</code> 的状态只依赖 <code>x_1…x_t</code>，与推理时「给定前缀生成下一个 token」<strong>完全同构</strong>。</p>
+
+      <h4>训练目标（概念公式）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">latex</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-latex">\mathcal{L} = -\sum_{t=1}^{T-1} \log P(x_{t+1} \mid x_1, \ldots, x_t; \theta)</code></pre>
+      </div>
+
+      <p>对齐（SFT）、RLHF 等后训练阶段<strong>不改变</strong>这一自回归接口，只是改变条件分布 <code>P(·|context)</code> 偏向「有用、安全、遵循指令」。CorpAssist 的 system prompt「仅依据引用回答」是在<strong>推理时</strong>塑造条件，而非运行时换架构。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>阶段</th><th>数据形式</th><th>与 CorpAssist 关系</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>预训练 CLM</td>
+            <td>海量文本，下一 token 标签</td>
+            <td>基座能力：语法、常识、代码模式</td>
+          </tr>
+          <tr>
+            <td>SFT</td>
+            <td>instruction-response 对</td>
+            <td>贴近「助手」口吻与格式</td>
+          </tr>
+          <tr>
+            <td>偏好对齐</td>
+            <td>人类偏好排序 / RL</td>
+            <td>减少有害输出、提升遵循度</td>
+          </tr>
+          <tr>
+            <td>在线推理</td>
+            <td>messages → 单序列前缀</td>
+            <td>gateway 流式返回 incremental tokens</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>伪代码：训练一步 vs 推理一步</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 训练：整段序列并行算所有位置的 next-token loss（Teacher Forcing）
+def training_step(model, token_ids: list[int]) -> float:
+    logits = model(token_ids)  # shape: (seq_len, vocab)
+    loss = cross_entropy(logits[:-1], token_ids[1:])
+    return loss
+
+# 推理：自回归循环，每次只取最后一个位置的 logits
+def generate(model, prompt_ids: list[int], max_new: int = 128) -> list[int]:
+    ids = list(prompt_ids)
+    for _ in range(max_new):
+        logits = model(ids)          # 生产环境用 KV Cache，只算最后一步
+        next_id = sample(logits[-1]) # 见下一节 temperature / top-p
+        ids.append(next_id)
+        if next_id == eos_id:
+            break
+    return ids</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Teacher Forcing 与推理不一致会出问题吗？</summary>
+          <div class="learn-faq-body">
+            训练时模型总看到「正确」历史 token；推理时历史由自身采样得到，存在 exposure bias。工程上靠足够规模预训练、采样策略与对齐缓解。应用侧通过<strong>低温度</strong>、约束解码、引用块降低跑偏，而非改架构。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>采样与温度（算法视角）</h3>
+      <p>Decoder 最后一步输出词表上的 logits <code>z</code>。<strong>贪心</strong>取 <code>argmax</code>；<strong>采样</strong>先得到概率 <code>p = softmax(z / T)</code>，其中 <code>T</code> 为 <span class="term" data-term-id="temperature-sampling" tabindex="0">temperature</span>。<code>T→0</code> 趋近贪心；<code>T&gt;1</code> 分布更平、更随机。CorpAssist 客服场景常用 <code>T=0.3~0.7</code>；创意文案可略高。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>参数</th><th>作用</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>temperature</code></td>
+            <td>缩放 logits，调节随机性</td>
+            <td>制度问答偏低；头脑风暴略高</td>
+          </tr>
+          <tr>
+            <td><code>top_p</code> (nucleus)</td>
+            <td>从累积概率达 p 的最小词集采样</td>
+            <td>与 temperature 二选一或组合，防长尾胡言</td>
+          </tr>
+          <tr>
+            <td><code>max_tokens</code></td>
+            <td>限制自回归步数上界</td>
+            <td>编排层与网关双重限制，控费用</td>
+          </tr>
+          <tr>
+            <td><code>stop</code> / EOS</td>
+            <td>提前终止 decode 环</td>
+            <td>JSON 模式可配 stop sequence</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>temperature 对分布的影响（示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import numpy as np
+
+def softmax(logits, temperature=1.0):
+    z = logits / max(temperature, 1e-8)
+    z = z - z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+logits = np.array([2.0, 1.0, 0.5, 0.1])  # 四个候选 token
+print("T=0.3:", softmax(logits, 0.3).round(3))  # 更尖锐 → 几乎确定性
+print("T=1.0:", softmax(logits, 1.0).round(3))
+print("T=1.5:", softmax(logits, 1.5).round(3))  # 更平坦 → 更易选到低分 token</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">应用反模式</span>
+          <ul>
+            <li>制度问答 <code>temperature=1.2</code> 求「灵活」→ 幻觉增加</li>
+            <li>不设 <code>max_tokens</code> → 自回归环过长，p95 爆炸</li>
+            <li>把 top_p 当「质量开关」而不看任务类型</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>RAG 问答：低 T + 引用约束 + 拒答模板</li>
+            <li>网关按租户存默认采样 profile</li>
+            <li>评测集固定 seed / T=0 便于回归</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Chat API 生成关系</h3>
+      <p>你在 CorpAssist 调用的 OpenAI 兼容 API，请求体是 <code>messages</code> 数组；服务端将其<strong>渲染为单一 token 前缀</strong>（含特殊 token、角色标记），再进入 Decoder-only 自回归。流式响应每个 <code>delta.content</code> 对应 decode 环的一次或多次 token 增量。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist Chat 请求 → Decoder-only 推理</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant ORCH as dialog-orchestrator
+  participant GW as llm-gateway
+  participant TOK as Chat Template + Tokenizer
+  participant DEC as Decoder-only 模型
+  ORCH->>GW: POST /v1/chat/completions stream=true
+  GW->>TOK: messages → token ids
+  loop 自回归 decode
+    DEC->>DEC: causal attention + sample
+    DEC-->>GW: token delta
+    GW-->>ORCH: SSE chunk
+  end</pre>
+        <p class="diagram-caption">首 token 延迟（TTFT）≈ 前缀 prefill + 首步 decode；后续 token 间隔（ITL）与 KV Cache、批大小相关。</p>
+      </div>
+
+      <h4>API 请求片段（与自回归参数对应）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "model": "qwen-plus",
+  "messages": [
+    {"role": "system", "content": "仅依据引用回答；无依据则拒答。"},
+    {"role": "user", "content": "产假天数是多少？\n\n[引用1] ..."}
+  ],
+  "stream": true,
+  "temperature": 0.3,
+  "max_tokens": 512
+}</code></pre>
+      </div>
+
+      <p>编排层职责：控制前缀长度（RAG top-k、历史轮次）、设定采样默认值、在 TTFT 超 SLA 时降级（换小模型、缩短引用）。算法认知帮助你在面试中说清：<strong>不是 API 「变慢了」，而是序列变长或 decode 步数变多</strong>。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>completion 与 chat 在架构上有区别吗？</summary>
+          <div class="learn-faq-body">
+            底层通常是同一 Decoder-only；差异在<strong>模板与对齐数据</strong>。Chat 模型经对话格式 SFT，更适合多轮 messages；纯 completion API 直接续写前缀。CorpAssist 应统一走 chat/completions 以便 system 注入合规指令。
+          </div>
+        </details>
+        <details>
+          <summary>为何 Agent 多步工具会拉高 p95？</summary>
+          <div class="learn-faq-body">
+            每轮工具结果拼回 messages → 前缀变长 → prefill 与每步 attention 成本上升；且多轮多次完整生成。需步数预算、上下文压缩与 <a href="#ch-practice-04-kv-cache-flash">KV Cache</a> Aware 路由（见后续章）。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>仅解码器栈</strong>：GPT/Qwen/LLaMA 对话骨干 = N 层因果 Decoder Block，无独立 Encoder。</li>
+        <li><strong>Next-Token</strong>：训练与推理同构；SFT/对齐只改条件分布，不改自回归接口。</li>
+        <li><strong>采样</strong>：temperature / top-p 调节 softmax 后分布；RAG 宜低温、限 max_tokens。</li>
+        <li><strong>Chat API</strong>：messages → 模板化前缀 → 流式自回归；TTFT/ITL 是工程 SLA 核心。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="decoder-stack" /> 能画出 Decoder-only 栈并标因果掩码</label></li>
+          <li><label><input type="checkbox" data-id="clm-loss" /> 能写出 Next-Token 损失一句话含义</label></li>
+          <li><label><input type="checkbox" data-id="sampling" /> 能说明 temperature 高低对输出的影响</label></li>
+          <li><label><input type="checkbox" data-id="chat-api" /> 能口述 messages 如何进入自回归环</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>Decoder-only</td><td>仅因果自注意力 Decoder 栈</td></tr>
+                <tr><td>CLM</td><td>预测下一 token</td></tr>
+                <tr><td>Causal Mask</td><td>禁止看未来 token</td></tr>
+                <tr><td>TTFT</td><td>首 token 时间，含 prefill</td></tr>
+                <tr><td>temperature</td><td>logits 缩放，控随机性</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>GPT 与原始 Transformer Encoder-Decoder 结构差异？</li>
+              <li>为什么 RAG 检索用 Encoder embedding，生成仍用 GPT？</li>
+              <li>CorpAssist 流式 SLA 变差，从 Decoder 自回归角度列 3 个可能原因。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：对照 <a href="#ch-practice-02-bert-encoder">BERT 与表示学习：Encoder 路线</a>，理解 GPT 与 BERT 在 CorpAssist 中的分工（生成 vs 向量检索）。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need（原始 Transformer）</a></li>
+      <li><a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">GPT-3: Language Models are Few-Shot Learners</a></li>
+      <li><a href="https://platform.openai.com/docs/api-reference/chat/create" target="_blank" rel="noopener">OpenAI Chat Completions API</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/model_doc/gpt2" target="_blank" rel="noopener">Hugging Face — GPT-2 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用本章 Mermaid 与伪代码，完成「CorpAssist 制度问答」从 messages 到自回归 decode 的标注表，并解释采样参数取舍。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制「Decoder-only 栈」Mermaid，在因果 Self-Attention 旁标注：RAG 引用 token 位于<strong>前缀</strong>，仍受因果掩码约束（位置靠后的 token 可见引用）。</li>
+      <li>对照「Next-Token 训练目标」表，为 CorpAssist 填一行：<strong>SFT 后在线推理</strong> 的数据形式与损失是否仍算 CLM（提示：推理不算 loss，但每步仍是 next-token 接口）。</li>
+      <li>用正文 temperature 代码块，对 logits <code>[2.0, 1.0, 0.5, 0.1]</code> 手算 <code>T=0.5</code> 时最大概率 token 的下标，并说明制度问答为何选更低 T。</li>
+      <li>根据「与 Chat API 生成关系」序列图，列出影响 TTFT 的 3 个编排层可控因素（如 prompt 长度、模型规格、是否 stream）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）产品要求「把 PDF 放进 GPT 的 Encoder，再让 Decoder 生成答案」，是否准确描述当前 Qwen-Chat 架构？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不准确</strong>。Qwen-Chat 为 <span class="term" data-term-id="decoder-only" tabindex="0">Decoder-only</span>：PDF 文本需先解析为字符串，经 Tokenizer 进入<strong>前缀</strong>，无独立 Encoder 栈。向量检索应使用 <a href="#ch-practice-02-bert-encoder">Encoder 类 embedding 模型</a>，再拼入 prompt。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">（排障）同一模型 TTFT 从 800ms 升到 2.5s，ITL 正常。最应优先排查什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>优先查<strong>前缀变长</strong>：RAG top-k 增大、历史对话未截断、system 模板膨胀。ITL 正常说明 decode 步成本尚可，瓶颈在 prefill 阶段对长序列的因果注意力（见 <a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a>）。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-05-multi-head-mask">多头注意力与 Mask</a>：因果掩码数学形式</li>
+      <li><a href="#ch-practice-02-bert-encoder">BERT 与表示学习：Encoder 路线</a>：与 GPT 对比</li>
+      <li><a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a>：推理优化</li>
+      <li><a href="https://jalammar.github.io/gpt2/" target="_blank" rel="noopener">Jay Alammar — The Illustrated GPT-2</a></li>
+    </ul>
+  </div>
+</section>

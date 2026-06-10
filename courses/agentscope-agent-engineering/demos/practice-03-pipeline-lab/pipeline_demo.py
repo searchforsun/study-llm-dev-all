@@ -1,44 +1,53 @@
-"""Pipeline sequential / fanout Demo."""
+"""Pipeline sequential / fanout Demo（兼容层 shim）。"""
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
+import sys
+from pathlib import Path
 
-from agentscope.agent import ReActAgent
-from agentscope.formatter import DashScopeChatFormatter
-from agentscope.message import Msg
-from agentscope.model import DashScopeChatModel
-from agentscope.pipeline import fanout_pipeline, sequential_pipeline
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _corpassist_compat import (
+    build_agent,
+    dashscope_model,
+    fanout_pipeline,
+    is_mock,
+    sequential_pipeline,
+    user_msg,
+)
 
 
-def _agent(name: str, task: str) -> ReActAgent:
-    return ReActAgent(
-        name=name,
-        sys_prompt=f"你是 {name}。{task} 用一两句话汇报进度。",
-        model=DashScopeChatModel(
-            model_name="qwen-max",
-            api_key=os.environ.get("DASHSCOPE_API_KEY", "sk-demo"),
-        ),
-        formatter=DashScopeChatFormatter(),
+def _agent(name: str, task: str):
+    return build_agent(
+        name,
+        f"你是 {name}。{task} 用一两句话汇报进度。",
+        model=dashscope_model("qwen-max"),
         max_iters=2,
     )
 
 
 async def run_sequential() -> None:
+    if is_mock():
+        print("[sequential] HR→IT→Admin 入职流程已完成（mock）")
+        return
     hr = _agent("HR", "完成入职登记表")
     it = _agent("IT", "开通账号")
     admin = _agent("Admin", "发放设备")
-    msg = Msg("user", "为新员工 Alice 办理入职", "user")
+    msg = user_msg("为新员工 Alice 办理入职")
     result = await sequential_pipeline(agents=[hr, it, admin], msg=msg)
     print("[sequential]", result.get_text_content())
 
 
 async def run_fanout() -> None:
+    if is_mock():
+        print("[fanout-1] 法务审阅通过（mock）")
+        print("[fanout-2] 安全审阅通过（mock）")
+        print("[fanout-3] 合规审阅通过（mock）")
+        return
     legal = _agent("Legal", "法务审阅")
     security = _agent("Security", "安全审阅")
     compliance = _agent("Compliance", "合规审阅")
-    msg = Msg("user", "审阅远程办公政策草案", "user")
+    msg = user_msg("审阅远程办公政策草案")
     reviews = await fanout_pipeline(
         agents=[legal, security, compliance],
         msg=msg,

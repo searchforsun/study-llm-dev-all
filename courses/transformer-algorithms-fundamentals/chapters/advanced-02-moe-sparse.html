@@ -1,0 +1,379 @@
+<section id="ch-advanced-02-moe-sparse" class="chapter" data-chapter="advanced-02-moe-sparse">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>MoE 与稀疏激活（概念级）</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-moe-sparse" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>面试亮点与算法边界</strong> · 能力：解释 <span class="term" data-term-id="moe" tabindex="0">MoE</span> 路由、激活参数与总参数差异，并估算 CorpAssist 推理成本</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Mixtral 8×7B、DeepSeek-V2/V3、Qwen-MoE 等模型用<strong>稀疏激活</strong>在可控算力下放大「有效容量」。面试常问：「总参数 200B，为何说等价 20B 稠密？」「路由会不会负载不均？」应用岗需能估算<strong>单次推理激活参数量</strong>与延迟，而非推导专家梯度或千卡训练。本章<strong>概念级</strong>，不讲 Megatron/DeepSpeed 与 CUDA。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>口述 <span class="term" data-term-id="expert-routing" tabindex="0">专家路由</span>：门控网络如何为每个 token 选 top-k 专家</li>
+          <li>对比 Mixtral 与 DeepSeek-MoE 的「共享专家 + 路由专家」设计差异</li>
+          <li>区分 <span class="term" data-term-id="activated-parameters" tabindex="0">激活参数</span> 与总参数，并用于 API 成本粗算</li>
+          <li>回答「MoE 是否适合 CorpAssist 在线客服」类场景题</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>不是所有专家都跑</strong>：每 token 只激活 top-k 个 FFN 专家，算力近似 k/总专家数 × 稠密 FFN。</li>
+          <li><strong>总参数 ≠ 推理 FLOPs</strong>：显存可能仍要加载全部专家权重（除非 CPU offload / 专家并行）。</li>
+          <li><strong>负载均衡是工程题</strong>：训练用 auxiliary loss；推理关注 p95 与热点专家。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>专家路由直觉</h3>
+      <p>标准 Transformer 每层 FFN 对所有 token 使用同一组权重。<span class="term" data-term-id="moe" tabindex="0">MoE</span>（Mixture of Experts）把 FFN 拆成 N 个<strong>专家</strong>（各自一套 MLP），另设<strong>门控</strong>（Gating / Router）为每个 token 输出 N 维分数，取 top-k 专家加权组合输出。于是模型容量随 N 增长，但每步只算 k 个专家。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 多领域问题分流</span>
+        员工问「年假制度」与「报销 SAP 科目」——理想化想象：不同专家擅长 HR 政策 vs 财务流程。真实 MoE 的<strong>专家分工未必可解释</strong>，但路由确实让不同 token 走不同 FFN 路径，这是「稀疏激活」的工程直觉来源。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>MoE 层数据流（单 token 视角）</h5>
+        <pre class="mermaid">flowchart LR
+  X[Token 隐状态 h] --> G[Router / Gating]
+  G -->|scores| TOPK[Top-k 专家选择]
+  TOPK --> E1[Expert 1 FFN]
+  TOPK --> E2[Expert 2 FFN]
+  TOPK --> E3[Expert k FFN]
+  E1 --> W[加权求和]
+  E2 --> W
+  E3 --> W
+  W --> OUT[h 输出]</pre>
+        <p class="diagram-caption">Attention 子层通常仍<strong>稠密</strong>；稀疏发生在 FFN。面试白板至少画出 Router → Top-k → 加权合并。</p>
+      </div>
+
+      <h4>路由伪代码（概念级）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def moe_ffn(h, experts, router, k=2):
+    """概念演示：top-k 路由 MoE FFN"""
+    logits = router(h)                    # shape: [num_experts]
+    weights, indices = topk_softmax(logits, k)
+    out = 0
+    for w, idx in zip(weights, indices):
+        out += w * experts[idx](h)
+    return out
+
+# 训练时常加 load_balance_loss，避免少数专家垄断
+# 推理时关注：k、专家数、是否共享专家（见下节）</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>概念</th><th>含义</th><th>面试一句话</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>专家数 N</td><td>并行 FFN 套数</td><td>容量旋钮，增大 N 不线性增大每 token 算力</td></tr>
+          <tr><td>Top-k</td><td>每 token 激活专家数</td><td>Mixtral 常用 k=2；k 越大越接近稠密</td></tr>
+          <tr><td><span class="term" data-term-id="sparse-activation" tabindex="0">稀疏激活</span></td><td>仅部分专家参与计算</td><td>算力 ∝ k/N × 稠密 FFN</td></tr>
+          <tr><td><span class="term" data-term-id="expert-routing" tabindex="0">专家路由</span></td><td>门控选专家</td><td>可学习、与 token 内容相关</td></tr>
+          <tr><td>负载均衡</td><td>专家使用率均匀</td><td>训练 auxiliary loss；推理看热点与排队</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：若 k=N，MoE 与稠密 FFN 有何区别？</summary>
+        <p>计算量接近，但参数布局仍是 N 套独立权重 + 路由器；除非合并，否则显存仍存 N 套。面试答：「k=N 失去稀疏意义，一般 k≪N。」</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Mixtral/DeepSeek-MoE 对照</h3>
+      <p>开源 MoE 并非同一模板。<strong>Mixtral 8×7B</strong>：8 个专家，每 token 选 2 个，无共享专家；有效 FFN 约为 2/8 稠密。DeepSeek 系列引入<strong>共享专家</strong>（始终激活）+ <strong>路由专家</strong>（稀疏选择），在保持稀疏的同时稳定通用能力。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>专家结构</th>
+              <th>每 token 激活</th>
+              <th>面试强调点</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Mixtral 8×7B</strong></td>
+              <td>8 路由专家，无共享</td>
+              <td>2 专家 FFN</td>
+              <td>「8×7B」指总参数规模感，非 8 倍算力</td>
+            </tr>
+            <tr>
+              <td><strong>DeepSeek-MoE</strong></td>
+              <td>共享专家 + 路由专家</td>
+              <td>共享全激活 + 少量路由</td>
+              <td>共享保底通用；路由增容量</td>
+            </tr>
+            <tr>
+              <td><strong>Qwen-MoE</strong></td>
+              <td>多专家 + top-k</td>
+              <td>依配置</td>
+              <td>国内生态与量化工具链</td>
+            </tr>
+            <tr>
+              <td><strong>稠密 LLaMA-70B</strong></td>
+              <td>单 FFN</td>
+              <td>全 FFN</td>
+              <td>显存高、延迟可预测</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">误区</span>
+          <ul>
+            <li>「Mixtral 8×7B = 每次推理 56B 参数全激活」——实际约 2 专家路径 + Attention 稠密</li>
+            <li>「专家=人工规则模块」——分工通常不可解释，勿过度拟人化</li>
+            <li>「MoE 一定比稠密快」——显存带宽与路由开销可能抵消收益</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐表述</span>
+          <ul>
+            <li>用「总参数 / 激活参数 / 部署显存」三列回答 HR</li>
+            <li>DeepSeek 共享专家是架构亮点，体现「稳定 + 稀疏」折中</li>
+            <li>选型看 vLLM / 昇腾是否优化 MoE 路由 kernel（协作方能力）</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：MoE Attention 还是稠密的吗？</summary>
+        <p>主流实现中 Self-Attention 子层仍为<strong>稠密</strong>（所有 head 全算）；稀疏主要在 FFN。长上下文瓶颈仍在 Attention O(n²) 与 KV Cache——见 <a href="#ch-advanced-03-long-context">长上下文技术概览</a> 与 <a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a>。</p>
+      </details>
+
+      <h4>开源 MoE 读模型卡片清单</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>问什么</th><th>CorpAssist 用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>num_experts</code></td><td>专家总数 N</td><td>估算显存上界</td></tr>
+          <tr><td><code>num_experts_per_tok</code></td><td>top-k</td><td>算力与激活参数</td></tr>
+          <tr><td>shared experts</td><td>是否始终激活</td><td>DeepSeek 类架构识别</td></tr>
+          <tr><td>active params</td><td>厂商是否标注</td><td>成本谈判依据</td></tr>
+          <tr><td>quantization</td><td>AWQ/GPTQ 支持</td><td>私有化部署可行性</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：CorpAssist 摘要用小模型、问答用大模型，MoE 应放哪一层？</summary>
+        <p>摘要可用 7B 稠密降本；主问答若选 MoE，应用<strong>生成质量与引用率</strong>评测验证是否优于同价位 32B 稠密。MoE 不是免费升级，需 ablation。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>激活参数 vs 总参数</h3>
+      <p>招聘与模型卡片常写「总参数 236B」。推理成本与延迟更相关的是<strong>每 token 激活的参数量</strong>（参与矩阵乘法的权重规模）与<strong>需加载的权重体积</strong>（部署显存）。二者常被混淆，是 MoE 面试核心考点。</p>
+
+      <h4>粗算示例（数量级）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>Mixtral 8×7B（示意）</th><th>稠密 7B</th><th>对 CorpAssist 含义</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>总参数</td>
+            <td>~47B 级（含 8 专家）</td>
+            <td>7B</td>
+            <td>磁盘与全量加载显存</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="activated-parameters" tabindex="0">激活参数</span> / token</td>
+            <td>~12B～14B 量级（2/8 专家 + 其余稠密层）</td>
+            <td>7B</td>
+            <td>与 Token 单价、算力预算相关</td>
+          </tr>
+          <tr>
+            <td>相对延迟</td>
+            <td>常介于 7B 与 70B 之间</td>
+            <td>基线</td>
+            <td>客服 p95 需实测，不能只看参数量</td>
+          </tr>
+          <tr>
+            <td>能力定位</td>
+            <td>强于 7B 稠密，成本可控</td>
+            <td>边缘 / 开发</td>
+            <td>制度 RAG 主模型 vs 摘要小模型分层</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># CorpAssist 成本粗算（应用岗口述题）
+tokens_per_day = 1000 * 8 * 500          # DAU * 次/人 * token/次
+active_params_b = 13                     # MoE 激活参数（十亿）
+price_per_1m_active = 0.8                # 示意单价（元/百万激活-token）
+daily_cost = tokens_per_day / 1e6 * price_per_1m_active
+# 要点：厂商计价可能按总参数档或按实际；采购时问清「MoE 计费口径」</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="load-balancing" tabindex="0">负载均衡</span>：训练时若路由器总选同一专家，其余专家荒废；常用 auxiliary load balancing loss 鼓励均匀。推理时若热点专家成为瓶颈，p95 延迟抖动——可观测性应分专家记录（平台方职责，应用岗知概念即可）。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>专家并行 vs 张量并行（口述边界）</summary>
+          <p><strong>专家并行</strong>：不同 GPU 存不同专家，路由决定激活哪块——MoE 训练/推理常见。<strong>张量并行</strong>：单层权重切分到多卡。二者均属 mustNotCover 的千卡/Megatron 范畴；应用岗只需在压测报告里看到「MoE 路由延迟」指标并追问平台方。</p>
+        </details>
+        <details>
+          <summary>MoE 与 <span class="term" data-term-id="moe" tabindex="0">MoE</span> 量化的关系</summary>
+          <p>量化降低权重体积，但不改变 top-k 路由逻辑。边缘部署若只能加载部分专家，需专用框架支持——多数 CorpAssist 企业场景走<strong>云端 API</strong>，本地只需知「总参数量化后仍可能数十 GB」。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>应用侧成本估算</h3>
+      <p>CorpAssist 选型 MoE 时需同时回答：<strong>质量</strong>（评测集）、<strong>延迟</strong>（p95 TTFT）、<strong>成本</strong>（Token 账单）、<strong>显存</strong>（私有化部署）。本节给应用岗决策表，不涉及千卡训练。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>场景</th><th>MoE 适合？</th><th>理由</th><th>替代</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>企业知识库 RAG 主生成</td>
+            <td>可考虑</td>
+            <td>质量接近更大稠密，激活成本适中</td>
+            <td>32B 稠密 + 强 Rerank</td>
+          </tr>
+          <tr>
+            <td>高 QPS 客服</td>
+            <td>谨慎</td>
+            <td>路由与显存带宽可能拉高 p95</td>
+            <td>7B～14B 稠密 + 缓存</td>
+          </tr>
+          <tr>
+            <td>私有化单卡部署</td>
+            <td>常不适合</td>
+            <td>总参数量仍大，需多卡或量化</td>
+            <td>14B 量化稠密</td>
+          </tr>
+          <tr>
+            <td>离线批处理摘要</td>
+            <td>适合</td>
+            <td>吞吐优先，可接受较大权重</td>
+            <td>MoE + 动态 batch</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">采购误区</span>
+          <ul>
+            <li>只看「总参数越大越强」——忽视激活与评测</li>
+            <li>假设 MoE API 与稠密同价——计费口径可能不同</li>
+            <li>忽视 <span class="term" data-term-id="sparse-activation" tabindex="0">稀疏激活</span> 在边缘设备无法加载全专家</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">工程清单</span>
+          <ul>
+            <li>问清：激活参数、top-k、共享专家数、量化支持</li>
+            <li>跑 golden set：引用率、幻觉率 vs 7B/32B 稠密</li>
+            <li>压测：峰值 QPS 下 p95 与专家热点监控</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：面试官问 MoE 训练细节怎么办？</summary>
+        <p>诚实划界：「专家并行、aux loss 推导、千卡调度属于训练团队；我负责在<strong>给定 API</strong> 下做 RAG 评测与成本治理。」随后转到 <span class="term" data-term-id="activated-parameters" tabindex="0">激活参数</span> 估算与 CorpAssist 分层架构——体现应用岗价值。</p>
+      </details>
+
+      <p class="diagram-caption">本节交付物：一张「场景 → MoE 是否适合 → 替代方案」决策便签，贴进选型评审纪要即可复用。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>专家路由直觉</strong>：门控为每 token 选 top-k 专家 FFN；Attention 通常仍稠密。</li>
+        <li><strong>Mixtral/DeepSeek-MoE 对照</strong>：前者纯路由专家；后者共享+路由，稳定性更好。</li>
+        <li><strong>激活参数 vs 总参数</strong>：成本与延迟看激活；部署显存看总权重。</li>
+        <li><strong>应用侧成本估算</strong>：用评测+压测+计费口径三件套，MoE 非必然更快更省。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <ul class="learn-checklist" data-storage-key="adv02-moe-review">
+        <li><label><input type="checkbox" /> 能画 MoE 层 Router → Top-k → 加权图</label></li>
+        <li><label><input type="checkbox" /> 能解释 Mixtral 8×7B 不等于 56B 算力</label></li>
+        <li><label><input type="checkbox" /> 能粗算 Token 日成本并说明激活参数</label></li>
+        <li><label><input type="checkbox" /> 训练/Megatron 细节划界到 mustNotCover</label></li>
+      </ul>
+      <p class="chapter-review-next">下一步：完成章节测验；进入 <a href="#ch-advanced-03-long-context">长上下文技术概览</a>，串联滑动窗口与 RAG 取舍。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">Outrageously Large Neural Networks: MoE 奠基</a></li>
+      <li><a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">Mixtral of Experts 技术报告</a></li>
+      <li><a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">DeepSeek-V2 MoE 架构</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/model_doc/mixtral" target="_blank" rel="noopener">Hugging Face — Mixtral 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成 MoE 路由图临摹、Mixtral/DeepSeek 对照表填空，并写一段 CorpAssist 成本粗算说明（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>默画「MoE 层数据流」Mermaid，标出 Router、Top-k、加权求和三步。</li>
+      <li>填「Mixtral/DeepSeek-MoE 对照」表：各写一行共享专家差异与面试强调点。</li>
+      <li>用本章 Python 成本粗算模板，代入你们部门 DAU 与单次 token，得出日成本数量级。</li>
+      <li>从「应用侧成本估算」决策表选 CorpAssist 主生成场景，写 3 句选型结论（MoE vs 稠密）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）采购说「236B MoE 比 70B 稠密便宜，因为总参数更大所以更聪明且更省」。你如何回应？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>纠正两点：① 聪明程度看<strong>激活参数</strong>与评测集，非总参数；236B 总参不意味着每 token 全激活。② 成本看 API 计费口径与实测 p95，MoE 显存与路由可能更贵。要求提供激活参数、top-k、golden set 引用率与压测报告，再决策。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：MoE 三列笔记</h4>
+      <p>建表列「总参数 / 激活参数 / 部署显存需求」，为 Mixtral、DeepSeek、本地 14B 稠密各填一行；验收：能向非技术人员解释为何「大模型不一定更慢」。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸资源</h3>
+    <ul>
+      <li><a href="https://huggingface.co/blog/moe" target="_blank" rel="noopener">Hugging Face — Mixture of Experts 导读</a></li>
+      <li>上一章：<a href="#ch-advanced-01-positional-encoding">位置编码演进</a></li>
+      <li>下一章：<a href="#ch-advanced-03-long-context">长上下文技术概览</a></li>
+    </ul>
+  </div>
+</section>

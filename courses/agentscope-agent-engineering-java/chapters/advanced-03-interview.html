@@ -1,0 +1,396 @@
+<section id="ch-advanced-03-interview" class="chapter" data-chapter="advanced-03-interview">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：AgentScope Java 排障</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-interview" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>Capstone 与导读</strong> · 能力：AgentScope Java 生产故障排查与面试应答</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>AgentScope Java 生产环境与本地 IDE 差异巨大——<span class="term" data-term-id="event-stream-disconnect-java" tabindex="0">SSE 事件流断连</span>、<span class="term" data-term-id="tool-permission-deny" tabindex="0">工具权限拒绝</span>、<span class="term" data-term-id="session-loss-redis" tabindex="0">Session Redis 丢失</span>、<span class="term" data-term-id="sub-agent-deadlock" tabindex="0">Sub-agent 死锁</span> 是 CorpAssist S3 最高频故障。本章给出 Java 栈特有的 Trace 排查路径与 STAR 案例模板，区别于通用 LangGraph 话术；样例 Trace 见 Demo 目录。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>诊断 Spring Boot SSE 与 Gateway 导致的 <span class="term" data-term-id="event-stream-disconnect-java" tabindex="0">事件流断连</span></li>
+          <li>处理 Permissions allow/approve/deny 与 <span class="term" data-term-id="tool-permission-deny" tabindex="0">工具权限拒绝</span></li>
+          <li>排查 Redis Session TTL 与序列化导致的 <span class="term" data-term-id="session-loss-redis" tabindex="0">Session 丢失</span></li>
+          <li>识别 Sub-agent 同步等待导致的 <span class="term" data-term-id="sub-agent-deadlock" tabindex="0">死锁</span> 并给出修复</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>排障第一原则</strong>：先看 streamEvents Trace 与 <code>trace_id</code>，再看工具入参出参。</li>
+          <li><strong>maxIterations 触发不是正常降级</strong>：说明根因未修，需查循环或权限阻塞。</li>
+          <li><strong>面试讲 Java 细节</strong>：Msg、Event type、@Tool、RuntimeContext 要能举例。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>事件流断连</h3>
+      <p>CorpAssist BFF 通过 <code>TEXT_EVENT_STREAM</code> 消费 AgentScope Java <code>streamEvents()</code>。断连表现为客户端收不到后续 tool_call 事件，或 Gateway 返回 504。与 Python FastAPI SSE 类似，但 Java 侧常见 Reactor 背压与 Spring Cloud Gateway 超时。</p>
+
+      <div class="mermaid-wrap">
+        <h5>SSE 事件流断连排查流程</h5>
+        <pre class="mermaid">flowchart TD
+    Alert[客户端 SSE 中断 / 504] --> Trace[查 trace_id 对应 Event 日志]
+    Trace --> Q1{Agent 侧是否仍在 emit?}
+    Q1 -->|是| GW[检查 Gateway / Nginx 超时]
+    Q1 -->|否| Q2{是否 CancellationException?}
+    Q2 -->|是| Client[客户端断开或未读 Flux]
+    Q2 -->|否| Q3{Reactor 线程阻塞?}
+    Q3 -->|是| Block[工具同步 IO 阻塞 event 线程]
+    GW --> Fix1[proxy_read_timeout / response-timeout]
+    Client --> Fix2[前端 EventSource reconnect + Last-Event-ID]
+    Block --> Fix3[工具改 boundedElastic / 虚拟线程]</pre>
+        <p class="diagram-caption">先确认 Agent 是否仍在发事件，再查网关超时与 Reactor 阻塞。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>征象</th><th>Trace 特征</th><th>常见根因</th><th>修复</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>504 Gateway Timeout</td><td>Agent 日志有完整 tool 链</td><td>Gateway <code>response-timeout</code> &lt; Agent P95</td><td>调至 60s+ 或异步任务模式</td></tr>
+          <tr><td>事件突然停止</td><td>最后事件为 tool_call，无 tool_result</td><td>工具 HTTP 调用无超时</td><td><code>WebClient</code> 设 connect/read timeout</td></tr>
+          <tr><td>首包有、后续无</td><td>Reactor 单线程 blocked</td><td>@Tool 内同步 JDBC/大文件</td><td><code>subscribeOn(Schedulers.boundedElastic())</code></td></tr>
+          <tr><td>重连丢上下文</td><td>新 session 无历史</td><td>未传 <code>X-Session-Id</code></td><td>BFF 持久化 sessionId</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-yaml"># application.yaml — CorpAssist Gateway SSE 超时（示意）
+spring:
+  cloud:
+    gateway:
+      httpclient:
+        response-timeout: 60s
+      routes:
+        - id: corp-assist-agent
+          uri: lb://agent-service
+          predicates:
+            - Path=/agent/**
+          metadata:
+            response-timeout: 60000
+
+# Agent Service — SSE 心跳（可选）
+agentscope:
+  sse:
+    heartbeat-interval: 15s</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Trace 显示 Agent 已 emit 全部事件，但浏览器只收到一半——优先查哪一层？</summary>
+        <p>优先查 <span class="term" data-term-id="sse-gateway-timeout" tabindex="0">Gateway SSE 超时</span> 与缓冲（nginx <code>proxy_buffering off</code>、<code>proxy_read_timeout</code>）；Agent 侧完整则问题在传输链或客户端 EventSource 未持续读取。</p>
+      </details>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>典型配置项</th><th>断连征象</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Spring MVC SSE</td><td><code>spring.mvc.async.request-timeout</code></td><td>30s 后 503</td></tr>
+          <tr><td>API Gateway</td><td>idle timeout / buffer</td><td>tool_call 中途断流</td></tr>
+          <tr><td>AgentScope</td><td><code>agentscope.sse.heartbeat-interval</code></td><td>无 heartbeat 被中间层判死</td></tr>
+          <tr><td>客户端</td><td>EventSource reconnect</td><td>重连后 session 不一致</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>工具权限拒绝</h3>
+      <p><span class="term" data-term-id="tool-permission-deny" tabindex="0">工具权限拒绝</span> 发生在 practice-03 的 Permissions 三态：<code>deny</code> 永久拒绝、<code>approve</code> 待人工、<code>allow</code> 放行。生产故障常表现为 Agent 反复尝试同一工具或卡在 HITL 等待。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">权限故障征象</span>
+          <ul>
+            <li>Trace 连续 <code>permission_denied</code> 同工具</li>
+            <li>用户已审批但 Agent 仍 pending</li>
+            <li>bookMeeting 需审批，模型改调 sendEmail 绕过</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">防护</span>
+          <ul>
+            <li>deny 返回结构化 reason 供模型换策略</li>
+            <li>审批回调写 audit 表 + 唤醒外部执行循环</li>
+            <li>敏感工具强制 approve，禁止 allow 默认</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-java">// PermissionMiddleware — deny 时返回可解析错误，避免 silent loop
+@Component
+public class CorpAssistPermissionGate implements ToolPermissionEvaluator {
+
+    @Override
+    public PermissionDecision evaluate(ToolCallContext ctx) {
+        if ("bookMeeting".equals(ctx.toolName()) && !ctx.userRoles().contains("CALENDAR_WRITE")) {
+            return PermissionDecision.deny(
+                "PERMISSION_DENIED: 用户无 CALENDAR_WRITE，请引导用户申请权限或改查可用会议室");
+        }
+        if (isSensitive(ctx.toolName())) {
+            return PermissionDecision.approve("需人工确认订会议室操作");
+        }
+        return PermissionDecision.allow();
+    }
+}
+
+// 外部执行循环：审批完成后 resume
+@PostMapping("/agent/resume/{approvalId}")
+public Mono&lt;Msg&gt; resume(@PathVariable String approvalId, @RequestBody ApprovalResult result) {
+    return approvalStore.complete(approvalId, result)
+        .flatMap(pending -&gt; agent.resume(pending.ctx(), result.toPermissionOutcome()));
+}</code></pre>
+      </div>
+
+      <p>Python 平行课 <a href="../agentscope-agent-engineering/index.html#ch-advanced-04-interview" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">生产排障</span><code class="course-ref-slug">agentscope-agent-engineering</code></a> 侧重 ReAct 死循环与假执行；Java 课额外强调 Permissions 与 Spring Security 角色集成。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>模型绕过审批换工具调用怎么办？</summary>
+          <div class="learn-faq-body">在 PermissionGate 对「等效副作用」工具统一审批（如 bookMeeting 与 createCalendarEvent）；golden set 增加 must_not_call 断言；systemPrompt 禁止绕过审批。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Session 丢失</h3>
+      <p><span class="term" data-term-id="session-loss-redis" tabindex="0">Session 丢失</span> 表现为第二轮对话 Agent 「失忆」、重复询问已提供信息，或 Sub-agent 拿不到主管上下文。CorpAssist 默认 Redis SessionStore，故障多在 TTL、key 前缀与序列化版本。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>征象</th><th>排查命令 / 日志</th><th>根因</th><th>修复</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>每轮像新用户</td><td>Redis <code>GET session:{id}</code> 为空</td><td>BFF 未透传 sessionId</td><td>固定 <code>X-Session-Id</code> header</td></tr>
+          <tr><td>30 分钟后失忆</td><td>TTL 约 1800</td><td>Session TTL 过短</td><td>延长至 24h + sliding refresh</td></tr>
+          <tr><td>升级后全员失忆</td><td>反序列化异常</td><td>Msg 类结构变更</td><td>版本化 key <code>session:v2:</code></td></tr>
+          <tr><td>Sub-agent 无上下文</td><td>spawn 事件无 parent_session</td><td>RuntimeContext 未继承</td><td>spawn 时 copy sessionId + tenantId</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-java">@Configuration
+public class SessionStoreConfig {
+
+    @Bean
+    public SessionStore redisSessionStore(RedisTemplate&lt;String, byte[]&gt; redis) {
+        return RedisSessionStore.builder()
+            .redis(redis)
+            .keyPrefix("corp-assist:session:v2:")
+            .ttl(Duration.ofHours(24))
+            .slidingExpiration(true)
+            .serializer(new MsgHistorySerializer(/* schema version */ 2))
+            .build();
+    }
+}
+
+// 诊断：记录 session miss
+@Component
+public class SessionDiagnosticFilter implements WebFilter {
+    public Mono&lt;Void&gt; filter(ServerWebExchange ex, WebFilterChain chain) {
+        String sid = ex.getRequest().getHeaders().getFirst("X-Session-Id");
+        if (sid != null && !sessionStore.exists(sid)) {
+            log.warn("SESSION_MISS trace_id={} sessionId={}", traceId(ex), sid);
+        }
+        return chain.filter(ex);
+    }
+}</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 上线当晚</span>
+        用户反馈「刚才说过参会人，又问一遍」。运维查 Redis：session key 存在但 TTL 剩余 12s；原因是 load test 脚本每轮随机 UUID。修复：BFF 从 JWT 派生稳定 sessionId。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>Sub-agent 死锁</h3>
+      <p><span class="term" data-term-id="sub-agent-deadlock" tabindex="0">Sub-agent 死锁</span> 常见于 practice-02：主管 Agent 同步等待 Sub-agent，Sub-agent 又通过 <code>agent_send</code> 回调主管，或两个 Sub-agent 互相等待。Trace 表现为长时间无新 Event、线程 pool 耗尽。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Sub-agent 死锁模式</h5>
+        <pre class="mermaid">flowchart TD
+    M[主管 Agent sync spawn Worker-A] --> W[Worker-A 等待主管回复]
+    W -->|agent_send 回主管| M
+    M -->|blocked on Future| W
+    style M fill:#f96
+    style W fill:#f96</pre>
+        <p class="diagram-caption">同步 spawn + 双向 agent_send 是最典型死锁环。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>模式</th><th>Trace 特征</th><th>修复</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>同步环</td><td>spawn 与 send 交叉，无 tool_result</td><td>Sub-agent 改后台模式；主管用事件回调</td></tr>
+          <tr><td>线程耗尽</td><td>大量 BLOCKED on ReActAgent.call</td><td>限制并发 spawn；虚拟线程 + 超时</td></tr>
+          <tr><td>权限阻塞</td><td>Sub-agent tool 永久 approve</td><td>子 Agent 独立 Permission 策略</td></tr>
+          <tr><td>maxIterations 互等</td><td>双 Agent 均触顶</td><td>主管设汇总步数预算，禁止递归 spawn</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-java">// 反模式：同步 spawn 并 block
+// Msg result = subAgent.call(task, ctx).block();  // 若 subAgent 回调主管 → 死锁
+
+// 推荐：后台 spawn + 事件驱动汇总
+agentSpawnService.spawnBackground("Worker-Research", task, ctx)
+    .subscribe(
+        ev -&gt; eventBus.publish(ev),
+        err -&gt; log.error("sub-agent failed", err)
+    );
+
+// 主管在 SubAgentCompletedEvent 时继续 ReAct，而非 block 等待
+@EventListener
+public void onSubAgentDone(SubAgentCompletedEvent ev) {
+    orchestrator.continueWithResult(ev.parentCtx(), ev.resultMsg());
+}</code></pre>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>STAR 案例模板（面试）</summary>
+          <div class="learn-interview-body">
+            <p><strong>S</strong>：CorpAssist 报告生成主管-双 Worker 上线后 P95 从 8s 升至 120s。<br/>
+            <strong>T</strong>：定位 AgentScope Java Sub-agent 阻塞。<br/>
+            <strong>A</strong>：导出 trace_id，发现主管 sync block + Worker agent_send 回环；改为 background spawn + SubAgentCompletedEvent。<br/>
+            <strong>R</strong>：P95 回落 12s，线程 BLOCKED 归零。</p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>事件流断连</strong>：先确认 Agent emit 完整，再查 Gateway 超时与 Reactor 阻塞。</li>
+        <li><strong>工具权限拒绝</strong>：deny 须结构化 reason；approve 须外部 resume 循环。</li>
+        <li><strong>Session 丢失</strong>：稳定 sessionId、合理 TTL、Msg 序列化版本化。</li>
+        <li><strong>Sub-agent 死锁</strong>：禁止 sync spawn + 双向 send；用后台模式与事件汇总。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering-java_advanced03">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 4 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="sse" /> 能排查 SSE 断连的 Gateway 与 Reactor 因素</label></li>
+          <li><label><input type="checkbox" data-id="permission" /> 能说明 deny/approve/allow 三态排障</label></li>
+          <li><label><input type="checkbox" data-id="session" /> 能定位 Redis Session 丢失根因</label></li>
+          <li><label><input type="checkbox" data-id="deadlock" /> 能识别 Sub-agent 死锁并给出改法</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>故障</th><th>第一句排查</th></tr></thead>
+              <tbody>
+                <tr><td>SSE 断连</td><td>Trace 完整？→ Gateway timeout</td></tr>
+                <tr><td>权限拒绝</td><td>deny reason 是否结构化</td></tr>
+                <tr><td>Session 丢</td><td>Redis key + sessionId 稳定</td></tr>
+                <tr><td>Sub-agent 死锁</td><td>sync block + 双向 send</td></tr>
+                <tr><td>trace_id</td><td>全链路透传</td></tr>
+                <tr><td>maxIterations</td><td>触顶 = 根因未修</td></tr>
+                <tr><td>Demo 样例</td><td>sample-traces/*.json</td></tr>
+                <tr><td>Python 对照</td><td>advanced-04-interview 死循环/假执行</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-04-harness-bridge">长任务生产化导读</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java.agentscope.io/" target="_blank" rel="noopener">AgentScope Java — Events &amp; Permissions</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webflux/reactive_streams.html" target="_blank" rel="noopener">Spring WebFlux — Reactive Streams</a></li>
+      <li><a href="../agentscope-agent-engineering/index.html#ch-advanced-04-interview" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 平行课 · 生产排障</span><code class="course-ref-slug">agentscope-agent-engineering</code></a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">对照 Demo 四类 sample Trace JSON，写出每类故障的排查顺序与修复配置（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>打开 <code>sample-traces/event-disconnect.json</code>，按「SSE 排查流程」Mermaid 逐步标注断点位置。</li>
+      <li>阅读 <code>tool-deny.json</code>，写出 PermissionGate 应返回的 deny 文案（含角色 CALENDAR_WRITE）。</li>
+      <li>对 <code>session-lost.json</code>，列出 Redis 应检查的 key 前缀与 TTL 配置项。</li>
+      <li>分析 <code>sub-agent-deadlock.json</code>，将 sync spawn 改为 background 模式的一句话方案。</li>
+      <li>可选：运行 <code>demos/advanced-03-interview-lab/diagnose.ps1 event-disconnect</code> 对照输出。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障顺序）生产 SSE 中断：A 调大 Gateway timeout → B 查 Agent Trace 是否仍 emit → C 改前端 EventSource。最优顺序是？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>B → A → C。</strong> 先确认 Agent 侧是否完整 emit（定位问题在传输还是 Agent）；若 Agent 完整再调 Gateway；最后优化客户端重连。未确认 Agent 就调 timeout 可能掩盖 Reactor 阻塞。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">主管 Agent 使用 <code>subAgent.call(task, ctx).block()</code>，Sub-agent 内 <code>agent_send</code> 回主管要澄清需求——会发生什么？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>典型死锁。</strong> 主管线程 block 等 Sub-agent，Sub-agent 等主管回复。应改为 background spawn，主管在 SubAgentCompletedEvent 或异步 Msg 通道继续。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：AgentScope Java 生产排障样例</h4>
+      <p>目录：<code>demos/advanced-03-interview-lab/</code>（<code>sample-traces/*.json</code>、<code>diagnose.ps1</code>）。<strong>验收</strong>：运行 <code>.\diagnose.ps1 event-disconnect</code> 输出含「检查 SSE 超时与 cancellation」；四类样例均含 <code>trace_id</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-03-permissions">Events + Permissions 与 HITL</a>：权限三态实战</li>
+      <li><a href="#ch-practice-02-sub-agent">Sub-agent 多 Agent 协作</a>：避免死锁的模式</li>
+      <li><a href="../agentscope-agent-engineering/index.html#ch-advanced-04-interview" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 平行课 · 生产排障</span><code class="course-ref-slug">agentscope-agent-engineering</code></a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-04-harness-bridge">长任务生产化导读</a></li>
+    </ul>
+  </div>
+</section>

@@ -3,17 +3,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-import os
+import sys
 from pathlib import Path
 
-from agentscope.agent import ReActAgent
-from agentscope.formatter import DashScopeChatFormatter
-from agentscope.message import Msg
-from agentscope.model import DashScopeChatModel
-from agentscope.tool import Toolkit, ToolResponse
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _corpassist_compat import build_agent, build_toolkit, dashscope_model, is_mock, user_msg
+from agentscope.tool import ToolResponse
 
-CHROMA_DIR = Path("./data/chroma")
 MIN_SCORE = 0.65
 
 MOCK_DOCS = [
@@ -57,21 +53,15 @@ async def search_knowledge_base(query: str) -> ToolResponse:
     return ToolResponse(content="\n---\n".join(blocks))
 
 
-def build_kb_agent() -> ReActAgent:
-    toolkit = Toolkit()
-    toolkit.register_tool_function(search_knowledge_base)
-    return ReActAgent(
-        name="CorpAssistKB",
-        sys_prompt=(
+def build_kb_agent():
+    return build_agent(
+        "CorpAssistKB",
+        (
             "你是 CorpAssist 知识库助手。事实性问题必须先调用 search_knowledge_base；"
             "回答用 [n] 标注引用；无依据时拒答；末尾输出 ### 参考文献。"
         ),
-        model=DashScopeChatModel(
-            model_name="qwen-max",
-            api_key=os.environ.get("DASHSCOPE_API_KEY", "sk-demo"),
-        ),
-        formatter=DashScopeChatFormatter(),
-        toolkit=toolkit,
+        model=dashscope_model("qwen-max"),
+        toolkit=build_toolkit(search_knowledge_base),
         max_iters=6,
     )
 
@@ -80,8 +70,16 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("query", nargs="?", default="年假最多几天")
     args = parser.parse_args()
+    if is_mock():
+        docs = _mock_search(args.query)
+        if docs:
+            print("[1] 年假：工龄 1-10 年享有 10 天带薪年假。")
+            print("### 参考文献\n[1] 员工手册.pdf p.12")
+        else:
+            print("未找到相关文档，请换关键词或转人工。")
+        return
     agent = build_kb_agent()
-    result = await agent(Msg("user", args.query, "user"))
+    result = await agent.reply(user_msg(args.query))
     print(result.get_text_content())
 
 

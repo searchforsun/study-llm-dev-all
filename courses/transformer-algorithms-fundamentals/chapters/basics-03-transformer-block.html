@@ -1,0 +1,394 @@
+<section id="ch-basics-03-transformer-block" class="chapter" data-chapter="basics-03-transformer-block">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Transformer 块：层归一化与 FFN</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-transformer-block" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>序列建模与 Attention 基座</strong> · 能力：拆解 Encoder/Decoder 栈，口述 Pre-LN 子层与 FFN 作用</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-02-attention-qkv">Q/K/V 与缩放点积</a> 给出注意力核；真实大模型是<strong>重复堆叠的 Transformer 块</strong>。本章把 <span class="term" data-term-id="self-attention" tabindex="0">Self-Attention</span>、<span class="term" data-term-id="layer-norm" tabindex="0">LayerNorm</span>、<span class="term" data-term-id="ffn" tabindex="0">FFN</span> 与 <span class="term" data-term-id="positional-encoding" tabindex="0">位置编码</span> 拼成完整层——读懂 CorpAssist 调用的 GPT/BERT 类模型的「一层」长什么样。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>区分 Encoder 栈、Decoder 栈与 Decoder-only（GPT）结构差异</li>
+          <li>解释 <span class="term" data-term-id="residual-connection" tabindex="0">残差连接</span> + LayerNorm 的稳定训练作用</li>
+          <li>说明为何 Attention 置换不变性需要位置编码</li>
+          <li>口述 FFN 作为「逐 Token 非线性变换」的角色</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>一层 = Attention 子层 + FFN 子层</strong>，各配残差与归一化（Pre-LN 为主流）。</li>
+          <li><strong>Encoder 双向看全文</strong>；Decoder 生成时因果 Mask，并可 Cross-Attend 编码器输出。</li>
+          <li><strong>位置编码注入顺序信息</strong>：否则「报销不通过」与「不通过报销」对 Self-Attention 等价。</li>
+          <li><strong>FFN 占参数量大头</strong>：常 d<sub>ff</sub> = 4×d<sub>model</sub>，提供表达能力。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Encoder/Decoder 栈结构</h3>
+      <p>把 <span class="term" data-term-id="transformer-block" tabindex="0">Transformer 块</span> 理解成「可堆叠的乐高单元」：同一 Block 重复 N 次，仅参数不共享（每层独立 W<sub>Q</sub>…）。CorpAssist 调用 32 层 7B 模型时，一次 forward 等于把长度为 n 的序列依次穿过 32 个 Attn+FFN 组合。</p>
+      <p>原始 Transformer 为机器翻译设计：<strong>N 层 Encoder</strong> 处理源序列，<strong>N 层 Decoder</strong> 自回归生成目标序列。现代 LLM 多简化为单一栈：</p>
+
+      <p>选型时先问「要生成还是要向量」：生成走 Decoder，向量走 Encoder；CorpAssist 两条链路常并存，<strong>不要混用同一 checkpoint 承担两种角色</strong>。</p>
+
+      <h4>三种常见拓扑</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>架构</th><th>栈组成</th><th>代表模型</th><th>CorpAssist 用途</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Encoder-only</td>
+              <td>仅 Encoder × N</td>
+              <td>BERT、文本向量模型</td>
+              <td>RAG Embedding、分类</td>
+            </tr>
+            <tr>
+              <td>Decoder-only</td>
+              <td>仅 Decoder × N</td>
+              <td>GPT、Qwen、LLaMA</td>
+              <td>对话、摘要、Agent 规划</td>
+            </tr>
+            <tr>
+              <td>Encoder-Decoder</td>
+              <td>Encoder + Decoder</td>
+              <td>T5、BART、早期翻译</td>
+              <td>结构化翻译、重排（较少直接用 API）</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>原始 Transformer · 双栈数据流</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph ENC["Encoder × N"]
+    E1[Self-Attn + FFN] --> E2[...] --> EN[输出 memory]
+  end
+  subgraph DEC["Decoder × N"]
+    D1[Masked Self-Attn] --> D2[Cross-Attn 读 memory] --> D3[FFN]
+  end
+  SRC[源 Token + 位置编码] --> ENC
+  TGT[目标 Token + 位置编码] --> DEC
+  EN --> D2</pre>
+        <p class="diagram-caption">CorpAssist 主力对话模型走 Decoder-only，省去 Encoder 与 Cross-Attention（详见 <a href="#ch-practice-01-gpt-decoder">GPT 系列</a>）。</p>
+      </div>
+
+      <h4>Decoder-only 块（GPT 类）简化视图</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">for layer in 1..N:
+    x = x + SelfAttention(LayerNorm(x))   # 因果 Mask
+    x = x + FFN(LayerNorm(x))
+# 最后 LayerNorm → 线性层 → 词表 logits</code></pre>
+      </div>
+      <p>你调用 Chat API 时，每一次 forward 都在重复上述块；<span class="term" data-term-id="transformer-block" tabindex="0">层数 N</span> 与 <span class="term" data-term-id="d-model" tabindex="0">d_model</span> 决定模型规模（7B、72B 等）。</p>
+
+      <h4>读开源 config.json 时看什么</h4>
+      <ul>
+        <li><code>num_hidden_layers</code> → N</li>
+        <li><code>hidden_size</code> → d_model</li>
+        <li><code>num_attention_heads</code> → h</li>
+        <li><code>intermediate_size</code> → d_ff</li>
+        <li><code>architectures</code> → 是否 <code>ForCausalLM</code>（Decoder-only）</li>
+      </ul>
+      <p>CorpAssist 私有化部署前，用上述字段向运维说明显存与 batch 上限，比只报「7B」更专业。</p>
+
+      <h4>栈类型选型口诀（面试 20 秒）</h4>
+      <ul>
+        <li><strong>要生成</strong> → Decoder-only + Causal Mask</li>
+        <li><strong>要句向量/检索</strong> → Encoder-only + 双向 Attn</li>
+        <li><strong>要翻译/重排</strong> → Encoder-Decoder + Cross-Attn</li>
+        <li><strong>CorpAssist 默认</strong>：对话/摘要用 Decoder；RAG 索引用 Encoder</li>
+      </ul>
+      <p>记住拓扑比背层数更重要：面试官问「GPT 与 BERT」时，先答栈类型再答训练目标。</p>
+      <p>双栈 CorpAssist 团队应维护「生成模型 / 向量模型」两份配置清单，避免混用 checkpoint。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>残差连接与 LayerNorm</h3>
+      <p>深层网络训练就像「信号穿过很多层放大器」：<span class="term" data-term-id="residual-connection" tabindex="0">残差</span> 保证至少有一条不经过非线性的直通路径；<span class="term" data-term-id="layer-norm" tabindex="0">LayerNorm</span> 把每层输出拉回稳定数值区间，避免某一 Token 的激活爆炸拖垮整批训练。</p>
+      <p>深层网络训练难点是梯度消失与表示退化。<span class="term" data-term-id="residual-connection" tabindex="0">残差连接（Residual）</span> 让子层学习「增量」Δ而非全新映射：output = x + SubLayer(x)。<span class="term" data-term-id="layer-norm" tabindex="0">Layer Normalization</span> 对每个 Token 的特征维做归一化，稳定激活分布。</p>
+
+      <h4>Post-LN vs Pre-LN</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Post-LN（原论文）</span>
+          <ul>
+            <li>x → SubLayer → LayerNorm → 残差</li>
+            <li>深模型训练需小心 warmup</li>
+            <li>早期 BERT 采用</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Pre-LN（GPT/LLaMA 主流）</span>
+          <ul>
+            <li>x → LayerNorm → SubLayer → 残差加回 x</li>
+            <li>深层栈更易训练</li>
+            <li>CorpAssist 调用的开源权重多为 Pre-LN</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>LayerNorm 公式直觉</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 对单个 token 的 d_model 维向量 x 做 LN
+mean = x.mean()
+var = x.var()
+x_hat = (x - mean) / sqrt(var + eps)
+out = gamma * x_hat + beta   # gamma, beta 可学习</code></pre>
+      </div>
+      <p>与 BatchNorm（按 batch 维）不同，LayerNorm 对<strong>序列长度维不变</strong>，适合变长工单与对话——这也是 NLP Transformer 普遍选 LN 的原因。后续 <a href="#ch-practice-03-llm-arch-compare">LLaMA 对照</a> 会提到 RMSNorm 变体。</p>
+      <p>BatchNorm 在 batch=1 的在线推理时不稳定；LayerNorm 只依赖单 Token 向量统计，<strong>batch 大小不影响归一化语义</strong>——CorpAssist 低并发与压测高并发行为一致。</p>
+
+      <h4>残差路径的梯度直觉</h4>
+      <p>反传时损失 ∂L/∂x 除穿过子层 ∂SubLayer/∂x 外，还有<strong>恒等项 +1</strong> 直达更浅层。深层 <span class="term" data-term-id="transformer" tabindex="0">Transformer</span>（N=80+）若无残差，底层嵌入层几乎收不到有效梯度，无法学到可用表示。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：若没有残差，100 层 Transformer 训练会怎样？</summary>
+        <p>纯堆叠非线性变换时梯度须穿过所有层连乘，极易消失；残差提供<strong>恒等捷径</strong>，使底层表示仍可直达顶层，深层栈才可训练。CorpAssist 72B 级模型若无残差，工程上无法收敛到可用 checkpoint。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>位置编码必要性</h3>
+      <p>词嵌入只编码「是什么词」，不编码「在第几位」。<span class="term" data-term-id="positional-encoding" tabindex="0">位置编码</span> 补上坐标；否则 Self-Attention 对输入集合是置换等变的——打乱 Token 顺序，若嵌入向量集合相同，则注意力输出可完全一致。</p>
+      <p><span class="term" data-term-id="self-attention" tabindex="0">Self-Attention</span> 对输入集合是<strong>置换等变</strong>的：打乱 Token 顺序但保留各向量，注意力模式可重组为相同——模型<strong>原生不知先后</strong>。语言中语序承载否定、条件、修饰关系，必须显式注入位置信息。</p>
+
+      <h4>绝对正弦位置编码（原论文）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+# PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+# 输入 = TokenEmbedding + PositionalEncoding</code></pre>
+      </div>
+      <p><span class="term" data-term-id="positional-encoding" tabindex="0">位置编码</span> 与词嵌入<strong>相加</strong>后送入第一层。不同频率的正弦波让模型学习相对距离模式。现代 LLM 多用可学习绝对嵌入或 <a href="#ch-advanced-01-positional-encoding">RoPE</a>，但「必须注入位置」这一点不变。</p>
+
+      <h4>无位置编码的反例</h4>
+      <ul>
+        <li>「不报销」与「报销不」嵌入集合相同 → Self-Attention 输出可完全一致 → 语义灾难。</li>
+        <li>CorpAssist 工单「驳回后再提交」vs「提交后再驳回」流程相反，缺位置则模型无法区分。</li>
+        <li>条件句「若 A 则 B」中 A、B 的先后顺序改变政策含义，位置信息不可或缺。</li>
+        <li>多轮对话里 user/assistant 轮换顺序依赖位置下标，而非仅靠 role 字符串。</li>
+      </ul>
+
+      <h4>正弦 PE 的频率直觉（不必背公式）</h4>
+      <p>低频维度编码「大致位置区间」，高频维度编码「精细偏移」——类似用不同刻度的尺子量距离。<span class="term" data-term-id="positional-encoding" tabindex="0">位置编码</span> 与词嵌入<strong>相加</strong>后，Self-Attention 的 Q/K 点积会隐含相对距离信息（原论文性质）；现代 <a href="#ch-advanced-01-positional-encoding">RoPE</a> 把这一思想做得更干净。</p>
+
+      <div class="mermaid-wrap">
+        <h5>嵌入 + 位置 → 第一层</h5>
+        <pre class="mermaid">flowchart LR
+  TID[Token ID] --> EMB[词嵌入]
+  POS[位置 0..n-1] --> PE[位置编码]
+  EMB --> ADD[相加]
+  PE --> ADD
+  ADD --> L1[第 1 层 Transformer Block]</pre>
+        <p class="diagram-caption">推理时位置即序列下标；打包 batch 时可用 attention mask 区分真实 Token 与 padding。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>FFN 子层作用</h3>
+      <p>Attention 负责<strong>Token 间混合</strong>；<span class="term" data-term-id="ffn" tabindex="0">前馈网络（FFN）</span> 负责<strong>每个 Token 位置独立</strong>做非线性变换，常写作两层 MLP：</p>
+
+      <h4>标准 FFN 公式</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">latex</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">FFN(x) = max(0, x @ W1 + b1) @ W2 + b2   # ReLU 版（原论文）
+维度：W1: (d_model, d_ff), W2: (d_ff, d_model), 常 d_ff = 4 * d_model
+
+LLaMA/Qwen 等改用 SwiGLU（见 practice 章），但「先扩维再压回」结构不变。</code></pre>
+      </div>
+
+      <h4>分工对照</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>子层</th><th>跨 Token</th><th>主要作用</th><th>参数量占比</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Self-Attention</td>
+              <td>是（n×n 混合）</td>
+              <td>上下文依赖、动态对齐</td>
+              <td>中等</td>
+            </tr>
+            <tr>
+              <td>FFN</td>
+              <td>否（逐位置）</td>
+              <td>特征提炼、存储事实模式</td>
+              <td>Often ~2/3</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>面试常问「Attention 既然能全局看，还要 FFN 干嘛？」——答：<strong>Attention 是路由与混合，FFN 是逐位置的可学习「小 MLP 记忆」</strong>；二者互补。CorpAssist 模型越大，FFN 扩维倍数往往越高，推理显存相当一部分在 FFN 激活上。</p>
+
+      <h4>参数量粗算（单层 FFN）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">W1: d_model × d_ff  → 4096 × 16384 ≈ 67M
+W2: d_ff × d_model  → 16384 × 4096 ≈ 67M
+单层 FFN 权重约 134M；Attention 权重同量级
+N=32 层 → 单块重复 32 次（另有嵌入、LM head）</code></pre>
+      </div>
+      <p>懂 FFN 占参比后，选型面试可解释：「7B 并非 70 亿个 Attention 参数，<span class="term" data-term-id="ffn" tabindex="0">FFN</span> 与嵌入/LM head 占相当份额。」</p>
+      <div class="notice">
+        <strong>与 practice 章预告</strong>
+        <p>开源 LLM 常把 ReLU FFN 换成 SwiGLU、LayerNorm 换成 RMSNorm——<strong>块拓扑不变</strong>（仍是 Attn→FFN+残差），变的是子层内部激活与归一化实现（见 <a href="#ch-practice-03-llm-arch-compare">架构对照</a>）。</p>
+        <p>CorpAssist 升级模型版本时，优先核对 <code>hidden_size</code>、<code>num_hidden_layers</code> 是否变化——接口不变但算力画像可能完全不同。</p>
+      </div>
+
+      <h4>子层顺序为何固定为 Attn → FFN</h4>
+      <p>先 <span class="term" data-term-id="self-attention" tabindex="0">Self-Attention</span> 让 Token 间交换信息，再 <span class="term" data-term-id="ffn" tabindex="0">FFN</span> 在各位置独立提炼特征——若对调，FFN 在「尚未混合上下文」的表示上运算，再 Attention 混合，表达路径不同且与原论文/预训练权重不兼容。开源权重按 Attn→FFN 训练，<strong>推理实现不可擅自调换</strong>。</p>
+
+      <h4>CorpAssist 一层 forward 的 Java 视角（口述）</h4>
+      <ul>
+        <li>网关组装 messages → Tokenizer → token_ids[]</li>
+        <li>推理服务 embedding + 位置 → 重复 N 次 Block</li>
+        <li>每层 Block：LN → Attn(+Mask) → 残差 → LN → FFN → 残差</li>
+        <li>末层 LM head → logits → 采样下一 Token</li>
+        <li>你不需要实现 Block，但需知<strong>延迟与 n、N、d_model 线性/平方关系</strong></li>
+        <li>监控项：prompt_tokens（n）、model_layers（N）、time_to_first_token</li>
+      </ul>
+
+      <div class="learn-faq">
+        <details>
+          <summary>一层 Transformer Block 在推理时算几次？</summary>
+          <p>每个生成步对<strong>整段已生成序列</strong>做一次 forward 穿过 N 层（配合 KV Cache 可复用历史 K/V，见 <a href="#ch-practice-04-kv-cache-flash">KV Cache 章</a>）。不是「每层每 Token 单独调 API」——那是工程批处理细节。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，用于评审前 30 秒复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>栈结构</strong>：Encoder / Decoder / Decoder-only 三种；CorpAssist 对话以 Decoder-only 为主。</li>
+        <li><strong>残差 + LN</strong>：Pre-LN 主流；残差提供梯度捷径，LN 稳定特征尺度。</li>
+        <li><strong>位置编码</strong>：打破 Attention 置换不变性；嵌入与位置相加后入栈。</li>
+        <li><strong>FFN</strong>：逐 Token MLP，扩维再压回；参数量与表达能力的重要来源。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_basics03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="stack-type" /> 能说出 CorpAssist 对话模型属于哪种栈</label></li>
+          <li><label><input type="checkbox" data-id="pre-ln" /> 能对比 Pre-LN 与 Post-LN 子层顺序</label></li>
+          <li><label><input type="checkbox" data-id="pos-why" /> 能解释无位置编码时语序为何崩溃</label></li>
+          <li><label><input type="checkbox" data-id="ffn-role" /> 能说明 FFN 与 Attention 分工</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>组件</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>Transformer Block</td><td>Masked Attn + FFN，各带残差 LN</td></tr>
+                <tr><td>Pre-LN</td><td>先 Norm 再子层</td></tr>
+                <tr><td>位置编码</td><td>注入顺序；常加在嵌入上</td></tr>
+                <tr><td>d_ff</td><td>FFN 中间维，常 4×d_model</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 用 BERT 做向量、Qwen 做生成，两模型栈结构有何不同？</li>
+              <li>为什么 LayerNorm 比 BatchNorm 更适合 NLP Transformer？</li>
+              <li>一层 Block 里 Attention 与 FFN 的执行顺序能否对调？为什么一般不换？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-basics-04-self-attention-math">Self-Attention 矩阵视角</a> 量化复杂度。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need — §3.1 Encoder/Decoder</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/model_doc/gpt2" target="_blank" rel="noopener">Hugging Face — GPT-2 模型结构说明</a></li>
+      <li><a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">On Layer Normalization in the Transformer Architecture（Pre-LN 分析）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">手绘一层 Pre-LN Decoder Block，并标注 CorpAssist 对话 forward 时张量形状变化。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按「Decoder-only 块」伪代码，画出 x → LN → Self-Attn → 残差 → LN → FFN → 残差 的数据流。</li>
+      <li>从「三种常见拓扑」表说明：CorpAssist RAG 向量服务与对话 API 分别对应哪一行架构。</li>
+      <li>设 d_model=4096、d_ff=16384，估算单层 FFN 权重矩阵参数量量级（W1+W2）。</li>
+      <li>在「嵌入 + 位置」Mermaid 上补充：padding Token 的位置下标是否应参与有效注意力（预告 <a href="#ch-basics-05-multi-head-mask">Padding Mask</a>）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障）同事去掉位置编码以「降低显存」，CorpAssist 工单分类准确率暴跌。最可能机制原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>Self-Attention 对 Token <strong>集合置换不变</strong>，去掉位置后「驳回再提交」与「提交再驳回」等语序敏感样本不可区分，分类边界崩溃。应恢复位置编码或改用含 RoPE 的 checkpoint，而非删 PE 省显存。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：单层 Block 结构卡</h4>
+      <p>目录：<code>demos/basics-03-transformer-block-lab/</code>（空白结构卡 + 参数量计算器）。<strong>验收</strong>：结构卡 6 框（LN/Attn/残差/FFN）箭头完整；计算器在 d_model=4096 时 FFN 参数量与手算误差 &lt;5%。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-02-attention-qkv">注意力机制：Q/K/V 与缩放点积</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-self-attention-math">Self-Attention 矩阵视角</a></li>
+      <li><a href="https://lilianweng.github.io/posts/2019-11-10-attention/" target="_blank" rel="noopener">Lil'Log — Attention? Attention!</a></li>
+    </ul>
+  </div>
+</section>

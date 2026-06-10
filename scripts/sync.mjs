@@ -120,6 +120,7 @@ for (const slug of Object.keys(specFinal.courses)) {
 
 const accents = {
   'llm-application-fundamentals': { light: '#1565c0', dark: '#64b5f6' },
+  'transformer-algorithms-fundamentals': { light: '#5e35b1', dark: '#b39ddb' },
   'python-engineering-for-llm': { light: '#2e7d32', dark: '#81c784' },
   'spring-ai-engineering': { light: '#1b5e20', dark: '#66bb6a' },
   'production-prompt-engineering': { light: '#6a1b9a', dark: '#ce93d8' },

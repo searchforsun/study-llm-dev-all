@@ -1,0 +1,394 @@
+<section id="ch-advanced-01-positional-encoding" class="chapter" data-chapter="advanced-01-positional-encoding">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>位置编码演进：绝对/相对/RoPE</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-positional-encoding" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>38 分钟</strong> · 阶段：<strong>面试亮点与算法边界</strong> · 能力：口述绝对/相对/<span class="term" data-term-id="rope" tabindex="0">RoPE</span> 差异，并解释长上下文外推对 CorpAssist 文档问答的影响</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>Self-Attention 本身<strong>置换不变</strong>——打乱 token 顺序，注意力权重矩阵只是行列重排，模型无法区分「第 3 个词」与「第 300 个词」。位置信息必须显式注入；而 2023～2026 主流开源 LLM（LLaMA、Qwen、DeepSeek）几乎清一色采用 <span class="term" data-term-id="rope" tabindex="0">RoPE</span>。面试常问「为何不用原始 Transformer 正弦编码」「<span class="term" data-term-id="alibi" tabindex="0">ALiBi</span> 与 RoPE 谁更适合外推」——本章建立<strong>概念级</strong>直觉，不涉及预训练推导与 CUDA 实现。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>对比 <span class="term" data-term-id="sinusoidal-pe" tabindex="0">正弦位置编码</span>、学习型绝对编码、<span class="term" data-term-id="relative-position" tabindex="0">相对位置</span> 与 RoPE 的注入点与长序列表现</li>
+          <li>用二维旋转直觉解释 RoPE 如何把相对距离编码进 Q·K 点积</li>
+          <li>说明 <span class="term" data-term-id="alibi" tabindex="0">ALiBi</span> 线性偏置如何免训练外推到更长上下文</li>
+          <li>回答「128K 窗口对 RAG 是否够用」类面试题，并关联 <a href="#ch-advanced-03-long-context">长上下文技术概览</a></li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>绝对 vs 相对</strong>：绝对编码告诉模型「我在第 i 位」；相对编码强调「我与你相距 Δ」——长文外推更依赖后者。</li>
+          <li><strong>RoPE 是主流</strong>：在 Q/K 上旋转向量，使注意力分数只依赖相对位置；LLaMA 系默认选择。</li>
+          <li><strong>外推 ≠ 免费午餐</strong>：训练 8K、推理 128K 需 YaRN/NTK 等<strong>应用侧</strong>策略；见 advanced-03，本章不讲微调推导。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>正弦位置编码</h3>
+      <p>原始 Transformer（Vaswani et al., 2017）在嵌入层<strong>相加</strong>固定 <span class="term" data-term-id="sinusoidal-pe" tabindex="0">正弦位置编码</span>：偶数维用 sin，奇数维用 cos，不同维度对应不同波长。其设计动机是：对任意固定偏移 Δ，PE(pos+Δ) 可表示为 PE(pos) 的线性函数，从而隐含<strong>相对位置</strong>信息。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度 PDF 切块后的顺序</span>
+        同一政策文档切成 40 个 chunk 再拼接进 prompt 时，模型需知道「第 12 段在讲请假流程、第 13 段在讲审批链」——若缺少位置信号，Attention 可能把相隔很远的两条款误当作相邻条款比对。<span class="term" data-term-id="positional-encoding" tabindex="0">位置编码</span> 就是给每个 token 打上「序列坐标」。
+      </aside>
+
+      <h4>正弦公式（概念级）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">latex</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-latex">PE_{(pos, 2i)}   = \sin\!\left(pos / 10000^{2i/d}\right)
+PE_{(pos, 2i+1)} = \cos\!\left(pos / 10000^{2i/d}\right)
+# pos: 位置索引；i: 维度对索引；d: 模型维度
+# 最终输入: x = TokenEmbed + PE(pos)</code></pre>
+      </div>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr>
+              <th>方案</th>
+              <th>注入方式</th>
+              <th>是否可学习</th>
+              <th>长于训练长度时</th>
+              <th>代表模型</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>正弦绝对 PE</strong></td>
+              <td>嵌入层相加</td>
+              <td>否（固定）</td>
+              <td>可计算任意 pos，但分布外推质量下降</td>
+              <td>原始 Transformer、早期 BERT</td>
+            </tr>
+            <tr>
+              <td><strong>可学习绝对 PE</strong></td>
+              <td>查表相加</td>
+              <td>是</td>
+              <td><strong>无法</strong>直接超出训练最大长度</td>
+              <td>GPT-2、部分 Encoder</td>
+            </tr>
+            <tr>
+              <td><strong>相对位置偏置</strong></td>
+              <td>注意力分数 + bias(i−j)</td>
+              <td>可学习或固定</td>
+              <td>依赖 bias 表或 ALiBi 斜率</td>
+              <td>T5、Transformer-XL</td>
+            </tr>
+            <tr>
+              <td><strong>RoPE</strong></td>
+              <td>旋转 Q/K</td>
+              <td>否（结构固定）</td>
+              <td>配合 NTK/YaRN 外推</td>
+              <td>LLaMA、Qwen、DeepSeek</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">面试误区 · 避免</span>
+          <ul>
+            <li>说「正弦 PE 不能表达相对位置」——其实设计目标就包含相对性，只是长外推仍弱</li>
+            <li>把「可学习 PE」说成万能——超长序列会直接越界</li>
+            <li>声称「位置编码在 FFN 里」——标准 Transformer 在嵌入或 Q/K 注入</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐表述</span>
+          <ul>
+            <li>Attention 置换不变，必须额外注入顺序信息</li>
+            <li>绝对 PE 加在 embedding；RoPE 改 Q/K 几何结构</li>
+            <li>CorpAssist 选模型时看<strong>有效上下文</strong>与位置方案，而非背公式</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：BERT 也用位置编码，为何说 GPT 系更关心外推？</summary>
+        <p>BERT 编码器常处理固定 512 token 分类/句对；GPT 类 Decoder 在推理时要<strong>自回归展开</strong>，KV Cache 随序列增长，<span class="term" data-term-id="context-length" tabindex="0">上下文长度</span> 直接决定能否一次读完整份制度 PDF。应用岗应关注 API 标注的 context window 与实测 p95，而非推导 PE 梯度。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>相对位置与 ALiBi</h3>
+      <p><span class="term" data-term-id="relative-position" tabindex="0">相对位置</span> 强调 token 对 (i, j) 的距离 Δ = i − j，而非各自绝对坐标。T5 在 Attention logits 上加可学习 bias(Δ)；<span class="term" data-term-id="alibi" tabindex="0">ALiBi</span>（Attention with Linear Biases, Press et al.）则用<strong>固定线性斜率</strong>惩罚远距离键，使模型在未见过更长序列的训练下，仍能在推理时保持较稳定的注意力衰减模式。</p>
+
+      <h4>ALiBi 核心直觉</h4>
+      <p>对第 m 个 query 与第 n 个 key，在缩放点积分数上添加 −m·|m−n|（m 为 head 专属斜率，越靠后的 head 斜率越大）。效果：距离越远，分数被扣得越多，形成<strong>inductive bias</strong> 偏向局部上下文。与 RoPE 相比，ALiBi <strong>不修改 Q/K 向量本身</strong>，实现简单，曾用于 MPT、BLOOM 等；但 2024 后主流开源 LLM 仍以 RoPE 为主。</p>
+
+      <div class="mermaid-wrap">
+        <h5>绝对 PE vs ALiBi vs RoPE 注入位置</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph abs["绝对正弦 / 可学习 PE"]
+    E1[Token Embedding] --> ADD[+ PE pos]
+    ADD --> SA1[Self-Attention]
+  end
+  subgraph alibi["ALiBi"]
+    E2[Token Embedding] --> SA2[Self-Attention]
+    SA2 --> BIAS["logits -= slope * |i-j|"]
+  end
+  subgraph rope["RoPE"]
+    E3[Token Embedding] --> QK[Q/K 旋转变换]
+    QK --> SA3[Self-Attention]
+  end</pre>
+        <p class="diagram-caption">三种路线：<strong>改输入</strong>、<strong>改分数</strong>、<strong>改 Q/K 几何</strong>；面试时画此三路即可展示体系化理解。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>ALiBi</th><th>RoPE</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>训练长度 8K → 推理 32K</td><td>无需改权重，偏置自动延伸</td><td>常需 NTK/YaRN 缩放 base</td></tr>
+          <tr><td>与 KV Cache</td><td>兼容，偏置在 score 阶段</td><td>兼容，旋转可增量应用到新 token</td></tr>
+          <tr><td>开源生态</td><td>较少新模型默认</td><td>LLaMA/Qwen/DeepSeek 默认</td></tr>
+          <tr><td>面试话术</td><td>强调「免训练外推的线性偏置」</td><td>强调「相对距离编码进内积」</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">误区</span>
+          <ul>
+            <li>「ALiBi 比 RoPE 全面更好」——生态与长文 SOTA 实践多围绕 RoPE + 外推策略</li>
+            <li>「相对位置 = RoPE」——T5 bias、ALiBi、RoPE 都是相对思想的不同实现</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">应用岗 takeaway</span>
+          <ul>
+            <li>采购模型时读卡片：context length、是否支持 YaRN、是否 ALiBi 架构</li>
+            <li>RAG 拼接 20 段 chunk 时，相对位置帮助模型区分「段内邻近」与「跨段引用」</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：MPT 用 ALiBi 宣传 65K context，CorpAssist 能否直接把所有制度 chunk 塞进一个 prompt？</summary>
+        <p>不能仅凭窗口数字决策。还需考虑：检索质量（无关 chunk 越多幻觉越高）、延迟与 Token 成本、以及模型在超长分布上的<strong>实测</strong>引用准确率。长窗口是必要条件，不是充分条件——见 <a href="#ch-advanced-03-long-context">长上下文技术概览</a> 与 RAG 取舍节。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>RoPE 旋转直觉</h3>
+      <p><span class="term" data-term-id="rope" tabindex="0">RoPE</span>（Rotary Position Embedding）把位置信息通过<strong>复平面旋转</strong>注入 Query 与 Key：将相邻维度两两配对，按位置 pos 旋转角度 θ(pos)。神奇之处在于：旋转后的 q·k 内积只依赖 (pos_q − pos_k)，即<strong>相对位置</strong>，且与绝对起点无关。</p>
+
+      <h4>二维旋转示意（单对维度）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import numpy as np
+
+def rotate2d(x_pair, pos, base=10000.0, dim_pair_idx=0):
+    """概念演示：对 (x_{2i}, x_{2i+1}) 施加位置旋转"""
+    freq = 1.0 / (base ** (2 * dim_pair_idx / 64))  # 示意 d=64
+    angle = pos * freq
+    c, s = np.cos(angle), np.sin(angle)
+    x0, x1 = x_pair
+    return np.array([x0 * c - x1 * s, x0 * s + x1 * c])
+
+# 关键性质（口述面试）：
+# rotate(q, m) · rotate(k, n) 的标量积 ∝ f(q, k, m-n)
+# 相对距离 m-n 决定注意力，而非绝对 m、n</code></pre>
+      </div>
+
+      <p>高维时对各维度对使用不同旋转频率（波长从短到长），低频维度捕获长距离相对关系，高频维度捕获局部邻接——与正弦 PE 的频率分解思想一脉相承，但作用在 Q/K 而非 embedding 加法。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>面试追问</th><th>要点回答</th><th>勿深入（mustNotCover）</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>RoPE 为何只旋 Q/K，不旋 V？</td>
+              <td>相对位置应影响「谁关注谁」的匹配；V 承载内容聚合，位置已通过权重体现</td>
+              <td>手写 CUDA 核</td>
+            </tr>
+            <tr>
+              <td>与 Multi-Head 关系？</td>
+              <td>每个 head 独立 Q/K，RoPE 逐 head 应用；GQA 共享 K 时旋转仍按位置一致</td>
+              <td>Megatron 并行切分</td>
+            </tr>
+            <tr>
+              <td>推理增量解码？</td>
+              <td>新 token 位置 pos，仅对新 Q/K 算旋转角；历史 KV 已带位置信息可缓存</td>
+              <td>KV Cache 内核实现</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="RoPE 口述模板">
+        <input type="radio" name="rope-tab" id="rope-tab-short" class="learn-tab-input" checked />
+        <input type="radio" name="rope-tab" id="rope-tab-long" class="learn-tab-input" />
+        <label for="rope-tab-short">30 秒版</label>
+        <label for="rope-tab-long">2 分钟版</label>
+        <div class="learn-tab-panel" id="rope-panel-short" role="tabpanel">
+          <p>Self-Attention 本身不知道顺序；RoPE 在 Q/K 上做位置相关旋转，使注意力分数只依赖相对距离。LLaMA/Qwen 默认方案，配合 KV Cache 做增量解码。</p>
+        </div>
+        <div class="learn-tab-panel" id="rope-panel-long" role="tabpanel">
+          <ol>
+            <li>问题：置换不变 → 必须注入位置。</li>
+            <li>绝对 PE 加 embedding，超长外推弱；可学习 PE 有最大长度墙。</li>
+            <li>RoPE：复平面旋转 Q/K，内积只依赖 pos_q − pos_k。</li>
+            <li>不同维度对不同波长，兼顾局部与远程。</li>
+            <li>工程：与 GQA、Flash Attention、KV Cache 正交；外推靠 YaRN/NTK（advanced-03）。</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>长上下文外推面试题</h3>
+      <p>训练时常见 4K～8K，产品却宣传 128K～1M。<span class="term" data-term-id="extrapolation" tabindex="0">位置外推</span> 指在<strong>不重新预训练</strong>（本课不讲预训练）的前提下，让模型在更长序列上仍可用的推理侧技巧。应用岗需会解释概念与业务取舍，而非推导 loss。</p>
+
+      <h4>高频面试题与答法骨架</h4>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>题目</th><th>核心答点</th><th>CorpAssist 落地</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>128K 窗口是否取代 RAG？</td>
+            <td>不能取代。成本 ∝ 序列长度；无关文本越多幻觉越高；检索仍控证据边界</td>
+            <td>制度库 200 万 chunk 必须检索；长窗适合「少而精」的拼接</td>
+          </tr>
+          <tr>
+            <td>NTK-aware 缩放是什么？</td>
+            <td>调 RoPE base，使低频维度在更长 pos 上仍分布合理（概念级）</td>
+            <td>选型时看推理框架是否暴露 yarn/ntk 参数</td>
+          </tr>
+          <tr>
+            <td>为何外推后 MMLU 不变但长文 QA 掉点？</td>
+            <td>短题不触发长度分布偏移；长文依赖远距离依赖与位置 bias</td>
+            <td>用 golden set 长文档用例回归，不只看排行榜</td>
+          </tr>
+          <tr>
+            <td>ALiBi vs RoPE 外推谁省心？</td>
+            <td>ALiBi 训练外推省心；RoPE 生态强 + 外推补丁成熟</td>
+            <td>跟模型卡片与 vLLM 配置走</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">答辩反例</span>
+          <ul>
+            <li>「窗口越大越好，直接把全库塞 prompt」——忽略成本、幻觉与延迟</li>
+            <li>「外推 = 再训练 128K」——混淆推理技巧与预训练（mustNotCover）</li>
+            <li>「位置编码解决幻觉」——幻觉主因是证据不足与目标错位，非 PE 单独能修</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">答辩正例</span>
+          <ul>
+            <li>「8K 训练 + YaRN 推 32K，我们用 20 段×400 token chunk 做 ablation」</li>
+            <li>「RoPE 保证相对距离；RAG 保证证据来源——两层互补」</li>
+            <li>「p95 延迟随序列线性恶化，长窗方案要配流式与摘要」</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-faq">
+        <summary>FAQ：<span class="term" data-term-id="ntk-scaling" tabindex="0">NTK 缩放</span> 需要改权重吗？</summary>
+        <p>常见推理时调整 RoPE 的 base 或应用 YaRN 插值策略，<strong>不改动</strong>已下载的 FP16 权重张量；属于推理框架 / 模型配置层。若面试官追问训练级扩展，应诚实划界：「本岗位关注推理配置与评测，预训练扩展不在我职责内」——对齐 mustNotCover。</p>
+      </details>
+
+      <div class="learn-cheat-sheet">
+        <h4>位置编码速查</h4>
+        <ul>
+          <li><strong>正弦 PE</strong>：固定、可外推计算但质量衰减</li>
+          <li><strong>可学习 PE</strong>：有最大长度上限</li>
+          <li><strong>ALiBi</strong>：线性偏置，免训练外推友好</li>
+          <li><strong>RoPE</strong>：旋转 Q/K，相对距离进内积；主流默认</li>
+          <li><strong>外推</strong>：NTK / YaRN；配合 RAG，不替代检索</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>正弦位置编码</strong>：在嵌入层注入绝对坐标，隐含相对性但长外推仍弱；可学习 PE 受最大长度限制。</li>
+        <li><strong>相对位置与 ALiBi</strong>：用距离惩罚远距离注意力；ALiBi 线性偏置实现简单、外推省心，但生态次于 RoPE。</li>
+        <li><strong>RoPE 旋转直觉</strong>：旋转 Q/K 使内积只依赖相对距离；LLaMA/Qwen 默认，与 KV Cache 增量解码兼容。</li>
+        <li><strong>长上下文外推面试题</strong>：长窗不取代 RAG；外推是推理侧技巧；评测要用长文档 golden set，不只看榜单短题。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <ul class="learn-checklist" data-storage-key="adv01-pe-review">
+        <li><label><input type="checkbox" /> 能白板画三路注入：绝对 PE / ALiBi / RoPE</label></li>
+        <li><label><input type="checkbox" /> 能 30 秒口述 RoPE 相对距离性质</label></li>
+        <li><label><input type="checkbox" /> 能反驳「128K 取代 RAG」并给 CorpAssist 例子</label></li>
+        <li><label><input type="checkbox" /> 明确 mustNotCover：不讲预训练扩展与 CUDA kernel</label></li>
+      </ul>
+      <p class="chapter-review-next">下一步：完成章节测验；进入 <a href="#ch-advanced-02-moe-sparse">MoE 与稀疏激活（概念级）</a>，理解 Mixtral 路由与成本估算。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need（原始 Transformer）</a></li>
+      <li><a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">RoFormer: RoPE 论文</a></li>
+      <li><a href="https://arxiv.org/abs/2108.12409" target="_blank" rel="noopener">Train Short, Test Long: ALiBi</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/model_doc/llama" target="_blank" rel="noopener">Hugging Face — LLaMA 文档（RoPE 配置）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">用对比表与 RoPE 二维旋转代码建立口述肌肉记忆，并完成一道「长窗 vs RAG」判断题（约 20 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在纸上复现「绝对 PE vs ALiBi vs RoPE 注入位置」Mermaid 三路，标注数据流经过的模块名。</li>
+      <li>对照「正弦 / 可学习 / 相对 / RoPE」决策表：为 CorpAssist 制度问答写一句模型选型检查项（context + 位置方案）。</li>
+      <li>运行或阅读本章 Python 旋转示意代码，手算 pos=0 与 pos=1 时同一向量旋转角差，口述「相对距离」含义。</li>
+      <li>从「长上下文外推面试题」表选一题，写 5 句答辩提纲（需求→机制→权衡→CorpAssist→指标）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（判断）产品宣称「128K 上下文，可弃用向量检索直接把全库塞入 prompt」。你是否同意？请从位置外推、成本、幻觉三角度论证。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>不同意。</strong>① 位置外推：训练 8K + 推理 128K 存在分布偏移，需 YaRN/实测回归，非窗口数字保证质量。② 成本：Attention 与 KV 随长度恶化，全库 token 成本不可接受。③ 幻觉：无关 chunk 噪声放大，引用链无法像 RAG 那样约束证据边界。CorpAssist 应「检索 Top-K + 适度长窗拼接」，见 advanced-03。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：位置编码对照笔记</h4>
+      <p>在笔记中自建四列表（方案 / 注入点 / 外推 / 代表模型），每项至少填 3 行；验收：同伴盲听你能 60 秒讲完 RoPE 与 ALiBi 差异。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸资源</h3>
+    <ul>
+      <li><a href="https://kazemnejad.com/blog/transformer_architecture_positional_encoding/" target="_blank" rel="noopener">Transformer 位置编码可视化博文</a></li>
+      <li>下一章：<a href="#ch-advanced-02-moe-sparse">MoE 与稀疏激活（概念级）</a></li>
+      <li>关联：<a href="#ch-practice-03-llm-arch-compare">LLaMA/Qwen/DeepSeek 架构对照</a>（RMSNorm、GQA 与 RoPE 同读）</li>
+    </ul>
+  </div>
+</section>

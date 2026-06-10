@@ -1,0 +1,392 @@
+<section id="ch-advanced-03-long-context" class="chapter" data-chapter="advanced-03-long-context">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>长上下文技术概览</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-03-long-context" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>面试亮点与算法边界</strong> · 能力：对比滑动窗口、分块注意力与 <span class="term" data-term-id="yarn" tabindex="0">YaRN</span> 外推，并决策 RAG vs 长窗口</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 制度库单 PDF 可达数百页；产品侧常问「模型已 128K，还要不要做 RAG？」技术侧需同时理解：<strong>算法如何让 Attention 在更长序列上可算</strong>，以及<strong>应用上何时仍必须检索</strong>。本章覆盖滑动窗口、Ring/Chunked Attention、YaRN/NTK 外推（应用视角），不讲 CUDA kernel 与千卡训练。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>解释 <span class="term" data-term-id="sliding-window-attention" tabindex="0">滑动窗口注意力</span> 如何将复杂度从 O(n²) 降到近似 O(n·w)</li>
+          <li>口述 Ring / Chunked Attention 的「分块 + 通信」直觉</li>
+          <li>说明 <span class="term" data-term-id="yarn" tabindex="0">YaRN</span> / <span class="term" data-term-id="ntk-scaling" tabindex="0">NTK 缩放</span> 在推理配置层的作用</li>
+          <li>用决策表回答「RAG 与长窗口如何组合」</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>长上下文 ≠ 全库入 prompt</strong>：可算、可付、可信是三道关。</li>
+          <li><strong>稀疏 Attention 换显存/算力</strong>：窗口、分块、Flash 是不同层面的优化。</li>
+          <li><strong>外推要实测</strong>：YaRN/NTK 是推理技巧，长文档 golden set 才能验真。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>滑动窗口注意力</h3>
+      <p>全量 Self-Attention 对每个 token 关注全部历史，复杂度 O(n²)，<span class="term" data-term-id="kv-cache" tabindex="0">KV Cache</span> 显存也随 n 线性增长。Mistral 等模型采用<strong>滑动窗口</strong>：每个 token 只关注前 w 个位置（如 w=4096），更远历史被丢弃，计算与缓存有界。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 超长会话</span>
+        智能客服多轮对话超过 50 轮时，即使用 128K 模型，<strong>窗口截断</strong> 可能导致早期「已核实订单号」被遗忘。应用层需：摘要压缩、结构化会话状态、或 RAG 拉回复关键事实——不能假设模型「天然记得一切」。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>全量 Attention vs 滑动窗口（w=4 示意）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph full["全量 O(n²)"]
+    T1[每个 token 看全部历史]
+  end
+  subgraph sw["滑动窗口 O(n·w)"]
+    T2[每个 token 仅看前 w 个]
+    T2 --> DROP[更早 token 不参与注意力]
+  end</pre>
+        <p class="diagram-caption">窗口外 token 仍存在于序列，但<strong>不参与</strong>当前注意力计算；与「上下文长度」产品宣传需区分。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>方案</th><th>复杂度</th><th>KV Cache</th><th>远程依赖</th><th>局限</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>全量 Attention</td>
+            <td>O(n²)</td>
+            <td>O(n)</td>
+            <td>任意距离</td>
+            <td>长序列贵</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="sliding-window-attention" tabindex="0">滑动窗口</span></td>
+            <td>O(n·w)</td>
+            <td>O(w) 有界</td>
+            <td>仅窗口内</td>
+            <td>超长依赖需外部记忆</td>
+          </tr>
+          <tr>
+            <td>稀疏全局 token</td>
+            <td>混合</td>
+            <td>中等</td>
+            <td>部分远程</td>
+            <td>架构专用</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">误区</span>
+          <ul>
+            <li>「窗口 128K = 每 token 都看 128K」——可能含滑动/稀疏策略</li>
+            <li>「窗口模型不需要 RAG」——窗口外知识仍需检索</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">面试正答</span>
+          <ul>
+            <li>问清架构：全量 / 滑动 / 混合</li>
+            <li>CorpAssist 用会话摘要 + RAG 补窗口外事实</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Ring/Chunked Attention 概念</h3>
+      <p>当单卡装不下长序列 KV 时，<strong>分块注意力</strong>把序列切成 chunk，每块在本地算 Attention；块间通过 Ring All-Reduce 等通信交换 KV，实现「逻辑全上下文、物理分布式」。这是<strong>推理/训练系统</strong>概念，应用岗知「存在此类多卡方案」即可，不需手写通信原语。</p>
+
+      <h4>Chunked 直觉</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">序列: [chunk0 | chunk1 | chunk2 | chunk3]
+单卡: 先算 chunk1 局部 QK^T
+跨块: 向相邻卡请求 chunk0 的 K/V → 拼接到注意力范围
+Ring: 卡0→卡1→卡2→卡3→卡0 传递 KV 块，覆盖全历史
+
+应用岗 takeaway: 私有化「超长文档一次推理」可能需多卡 + 此类框架</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>技术</th><th>解决什么</th><th>谁负责</th><th>应用岗接口</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Flash Attention</td>
+            <td>单卡算子级省显存</td>
+            <td>推理框架</td>
+            <td>看 TTFT 是否改善</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="chunked-attention" tabindex="0">Chunked Attention</span></td>
+            <td>序列切分跨卡</td>
+            <td>Infra / 平台</td>
+            <td>问清最大可推理长度与副本数</td>
+          </tr>
+          <tr>
+            <td>Ring Attention</td>
+            <td>KV 块环状传递</td>
+            <td>训练/推理集群</td>
+            <td>不在应用 BFF 实现</td>
+          </tr>
+          <tr>
+            <td><span class="term" data-term-id="kv-cache" tabindex="0">KV Cache</span> 分页</td>
+            <td>显存碎片与共享</td>
+            <td>vLLM 等</td>
+            <td>并发客服 QPS 能力</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Flash Attention 与 Ring Attention 解决的是同一问题吗？</summary>
+        <p>不同层面。Flash 是单卡 kernel 融合减少 HBM 读写；Ring 是多卡间 KV 传递以扩展<strong>可处理序列长度</strong>。CorpAssist 压测报告应分「单请求最长上下文」与「并发 QPS」两项。</p>
+      </details>
+
+      <h4>Infra 协作问题清单（应用岗版）</h4>
+      <ul>
+        <li>单请求最大 <code>max_model_len</code> 与 YaRN factor 如何配置？</li>
+        <li>并发 200 路客服时 KV 分页是否启用？p95 变化多少？</li>
+        <li>超长 PDF 一次推理需几卡？是否比「检索 Top-K」更贵？</li>
+        <li>故障时能否回退到 8K 窗口 + RAG 而不改业务代码？</li>
+      </ul>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">与平台沟通误区</span>
+          <ul>
+            <li>只问「能不能 128K」不问 golden set 引用率</li>
+            <li>假设多卡 Ring 对应用透明且无额外成本</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐问法</span>
+          <ul>
+            <li>「32K + YaRN factor=4，长文档 50 条引用率多少？」</li>
+            <li>「超窗请求是否自动截断？截断策略是什么？」</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>YaRN/NTK 外推（应用视角）</h3>
+      <p>模型训练在 8K 长度，产品需 32K～128K。<span class="term" data-term-id="ntk-scaling" tabindex="0">NTK-aware 插值</span> 调整 RoPE 频率基座，使旋转角在更长 pos 上不过快饱和；<span class="term" data-term-id="yarn" tabindex="0">YaRN</span>（Yet another RoPE extensioN）在低频/高频维度上分段插值，兼顾短程与长程。二者常在 <strong>推理配置</strong> 或 vLLM <code>--rope-scaling</code> 中启用，<strong>不改权重</strong>。</p>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>方法</th><th>操作层</th><th>典型效果</th><th>风险</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>NTK scaling</td>
+              <td>调 RoPE base</td>
+              <td>零样本略延长可用长度</td>
+              <td>短题质量偶发波动</td>
+            </tr>
+            <tr>
+              <td>YaRN</td>
+              <td>分段频率插值</td>
+              <td>长文 QA 更稳</td>
+              <td>需匹配模型卡片参数</td>
+            </tr>
+            <tr>
+              <td>继续预训练扩展</td>
+              <td>训练（mustNotCover）</td>
+              <td>最强</td>
+              <td>非应用岗职责</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash"># vLLM 启动示意（应用岗会与 Infra 协作）
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --max-model-len 32768 \
+  --rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":8192}'
+
+# 验收：用 20 页制度 PDF 的 golden set 测引用率，而非只看 MMLU</code></pre>
+      </div>
+
+      <p>外推与 <a href="#ch-advanced-01-positional-encoding">位置编码</a> 一脉相承：RoPE 决定相对距离如何进入内积；YaRN/NTK 决定「更长 pos 时角度是否合理」。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>验收项</th><th>短题 benchmark</th><th>长文档 golden set</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>启用 YaRN 后</td><td>可能持平或略波动</td><td>跨页引用率应上升或持平</td></tr>
+          <tr><td>未启用外推硬拉 32K</td><td>看似正常</td><td>中间段漏引用明显</td></tr>
+          <tr><td>CorpAssist 门禁</td><td>非主指标</td><td><strong>主指标</strong>：引用率、幻觉率</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-faq">
+        <summary>NTK 与 YaRN 选型口语</summary>
+        <p>「NTK 调 base，实现快；YaRN 分段插值，长文 QA 更稳。我们跟 vLLM 推荐配置走，用<strong>长文档 golden set</strong> ablation，不手调角度公式。」——体现应用岗验收思维，避开预训练 re-train（mustNotCover）。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>RAG 与长窗口取舍</h3>
+      <p><span class="term" data-term-id="long-context" tabindex="0">长上下文</span> 与 <span class="term" data-term-id="rag" tabindex="0">RAG</span> 是<strong>互补</strong>关系：前者扩大「一次能读多少」；后者控制「读什么、能否溯源」。CorpAssist 企业知识库（百万 chunk）在可预见未来仍依赖检索；长窗口适合「已精选的少文档全文」或「多轮会话未压缩历史」。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>维度</th><th>纯长窗口</th><th>纯 RAG</th><th>推荐组合</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>知识边界</td>
+            <td>易混入无关段落</td>
+            <td>Top-K 可控</td>
+            <td>检索 Top-K + 适度拼接</td>
+          </tr>
+          <tr>
+            <td>引用溯源</td>
+            <td>需额外段落标记</td>
+            <td>chunk_id 天然支持</td>
+            <td>RAG 主链路 + 引用字段</td>
+          </tr>
+          <tr>
+            <td>成本</td>
+            <td>∝ 序列长度</td>
+            <td>∝ K × chunk 长</td>
+            <td>动态 K + 摘要压缩</td>
+          </tr>
+          <tr>
+            <td>延迟</td>
+            <td>首 token 随长度升</td>
+            <td>检索 + 生成两阶段</td>
+            <td>并行检索与流式生成</td>
+          </tr>
+          <tr>
+            <td>面试金句</td>
+            <td>「不能替代索引」</td>
+            <td>「不能替代跨段推理」</td>
+            <td>「检索定证据，长窗补连贯」</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 长文档问答推荐路径</h5>
+        <pre class="mermaid">flowchart LR
+  Q[用户问题] --> RET[混合检索 Top-K]
+  RET --> FILT[租户/权限过滤]
+  FILT --> PACK[拼接 prompt ≤ 窗口预算]
+  PACK --> LLM[长窗口 LLM 生成]
+  LLM --> CITE[引用 chunk_id 回显]
+  PACK -.->|可选| SUM[会话摘要进 prompt]</pre>
+        <p class="diagram-caption">长窗口是<strong>打包预算</strong>，不是全库入口；权限过滤在检索层完成。</p>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">架构反例</span>
+          <ul>
+            <li>每晚把全库 embedding 删了改「128K 直读」</li>
+            <li>不做 chunk 边界，指望模型在长 prompt 里自己找页码</li>
+            <li>忽视 <span class="term" data-term-id="long-context" tabindex="0">长上下文</span> 外推未回归的长文档用例</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">架构正例</span>
+          <ul>
+            <li>检索决定证据集；prompt 预算内拼接；超长用 YaRN 配置</li>
+            <li>客服会话：滑动窗口 + 结构化槽位 + 摘要</li>
+            <li>评测：短题 + 长文档双 golden set</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>滑动窗口注意力</strong>：有界 w 降低算力与 KV；远程依赖需外部记忆或 RAG。</li>
+        <li><strong>Ring/Chunked Attention</strong>：多卡分块交换 KV；平台能力，应用岗知边界即可。</li>
+        <li><strong>YaRN/NTK 外推</strong>：推理侧 RoPE 缩放；须长文档实测，非万能。</li>
+        <li><strong>RAG 与长窗口取舍</strong>：检索定证据，长窗补连贯；全库入 prompt 不可行。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <ul class="learn-checklist" data-storage-key="adv03-longctx-review">
+        <li><label><input type="checkbox" /> 能对比全量 vs 滑动窗口复杂度</label></li>
+        <li><label><input type="checkbox" /> 能区分 Flash vs Ring 解决的问题</label></li>
+        <li><label><input type="checkbox" /> 能说明 YaRN 在 vLLM 配置层启用</label></li>
+        <li><label><input type="checkbox" /> 能画 RAG + 长窗组合路径图</label></li>
+      </ul>
+      <p class="chapter-review-next">下一步：完成章节测验；进入 <a href="#ch-advanced-04-interview-defense">面试 TOP10：Transformer 答辩</a> 做综合演练。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B — Sliding Window Attention</a></li>
+      <li><a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">Ring Attention 论文</a></li>
+      <li><a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">YaRN: Efficient Context Window Extension</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/serving/engine_args.html" target="_blank" rel="noopener">vLLM — Engine Args（rope-scaling）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">完成长上下文决策表与 CorpAssist 组合架构图，并写一道 RAG vs 长窗权衡判断题（约 25 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>默画「全量 vs 滑动窗口」对比图，标 O(n²) 与 O(n·w)。</li>
+      <li>填「Ring/Chunked vs Flash vs KV 分页」表：各写一句应用岗应问的接口问题。</li>
+      <li>阅读 vLLM rope-scaling 示例，列出启用 YaRN 需知的两个参数（factor、original_max）。</li>
+      <li>按「RAG 与长窗口取舍」表，为制度库场景写推荐组合 5 句（含引用溯源）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（权衡）客服场景应用 128K 窗口后，是否可下线会话摘要与结构化订单槽位？说明理由。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>不应下线。</strong>滑动窗口或成本约束仍可能截断早期事实；结构化槽位提供确定性状态，比模型「记忆」更可靠。128K 可减少摘要频率，但不能替代业务字段与 RAG 查单。应「槽位 + 可选摘要 + 检索」组合。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：长文档 golden set 设计</h4>
+      <p>设计 5 条 15～30 页 PDF 问答用例，含跨页引用；验收：换 YaRN on/off 各跑一遍，记录引用率差异。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸资源</h3>
+    <ul>
+      <li><a href="https://blog.eleuther.ai/yarn/" target="_blank" rel="noopener">EleutherAI — YaRN 说明</a></li>
+      <li>关联：<a href="#ch-practice-04-kv-cache-flash">KV Cache 与 Flash Attention</a></li>
+      <li>下一章：<a href="#ch-advanced-04-interview-defense">面试 TOP10：Transformer 答辩</a></li>
+    </ul>
+  </div>
+</section>

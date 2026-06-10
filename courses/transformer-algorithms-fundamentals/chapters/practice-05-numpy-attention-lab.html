@@ -1,0 +1,360 @@
+<section id="ch-practice-05-numpy-attention-lab" class="chapter" data-chapter="practice-05-numpy-attention-lab">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>动手：NumPy 迷你 Attention</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-numpy-attention-lab" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>架构变体与工程映射</strong> · 能力：用 NumPy 实现 Scaled Dot-Product Attention 与因果 Mask，验证权重归一化</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>前几章讲了 <span class="term" data-term-id="decoder-only" tabindex="0">GPT</span>、<span class="term" data-term-id="kv-cache" tabindex="0">KV Cache</span> 与 <span class="term" data-term-id="flash-attention" tabindex="0">Flash Attention</span> 的工程故事；本章用<strong>约 60 行 NumPy</strong> 落地 <a href="#ch-basics-02-attention-qkv">Q/K/V 与缩放点积</a> 公式。亲手跑通 <span class="term" data-term-id="scaled-dot-product" tabindex="0">Scaled Dot-Product</span> 与 <span class="term" data-term-id="causal-mask" tabindex="0">因果 Mask</span>，面试「手写 Attention」不再只背公式。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>实现 <code>softmax(QK^T / sqrt(d_k)) V</code> 并得到正确 shape</li>
+          <li>应用上三角 mask，理解 GPT decode 为何不能看未来</li>
+          <li>验收每行注意力权重和为 1</li>
+          <li>与 PyTorch 内置算子对照数值（可选）</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>Scale</strong>：除以 <code>sqrt(d_k)</code> 防点积过大 softmax 饱和。</li>
+          <li><strong>Softmax 按行</strong>：对每个 query 位置，在所有 key 上归一化。</li>
+          <li><strong>Mask</strong>：未来位置置 <code>-inf</code>（实现用 <code>-1e9</code>）再 softmax → 权重 0。</li>
+          <li><strong>输出</strong>：权重矩阵乘 V 得加权 value 组合。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>实现 Scaled Dot-Product</h3>
+      <p>给定序列长度 <code>seq_len</code> 与模型维 <code>d_model</code>，设 Q/K/V 形状均为 <code>(seq_len, d_model)</code>（单头简化）。注意力分数 <code>S = Q K^T / sqrt(d_k)</code>，权重 <code>A = softmax(S)</code>，输出 <code>O = A V</code>。</p>
+
+      <h4>核心公式（LaTeX）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">latex</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-latex">\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V</code></pre>
+      </div>
+
+      <h4>NumPy 实现（与 demo 一致）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import numpy as np
+
+def softmax(x, axis=-1):
+    shifted = x - np.max(x, axis=axis, keepdims=True)
+    exp = np.exp(shifted)
+    return exp / np.sum(exp, axis=axis, keepdims=True)
+
+def scaled_dot_product_attention(q, k, v, mask=None):
+    d_k = q.shape[-1]
+    scores = q @ k.T / np.sqrt(d_k)
+    if mask is not None:
+        scores = np.where(mask, scores, -1e9)
+    weights = softmax(scores, axis=-1)
+    return weights @ v, weights</code></pre>
+      </div>
+
+      <p>CorpAssist 类比：RAG 引用 token 在 GPT 前缀中，因果 mask 保证生成第 <code>t</code> 个答案 token 时不能「偷看」尚未生成的后续答案 token；但对<strong>已写入前缀的引用</strong>，只要位置 ≤ 当前，即可 attend。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>张量</th><th>shape（单头）</th><th>含义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Q</td><td>(seq, d_k)</td><td>「我要查什么」</td></tr>
+          <tr><td>K</td><td>(seq, d_k)</td><td>「可被匹配的键」</td></tr>
+          <tr><td>V</td><td>(seq, d_v)</td><td>「取回的内容」</td></tr>
+          <tr><td>weights</td><td>(seq, seq)</td><td>对每个 query 行 softmax 和为 1</td></tr>
+          <tr><td>output</td><td>(seq, d_v)</td><td>加权后的表示</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不除以 d_k 而除以 sqrt(d_k)？</summary>
+        <p>点积方差随 <code>d_k</code> 增大而增大，softmax 会极端 one-hot，梯度变小。<strong>缩放</strong>使分数分布更稳定，与 <a href="#ch-basics-02-attention-qkv">缩放点积</a> 一致。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>因果 Mask 实验</h3>
+      <p><span class="term" data-term-id="causal-mask" tabindex="0">因果 Mask</span> 为下三角矩阵 <code>M</code>：<code>M[i,j]=1</code> 当 <code>j≤i</code>，否则 mask 掉。实现上用 <code>np.tril</code> 生成 bool mask，在 softmax 前把禁止位置设为 <code>-1e9</code>。</p>
+
+      <div class="mermaid-wrap">
+        <h5>4×4 因果 Mask（1=可见）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph matrix [Mask 可视化]
+    direction TB
+    R1["行0: 1 0 0 0"]
+    R2["行1: 1 1 0 0"]
+    R3["行2: 1 1 1 0"]
+    R4["行3: 1 1 1 1"]
+  end</pre>
+        <p class="diagram-caption">行 i 只能 attend 到列 j≤i；对应 GPT 自回归「不看未来」。</p>
+      </div>
+
+      <h4>生成 mask 与调用</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def causal_mask(seq_len):
+    return np.tril(np.ones((seq_len, seq_len), dtype=bool))
+
+seq_len = 4
+mask = causal_mask(seq_len)
+out, weights = scaled_dot_product_attention(q, k, v, mask=mask)
+# 上三角应 ≈ 0
+assert np.all(weights[np.triu_indices(seq_len, k=1)] &lt; 1e-6)</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">常见错误</span>
+          <ul>
+            <li>mask 用 0/1 直接乘 scores（softmax 后非零）</li>
+            <li>softmax 沿错轴（列而非行）</li>
+            <li>忘记 scale，权重 one-hot 极端</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">正确做法</span>
+          <ul>
+            <li>禁止位 large negative 再 softmax</li>
+            <li><code>axis=-1</code> 对 key 维归一化</li>
+            <li>验收 <code>weights.sum(axis=1) ≈ 1</code></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 PyTorch 对照</h3>
+      <p>生产环境用 PyTorch / Flash Attention kernel；本 lab 数值应与其<strong>一致</strong>（fp 误差内）。可选对照脚本：</p>
+
+      <h4>PyTorch 对照（可选依赖 torch）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 需 pip install torch
+import torch
+import torch.nn.functional as F
+
+q_t = torch.tensor(q, dtype=torch.float32).unsqueeze(0)  # (1, seq, d)
+k_t = torch.tensor(k, dtype=torch.float32).unsqueeze(0)
+v_t = torch.tensor(v, dtype=torch.float32).unsqueeze(0)
+
+# is_causal=True 等价于下三角 mask
+out_pt = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+# 与 NumPy out 对比 np.allclose</code></pre>
+      </div>
+
+      <p>Flash Attention 是<strong>更快实现同一运算</strong>；NumPy 版 O(n²) 显式矩阵，seq=4 仅教学。CorpAssist 线上 seq 数千，必须依赖优化 kernel + KV Cache（见 <a href="#ch-practice-04-kv-cache-flash">上一章</a>）。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>多头 Attention 在本 lab 如何扩展？</summary>
+          <div class="learn-faq-body">
+            将 Q/K/V 变为 (seq, num_heads, head_dim)，对每个 head 独立做 scaled dot-product，最后 concat 再经 <code>W_o</code>。本课 demo 单头足够理解 mask 与 softmax；多头见 <a href="#ch-basics-05-multi-head-mask">多头注意力与 Mask</a>。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>验收：权重和为 1</h3>
+      <p>Softmax 性质：对每个 query 行 i，<code>Σ_j A[i,j] = 1</code>。这是面试常考的<strong>可验证不变量</strong>。Demo <code>mini_attention.py</code> 打印权重矩阵与 <code>row_sums</code>，并用 assert 自动验收。</p>
+
+      <h4>期望终端输出（节选）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">=== CorpAssist mini attention (no mask) ===
+Attention weights (rows should sum to 1):
+[[0.28  0.22  0.26  0.24]
+ ...
+Row sums: [1. 1. 1. 1.]
+
+=== Causal mask (decoder / GPT style) ===
+Upper triangle (should be ~0): [0.0, 0.0, 0.0]
+Row sums: [1. 1. 1. 1.]
+
+OK: all checks passed</code></pre>
+      </div>
+
+      <p>运行命令（在 lab 目录）：</p>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">bash</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-bash">pip install -r requirements.txt
+python mini_attention.py</code></pre>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>口述：手写 Attention 四步</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>线性投影得 Q、K、V</li>
+              <li>scores = QK^T / sqrt(d_k)，加 mask 若有</li>
+              <li>weights = softmax(scores, dim=-1)</li>
+              <li>output = weights @ V</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <h4>手算例题（seq_len=2, d_k=2）</h4>
+      <p>设 Q=K=V（省略投影）：<code>q1=[1,0], q2=[0,1]</code>。无 mask 时 scores 为 QK^T；加因果 mask 后第 1 行只 attend 位置 0。可在纸面算 softmax 验证行和为 1——与 demo 打印一致。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>步骤</th><th>CorpAssist 工程映射</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Q/K/V 投影</td>
+            <td>模型权重 Wq/Wk/Wv；应用层不可见</td>
+          </tr>
+          <tr>
+            <td>Scale + softmax</td>
+            <td>数值稳定性影响长上下文精度</td>
+          </tr>
+          <tr>
+            <td>Causal mask</td>
+            <td>Chat 流式生成不泄露未来 token</td>
+          </tr>
+          <tr>
+            <td>O = AV</td>
+            <td>hidden state 传入 FFN；堆 L 层</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-faq">
+        <details>
+          <summary>demo 中 rng seed=42 的作用？</summary>
+          <div class="learn-faq-body">
+            固定随机 Q/K/V 投影，使每次运行打印的权重矩阵一致，便于对照讲义与同学之间比对。生产模型权重由训练决定，非随机初始化。
+          </div>
+        </details>
+        <details>
+          <summary>为何 lab 不用 PyTorch 而用 NumPy？</summary>
+          <div class="learn-faq-body">
+            NumPy 无 GPU 依赖，适合课程离线验收；公式与矩阵维度一目了然。确认直觉后再用 PyTorch/Flash 做规模化和加速。
+          </div>
+        </details>
+        <details>
+          <summary>如何将本 lab 扩展到多头？</summary>
+          <div class="learn-faq-body">
+            在 Q/K/V 增加 head 维，对每个 head 独立调用 <code>scaled_dot_product_attention</code>，concat 后乘 <code>W_o</code>。CorpAssist 线上模型 head 数见 config 的 <code>num_attention_heads</code>。
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>Attention 手算检查清单</summary>
+          <div class="learn-cheat-body">
+            <ol>
+              <li>scores shape = (seq, seq)</li>
+              <li>每行 softmax 和 = 1</li>
+              <li>causal：上三角权重 ≈ 0</li>
+              <li>output shape = (seq, d_v)</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Scaled Dot-Product</strong>：scale + softmax + 乘 V，NumPy 可完整实现。</li>
+        <li><strong>因果 Mask</strong>：下三角可见，上三角权重为 0，对应 GPT decode。</li>
+        <li><strong>PyTorch</strong>：<code>scaled_dot_product_attention</code> 数值对照，Flash 为加速实现。</li>
+        <li><strong>验收</strong>：每行权重和为 1；causal 上三角 ≈ 0。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_practice05">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="implement" /> 已运行 mini_attention.py 并通过 assert</label></li>
+          <li><label><input type="checkbox" data-id="scale" /> 能解释 sqrt(d_k) 缩放</label></li>
+          <li><label><input type="checkbox" data-id="mask" /> 能解释因果 mask 实现</label></li>
+          <li><label><input type="checkbox" data-id="row-sum" /> 能说明为何 row sum = 1</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">practice 阶段完成。进入 <a href="#ch-advanced-01-positional-encoding">位置编码演进：绝对/相对/RoPE</a> 或 <a href="#ch-advanced-04-interview-defense">面试 TOP10：Transformer 答辩</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li>
+      <li><a href="https://numpy.org/doc/stable/" target="_blank" rel="noopener">NumPy 文档</a></li>
+      <li><a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch scaled_dot_product_attention</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 <code>demos/practice-05-numpy-attention-lab/</code> 运行验收，并修改 seq_len 观察权重矩阵形状。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>进入 demo 目录，执行 <code>pip install -r requirements.txt</code> 与 <code>python mini_attention.py</code>，确认输出含 <code>OK: all checks passed</code>。</li>
+      <li>阅读 <code>scaled_dot_product_attention</code>，在纸上手算 seq_len=2 时 scores 矩阵 shape 与 softmax 行和。</li>
+      <li>将 <code>seq_len</code> 改为 6 重新运行，记录 weights shape 与 row_sums 是否仍为 1。</li>
+      <li>（可选）安装 torch，用正文对照代码与 NumPy 输出比 <code>allclose</code> 误差。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）同事把 mask 位置设为 0 再直接 softmax，发现「未来」位置仍有 0.08 权重。原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>应对禁止位置设<strong>大负数</strong>（如 -1e9）再 softmax，使 exp≈0。直接把 score 置 0 仍会参与 softmax 归一化，分走概率质量。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：NumPy 迷你 Attention</h4>
+      <p>目录：<code>demos/practice-05-numpy-attention-lab/</code>（<code>mini_attention.py</code>、<code>requirements.txt</code>、<code>README.md</code>）。<strong>验收</strong>：执行 <code>python mini_attention.py</code>，打印无 mask 与 causal 两段权重，每行和为 1，末尾 <code>OK: all checks passed</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-basics-02-attention-qkv">注意力机制：Q/K/V 与缩放点积</a></li>
+      <li><a href="#ch-basics-04-self-attention-math">Self-Attention 矩阵视角</a></li>
+      <li><a href="#ch-practice-01-gpt-decoder">GPT 系列：Decoder-only 与自回归</a></li>
+    </ul>
+  </div>
+</section>

@@ -9,7 +9,7 @@
 
 ## 练习
 1. 阅读 `TicketTools.java` 的 @Tool 定义
-2. 阅读 `mock_mcp.java` 模拟 MCP list_tools
+2. 阅读 `MockMcp.java` 模拟 MCP list_tools
 3. 检查 `tools.json` 中 sendEmail=approve、deleteTicket=deny
 
 ## 验收标准

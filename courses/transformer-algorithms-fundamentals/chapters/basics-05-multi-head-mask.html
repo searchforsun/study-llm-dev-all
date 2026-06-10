@@ -1,0 +1,395 @@
+<section id="ch-basics-05-multi-head-mask" class="chapter" data-chapter="basics-05-multi-head-mask">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>多头注意力与 Mask</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05-multi-head-mask" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>序列建模与 Attention 基座</strong> · 能力：解释多头并行子空间与三类 Mask 在生成/RAG 中的作用</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p><a href="#ch-basics-04-self-attention-math">矩阵视角</a> 讲完单头 Self-Attention；真实模型用 <span class="term" data-term-id="multi-head-attention" tabindex="0">多头注意力</span> 并行多种「看法」，并用 <span class="term" data-term-id="causal-mask" tabindex="0">Causal Mask</span>、<span class="term" data-term-id="padding-mask" tabindex="0">Padding Mask</span> 约束可见范围。本章补齐后，basics 阶段即可对接 <a href="#ch-practice-01-gpt-decoder">GPT Decoder</a> 与 CorpAssist 批处理推理。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>说明多头切分 d<sub>model</sub> 与拼接输出流程</li>
+          <li>区分 Padding Mask 与 Causal Mask 的适用场景</li>
+          <li>描述 <span class="term" data-term-id="cross-attention" tabindex="0">Cross-Attention</span> 在 Encoder-Decoder 与 RAG 增强中的角色</li>
+          <li>在配置 batch 推理时指出 Mask 错误导致的典型 badcase</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>多头 = h 个独立子空间</strong> 各做 Scaled Dot-Product，再拼接投影。</li>
+          <li><strong>Padding Mask</strong>：batch 对齐时屏蔽 pad Token，防止 attend 到无意义位置。</li>
+          <li><strong>Causal Mask</strong>：解码器不能偷看未来 Token，保证自回归合法。</li>
+          <li><strong>Cross-Attention</strong>：Q 来自解码器，K/V 来自编码器或外部 memory。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多头并行子空间</h3>
+      <p>单头 Attention 只有一套 Q/K/V。<span class="term" data-term-id="multi-head-attention" tabindex="0">多头注意力（MHA）</span> 把 d<sub>model</sub> 切成 h 份，每份维度 d<sub>k</sub> = d<sub>model</sub>/h，各自独立算 Attention，最后拼接再乘 W<sub>O</sub> 投影回 d<sub>model</sub>。</p>
+
+      <p>多头不改变渐近 <span class="term" data-term-id="quadratic-complexity" tabindex="0">O(n²)</span>——每个头仍算 n×n 权重，只是 d_k 变小、h 路并行；总 FLOPs 与单头同量级，主要增益在表达多样性。</p>
+
+      <h4>公式骨架</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">head_i = Attention(Q_i, K_i, V_i),  i = 1..h
+MultiHead = Concat(head_1, ..., head_h) @ W_O
+
+CorpAssist 7B 级常见：h=32, d_model=4096, d_k=d_v=128</code></pre>
+      </div>
+
+      <h4>为何要多头？</h4>
+      <ul>
+        <li><strong>多子空间并行</strong>：不同头可学习关注不同模式（句法、共指、数字邻近等）。</li>
+        <li><strong>稳定训练</strong>：较多个小头比单一大头更易优化（类似集成）。</li>
+        <li><strong>算力折中</strong>：总参数量与单头全维相近，但表达更丰富。</li>
+      </ul>
+
+      <div class="mermaid-wrap">
+        <h5>多头 Attention 数据流</h5>
+        <pre class="mermaid">flowchart TB
+  X[X d_model] --> SPL[切分 h 头]
+  SPL --> H1[Head 1 Attn]
+  SPL --> H2[Head 2 Attn]
+  SPL --> Hh[Head h Attn]
+  H1 --> CAT[Concat]
+  H2 --> CAT
+  Hh --> CAT
+  CAT --> WO["W_O 投影 → d_model"]</pre>
+        <p class="diagram-caption">推理引擎对多头做融合 kernel；应用岗只需知 h 与 d_model 影响显存与速度。</p>
+      </div>
+
+      <h4>单头 vs 多头（表达力直觉）</h4>
+      <p>单头 Attention 只有一套 Q/K/V 投影；<span class="term" data-term-id="multi-head-attention" tabindex="0">多头</span> 相当于<strong>并行跑 h 个「专家读者」</strong>，有的头偏向句法邻近，有的偏向共指、数字对齐等——最后拼接由 W<sub>O</sub> 学会如何混合。CorpAssist 评测 badcase 时，个别头可呈现对「制度编号」「金额」列的集中权重（研究向，非生产依赖）。</p>
+      <ul>
+        <li>头数 h 增大 → 每头 d<sub>k</sub> 变小（d<sub>model</sub> 固定时），单头容量下降但多样性上升。</li>
+        <li>GQA/MQA（practice 章）进一步在 K/V 头间共享，降 KV Cache 显存。</li>
+        <li>应用岗读 config：<code>num_attention_heads</code> 与 <code>num_key_value_heads</code> 可能不同。</li>
+      </ul>
+
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>参数</th><th>典型值（7B）</th><th>含义</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>h</td><td>32</td><td>注意力头数</td></tr>
+            <tr><td>d_model</td><td>4096</td><td>模型隐藏维</td></tr>
+            <tr><td>d_k</td><td>128</td><td>每头 Q/K 维</td></tr>
+            <tr><td>GQA</td><td>见 practice 章</td><td>多 Q 头共享 K/V 降显存</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Padding Mask</h3>
+      <p>训练 CorpAssist 意图分类小模型时，batch 内短句用 <code>&lt;pad&gt;</code> 对齐是常规操作。<span class="term" data-term-id="padding-mask" tabindex="0">Padding Mask</span> 确保模型不会把 pad 当成真实语义去 attend——否则「报销」可能错误地关注到另一句的 padding 列，拉低验证集准确率。</p>
+      <p>Hugging Face <code>attention_mask</code> 中 1 表示真实 Token、0 表示 pad；传入模型前须与 input_ids 等长，<strong>Java 侧拼 batch 时由网关统一生成</strong>。</p>
+      <p>批处理多条 CorpAssist 请求时，序列长短不一，短句右侧用 <code>&lt;pad&gt;</code> 填充到统一长度。<span class="term" data-term-id="padding-mask" tabindex="0">Padding Mask</span> 在 softmax 前把<strong>pad 位置分数置为 −∞</strong>，使权重为 0，避免模型从 padding 读取噪声。</p>
+
+      <h4>Mask 矩阵示意（batch=2）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">序列 A: [我, 要, 报销]           → 长度 3
+序列 B: [制度, 问答, pad, pad]   → 长度 4（pad 为填充）
+
+对序列 B，任何 Query 对 pad 列的 score 设为 -inf
+有效 Token 只 attend 到前 2 个真实词</code></pre>
+      </div>
+
+      <h4>工程注意</h4>
+      <ul>
+        <li>训练与推理必须一致：漏 Mask 会导致 pad 污染表示，批推理准确率抖动。</li>
+        <li>自研 Java 网关若做 batch 拼 prompt，须同步传递 attention_mask 给推理服务（与 Hugging Face 约定一致）。</li>
+        <li>单条在线请求常无 pad，Mask 全 1；但微调数据管道仍要处理。</li>
+        <li>动态 padding（按 batch 内最长句）可省算力，但须每 batch 重算 mask 张量。</li>
+        <li>导出 ONNX/TensorRT 时确认 mask 作为输入传入，勿写死全 1。</li>
+      </ul>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Padding Mask 加在 softmax 之前还是之后？</summary>
+        <p><strong>之前</strong>：对无效 (i,j) 位置将 score 设为 −∞，softmax 后权重为 0。若在 softmax 之后乘 0 虽也可行，但数值上常在 softmax 前 mask 以避免 exp 溢出并实现标准 fused kernel。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Causal Mask（自回归）</h3>
+      <p>CorpAssist 流式对话里，用户看到 assistant 消息逐字出现，本质是模型每步只多生成 1 个 Token。<span class="term" data-term-id="causal-mask" tabindex="0">因果 Mask</span> 在训练阶段就强制模型习惯「只看过去」——与推理时可见上下文一致，避免 train/serve skew。</p>
+      <p>推理框架在 KV Cache 命中时仍须对<strong>新 Token 行</strong>应用 Causal Mask，使其不能 attend 到未生成的未来位置。</p>
+      <p>去掉 Causal Mask 的「捷径」训练在上线后几乎必然产生泄漏式胡话，不可用于生产微调。</p>
+      <p>SFT 数据构造时，labels 仍须与 Causal 可见范围一致，仅对 assistant 段计算 loss。</p>
+      <p>GPT 类 <span class="term" data-term-id="causal-mask" tabindex="0">因果 Mask（Causal / Look-ahead Mask）</span> 保证位置 i 只能看见 ≤i 的 Token，<strong>不能偷看未来</strong>。否则训练时标签泄漏，推理时无法逐 Token 生成。</p>
+
+      <h4>下三角可见矩阵</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">n=4 时允许 attend 位置（1=可见，0=屏蔽上三角）
+
+     t0 t1 t2 t3
+t0 [ 1  0  0  0 ]
+t1 [ 1  1  0  0 ]
+t2 [ 1  1  1  0 ]
+t3 [ 1  1  1  1 ]
+
+CorpAssist 流式生成：每新 Token 只能依赖已输出前缀</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>自回归生成与 Causal Mask</h5>
+        <pre class="mermaid">flowchart LR
+  T0[t0 我] --> T1[t1 要]
+  T1 --> T2[t2 报销]
+  T2 --> T3[t3 ?]
+  T3 -.->|不可见| T4[未来 Token]</pre>
+        <p class="diagram-caption">生成 t3 时 Mask 屏蔽 t4 及之后；与 Chat API 逐 chunk 输出一致。</p>
+      </div>
+
+      <h4>实现提示：mask 加在 logits 上</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># scores: (n, n)；mask 为 0/1 或 bool
+scores = scores.masked_fill(causal_mask == 0, float('-inf'))
+weights = softmax(scores, dim=-1)  # 被 mask 位置权重为 0</code></pre>
+      </div>
+
+      <h4>与 BERT 双向对比</h4>
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Decoder（GPT/Qwen）</span>
+          <ul>
+            <li>Causal Mask，单向上下文</li>
+            <li>适合生成、对话续写</li>
+            <li>CorpAssist 主对话链路</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Encoder（BERT 向量）</span>
+          <ul>
+            <li>无 Causal Mask，双向</li>
+            <li>适合分类、Embedding</li>
+            <li>CorpAssist RAG 召回编码</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Cross-Attention 场景</h3>
+      <p>当解码器生成目标语言每个词时，<span class="term" data-term-id="cross-attention" tabindex="0">Cross-Attention</span> 让 Q 来自「我已生成部分」，K/V 来自「源语言编码」——经典机器翻译里生成英文 "subsidy" 时对齐中文「补贴」位置。CorpAssist 若用 T5 做制度中英对照，栈内仍有 Cross-Attn；Qwen 对话则把双语材料拼进同一上下文用 Self-Attn 完成。</p>
+      <p><span class="term" data-term-id="cross-attention" tabindex="0">Cross-Attention（交叉注意力）</span> 中 Query 来自<strong>一方序列</strong>（常为 Decoder 当前状态），Key/Value 来自<strong>另一方</strong>（Encoder 输出或外部 memory）。这是 Seq2Seq 翻译与部分多模态架构的核心。</p>
+
+      <h4>典型场景</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>场景</th><th>Q 来源</th><th>K/V 来源</th><th>CorpAssist 映射</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>经典翻译 Decoder</td>
+              <td>目标语言已生成部分</td>
+              <td>源语言 Encoder 输出</td>
+              <td>多语言制度翻译（T5 类）</td>
+            </tr>
+            <tr>
+              <td>Self-Attention</td>
+              <td>同序列 X</td>
+              <td>同序列 X</td>
+              <td>GPT 对话上下文互看</td>
+            </tr>
+            <tr>
+              <td>RAG「软」对照</td>
+              <td>生成中的回答 Token</td>
+              <td>上下文中的检索 chunk</td>
+              <td>无独立 Cross-Attn 层时由 Self-Attn 在同一上下文内完成</td>
+            </tr>
+            <tr>
+              <td>多模态</td>
+              <td>文本 Token</td>
+              <td>图像 patch 编码</td>
+              <td>未来 CorpAssist 图文工单（扩展）</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Decoder-only 为何常说「没有 Cross-Attention」</h4>
+      <p>CorpAssist 主力 Qwen/GPT 把检索 chunk 与问题<strong>拼成一条上下文</strong>，用 <span class="term" data-term-id="self-attention" tabindex="0">Self-Attention</span> 统一处理——工程上等价于「让模型自己找对齐」，无需独立 Encoder 栈。理解 <span class="term" data-term-id="cross-attention" tabindex="0">Cross-Attention</span> 仍有助于读 T5/BART 权重与面试「Seq2Seq 与 GPT 差异」。</p>
+
+      <h4>Mask 组合速查（批训练 Decoder）</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>子层</th><th>Mask 类型</th><th>作用</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Self-Attention</td><td>Causal + Padding</td><td>不看未来、不看 pad</td></tr>
+            <tr><td>Cross-Attention（若有）</td><td>Encoder Padding</td><td>源句 pad 屏蔽</td></tr>
+            <tr><td>FFN</td><td>无</td><td>逐位置，无 n×n 权重</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Mask 组合（Encoder-Decoder）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Decoder Self-Attn: Causal Mask + 可选 Padding Mask
+# Decoder Cross-Attn:  对 Encoder 输出做 Padding Mask（源句 pad）
+# Encoder Self-Attn:   仅 Padding Mask（双向）</code></pre>
+      </div>
+
+      <h4>basics 五章知识链（复习用）</h4>
+      <ol>
+        <li><a href="#ch-basics-01-seq-modeling">RNN 瓶颈</a> → 要 Attention</li>
+        <li><a href="#ch-basics-02-attention-qkv">Q/K/V 公式</a> → 可算权重</li>
+        <li><a href="#ch-basics-03-transformer-block">Block 拼装</a> → 真实一层</li>
+        <li><a href="#ch-basics-04-self-attention-math">O(n²)</a> → 工程限长</li>
+        <li>本章：多头 + Mask → 可对接 GPT 训练/推理</li>
+      </ol>
+      <p>进入 <a href="#ch-practice-01-gpt-decoder">practice 阶段</a> 前，应能白板写出 Scaled Dot-Product 并说明 <span class="term" data-term-id="causal-mask" tabindex="0">Causal Mask</span> 为何不可或缺。</p>
+      <div class="notice">
+        <strong>basics 收官检验</strong>
+        <p>若你能向同事讲清：多头为何并行、h 与 d_k 关系、三类 Mask 各解决什么问题、Decoder-only 为何不用 Cross-Attn——即可开始 practice 章对照真实 GPT/BERT 权重与 CorpAssist API 行为。</p>
+        <p>建议把本章 Mask 涂色练习纸与 <a href="#ch-practice-05-numpy-attention-lab">NumPy 实验</a> 一并完成，形成「图示 → 公式 → 代码」闭环。</p>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>basics 阶段学完下一步？</summary>
+          <p>进入 <a href="#ch-practice-01-gpt-decoder">GPT 系列：Decoder-only 与自回归</a>，把 Causal Mask 与 Next-Token 训练目标连到 CorpAssist Chat API；并用 <a href="#ch-practice-05-numpy-attention-lab">NumPy 实验</a> 验证权重和为 1。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，用于评审前 30 秒复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>多头</strong>：h 个子空间并行 Attention，Concat 后 W<sub>O</sub>；丰富表达且易训练。</li>
+        <li><strong>Padding Mask</strong>：批处理屏蔽 pad；score 置 −∞ 再 softmax。</li>
+        <li><strong>Causal Mask</strong>：下三角可见；自回归生成与 GPT 对话必备。</li>
+        <li><strong>Cross-Attention</strong>：Q 与 K/V 异源；Decoder-only 用拼接上下文 + Self-Attn 替代。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_basics05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="multi-head" /> 能说明 d_k = d_model / h 与拼接流程</label></li>
+          <li><label><input type="checkbox" data-id="pad-mask" /> 能解释 Padding Mask 防 pad 污染</label></li>
+          <li><label><input type="checkbox" data-id="causal" /> 能画出 n=4 下三角 Causal Mask</label></li>
+          <li><label><input type="checkbox" data-id="cross" /> 能区分 Self- 与 Cross-Attention 的 Q/K/V 来源</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>Mask/结构</th><th>作用</th></tr></thead>
+              <tbody>
+                <tr><td>Multi-Head</td><td>h 路并行子空间</td></tr>
+                <tr><td>Padding</td><td>屏蔽 pad 位置</td></tr>
+                <tr><td>Causal</td><td>禁止看未来</td></tr>
+                <tr><td>Cross-Attn</td><td>Q≠K/V 序列</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为何 GPT 需要 Causal Mask 而 BERT 不需要？</li>
+              <li>CorpAssist batch 推理漏传 attention_mask 会怎样？</li>
+              <li>多头相比单头的主要收益是什么（答两点）？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">basics 阶段收官：完成测验后进入 <a href="#ch-practice-01-gpt-decoder">GPT 系列：Decoder-only 与自回归</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need — Multi-Head Attention</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/glossary#attention-mask" target="_blank" rel="noopener">Hugging Face — Attention Mask 术语</a></li>
+      <li><a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" target="_blank" rel="noopener">PyTorch MultiheadAttention</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">手绘 n=4 的 Causal Mask 与 batch Padding Mask，并对照 Cross-Attention 表说明 CorpAssist 对话栈用哪种组合。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按「下三角可见矩阵」画出 4×4 Causal Mask（0/1 或 −∞/0），并标出生成第 3 个 Token 时可见列。</li>
+      <li>设计 batch=2 的长度 3+5 示例，写出 Padding Mask 应屏蔽的 (query,key) 对。</li>
+      <li>从「多头参数表」计算 d_model=4096、h=32 时的 d_k；说明 Concat 后维度 h×d_k。</li>
+      <li>对照「Cross-Attention 场景」表：CorpAssist GPT 对话与 T5 翻译各属于哪一行；RAG 拼 prompt 属于哪一行的工程等价。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）微调 CorpAssist 对话模型时，有人去掉 Causal Mask「让模型看见完整回答以加速收敛」。后果？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>训练标签泄漏</strong>：预测 t<sub>i</sub> 时可看见 t<sub>i+1</sub>… 真实标签，损失虚假降低；上线自回归生成时性能崩溃、胡言乱语。必须恢复下三角 Causal Mask；加速应靠更大 batch、Flash Attention、KV Cache，而非去掉 Mask。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Mask 涂色练习纸</h4>
+      <p>目录：<code>demos/basics-05-multi-head-mask-lab/</code>（4×4 因果格 + 批 padding 格）。<strong>验收</strong>：因果格仅下三角为「可见」；padding 例中 pad 列全部为「屏蔽」；附一句 CorpAssist GPT vs BERT Mask 差异。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-04-self-attention-math">Self-Attention 矩阵视角</a></li>
+      <li><strong>practice 首章</strong>：<a href="#ch-practice-01-gpt-decoder">GPT 系列：Decoder-only 与自回归</a></li>
+      <li><a href="#ch-practice-03-llm-arch-compare">LLaMA/Qwen 架构对照</a> — GQA 与多头变体</li>
+      <li><a href="https://jalammar.github.io/illustrated-gpt2/" target="_blank" rel="noopener">Illustrated GPT-2 — Decoder 与 Mask</a></li>
+    </ul>
+  </div>
+</section>

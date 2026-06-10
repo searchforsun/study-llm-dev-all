@@ -1,0 +1,363 @@
+<section id="ch-practice-02-bert-encoder" class="chapter" data-chapter="practice-02-bert-encoder">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>BERT 与表示学习：Encoder 路线</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-bert-encoder" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>32 分钟</strong> · 阶段：<strong>架构变体与工程映射</strong> · 能力：理解 BERT/Encoder 表示学习，并映射到 CorpAssist RAG 向量检索</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 知识库检索依赖 <span class="term" data-term-id="embedding-model" tabindex="0">Embedding 模型</span> 将制度段落变为向量；主流选型（bge、text-embedding-v3、E5 等）多为 <span class="term" data-term-id="bidirectional-encoder" tabindex="0">双向 Encoder</span> 路线，而非 <a href="#ch-practice-01-gpt-decoder">GPT Decoder-only</a>。不懂 BERT 的 <span class="term" data-term-id="mlm" tabindex="0">MLM</span> 训练与 [CLS]/mean pooling，就无法解释「为什么检索模型不宜直接当生成模型用」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>说明 BERT Encoder 栈与 GPT Decoder 在掩码、训练目标上的差异</li>
+          <li>解释 Embedding 输出如何进入 Milvus/pgvector 索引</li>
+          <li>为 CorpAssist 场景选择 Encoder vs Decoder 类模型</li>
+          <li>口述 RAG 链路中「检索 Encoder + 生成 Decoder」的双模型分工</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>双向上下文</strong>：Encoder 自注意力无因果掩码，整句互相可见（训练时用 MLM 防泄露）。</li>
+          <li><strong>输出是向量</strong>：句级/段级 embedding 用于相似度，不是逐 token 生成。</li>
+          <li><strong>RAG 标配</strong>：检索用 Encoder；回答用 Decoder-only Chat 模型。</li>
+          <li><strong>别混用</strong>：把 Chat 模型当 embedding 模型通常效果差、成本高。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>MLM 与双向上下文</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度段落入库</span>
+        <code>rag-index</code> 将 HR 制度 PDF 分块为 512 token 段落。每段经 <strong>bge-large-zh</strong>（BERT 类 Encoder）编码为 1024 维向量。用户问「产假天数」时，<strong>query 也用同一 Encoder</strong> 编码，在向量库做 ANN 检索——这要求表示对<strong>整句语义</strong>双向理解，而非自回归续写。
+      </aside>
+
+      <p>BERT（Bidirectional Encoder Representations from Transformers）使用<strong>仅 Encoder</strong> 栈：多层双向 Self-Attention + FFN。预训练任务为 <span class="term" data-term-id="mlm" tabindex="0">Masked Language Model（MLM）</span>：随机 mask 15% token，模型根据<strong>左右两侧</strong>上下文预测被 mask 词。与 GPT 的 Next-Token 不同，MLM 需要双向可见性，故<strong>不使用因果掩码</strong>。</p>
+
+      <div class="mermaid-wrap">
+        <h5>BERT Encoder 与 MLM</h5>
+        <pre class="mermaid">flowchart LR
+  subgraph enc [Encoder Stack]
+    E1[Token + Segment + Position]
+    E2[Bi-directional Self-Attention]
+    E3[FFN x L layers]
+  end
+  E1 --> E2 --> E3
+  E3 --> MLM[MLM Head 预测 mask 位]
+  E3 --> POOL[句向量 pooling]</pre>
+        <p class="diagram-caption">推理检索时不用 MLM Head，而取最后一层 hidden states 做 pooling 得 embedding。</p>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>维度</th><th>BERT / Encoder</th><th>GPT / Decoder-only</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>注意力掩码</td>
+            <td>双向（padding mask 仅屏蔽 pad）</td>
+            <td><span class="term" data-term-id="causal-mask" tabindex="0">因果掩码</span>，只看左侧</td>
+          </tr>
+          <tr>
+            <td>预训练目标</td>
+            <td>MLM + NSP（早期）</td>
+            <td><span class="term" data-term-id="next-token-prediction" tabindex="0">Next-Token CLM</span></td>
+          </tr>
+          <tr>
+            <td>典型输出</td>
+            <td>固定维向量 / 每个 token 表示</td>
+            <td>下一 token 分布 / 长文本生成</td>
+          </tr>
+          <tr>
+            <td>CorpAssist 角色</td>
+            <td>rag-index 向量、重排序特征</td>
+            <td>dialog 生成、Agent 推理</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>MLM 训练样本示意</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">原句：  员工享有 [MASK] 天带薪年假
+输入：  员工享有 [MASK] 天带薪年假  （双向上下文均可 attend）
+标签：  预测 [MASK] = 「15」</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：能否用 GPT 做 MLM 式双向填空？</summary>
+        <p>标准 GPT 因果掩码<strong>禁止</strong>看右侧 token，无法直接做 BERT 式 MLM。有研究用特殊训练或 UniLM 混合掩码，但 CorpAssist 检索仍选成熟 <span class="term" data-term-id="embedding-model" tabindex="0">Embedding 模型</span> 更稳妥。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Embedding 输出用途</h3>
+      <p>Encoder 最后一层输出 shape 约为 <code>(seq_len, hidden_dim)</code>。检索常用<strong>句级 pooling</strong>：</p>
+      <ul>
+        <li><strong>[CLS] token</strong>：BERT 原设计，取第 0 位向量</li>
+        <li><strong>Mean pooling</strong>：对非 pad 位置求平均（bge、E5 常见）</li>
+        <li><strong>Last token</strong>：部分新模型取最后有效 token</li>
+      </ul>
+      <p>向量经 L2 归一化后，用内积或余弦相似度检索。CorpAssist <code>rag-index</code> 存储 <code>chunk_id, embedding, metadata</code>，query 向量与库内向量做 top-k ANN。</p>
+
+      <h4>检索服务伪代码</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># CorpAssist rag-service 概念流程（Encoder 路线）
+from embedding_client import encode  # 调用 bge / text-embedding API
+
+def index_chunks(chunks: list[str], collection: str) -> None:
+    vectors = encode(chunks, model="bge-large-zh-v1.5", normalize=True)
+    vector_store.upsert(collection, ids=chunk_ids, vectors=vectors)
+
+def retrieve(query: str, collection: str, top_k: int = 6) -> list[dict]:
+    q_vec = encode([query], model="bge-large-zh-v1.5", normalize=True)[0]
+    hits = vector_store.search(collection, q_vec, top_k=top_k)
+    return [{"chunk_id": h.id, "text": h.text, "score": h.score} for h in hits]</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>输出类型</th><th>用途</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>段向量</td>
+            <td>ANN 检索</td>
+            <td>制度库 top-6 片段</td>
+          </tr>
+          <tr>
+            <td>Query 向量</td>
+            <td>与段向量相似度</td>
+            <td>用户问题 embedding</td>
+          </tr>
+          <tr>
+            <td>Cross-encoder 分数</td>
+            <td>精排（可选第二层）</td>
+            <td>对 top-50 做 pairwise 打分</td>
+          </tr>
+          <tr>
+            <td>Token 级表示</td>
+            <td>NER、分类（非本课 RAG 主路径）</td>
+            <td>工单意图离线标注</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>用 Chat 模型 <code>last hidden</code> 当 embedding，无对比学习</li>
+            <li>检索与入库用不同模型维度</li>
+            <li>不做 normalize 导致内积尺度漂移</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>统一 embedding 模型版本与 <code>chunk 版本</code> 别名</li>
+            <li>评测集固定 query-doc 相关性标签</li>
+            <li>大库用 HNSW/IVF + 定期 rebuild</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 RAG 向量模型关系</h3>
+      <p>现代 RAG 向量模型多继承 BERT Encoder 架构，经<strong>对比学习</strong>（In-batch negatives、难负例）微调，使语义相近的 query-doc 向量接近。与原始 BERT MLM 不同，但<strong>双向 Encoder 骨干</strong>相同。CorpAssist 典型链路：</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist RAG：Encoder 检索 + Decoder 生成</h5>
+        <pre class="mermaid">flowchart LR
+  DOC[制度 PDF 分块] --> ENC1[Encoder Embedding]
+  ENC1 --> IDX[(rag-index)]
+  Q[用户问题] --> ENC2[同一 Encoder]
+  ENC2 --> IDX
+  IDX --> CITE[top-k 引用块]
+  CITE --> PROMPT[编排层拼 messages]
+  PROMPT --> DEC[Decoder-only Chat 生成]</pre>
+        <p class="diagram-caption">两阶段、两模型：检索质量上限由 Encoder 决定；最终措辞由 Decoder 决定。</p>
+      </div>
+
+      <p>常见增强：<strong>Hybrid 检索</strong>（BM25 + 向量）、<strong>Reranker</strong>（Cross-encoder，仍多为 Encoder 变体）。这些都不替代最终 Chat 生成，但影响引用是否准确——引用错则 Decoder 再强也会幻觉。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>text-embedding-3 与 bge 选型差异？</summary>
+          <div class="learn-faq-body">
+            看维度、中文效果、延迟、私有化部署与许可证。CorpAssist 若数据不出域，优先私有化 bge/m3e；多语言场景可看 E5/multilingual。务必在 golden set 上测 Recall@k，而非只看 MTEB 榜单。
+          </div>
+        </details>
+        <details>
+          <summary>ColBERT 等多向量方案要懂到什么程度？</summary>
+          <div class="learn-faq-body">
+            应用岗知道「token 级 late interaction 提精度、增存储与延迟」即可。默认单向量 ANN 够用后再优化；本课 advanced 长上下文章会涉及检索与窗口取舍。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>何时选 Encoder 类模型</h3>
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>任务</th><th>推荐架构</th><th>理由</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>语义检索 / 去重 / 聚类</td>
+            <td><strong>Encoder embedding</strong></td>
+            <td>固定维向量，ANN 友好；双向语义</td>
+          </tr>
+          <tr>
+            <td>问答生成 / 摘要 / Agent</td>
+            <td><strong>Decoder-only Chat</strong></td>
+            <td>自回归生成长文本</td>
+          </tr>
+          <tr>
+            <td>分类 / NER / 情感</td>
+            <td>Encoder + 分类头</td>
+            <td>整句表示 + 小头微调</td>
+          </tr>
+          <tr>
+            <td>Seq2Seq 翻译（传统）</td>
+            <td>Encoder-Decoder（T5/BART）</td>
+            <td>CorpAssist 少见；多被 Chat 替代</td>
+          </tr>
+          <tr>
+            <td>精排 rerank</td>
+            <td>Cross-encoder（双句输入）</td>
+            <td>精度高、只适合小候选集</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>选型决策树（面试口述）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">需要输出长文本给用户？
+  ├─ 是 → Decoder-only Chat（Qwen/GPT/LLaMA）
+  └─ 否 → 需要固定长度向量做相似度？
+        ├─ 是 → Encoder Embedding（bge/E5/厂商 embedding API）
+        └─ 否 → 结构化标签 → Encoder + 分类头</code></pre>
+      </div>
+
+      <p>CorpAssist 面试常问：「为什么 RAG 不直接用 GPT embedding？」标准答：<strong>GPT 因果训练目标优化的是续写而非语义相似度</strong>；专用 embedding 经对比学习，Recall@k 更稳，且维度与索引 pipeline 成熟。</p>
+
+      <div class="learn-interview">
+        <details>
+          <summary>快速对比：GPT vs BERT 一句话</summary>
+          <div class="learn-interview-body">
+            <p>GPT：因果 Decoder，猜下一个词，擅长生成。BERT：双向 Encoder，MLM 表示学习，擅长句向量与理解类任务。CorpAssist：BERT 路线检索，GPT 路线回答。</p>
+          </div>
+        </details>
+      </div>
+
+      <h4>CorpAssist 索引字段与 embedding 对齐</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "chunk_id": "hr-policy-2024-015",
+  "embedding_model": "bge-large-zh-v1.5",
+  "embedding_dim": 1024,
+  "vector": "[...]",
+  "metadata": {
+    "doc_version": "v3.2",
+    "section": "产假与陪产假",
+    "token_count": 412
+  }
+}</code></pre>
+      </div>
+      <p>重建索引时必须<strong>整库同一 embedding 模型与维度</strong>；混用旧向量会导致检索分数不可比。编排层在 debug 模式可记录 query 与 top-1 的 cosine，便于 badcase 归因是「检索错」还是「生成错」。</p>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>MLM 与双向</strong>：Encoder 无因果掩码，MLM 学上下文表示。</li>
+        <li><strong>Embedding 输出</strong>：pooling 得句向量，入库 ANN；query 同模型编码。</li>
+        <li><strong>RAG 关系</strong>：检索 Encoder + 生成 Decoder，两模型分工明确。</li>
+        <li><strong>选型</strong>：相似度/检索选 Encoder；对话生成选 Decoder-only。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_practice02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="mlm" /> 能解释 MLM 与 CLM 差异</label></li>
+          <li><label><input type="checkbox" data-id="pooling" /> 能说出两种 pooling 方式</label></li>
+          <li><label><input type="checkbox" data-id="rag-dual" /> 能画 RAG 双模型链路</label></li>
+          <li><label><input type="checkbox" data-id="when-encoder" /> 能为 3 类任务选架构</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-03-llm-arch-compare">LLaMA/Qwen/DeepSeek 架构对照</a>，了解开源 Decoder 骨干的 Norm/FFN/Attention 变体。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">BERT: Pre-training of Deep Bidirectional Transformers</a></li>
+      <li><a href="https://huggingface.co/BAAI/bge-large-zh-v1.5" target="_blank" rel="noopener">BAAI bge-large-zh-v1.5</a></li>
+      <li><a href="https://platform.openai.com/docs/guides/embeddings" target="_blank" rel="noopener">OpenAI Embeddings Guide</a></li>
+      <li><a href="https://www.sbert.net/" target="_blank" rel="noopener">Sentence Transformers 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 制度库填写「Encoder/Decoder 分工表」，并对照 MLM 样本理解双向上下文。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>复制「GPT vs BERT」对比表，新增一列「CorpAssist 组件」：rag-index / rag-service / dialog-orchestrator / llm-gateway 各填 Encoder 或 Decoder 路线。</li>
+      <li>根据「Embedding 输出用途」伪代码，写出 <code>retrieve()</code> 返回的 JSON 字段（chunk_id、text、score）及编排层如何使用 score 做截断。</li>
+      <li>用「选型决策树」为三个任务标注架构：① 员工问题语义搜制度 ② 生成邮件草稿 ③ 工单意图分类。</li>
+      <li>阅读 MLM 样本，若 mask 词为「15」，说明右侧 token「年假」是否参与预测（双向 attend）。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）团队用 Qwen-Chat 最后一层 hidden state 做全库向量，Recall@6 偏低。最可能的架构层原因？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>Chat 模型为 <span class="term" data-term-id="decoder-only" tabindex="0">Decoder-only</span>，训练目标优化续写而非语义相似度；应换 <span class="term" data-term-id="embedding-model" tabindex="0">专用 Embedding 模型</span>（bge/E5 等）并统一 normalize 与索引版本。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-01-gpt-decoder">GPT 系列：Decoder-only 与自回归</a></li>
+      <li><a href="#ch-practice-03-llm-arch-compare">LLaMA/Qwen/DeepSeek 架构对照</a></li>
+      <li><a href="https://arxiv.org/abs/2104.08663" target="_blank" rel="noopener">SimCSE — 对比学习句向量</a></li>
+    </ul>
+  </div>
+</section>

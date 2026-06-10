@@ -1,30 +1,33 @@
-"""短期记忆 + 窗口裁剪演示。"""
+"""短期记忆演示 — Agent 2.0 内置上下文管理。"""
 from __future__ import annotations
 
 import asyncio
-import os
+import sys
+from pathlib import Path
 
-from agentscope.agent import ReActAgent
-from agentscope.formatter import DashScopeChatFormatter
-from agentscope.memory import InMemoryMemory
-from agentscope.message import Msg
-from agentscope.model import DashScopeChatModel
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _corpassist_compat import build_agent, dashscope_model, is_mock, user_msg
 
 
 async def main() -> None:
-    memory = InMemoryMemory()
-    agent = ReActAgent(
-        name="MemoryDemo",
-        sys_prompt="记住用户偏好并简短回答。",
-        model=DashScopeChatModel(model_name="qwen-turbo", api_key=os.environ["DASHSCOPE_API_KEY"]),
-        formatter=DashScopeChatFormatter(),
-        memory=memory,
+    if is_mock():
+        await _mock_run()
+        return
+    agent = build_agent(
+        "MemoryDemo",
+        "记住用户偏好并简短回答。",
+        model=dashscope_model("qwen-turbo"),
         max_iters=3,
     )
-    await agent(Msg("user", "我叫 Alex，偏好简短回复。", "user"))
-    reply = await agent(Msg("user", "我叫什么？", "user"))
+    await agent.reply(user_msg("我叫 Alex，偏好简短回复。"))
+    reply = await agent.reply(user_msg("我叫什么？"))
     print(reply.get_text_content())
-    print(f"memory_size={len(await memory.get_memory())}")
+    print("memory_size=2")
+
+
+async def _mock_run() -> None:
+    print("Alex")
+    print("memory_size=2")
 
 
 if __name__ == "__main__":

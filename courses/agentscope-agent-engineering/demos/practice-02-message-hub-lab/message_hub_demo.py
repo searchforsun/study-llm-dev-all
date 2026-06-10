@@ -1,16 +1,22 @@
-"""MsgHub 主管-工人协作 Demo."""
+"""MsgHub 主管-工人协作 Demo（兼容层 MsgHub shim）。"""
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
+import sys
+from pathlib import Path
 
-from agentscope.agent import ReActAgent
-from agentscope.formatter import DashScopeMultiAgentFormatter
-from agentscope.message import Msg
-from agentscope.model import DashScopeChatModel
-from agentscope.pipeline import MsgHub
-from agentscope.tool import Toolkit, ToolResponse
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _corpassist_compat import (
+    MsgHub,
+    build_agent,
+    build_toolkit,
+    dashscope_model,
+    is_mock,
+    system_msg,
+    user_msg,
+)
+from agentscope.tool import ToolResponse
 
 
 async def create_calendar_event(title: str, start_time: str) -> ToolResponse:
@@ -23,54 +29,51 @@ async def send_email(to: str, subject: str, body: str) -> ToolResponse:
     return ToolResponse(content=f"邮件已发至 {to}：{subject}")
 
 
-def _model():
-    return DashScopeChatModel(
-        model_name="qwen-max",
-        api_key=os.environ.get("DASHSCOPE_API_KEY", "sk-demo"),
-    )
-
-
-def _worker(name: str, role: str, tool_fn) -> ReActAgent:
-    tk = Toolkit()
-    tk.register_tool_function(tool_fn)
-    return ReActAgent(
-        name=name,
-        sys_prompt=f"你是 {name}，专职{role}。只处理本领域并简要汇报。",
-        model=_model(),
-        formatter=DashScopeMultiAgentFormatter(),
-        toolkit=tk,
+def _worker(name: str, role: str, tool_fn):
+    return build_agent(
+        name,
+        f"你是 {name}，专职{role}。只处理本领域并简要汇报。",
+        model=dashscope_model("qwen-max"),
+        toolkit=build_toolkit(tool_fn),
         max_iters=4,
     )
 
 
 async def run(manual_broadcast: bool) -> None:
-    supervisor = ReActAgent(
-        name="Supervisor",
-        sys_prompt="协调 Calendar/Mail 专家完成用户请求并汇总。",
-        model=_model(),
-        formatter=DashScopeMultiAgentFormatter(),
+    user_text = "订明天 10 点会议室 A，并邮件通知 team@corp.com"
+    if is_mock():
+        if manual_broadcast:
+            print("[manual] MailWorker 未参与")
+            print("日历已创建：会议室 A @ 明天10:00")
+        else:
+            print("Supervisor: 已协调 Calendar/Mail 完成预订与通知")
+        return
+
+    supervisor = build_agent(
+        "Supervisor",
+        "协调 Calendar/Mail 专家完成用户请求并汇总。",
+        model=dashscope_model("qwen-max"),
         max_iters=5,
     )
     calendar = _worker("CalendarWorker", "日历", create_calendar_event)
     mail = _worker("MailWorker", "邮件", send_email)
-    user_text = "订明天 10 点会议室 A，并邮件通知 team@corp.com"
 
     if manual_broadcast:
         async with MsgHub(participants=[supervisor], enable_auto_broadcast=False) as hub:
             hub.add(calendar)
-            await hub.broadcast(Msg("user", f"仅 Calendar 处理：{user_text}", "user"))
-            await calendar()
+            await hub.broadcast(user_msg(f"仅 Calendar 处理：{user_text}"))
+            await calendar.reply()
         print("[manual] MailWorker 未参与")
         return
 
     async with MsgHub(
         participants=[supervisor, calendar, mail],
-        announcement=Msg("user", user_text, "user"),
+        announcement=user_msg(user_text),
     ):
-        await supervisor(Msg("system", "请调度专家", "system"))
-        await calendar()
-        await mail()
-        final = await supervisor()
+        await supervisor.reply(system_msg("请调度专家"))
+        await calendar.reply()
+        await mail.reply()
+        final = await supervisor.reply()
     print(final.get_text_content())
 
 

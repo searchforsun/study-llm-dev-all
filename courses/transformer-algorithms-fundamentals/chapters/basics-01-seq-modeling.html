@@ -1,0 +1,398 @@
+<section id="ch-basics-01-seq-modeling" class="chapter" data-chapter="basics-01-seq-modeling">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>序列建模演进：RNN 到 Transformer</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-01-seq-modeling" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>30 分钟</strong> · 阶段：<strong>序列建模与 Attention 基座</strong> · 能力：口述序列任务演进脉络，解释 RNN 瓶颈与 Transformer 动机</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>你在 <a href="../llm-application-fundamentals/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">大模型应用基础</span><code class="course-ref-slug">llm-application-fundamentals</code></a> 已从应用层认识了 <span class="term" data-term-id="token" tabindex="0">Token</span> 与生成循环；本章下沉到<strong>算法史</strong>：语言模型如何把「一串词」变成可计算的向量序列，以及为何 2017 年 <span class="term" data-term-id="transformer" tabindex="0">Transformer</span> 取代 <span class="term" data-term-id="rnn" tabindex="0">RNN</span> 成为 CorpAssist 背后大模型的共同骨架。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>说明 <span class="term" data-term-id="word-embedding" tabindex="0">词向量</span> 如何把离散词映射到连续空间，支撑下游序列任务</li>
+          <li>指出 <span class="term" data-term-id="rnn" tabindex="0">RNN</span>/<span class="term" data-term-id="lstm" tabindex="0">LSTM</span> 在并行训练与 <span class="term" data-term-id="long-range-dependency" tabindex="0">长依赖</span> 上的结构性瓶颈</li>
+          <li>描述 <span class="term" data-term-id="seq2seq" tabindex="0">Seq2Seq</span> 编解码范式，并引出「全局注意力」的必要性</li>
+          <li>为后续 <a href="#ch-basics-02-attention-qkv">注意力机制：Q/K/V 与缩放点积</a> 建立历史动机</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>序列任务的本质</strong>：输入输出都是有序符号串；模型须保留顺序信息与语义关联。</li>
+          <li><strong>词向量是起点</strong>：每个 Token 先变成 d 维向量，再在时间上叠代或并行变换。</li>
+          <li><strong>RNN 串行、难并行</strong>：时刻 t 依赖 t−1 的隐状态，GPU 难以吃满；长文信息经多步传递易衰减。</li>
+          <li><strong>Attention 是破局点</strong>：任意两位置可直接交互，为 Transformer 全并行铺路。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>词向量与序列任务回顾</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 工单分类</span>
+        员工提交「报销单被驳回，提示发票抬头不符」——系统需把这句话映射为向量，再预测应路由到「财务合规」还是「IT 报障」。这是典型的<strong>序列分类</strong>：整句输入，单个标签输出。
+      </aside>
+      <p>自然语言处理的核心难题之一是：<strong>词是离散符号，神经网络需要连续数值</strong>。<span class="term" data-term-id="word-embedding" tabindex="0">词向量（Word Embedding）</span> 把词典中每个词映射到 ℝ<sup>d</sup> 空间中的一个点，语义相近的词（如「补贴」「津贴」）在该空间中距离更近。CorpAssist 的检索与分类链路都建立在「文本 → 向量」这一步之上。</p>
+
+      <h4>常见序列任务类型</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>任务</th><th>输入 → 输出</th><th>CorpAssist 示例</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>语言建模</td>
+              <td>前文 → 下一词概率</td>
+              <td>对话续写、邮件草稿补全</td>
+            </tr>
+            <tr>
+              <td>序列分类</td>
+              <td>整句 → 类别</td>
+              <td>工单意图识别、敏感词检测</td>
+            </tr>
+            <tr>
+              <td>序列标注</td>
+              <td>每个词 → 标签</td>
+              <td>NER 抽取合同甲乙方、金额字段</td>
+            </tr>
+            <tr>
+              <td>序列到序列</td>
+              <td>源序列 → 目标序列</td>
+              <td>会议纪要摘要、多语言制度翻译</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>从 one-hot 到稠密嵌入</h4>
+      <p>早期用 one-hot 表示词：维度 = 词表大小 V，几乎正交，无法表达语义相似性。Word2Vec、GloVe 等学习到的 <span class="term" data-term-id="word-embedding" tabindex="0">稠密嵌入</span> 把维度压到 256～1024，既省空间又保留「国王−男人+女人≈女王」这类类比关系。现代大模型不再单独预训练 Word2Vec，但<strong>嵌入层（Embedding Layer）</strong> 仍承担相同角色：查表得到每个 Token 的初始向量。</p>
+
+      <h4>嵌入查表示例（NumPy 直觉）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import numpy as np
+
+vocab_size, d_model = 50000, 512
+# 嵌入矩阵 E: (V, d)，第 i 行是词 i 的向量
+E = np.random.randn(vocab_size, d_model) * 0.02
+
+# CorpAssist 工单分词后的 token id 序列
+token_ids = [1042, 8831, 220, 9910]  # 「报销」「驳回」「发票」「抬头」
+# 查表得到序列矩阵 X: (seq_len, d_model)
+X = E[token_ids]
+print(X.shape)  # (4, 512)</code></pre>
+      </div>
+      <p>得到 X 之后，<span class="term" data-term-id="sequence-modeling" tabindex="0">序列建模</span> 模块要在<strong>时间维</strong>上传播或混合信息——这正是 RNN 与后来 Transformer 的分野所在。</p>
+
+      <h4>CorpAssist 嵌入层在双栈中的位置</h4>
+      <ul>
+        <li><strong>Python 推理服务</strong>：Hugging Face <code>AutoModel</code> 首层 <code>embed_tokens</code> 即查表；RAG 侧 bge/E5 同理。</li>
+        <li><strong>Java Spring AI</strong>：调用远程 Embedding API 或 ONNX 本地模型，输出 float[] 与 Python 维数须契约一致。</li>
+        <li><strong>网关计量</strong>：<span class="term" data-term-id="token" tabindex="0">Token</span> 数在嵌入<strong>之前</strong>由分词器确定，与 d_model 无关——估费时勿混淆。</li>
+      </ul>
+      <p>嵌入只解决「每个词是什么向量」；<span class="term" data-term-id="sequence-modeling" tabindex="0">序列建模</span> 解决「这些向量如何随上下文组合成句义」——下一节 RNN 是第一种答案，Transformer 是现行答案。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">无序列建模</span>
+          <ul>
+            <li>仅对词向量做平均池化</li>
+            <li>丢失词序：「不报销」与「报销不」相同</li>
+            <li>无法建模长距离修饰关系</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">有序列建模</span>
+          <ul>
+            <li>保留位置与上下文依赖</li>
+            <li>可区分否定、条件从句等语序敏感语义</li>
+            <li>支撑 CorpAssist 多轮对话与长文档理解</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>RNN/LSTM 的并行与长依赖瓶颈</h3>
+      <p><span class="term" data-term-id="rnn" tabindex="0">循环神经网络（RNN）</span> 按时间步 t=1…n 依次处理序列：每步读取当前词向量 x<sub>t</sub> 与上一步隐状态 h<sub>t−1</sub>，输出 h<sub>t</sub>。公式可简写为 h<sub>t</sub> = f(W·x<sub>t</sub> + U·h<sub>t−1</sub> + b)。这种<strong>串行依赖</strong>在 2017 年前是序列建模主流，但有两处硬伤。</p>
+
+      <h4>瓶颈一：训练难以并行</h4>
+      <p>计算 h<sub>5</sub> 必须先算完 h<sub>4</sub>，GPU 数千核心无法同时展开整条序列——批内只能并行不同样本，<strong>单条序列内部仍是串行</strong>。CorpAssist 若用纯 RNN 训练内部分类器，长工单序列的训练吞吐会明显低于同等参数规模的 Transformer。</p>
+
+      <h4>瓶颈二：长距离梯度与信息衰减</h4>
+      <p>句子开头的主语要约束句尾动词的一致性，或制度条文第 1 条与第 47 条的「除外条款」关系，都需要跨越数十到数百 Token 的 <span class="term" data-term-id="long-range-dependency" tabindex="0">长程依赖</span>。标准 RNN 反向传播时梯度连乘，易出现<strong>梯度消失/爆炸</strong>；<span class="term" data-term-id="lstm" tabindex="0">LSTM</span> 用门控机制缓解，但路径仍须经过 O(n) 步隐状态传递，远距离信号会被稀释。</p>
+
+      <div class="mermaid-wrap">
+        <h5>RNN 串行 vs Transformer 并行（概念对比）</h5>
+        <pre class="mermaid">flowchart TB
+  subgraph RNN["RNN：时刻串行"]
+    x1[x1] --> h1[h1]
+    h1 --> h2[h2]
+    x2[x2] --> h2
+    h2 --> h3[h3]
+    x3[x3] --> h3
+  end
+  subgraph TR["Transformer：层内并行"]
+    X[X: 整段嵌入] --> SA[Self-Attention 一次看全序列]
+    SA --> H[H: 所有位置同时更新]
+  end</pre>
+        <p class="diagram-caption">RNN 的 h<sub>t</sub> 链式传递限制并行；Self-Attention 在单层内让任意位置直接交互（详见 <a href="#ch-basics-04-self-attention-math">Self-Attention 矩阵视角</a>）。</p>
+      </div>
+
+      <h4>LSTM 门控直觉（不必背公式）</h4>
+      <ul>
+        <li><strong>遗忘门</strong>：决定从细胞状态丢弃多少旧信息。</li>
+        <li><strong>输入门</strong>：决定写入多少当前输入。</li>
+        <li><strong>输出门</strong>：决定暴露多少状态给下一步。</li>
+      </ul>
+      <p>LSTM 在 2014–2016 年的机器翻译、语音识别中表现优异，但<strong>无法从根本上消除序列内串行</strong>。当 CorpAssist 需要处理 8K～128K Token 的制度汇编时，纯 LSTM 架构在训练与推理效率上均已退出主流 LLM 选型。</p>
+
+      <h4>面试口述：RNN 两大瓶颈（30 秒版）</h4>
+      <ol>
+        <li><strong>并行</strong>：h<sub>t</sub> 依赖 h<sub>t−1</sub>，单序列内无法像 Self-Attention 那样一层算完全部位置。</li>
+        <li><strong>长依赖</strong>：信息须沿时间步传递 O(n) 次，梯度与信号均易衰减；LSTM 门控是补丁非根治。</li>
+      </ol>
+      <p>向 Java 后端同事解释时可用类比：<strong>RNN 像单线程 for 循环处理数组；Transformer 像对数组做一次矩阵批量变换</strong>（在层内）。</p>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何「更大 LSTM、更多层」仍难追上 GPT 类模型的训练速度？</summary>
+        <p>层数加深只改善表达能力，不消除时间维串行：每个时间步仍须等待上一步。Transformer 在序列长度维上可并行计算 Attention 矩阵（代价是 O(n²) 显存，见 <a href="#ch-basics-04-self-attention-math">复杂度章节</a>），因而更适合现代 GPU/TPU 数据并行。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Encoder-Decoder 与 Seq2Seq</h3>
+      <p>机器翻译推动了 <span class="term" data-term-id="seq2seq" tabindex="0">序列到序列（Seq2Seq）</span> 范式：用<strong>编码器</strong>把源语言句子压成上下文向量，再用<strong>解码器</strong>逐词生成目标语言。CorpAssist 的「中文制度 → 英文摘要」「工单详情 → 结构化 JSON」在抽象上都属于 Seq2Seq。</p>
+
+      <h4>经典 Encoder-Decoder 数据流</h4>
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 会议纪要摘要 · Seq2Seq 骨架</h5>
+        <pre class="mermaid">flowchart LR
+  SRC[源序列: 会议逐字稿 Token] --> ENC[Encoder RNN/LSTM]
+  ENC --> CTX[上下文向量 c]
+  CTX --> DEC[Decoder RNN/LSTM]
+  DEC --> TGT[目标序列: 摘要 Token 逐个生成]</pre>
+        <p class="diagram-caption">早期 Seq2Seq 把整段源文「压」进单个向量 c，长会议时 c 成为信息瓶颈。</p>
+      </div>
+
+      <h4>单向量瓶颈与注意力萌芽</h4>
+      <p>当源序列很长（如 2 小时会议纪要 8000 字），单个 c 无法承载全部细节，摘要容易漏掉「预算审批结论」等关键句。2015 年 Bahdanau 等人引入 <strong>Attention</strong>：解码每一步不再只读 c，而是对编码器<strong>所有时间步输出</strong>做加权求和——相当于「生成摘要每一句时，回头看转录稿里最相关的段落」。这是通往 Transformer 的关键一步。</p>
+
+      <h4>Seq2Seq 训练目标（应用岗口述版）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">text</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-plaintext">给定源序列 x = (x1, x2, ..., xm)
+目标序列 y = (y1, y2, ..., yk)
+训练最大化 P(y | x) = ∏ P(yt | y&lt;t, x)
+
+CorpAssist 摘要场景：
+  x = 会议转录 Token 序列
+  y = 摘要 Token 序列
+  每步预测「下一个摘要词」，条件于已生成摘要 + 源文编码</code></pre>
+      </div>
+
+      <div class="learn-tabs" id="b01-seq2seq-tabs" role="tablist" aria-label="编解码对比">
+        <input type="radio" name="b01-seq2seq-tab" id="b01-seq2seq-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="b01-seq2seq-tab" id="b01-seq2seq-tab-b" class="learn-tab-input" />
+        <label for="b01-seq2seq-tab-a">仅 Encoder-Decoder</label>
+        <label for="b01-seq2seq-tab-b">+ Attention</label>
+        <div id="b01-seq2seq-panel-a" class="learn-tab-panel" role="tabpanel">
+          <p>长源文信息挤进单向量 c，CorpAssist 长纪要摘要易漏关键决议；解码器对所有编码步「一视同仁」。</p>
+        </div>
+        <div id="b01-seq2seq-panel-b" class="learn-tab-panel" role="tabpanel">
+          <p>解码每步动态对齐源文不同位置，相当于可微分的「软检索」；为 <a href="#ch-basics-02-attention-qkv">Q/K/V 注意力</a> 与全 Transformer 编解码铺平道路。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>为何需要全局注意力</h3>
+      <p>到 2017 年，序列建模的矛盾已经很清晰：<strong>需要长距离、任意位置间的灵活依赖</strong>，同时<strong>需要 GPU 友好的并行</strong>。RNN 家族给不了后者；带 Attention 的 Seq2Seq 改善了信息通路，但编码器仍是串行 RNN。Vaswani 等人在《Attention Is All You Need》中提出：干脆<strong>去掉 RNN，只用 Attention 堆叠</strong>——即 <span class="term" data-term-id="transformer" tabindex="0">Transformer</span>。</p>
+
+      <h4>三条动机对照</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table learn-decision-table">
+          <thead>
+            <tr><th>痛点</th><th>RNN/LSTM 表现</th><th>全局 Self-Attention 思路</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>训练并行度</td>
+              <td>时间维串行，GPU 利用率低</td>
+              <td>同层内 n 个位置并行计算</td>
+            </tr>
+            <tr>
+              <td>长依赖路径</td>
+              <td>O(n) 步隐状态传递</td>
+              <td>任意两位置一步可达（矩阵一次乘法）</td>
+            </tr>
+            <tr>
+              <td>对齐可解释性</td>
+              <td>Attention 仅解码侧看编码</td>
+              <td>编码器内部亦可 Self-Attention 全文互看</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>CorpAssist 工程映射</h4>
+      <ul>
+        <li>你今天调用的 Qwen、GPT、DeepSeek API，底层均为 Transformer 解码器栈（<a href="#ch-practice-01-gpt-decoder">GPT 系列</a> 详述）。</li>
+        <li>RAG 检索把片段塞进上下文，本质是给 Self-Attention 更干净的「阅读材料」——与 <a href="../llm-application-fundamentals/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">应用基础课</span><code class="course-ref-slug">llm-application-fundamentals</code></a> 的 Attention 直觉一致，本章补齐算法动机。</li>
+        <li>理解「为何 Attention 能替代 recurrence」后，面试中「Transformer 相对 RNN 的优势」可答到<strong>并行 + 路径长度</strong>两点，而非空泛「效果更好」。</li>
+      </ul>
+
+      <h4>时间线：从 Word2Vec 到 Transformer（面试常问）</h4>
+      <div class="outline-table-wrap">
+        <table class="outline-table">
+          <thead>
+            <tr><th>年份</th><th>里程碑</th><th>对 CorpAssist 的意义</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>2013</td><td>Word2Vec 词向量</td><td>嵌入思想延续至今</td></tr>
+            <tr><td>2014–15</td><td>LSTM + Seq2Seq</td><td>摘要/翻译原型</td></tr>
+            <tr><td>2015</td><td>Bahdanau Attention</td><td>长文对齐可微分</td></tr>
+            <tr><td>2017</td><td>Transformer</td><td>当前 GPT/Qwen 骨架</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="notice">
+        <strong>basics 阶段收束</strong>
+        <p>你已具备「为何 Attention / Transformer」的历史答案；下一章起进入可手算公式。面试时先用本章 30 秒版答动机，再在下章接 Q/K/V 公式，层次清晰。</p>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Java 后端需要手写 RNN 吗？</summary>
+          <p>不需要。但需知道历史脉络：企业内遗留的 BiLSTM-CRF 命名实体服务与新版 Transformer NER 并存时，你能说清<strong>为何新项目应优先 Encoder 类 Transformer</strong>（见 <a href="#ch-practice-02-bert-encoder">BERT 与表示学习</a>）。</p>
+        </details>
+        <details>
+          <summary>本章与下一章的分工？</summary>
+          <p>本章回答「为什么要有 Attention / Transformer」；<a href="#ch-basics-02-attention-qkv">下一章</a> 回答「Attention 怎么算」——Q、K、V 与缩放点积公式。</p>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <p class="chapter-conclusions-lead">每条对应上一节 h3，用于评审前 30 秒复述。</p>
+      <ul class="chapter-conclusions-list">
+        <li><strong>词向量与任务</strong>：嵌入把离散 Token 变为连续向量；序列分类/标注/Seq2Seq 是 CorpAssist 常见形态。</li>
+        <li><strong>RNN/LSTM 瓶颈</strong>：时间维串行限制并行；长依赖经多步传递易衰减，LSTM 仅缓解不根治。</li>
+        <li><strong>Seq2Seq</strong>：Encoder-Decoder 支撑翻译与摘要；单向量 c 是长文瓶颈，Attention 引入动态对齐。</li>
+        <li><strong>全局注意力动机</strong>：要并行 + 短路径长依赖；Transformer 用 Self-Attention 取代 recurrence。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_basics01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="embedding-task" /> 能列举 2 种 CorpAssist 序列任务并说明输入输出形态</label></li>
+          <li><label><input type="checkbox" data-id="rnn-bottleneck" /> 能口述 RNN 并行与长依赖两大瓶颈</label></li>
+          <li><label><input type="checkbox" data-id="seq2seq-attn" /> 能说明 Seq2Seq 单向量瓶颈与 Attention 如何缓解</label></li>
+          <li><label><input type="checkbox" data-id="transformer-why" /> 能答「为何 Transformer 取代 RNN」两点（并行、路径长度）</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成右侧章节测验</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>一句</th></tr></thead>
+              <tbody>
+                <tr><td>词向量</td><td>离散词 → d 维连续向量</td></tr>
+                <tr><td>RNN</td><td>h_t 依赖 h_{t-1}，串行</td></tr>
+                <tr><td>LSTM</td><td>门控缓解梯度消失</td></tr>
+                <tr><td>Seq2Seq</td><td>编码源序列、解码目标序列</td></tr>
+                <tr><td>Transformer</td><td>Attention 取代 recurrence</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 one-hot 不适合直接喂给深度网络？</li>
+              <li>CorpAssist 长制度文档摘要，为何早期 Seq2Seq 容易漏关键句？</li>
+              <li>用两句话向 Java 同事解释「GPU 友好」为何推动 Transformer 普及。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：勾选过关清单、完成章节测验；下一章 <a href="#ch-basics-02-attention-qkv">注意力机制：Q/K/V 与缩放点积</a> 进入公式与检索类比。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need（Transformer 原论文）</a></li>
+      <li><a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener">Neural Machine Translation by Jointly Learning to Align and Translate（Bahdanau Attention）</a></li>
+      <li><a href="https://arxiv.org/abs/1301.3781" target="_blank" rel="noopener">Efficient Estimation of Word Representations（Word2Vec）</a></li>
+      <li><a href="https://d2l.ai/chapter_recurrent-modern/index.html" target="_blank" rel="noopener">Dive into Deep Learning — 现代 RNN 章节</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist「工单分类」与「会议纪要摘要」各画一条序列任务数据流，并对照 RNN 串行图标注瓶颈位置。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>从「常见序列任务类型」表选 2 行 CorpAssist 场景，各写一句输入输出形态（Token 序列 / 标签 / 摘要）。</li>
+      <li>运行或阅读「嵌入查表示例」代码，说明 <code>X.shape</code> 两维分别对应什么；若 seq_len=4、d_model=512，总参数量级与词表 50000 的关系是什么。</li>
+      <li>在 Mermaid「RNN 串行 vs Transformer 并行」图上用箭头标出：为何 h<sub>3</sub> 必须等 h<sub>2</sub> 算完；Transformer 侧哪一步可并行。</li>
+      <li>对照「三条动机对照」表，为 CorpAssist 8K Token 制度问答各写一句：RNN 路径长度 vs Self-Attention 路径长度。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（概念辨析）同事说：「CorpAssist 摘要慢是因为 LSTM 层数不够，加到 20 层就能追上 GPT 速度。」哪处最关键错误？应如何纠正？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>错误在于把「表达能力」与「并行度」混为一谈</strong>。LSTM 无论多少层，单条序列时间维仍串行；GPT 类 Transformer 在层内对全序列并行做 Self-Attention。纠正：瓶颈是<strong>架构的 recurrence</strong>，不是层数不够；应换 Transformer 路线或接受 RNN 训练吞吐上限。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：序列任务与演进时间线</h4>
+      <p>目录：<code>demos/basics-01-seq-modeling-lab/</code>（任务类型填空表 + RNN/Transformer 对照时间线模板）。<strong>验收</strong>：表中 4 种任务各填 1 个 CorpAssist 例子；时间线含 Word2Vec、LSTM、Bahdanau Attention、Transformer 四个节点且各有一句瓶颈说明。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-basics-02-attention-qkv">注意力机制：Q/K/V 与缩放点积</a> — 从检索类比到 Scaled Dot-Product 公式</li>
+      <li><strong>应用层对照</strong>：<a href="../llm-application-fundamentals/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">大模型应用基础</span><code class="course-ref-slug">llm-application-fundamentals</code></a> — Transformer 应用层直觉</li>
+      <li><a href="https://jalammar.github.io/visualizing-neural-machine-translation-mechanics-of-seq2seq-models-with-attention/" target="_blank" rel="noopener">Jay Alammar — Seq2Seq + Attention 图解</a></li>
+      <li><a href="https://colah.github.io/posts/2015-08-Understanding-LSTMs/" target="_blank" rel="noopener">Colah — Understanding LSTM Networks</a></li>
+    </ul>
+  </div>
+</section>

@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import sys
+from pathlib import Path
 
-from agentscope.agent import ReActAgent
-from agentscope.formatter import DashScopeChatFormatter
-from agentscope.message import Msg
-from agentscope.model import DashScopeChatModel
-from agentscope.tool import Toolkit, ToolResponse
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _corpassist_compat import build_agent, build_toolkit, dashscope_model, is_mock, user_msg
+from agentscope.tool import ToolResponse
 
 from mock_mcp import search_kb
 
@@ -19,17 +18,17 @@ async def mcp_search(query: str) -> ToolResponse:
 
 
 async def main() -> None:
-    tk = Toolkit()
-    tk.register_tool_function(mcp_search)
-    agent = ReActAgent(
-        name="McpDemo",
-        sys_prompt="用 mcp_search 回答政策问题。",
-        model=DashScopeChatModel(model_name="qwen-turbo", api_key=os.environ["DASHSCOPE_API_KEY"]),
-        formatter=DashScopeChatFormatter(),
-        toolkit=tk,
+    if is_mock():
+        print("年假：工龄 1-10 年享有 10 天带薪年假。")
+        return
+    agent = build_agent(
+        "McpDemo",
+        "用 mcp_search 回答政策问题。",
+        model=dashscope_model("qwen-turbo"),
+        toolkit=build_toolkit(mcp_search),
         max_iters=4,
     )
-    reply = await agent(Msg("user", "年假怎么算？", "user"))
+    reply = await agent.reply(user_msg("年假怎么算？"))
     print(reply.get_text_content())
 
 

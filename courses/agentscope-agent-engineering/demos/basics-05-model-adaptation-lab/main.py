@@ -1,25 +1,26 @@
-"""DashScope 模型无关编程 — 切换 model_name。"""
+"""DashScope 模型无关编程 — 切换 model。"""
 from __future__ import annotations
 
 import asyncio
-import os
+import sys
+from pathlib import Path
 
-from agentscope.agent import ReActAgent
-from agentscope.formatter import DashScopeChatFormatter
-from agentscope.message import Msg
-from agentscope.model import DashScopeChatModel
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _corpassist_compat import build_agent, dashscope_model, is_mock, user_msg
 
 
-async def run_with_model(model_name: str, prompt: str) -> None:
-    agent = ReActAgent(
-        name=f"Model-{model_name}",
-        sys_prompt="一句话回答。",
-        model=DashScopeChatModel(model_name=model_name, api_key=os.environ["DASHSCOPE_API_KEY"]),
-        formatter=DashScopeChatFormatter(),
+async def run_with_model(model: str, prompt: str) -> None:
+    if is_mock():
+        print(f"[{model}] mock: {prompt[:20]}...")
+        return
+    agent = build_agent(
+        f"Model-{model}",
+        "一句话回答。",
+        model=dashscope_model(model),
         max_iters=2,
     )
-    reply = await agent(Msg("user", prompt, "user"))
-    print(f"[{model_name}] {reply.get_text_content()}")
+    reply = await agent.reply(user_msg(prompt))
+    print(f"[{model}] {reply.get_text_content()}")
 
 
 async def main() -> None:

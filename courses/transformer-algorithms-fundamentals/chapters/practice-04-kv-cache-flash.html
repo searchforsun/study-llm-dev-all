@@ -1,0 +1,362 @@
+<section id="ch-practice-04-kv-cache-flash" class="chapter" data-chapter="practice-04-kv-cache-flash">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>KV Cache 与 Flash Attention</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-kv-cache-flash" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>36 分钟</strong> · 阶段：<strong>架构变体与工程映射</strong> · 能力：理解推理侧 KV 复用与 Flash Attention，并映射 CorpAssist p95 指标</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 网关监控的 <span class="term" data-term-id="p95-latency" tabindex="0">p95 延迟</span> 与 GPU 显存告警，多半来自 <span class="term" data-term-id="decoder-only" tabindex="0">Decoder-only</span> 自回归推理：<strong>前缀 prefill</strong> 算整段注意力，<strong>decode 步</strong> 若不用 <span class="term" data-term-id="kv-cache" tabindex="0">KV Cache</span> 会重复计算历史 K/V；长上下文还会触发显存 OOM。Flash Attention 等 IO 优化则决定「同样 32k 上下文能否上线」。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>解释 KV Cache 在自回归 decode 中如何复用 K/V</li>
+          <li>估算上下文长度、batch 对显存的影响（量级直觉）</li>
+          <li>口述 Flash Attention 的「分块、不重写完整注意力矩阵」直觉</li>
+          <li>将 TTFT、ITL、p95 与优化手段对应，参与 CorpAssist SLA 讨论</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 4 件事</strong>
+        <ul>
+          <li><strong>Prefill vs Decode</strong>：首包前算全前缀；之后每 token 主要算新 query 对历史 K/V。</li>
+          <li><strong>KV Cache</strong>：缓存每层每 token 的 K/V，避免 decode 重算，换显存换时间。</li>
+          <li><strong>显存 ∝ 层×seq×hidden×batch</strong>；GQA 减 KV 头（见 <a href="#ch-practice-03-llm-arch-compare">架构对照</a>）。</li>
+          <li><strong>Flash Attention</strong>：减少 HBM 读写，加速 prefill/decode，非改变数学结果。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>推理时 KV 复用</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 流式制度问答</span>
+        用户问题 + 6 段 RAG 引用共 4k token prefill。模型输出 200 token 答案时，<strong>第 50 个输出 token</strong> 的注意力需访问全部 4k+49 个历史位置的 K/V。若无 <span class="term" data-term-id="kv-cache" tabindex="0">KV Cache</span>，每步重算整段 Self-Attention，ITL 会线性恶化——用户感觉「越生成越卡」。
+      </aside>
+
+      <p>Self-Attention 中，对位置 <code>t</code> 的 query <code>q_t</code> 需与所有 <code>k_1…k_t</code> 做点积。自回归 decode 时 <code>t</code> 逐步增大；<strong>历史 token 的 K/V 在先前步已算过</strong>，存入 Cache 后仅计算新 token 的 Q/K/V 并 append。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Decode 步 KV Cache 复用</h5>
+        <pre class="mermaid">sequenceDiagram
+  participant S as 序列状态
+  participant C as KV Cache
+  participant A as Attention
+  Note over S,C: Prefill 阶段
+  S->>A: 整段 prefix tokens
+  A->>C: 写入每层 K/V
+  Note over S,C: Decode 第 t 步
+  S->>A: 新 token x_t
+  A->>C: 读取 K/V 1..t-1
+  A->>C: append K_t V_t
+  A->>S: 输出 hidden_t</pre>
+        <p class="diagram-caption">Prefill 一次写入长前缀 Cache；Decode 每步只增量计算，Attention 读全 Cache。</p>
+      </div>
+
+      <h4>无 Cache vs 有 Cache（伪代码）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 简化：单层单头 decode 一步
+def decode_step_no_cache(model, all_token_ids):
+    # 每步重算 1..t 全部 K/V — O(t) 重复计算
+    hidden = model.forward_full_sequence(all_token_ids)
+    return hidden[-1]
+
+def decode_step_with_cache(model, new_token_id, kv_cache):
+    # 仅对新 token 算 Q/K/V，与 cache 中历史 K/V 做 attention
+    q, k, v = model.project_new_token(new_token_id)
+    kv_cache.append(k, v)
+    out = attention(q, kv_cache.all_k, kv_cache.all_v)
+    return out</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Chat 多轮对话为何 KV Cache 会「累积变长」？</summary>
+        <p>每轮 user/assistant 消息 append 到上下文，<strong>有效 seq 长度增长</strong>，Cache 按当前全长存储。编排层需<strong>截断历史</strong>或摘要，否则 p95 与 OOM 风险上升——这是应用层上下文管理，不是模型 API 自动解决。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>显存与延迟权衡</h3>
+      <p>KV Cache 显存粗算（每层）：<code>2 × batch × seq_len × num_kv_heads × head_dim × dtype_bytes</code>。乘层数 <code>L</code> 得总量。GQA 减小 <code>num_kv_heads</code>；INT8/FP8 KV 量化可再减半（略损精度）。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>因素</th><th>对 KV Cache 显存</th><th>对 p95 / TTFT / ITL</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>上下文 seq 变长</td>
+            <td>线性增</td>
+            <td>TTFT（prefill）↑；decode 每步 attention 也 ↑</td>
+          </tr>
+          <tr>
+            <td>batch / 并发</td>
+            <td>线性增</td>
+            <td>吞吐↑但单请求可能排队，p95 尾部变差</td>
+          </tr>
+          <tr>
+            <td>层数、hidden</td>
+            <td>线性增</td>
+            <td>7B→32B 单步算力↑</td>
+          </tr>
+          <tr>
+            <td>GQA</td>
+            <td>KV 部分按头数比下降</td>
+            <td>同等显存可撑更长 ctx 或更大 batch</td>
+          </tr>
+          <tr>
+            <td>关闭 Cache（调试）</td>
+            <td>显存低</td>
+            <td>延迟爆炸，仅实验</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">CorpAssist 踩坑</span>
+          <ul>
+            <li>Agent 十轮对话不截断 → Cache 10k+ token</li>
+            <li>RAG 塞 20 段引用 → prefill 秒级 TTFT</li>
+            <li>高峰 batch 拉满 → p95 尾部超时</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">治理手段</span>
+          <ul>
+            <li>编排层 Token 预算与滑动窗口</li>
+            <li>检索 top-k 与片段长度上限</li>
+            <li>网关并发队列 + 小模型降级路由</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>指标对照（编排 / 网关看板）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "metrics": {
+    "ttft_ms_p95": 2200,
+    "itl_ms_p95": 45,
+    "prompt_tokens_p95": 3800,
+    "completion_tokens_avg": 180,
+    "kv_cache_hit": "n/a",
+    "gpu_mem_used_gb": 38.2
+  },
+  "interpretation": {
+    "ttft": "prefill 主导 → 查 prompt 长度与 Flash prefill",
+    "itl": "decode 主导 → 查 batch、KV 量化、模型大小"
+  }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Flash Attention 直觉</h3>
+      <p>标准 Attention 实现需物化 <code>n×n</code> 注意力分数矩阵，读写 HBM 成为瓶颈。<span class="term" data-term-id="flash-attention" tabindex="0">Flash Attention</span> 通过<strong>分块（tiling）</strong>在 SRAM 内完成 softmax 与加权，避免完整矩阵落盘，<strong>数学等价</strong>于精确 Attention（在 fp 误差内），显著加速 prefill 与长序列。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Flash Attention：分块避免完整 n×n 落 HBM</h5>
+        <pre class="mermaid">flowchart LR
+  Q[Q 分块] --> SRAM[GPU SRAM 小块]
+  K[K 分块] --> SRAM
+  V[V 分块] --> SRAM
+  SRAM --> ACC[在线 softmax 累加]
+  ACC --> OUT[输出 O 无需存全 S]</pre>
+        <p class="diagram-caption">应用岗只需知：启用 FA2 通常降延迟、降显存峰值；具体 CUDA 实现属 mustNotCover 边界。</p>
+      </div>
+
+      <p>推理框架（vLLM、TensorRT-LLM、SGLang 等）默认集成 Flash Attention 或同类 kernel。CorpAssist 私有化部署检查清单：</p>
+      <ul>
+        <li>GPU 架构是否支持（Ampere+ 常见）</li>
+        <li>PyTorch / CUDA / flash-attn 版本匹配</li>
+        <li>长上下文 prefill 是否走 FA（否则 TTFT 尖刺）</li>
+      </ul>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Flash Attention 与 KV Cache 关系？</summary>
+          <div class="learn-faq-body">
+            正交优化：<strong>KV Cache</strong> 减重复计算；<strong>Flash Attention</strong> 让每一步 attention 算得更快、更省显存峰值。二者同时使用是生产标配。
+          </div>
+        </details>
+        <details>
+          <summary>PagedAttention（vLLM）要背吗？</summary>
+          <div class="learn-faq-body">
+            知道「KV Cache 分页管理，减碎片、提并发」即可。面试可答：提升 GPU 利用率、改善 p95 尾部排队。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>对 CorpAssist p95 的影响</h3>
+      <p><span class="term" data-term-id="p95-latency" tabindex="0">p95 延迟</span> 是 SLA 常用分位：95% 请求在该时间内完成。LLM 场景拆为 <strong>TTFT</strong>（首 token）与 <strong>总时长</strong>（含生成）。优化映射表：</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>现象</th><th>可能原因</th><th>算法/工程手段</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>TTFT p95 高</td>
+            <td>长 RAG 前缀 prefill</td>
+            <td>减 top-k、Flash Attention、speculative 不适用 prefill 主因</td>
+          </tr>
+          <tr>
+            <td>ITL p95 高</td>
+            <td>decode 算力、batch 争抢</td>
+            <td>KV Cache、GQA、量化权重、限并发</td>
+          </tr>
+          <tr>
+            <td>显存 OOM</td>
+            <td>ctx×batch 过大</td>
+            <td>截断上下文、KV INT8、换 GQA 模型、PagedAttention</td>
+          </tr>
+          <tr>
+            <td>尾部 p95 尖刺</td>
+            <td>队列排队</td>
+            <td>多副本、优先级队列、小请求优先</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>编排层 Token 预算示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml"># dialog-orchestrator 片段：控制 prefill 长度，保护 p95
+corpassist:
+  context:
+    max_prompt_tokens: 4096
+    max_history_turns: 6
+    rag:
+      max_chunks: 6
+      max_chars_per_chunk: 800
+  sla:
+    ttft_p95_target_ms: 2500
+    route_to_smaller_model_if_prompt_above: 3500</code></pre>
+      </div>
+
+      <p>懂 KV Cache 与 Flash Attention 后，你在评审会上能区分：「加 GPU」vs「减 prompt」vs「换 GQA 模型」—— 避免盲目扩容。</p>
+
+      <div class="learn-interview">
+        <details>
+          <summary>面试题：如何把一个 TTFT p95=4s 的 RAG 服务降到 2s？</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>度量 prompt token 分布，砍超长引用与历史</li>
+              <li>确认推理栈启用 Flash Attention / 合适 batch</li>
+              <li>检索侧精排减 chunk 数，或摘要压缩引用</li>
+              <li>简单 query 路由 7B，复杂再 32B</li>
+              <li>监控验证 p95，而非只看均值</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-tabs" role="tablist" aria-label="Prefill vs Decode">
+        <input type="radio" name="p04-prefill-tab" id="p04-tab-a" class="learn-tab-input" checked />
+        <input type="radio" name="p04-prefill-tab" id="p04-tab-b" class="learn-tab-input" />
+        <label for="p04-tab-a">Prefill 阶段</label>
+        <label for="p04-tab-b">Decode 阶段</label>
+        <div class="learn-tab-panel" id="p04-panel-a" role="tabpanel">
+          <ul>
+            <li>一次性处理整段 prefix token</li>
+            <li>主导 <strong>TTFT</strong>；RAG 引用越多越慢</li>
+            <li>Flash Attention 收益最明显</li>
+          </ul>
+        </div>
+        <div class="learn-tab-panel" id="p04-panel-b" role="tabpanel">
+          <ul>
+            <li>每步仅新 token 参与 Q/K/V 计算</li>
+            <li>主导 <strong>ITL</strong>；依赖 KV Cache</li>
+            <li>输出越长，总时长线性增</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>KV 复用</strong>：decode 步缓存历史 K/V，避免重复 attention 计算。</li>
+        <li><strong>显存权衡</strong>：Cache 随 seq、层、batch、KV 头数增长；GQA/量化缓解。</li>
+        <li><strong>Flash Attention</strong>：分块精确 attention，降 HBM IO，加速 prefill/decode。</li>
+        <li><strong>p95</strong>：TTFT 看 prefill 与 prompt；ITL 看 decode 与并发；编排层可截断上下文。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="transformer-algorithms-fundamentals_practice04">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="kv" /> 能解释 KV Cache 作用</label></li>
+          <li><label><input type="checkbox" data-id="mem" /> 能列出 3 个影响 Cache 显存的因素</label></li>
+          <li><label><input type="checkbox" data-id="flash" /> 能一句话说明 Flash Attention</label></li>
+          <li><label><input type="checkbox" data-id="p95" /> 能区分 TTFT 与 ITL 优化方向</label></li>
+          <li><label><input type="checkbox" data-id="quiz-done" /> 已完成章节测验</label></li>
+        </ul>
+      </div>
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-05-numpy-attention-lab">动手：NumPy 迷你 Attention</a>，用代码验证 softmax 权重与因果 mask。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention</a></li>
+      <li><a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/" target="_blank" rel="noopener">vLLM 文档（PagedAttention）</a></li>
+      <li><a href="https://huggingface.co/docs/transformers/main/en/cache_utils" target="_blank" rel="noopener">Transformers KV Cache 说明</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">结合 YAML 预算与指标 JSON，为 CorpAssist 写一段 p95 排障笔记（TTFT 高 vs ITL 高）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>根据 KV 显存公式，假设 L=32、seq=4096、num_kv_heads=8、head_dim=128、FP16，粗算单层 KV 字节数（仅数量级）。</li>
+      <li>阅读 metrics JSON：若 <code>ttft_ms_p95</code> 高而 <code>itl_ms_p95</code> 正常，列 3 条 prefill 侧排查项。</li>
+      <li>对照 Flash Attention Mermaid，用一句话向同事解释「为何启用 FA 不 change 注意力数学结果」。 </li>
+      <li>修改 YAML 中 <code>max_chunks</code> 从 6→4，说明对 TTFT 与引用召回的权衡。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障顺序）GPU 显存 95% 且 p95 超时，团队首先加 2 张 A100。是否最优第一步？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>未必</strong>。应先查 <code>prompt_tokens_p95</code> 与 Agent 历史长度：截断上下文、减 RAG chunk、确认 <span class="term" data-term-id="kv-cache" tabindex="0">KV Cache</span> + <span class="term" data-term-id="flash-attention" tabindex="0">Flash Attention</span> 已启用。扩容是手段之一，常比「减 seq」贵。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-03-llm-arch-compare">LLaMA/Qwen/DeepSeek 架构对照</a>：GQA 与 Cache</li>
+      <li><a href="#ch-practice-05-numpy-attention-lab">动手：NumPy 迷你 Attention</a></li>
+      <li><a href="#ch-advanced-03-long-context">长上下文技术概览</a></li>
+    </ul>
+  </div>
+</section>
