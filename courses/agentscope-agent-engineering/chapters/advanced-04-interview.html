@@ -1,0 +1,412 @@
+<section id="ch-advanced-04-interview" class="chapter" data-chapter="advanced-04-interview">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>面试：AgentScope 生产排障</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-04-interview" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>42 分钟</strong> · 阶段：<strong>服务化与 Capstone</strong> · 能力：AgentScope 生产故障排查与面试应答</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>AgentScope 2.0 生产环境与 Notebook 差异巨大——<span class="term" data-term-id="react-loop-trap" tabindex="0">ReAct 死循环</span>、<span class="term" data-term-id="fake-tool-execution" tabindex="0">工具假执行</span>、<span class="term" data-term-id="memory-overflow" tabindex="0">记忆溢出</span>、<span class="term" data-term-id="event-stream-disconnect" tabindex="0">SSE 事件流断连</span> 是 CorpAssist S3 最高频故障。本章给出 AgentScope 特有的 Trace 排查路径与 STAR 案例模板，区别于通用 LangGraph 排障话术。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>识别 AgentScope ReActAgent 四种死循环/偏航模式</li>
+          <li>排查模型「声称已调用工具但未真正执行」的假执行问题</li>
+          <li>处理 Msg 历史膨胀导致的记忆溢出与 System Prompt 挤占</li>
+          <li>诊断 FastAPI SSE 事件流断连与 Spring BFF 超时</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>排障第一原则</strong>：先看 AgentScope Trace / Event 日志，再看工具入参出参。</li>
+          <li><strong>max_iters 不是万能</strong>：触发上限说明根因未修，不是「正常降级」。</li>
+          <li><strong>面试讲 AgentScope 细节</strong>：Msg 结构、Event type、Toolkit 注册方式要能举例。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>死循环与偏航</h3>
+      <p>AgentScope <span class="term" data-term-id="react-agent" tabindex="0">ReActAgent</span> 在 <code>max_iters</code> 内反复调用工具或输出无效推理，常见于工具返回信息不足、<code>sys_prompt</code> 缺少终止条件、或两个工具职责重叠。</p>
+
+      <div class="mermaid-wrap">
+        <h5>AgentScope 死循环排查流程</h5>
+        <pre class="mermaid">flowchart TD
+    Alert[max_iters 触发 / 用户超时] --> Trace[导出 AgentScope Trace]
+    Trace --> Pattern{调用模式}
+    Pattern -->|同工具同参数| P1[工具返回无效/模型未解析]
+    Pattern -->|工具 AB 交替| P2[职责重叠或权限边界]
+    Pattern -->|无 tool_call 纯文本| P3[sys_prompt 缺终止指令]
+    Pattern -->|参数微调重试| P4[Toolkit schema 过严]
+    P1 --> Fix1[充实 tool_result + description]
+    P2 --> Fix2[合并工具或加前置校验]
+    P3 --> Fix3[增加「信息足够则直接回答」]
+    P4 --> Fix4[放宽校验或给示例参数]</pre>
+        <p class="diagram-caption">从 Trace 中按 tool_call 模式分类，AgentScope Event 日志含 step 序号便于识别。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>故障模式</th><th>Trace 特征</th><th>AgentScope 常见根因</th><th>修复</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>相同工具重复</td><td><code>search_policy("年假")</code> × 4</td><td>tool_result 仅返回标题，模型认为未命中</td><td>返回摘要正文 + 明确「已找到」</td></tr>
+          <tr><td>AB 工具切换</td><td>search → book → search → book</td><td>book 失败未解释，模型回退查制度</td><td>book 返回结构化 error 供模型决策</td></tr>
+          <tr><td>偏航</td><td>用户问订会议室，Agent 查制度 5 次</td><td>sys_prompt 过度强调「先查制度」</td><td>意图路由或条件 Prompt</td></tr>
+          <tr><td>无工具循环</td><td>text 事件连续 6 轮无 tool_call</td><td>模型不支持 function call 或配置错误</td><td>检查 model_config 与 tools 注册</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># loop_detector.py — AgentScope 死循环检测 Hook（AOP）
+from agentscope.pipelines import functional_user_agent
+
+def detect_tool_loop(tool_trace: list[tuple[str, dict]], window: int = 3) -> bool:
+    """最近 window 次工具调用完全相同则判定死循环"""
+    if len(tool_trace) < window:
+        return False
+    recent = tool_trace[-window:]
+    return len(set(recent)) == 1
+
+class LoopGuardHook:
+    def post_tool_call(self, agent, tool_name: str, args: dict, result: str):
+        trace = agent.get_tool_trace()
+        if detect_tool_loop(trace):
+            raise RuntimeError(
+                f"LOOP_DETECTED: {tool_name} called {len(trace)} times with same args"
+            )</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具假执行</h3>
+      <p><span class="term" data-term-id="fake-tool-execution" tabindex="0">工具假执行</span>：模型在 <code>text</code> 或 <code>thinking</code> 中说「已为您预订 A301」，但 Trace 中无对应 <code>tool_call</code> 事件，或 tool_call 被 Mock 空实现。这在 Demo 切生产时极高频。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">假执行征象</span>
+          <ul>
+            <li>回复含「确认号 #12345」但工具日志无 book_meeting 记录</li>
+            <li>tool_call 有，Toolkit 函数体是 <code>pass</code> 或固定 return "ok"</li>
+            <li>模型在 thinking 中「模拟」工具结果而未触发 call</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">防护</span>
+          <ul>
+            <li>结构化输出必须引用 tool_result 中的 confirmation_id</li>
+            <li>工具层写审计日志，BFF 校验 side effect</li>
+            <li>golden set 断言 must_call_tools</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 假执行排查 Checklist — AgentScope 专用
+FAKE_EXECUTION_CHECKLIST = [
+    "1. Trace 中是否有 tool_call 事件？若无 → 模型未走 function call",
+    "2. tool_call 的 name 是否与用户感知操作一致？",
+    "3. Toolkit 函数是否真正调用 HTTP/DB？（非 return 硬编码）",
+    "4. sys_prompt 是否鼓励「假设已执行」？（禁止）",
+    "5. Mock 工具是否在非 Mock 环境被误加载？",
+    "6. DashScope 模型是否开启 tools 参数？",
+]
+
+def verify_side_effect(tool_name: str, trace: list) -> dict:
+    calls = [e for e in trace if e.get("event_type") == "tool_call"]
+    matching = [c for c in calls if c["payload"]["tool_name"] == tool_name]
+    return {
+        "claimed_in_text": True,  # 由 NLP 或规则检测
+        "actually_called": len(matching) > 0,
+        "call_count": len(matching),
+        "verdict": "FAKE" if not matching else "OK",
+    }</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>面试题：用户说 Agent「撒谎」已发邮件，你如何排查？</summary>
+        <div class="learn-faq-body">
+          <p><strong>STAR 答法</strong>：S——生产用户投诉未收到邮件；T——确认是否真调用 send_email；A——查 AgentScope Trace 无 tool_call，根因为 sys_prompt 示例含「已发送」诱导幻觉，且 Mock 工具在生产未替换；R——改 Prompt 禁止未调用断言 + 工具审计 + golden 断言 must_call_tools，投诉率降 80%。</p>
+        </div>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>记忆溢出</h3>
+      <p>AgentScope 默认将 <span class="term" data-term-id="msg-history" tabindex="0">Msg 历史</span> 追加进每次 LLM 调用。长会话下历史占满上下文，<code>sys_prompt</code> 被挤到窗口尾部，Agent 开始「失忆」——不遵守工具白名单、重复询问已确认信息。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>症状</th><th>Trace 信号</th><th>修复</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>忘记 System 规则</td><td>prompt token 中 sys 占比 &lt; 5%</td><td>每轮重写 sys_prompt 到消息列表首部</td></tr>
+          <tr><td>重复问用户</td><td>历史 &gt; 20 轮未裁剪</td><td>滑动窗口 10 轮 + 摘要 Msg</td></tr>
+          <tr><td>Token 费用暴涨</td><td>单次调用 input &gt; 8k</td><td>Agentic 记忆：只保留 task_state JSON</td></tr>
+          <tr><td>Redis session 过大</td><td>session 键 &gt; 1MB</td><td>TTL + 归档 + 压缩 tool_result</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># memory_budget.py — Msg 历史裁剪
+from agentscope.message import Msg
+
+def trim_messages(msgs: list[Msg], max_rounds: int = 10) -> list[Msg]:
+    """保留 system + 最近 max_rounds 轮 user/assistant"""
+    system = [m for m in msgs if m.role == "system"]
+    dialogue = [m for m in msgs if m.role != "system"]
+    keep = dialogue[-(max_rounds * 2):]
+    return system + keep
+
+def compress_tool_results(msgs: list[Msg], max_chars: int = 500) -> list[Msg]:
+    out = []
+    for m in msgs:
+        if m.role == "tool" and len(m.content) > max_chars:
+            out.append(Msg(m.name, m.content[:max_chars] + "…[truncated]", m.role))
+        else:
+            out.append(m)
+    return out</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>事件流断连</h3>
+      <p><span class="term" data-term-id="event-stream-disconnect" tabindex="0">SSE 断连</span> 表现为前端卡住、Spring BFF 报 ReadTimeout，但 Agent Service 仍在执行。根因包括：Nginx 缓冲 SSE、Pod 重启、客户端未处理 <code>event: done</code>、或 <span class="term" data-term-id="agentscope-trace" tabindex="0">AgentScope Trace</span> 阻塞主线程。</p>
+
+      <div class="mermaid-wrap">
+        <h5>SSE 断连排查序列</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant UI as 前端
+    participant BFF as Spring BFF
+    participant AS as agent-service
+    participant Agent as ReActAgent
+    UI->>BFF: SSE 订阅
+    BFF->>AS: /v1/chat/stream
+    AS->>Agent: run_stream
+    Note over AS,Agent: 工具 HTTP 30s 阻塞
+    BFF--xUI: 60s ReadTimeout 断连
+    Agent->>Agent: 继续执行无 cancellation
+    Note over UI: 用户以为失败，实际已订会议室</pre>
+        <p class="diagram-caption">断连后 Agent 未取消是「重复订会议室」类 bug 的常见根因。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>检查项</th><th>AgentScope 相关配置</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Nginx</td><td><code>proxy_buffering off</code></td><td>SSE 必须禁用缓冲</td></tr>
+          <tr><td>FastAPI</td><td>StreamingResponse heartbeat</td><td>每 15s 发送 comment ping</td></tr>
+          <tr><td>Spring</td><td>WebClient responseTimeout</td><td>≥ Agent max_iters × 单步 P99</td></tr>
+          <tr><td>Agent</td><td>asyncio.CancelledError</td><td>客户端断开 cancel agent task</td></tr>
+          <tr><td>工具</td><td>单工具 timeout</td><td>httpx timeout=10s，避免阻塞 Event 流</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># sse_heartbeat.py — 防止代理 idle 断连
+import asyncio
+
+async def stream_with_heartbeat(agent, messages, ping_interval=15):
+    queue = asyncio.Queue()
+    agent_task = asyncio.create_task(_run_agent(agent, messages, queue))
+
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=ping_interval)
+                if event is None:
+                    break
+                yield event
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"  # SSE comment 保活
+    finally:
+        if not agent_task.done():
+            agent_task.cancel()</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>生产排障案例</h3>
+
+      <div class="notice">
+        <strong>案例 1：CorpAssist S3 死循环 — search_policy × 8</strong>
+        <p><strong>现象</strong>：用户问「年假几天」，Agent 8 次调用 search_policy 后 max_iters 终止。</p>
+        <p><strong>Trace</strong>：每次 tool_result 仅返回 <code>{"title": "年假制度"}</code> 无正文。</p>
+        <p><strong>修复</strong>：工具返回 <code>summary</code> 字段 + sys_prompt 增加「单次搜索足够则回答」。</p>
+      </div>
+
+      <div class="notice">
+        <strong>案例 2：假执行 — 「已订 A301」但未调用 book_meeting</strong>
+        <p><strong>现象</strong>：用户到会议室发现未预订，Trace 无 tool_call。</p>
+        <p><strong>根因</strong>：qwen 某版本 function call 偶发失败，模型在 text 中幻觉执行结果。</p>
+        <p><strong>修复</strong>：后置校验——回复含「预订成功」时必须存在 book_meeting tool_call + confirmation_id。</p>
+      </div>
+
+      <div class="notice">
+        <strong>案例 3：SSE 断连 + 重复订会议室</strong>
+        <p><strong>现象</strong>：前端超时后用户重试，产生两个预订。</p>
+        <p><strong>修复</strong>：BFF 幂等键 <code>Idempotency-Key</code> + Agent cancel on disconnect + book 工具幂等。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>AgentScope Trace 和 LangSmith 能否同时使用？</summary>
+          <div class="learn-faq-body">可以。AgentScope 2.0 支持 OpenTelemetry 导出；LangSmith 可作为统一 Trace 后端。面试中强调：排障习惯应统一到一种 Trace UI，避免双系统查不到关联。</div>
+        </details>
+        <details>
+          <summary>max_iters 设多少合适？</summary>
+          <div class="learn-faq-body">CorpAssist 短链路 5～8；S3 复杂任务 10～12。超过 12 应考虑 Harness 任务分解，而非无限提高 max_iters。</div>
+        </details>
+        <details>
+          <summary>面试如何体现 AgentScope 深度而非泛泛 Agent 经验？</summary>
+          <div class="learn-faq-body">举具体 API：Msg 结构、ReActAgent max_iters、Event type 枚举、Toolkit 注册、AOP Hook 做 LoopGuard。对比 LangGraph checkpoint 说明迁移踩坑。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>死循环</strong>：按 Trace 模式分类——同工具/AB 切换/无工具/偏航。</li>
+        <li><strong>假执行</strong>：Trace 无 tool_call 却声称完成 → Prompt + 审计 + golden。</li>
+        <li><strong>记忆溢出</strong>：Msg 裁剪 + sys_prompt 前置 + tool_result 压缩。</li>
+        <li><strong>SSE 断连</strong>：heartbeat + cancel + 幂等 + 工具 timeout。</li>
+        <li><strong>面试</strong>：STAR 案例 + AgentScope 特有 API 细节。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering_advanced04">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="loop-pattern" /> 能识别四种死循环/偏航模式</label></li>
+          <li><label><input type="checkbox" data-id="fake-exec" /> 能排查工具假执行</label></li>
+          <li><label><input type="checkbox" data-id="memory" /> 能处理 Msg 记忆溢出</label></li>
+          <li><label><input type="checkbox" data-id="sse" /> 能诊断 SSE 断连根因</label></li>
+          <li><label><input type="checkbox" data-id="star" /> 能准备一个 AgentScope STAR 案例</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>故障</th><th>先看</th><th>常见修复</th></tr></thead>
+              <tbody>
+                <tr><td>死循环</td><td>tool_call 模式</td><td>充实 tool_result / 合并工具</td></tr>
+                <tr><td>假执行</td><td>Trace 有无 tool_call</td><td>禁止 Prompt 假设 + 审计</td></tr>
+                <tr><td>记忆溢出</td><td>input token 分布</td><td>trim_messages + 摘要</td></tr>
+                <tr><td>SSE 断连</td><td>Nginx / timeout</td><td>buffering off + cancel</td></tr>
+                <tr><td>max_iters</td><td>触发率指标</td><td>修根因非仅调上限</td></tr>
+                <tr><td>LoopGuard</td><td>AOP Hook</td><td>同参重复调用熔断</td></tr>
+                <tr><td>幂等</td><td>重复 side effect</td><td>Idempotency-Key</td></tr>
+                <tr><td>Trace</td><td>AgentScope Event</td><td>step + tool_name 关联</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>面试实战</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>描述 AgentScope ReActAgent 死循环的排查流程，与 LangGraph 有何不同？</li>
+              <li>用户投诉 Agent「撒谎」已执行操作，你的 Trace 排查步骤是什么？</li>
+              <li>S3 Agent SSE 频繁断连，如何从 Nginx、FastAPI、Spring 三层定位？</li>
+              <li>设计 AgentScope 生产排障 SOP（告警 → Trace → 修复 → 回归）。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">恭喜完成 <strong>AgentScope 多 Agent 工程实践</strong> advanced 阶段。长任务升级见 <a href="../agentscope-harness-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">AgentScope Harness 长任务工程</span><code class="course-ref-slug">agentscope-harness-engineering</code></a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://doc.agentscope.io/v2/tutorial/tracing.html" target="_blank" rel="noopener">AgentScope 2.0 Tracing</a></li>
+      <li><a href="https://doc.agentscope.io/v2/tutorial/hook.html" target="_blank" rel="noopener">AgentScope AOP Hook</a></li>
+      <li><a href="#ch-basics-02-react-events">ReActAgent 与事件流</a>：Event System 参考</li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">基于 AgentScope Trace 样例完成四份 mini 诊断报告：死循环、假执行、记忆溢出、SSE 断连各一例。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>阅读「死循环排查流程」Mermaid，为 AB 工具切换模式写 3 步排障顺序。</li>
+      <li>使用「假执行 Checklist」分析案例 2，列出 Trace 中缺失的事件类型。</li>
+      <li>为「记忆溢出」表设计 <code>trim_messages(max_rounds=10)</code> 的 before/after token 估算。</li>
+      <li>在「SSE 断连」序列图中标注应插入 cancellation 的位置并说明理由。</li>
+      <li>（可选）运行 <code>demos/advanced-04-interview-lab/</code>，对 <code>sample-traces/</code> 输出诊断 JSON。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">max_iters 触发率从 5% 升到 40%，团队建议「把 max_iters 从 8 调到 20」——是否采纳？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不采纳。</strong> 触发率飙升说明工具返回、Prompt 或模型行为退化。应查 Trace 找死循环/偏航根因；单纯提高上限会放大 Token 成本与假执行风险。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">排障顺序：A) 查 Redis session 大小 B) 看 AgentScope Trace tool_call 模式 C) 猜模型版本——正确顺序？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>B → A → 其他。</strong> 先看 Trace 定位故障类型（死循环/假执行/记忆/SSE），再针对性查 session 或网络。避免无 Trace 猜测。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：AgentScope 生产 Trace 诊断实验</h4>
+      <p>目录：<code>demos/advanced-04-interview-lab/</code>（<code>sample-traces/</code>、<code>diagnose.py</code>、<code>report-template.md</code>）。<strong>验收</strong>：对 <code>loop_search.json</code> 运行 <code>python diagnose.py sample-traces/loop_search.json</code> 输出 <code>verdict: LOOP_DETECTED</code> 与修复建议。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-03-pipeline">Pipeline 工作流编排</a>：循环检测 Hook</li>
+      <li><a href="#ch-basics-04-memory">记忆：短期与长期控制</a>：Msg 裁剪策略</li>
+      <li><a href="../observability-reliability-ops/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">可观测性与可靠性运维</span><code class="course-ref-slug">observability-reliability-ops</code></a>：生产 SLI 大盘</li>
+      <li><a href="../agentscope-harness-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">AgentScope Harness 长任务工程</span><code class="course-ref-slug">agentscope-harness-engineering</code></a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,372 @@
+<section id="ch-basics-05-model-adaptation" class="chapter" data-chapter="basics-05-model-adaptation">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>模型适配与 DashScope</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05-model-adaptation" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>AgentScope 核心抽象</strong> · 能力：模型无关编程、DashScope 接入与多模型路由</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 不能绑定单一模型：客服要快、报告要准、摘要要省——<span class="term" data-term-id="model-agnostic" tabindex="0">模型无关编程</span> 让你切换 DashScope / OpenAI 而不改 Agent 逻辑。<span class="term" data-term-id="dashscope-model" tabindex="0">DashScope 通义</span> 是 AgentScope 一等公民；<span class="term" data-term-id="model-routing" tabindex="0">多模型路由</span> 直接服务北星 NS3 成本权衡。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 ChatModel 抽象切换 DashScope 与其它 Provider</li>
+          <li>配置 DashScopeCredential 与 qwen 系列模型参数</li>
+          <li>设计 Planner 用大模型、摘要用小模型的路由表</li>
+          <li>在 CorpAssist 场景量化 NS3 Token/步数成本</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>换模型 = 换 ChatModel 实例</strong>：Agent / Toolkit / Memory API 不变。</li>
+          <li><strong>DashScope 原生</strong>：Credential + Formatter 与通义 tool_call 对齐。</li>
+          <li><strong>路由降本</strong>：复杂推理 qwen-max，摘要/分类 qwen-turbo。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>模型无关编程</h3>
+      <p>AgentScope 2.0 的 <span class="term" data-term-id="model-agnostic" tabindex="0">Model 层</span> 抽象异步调用、流式响应与统一 ChatResponse。业务代码依赖 <code>ChatModel</code> 接口，而非 HTTP 细节。与 LangChain 的 <code>ChatModel</code> 理念一致，但 Formatter 与 Event 与 AgentScope Agent 深度集成。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Model 层与 Agent</h5>
+        <pre class="mermaid">flowchart LR
+    Agent[Agent] --> FMT[Formatter]
+    FMT --> CM[ChatModel 接口]
+    CM --> DS[DashScopeChatModel]
+    CM --> OAI[OpenAIChatModel]
+    CM --> Ollama[OllamaChatModel]</pre>
+        <p class="diagram-caption">切换 Provider 只需替换 ChatModel 与匹配 Formatter。</p>
+      </div>
+
+      <h4>切换 Provider 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import os
+from agentscope.model import DashScopeChatModel, OpenAIChatModel
+from agentscope.credential import DashScopeCredential, OpenAICredential
+
+def build_model(provider: str = "dashscope"):
+    if provider == "dashscope":
+        return DashScopeChatModel(
+            credential=DashScopeCredential(api_key=os.environ["DASHSCOPE_API_KEY"]),
+            model="qwen-plus",
+        )
+    return OpenAIChatModel(
+        credential=OpenAICredential(api_key=os.environ["OPENAI_API_KEY"]),
+        model="gpt-4o-mini",
+    )
+
+# Agent 构造不变，仅 model= 参数不同
+agent = Agent(name="S3", model=build_model("dashscope"), toolkit=toolkit)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：换模型后为什么要检查 Formatter？</summary>
+        <p>不同 Provider 的 tool_call 与 message 字段格式不同；DashScopeChatFormatter 与 OpenAI Formatter 需与 ChatModel 配对，否则 ReAct 解析 tool_call 会失败。</p>
+      </details>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>Provider</th><th>ChatModel</th><th>Formatter</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>DashScope</td><td>DashScopeChatModel</td><td>DashScopeChatFormatter</td></tr>
+          <tr><td>OpenAI</td><td>OpenAIChatModel</td><td>OpenAIChatFormatter</td></tr>
+          <tr><td>Ollama 本地</td><td>OllamaChatModel</td><td>对应 Formatter</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>DashScope/通义接入</h3>
+      <p><span class="term" data-term-id="dashscope-model" tabindex="0">DashScope</span> 提供 qwen-max / qwen-plus / qwen-turbo 等模型。CorpAssist 默认 plus 平衡质量与成本；AgentScope 2.0 支持 streaming、retry 与 fallback 链。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>模型</th><th>适用</th><th>CorpAssist 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>qwen-max</td><td>复杂推理、长报告</td><td>S3 季度分析主 Agent</td></tr>
+          <tr><td>qwen-plus</td><td>日常办公、工具调用</td><td>默认办公助手</td></tr>
+          <tr><td>qwen-turbo</td><td>分类、摘要、路由</td><td>Memory 摘要、意图识别</td></tr>
+        </tbody>
+      </table>
+
+      <h4>DashScope 完整配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.model import DashScopeChatModel
+from agentscope.credential import DashScopeCredential
+from agentscope.formatter import DashScopeChatFormatter
+
+model = DashScopeChatModel(
+    credential=DashScopeCredential(api_key=os.environ["DASHSCOPE_API_KEY"]),
+    model="qwen-plus",
+    stream=True,
+    max_retries=2,
+)
+
+agent = Agent(
+    name="CorpAssist",
+    model=model,
+    formatter=DashScopeChatFormatter(),
+    toolkit=toolkit,
+    max_iters=10,
+)</code></pre>
+      </div>
+
+      <ul>
+        <li><span class="term" data-term-id="dashscope-model" tabindex="0">stream=True</span> 是 AG-UI 必需，与 basics-02 事件流配合。</li>
+        <li><code>max_retries=2</code> 应对 DashScope 偶发 5xx，与工具重试层分开计数。</li>
+        <li><span class="term" data-term-id="model-agnostic" tabindex="0">Formatter</span> 必须与 ChatModel Provider 配对，否则 tool_call 解析失败。</li>
+        <li>CorpAssist 生产环境 API Key 走 K8s Secret，与工具 MCP Token 同样管理。</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>多模型路由</h3>
+      <p><span class="term" data-term-id="model-routing" tabindex="0">多模型路由</span> 按任务类型选择 ChatModel：意图分类走 turbo，主对话走 plus，规划走 max。与 <span class="term" data-term-id="intent-routing" tabindex="0">意图路由</span> 结合时，避免为每个意图单独堆叠分类 LLM 造成 NS3 成本级联。</p>
+
+      <div class="learn-code-compare">
+        <h4>单模型 vs 路由</h4>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python"># 反模式：所有步骤用 qwen-max
+agent = Agent(model=DashScopeChatModel(model="qwen-max"), ...)</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-toolbar">
+            <span class="lang-tag">python</span>
+            <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+          </div>
+          <pre><code class="language-python"># 推荐：按角色分配
+router = {
+    "classify": DashScopeChatModel(model="qwen-turbo"),
+    "execute": DashScopeChatModel(model="qwen-plus"),
+    "plan": DashScopeChatModel(model="qwen-max"),
+}
+classifier = Agent(name="router", model=router["classify"], ...)
+worker = Agent(name="worker", model=router["execute"], toolkit=toolkit)</code></pre>
+        </div>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 模型路由</h5>
+        <pre class="mermaid">flowchart TD
+    Input[用户输入] --> C[qwen-turbo 意图分类]
+    C -->|简单问答| P[qwen-plus Agent]
+    C -->|复杂报告| M[qwen-max Planner]
+    M --> W[qwen-plus Worker + 工具]
+    P --> Out[回复]
+    W --> Out</pre>
+        <p class="diagram-caption">路由节点用最小模型，主链路按复杂度升级。</p>
+      </div>
+
+      <h4>意图分类 Agent（turbo）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">CLASSIFY_PROMPT = "只输出 simple 或 complex，不要解释。"
+
+classifier = Agent(
+    name="intent-router",
+    system_prompt=CLASSIFY_PROMPT,
+    model=DashScopeChatModel(model="qwen-turbo"),
+)
+
+async def route(user_text: str) -> str:
+    msg = await classifier.reply(UserMsg("user", user_text))
+    label = msg.content.strip().lower()
+    return "plan" if "complex" in label else "execute"</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="model-routing" tabindex="0">多模型路由</span> 应记录每步 model 名称到 OTel attribute，便于 NS3 账单分摊。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 意图路由</span>
+        用户问「帮我订会议室」→ turbo 分类为 simple → plus Worker 执行；用户问「对比 Q1/Q2 销售数据并写 executive summary」→ turbo 判 complex → max Planner 分解子任务 → plus Worker 调工具——路由错误时 trace 中 model 字段是第一排查点。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>与 NS3 成本权衡</h3>
+      <p>北星 NS3 要求 Agent 成本可度量、可优化。<span class="term" data-term-id="ns3-cost" tabindex="0">NS3 成本</span> = Token 费用 + 工具调用次数 × 步数。AgentScope Event 与 usage 字段可汇总到 OTel，配合 max_iters、路由与 Memory 摘要降本。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>杠杆</th><th>做法</th><th>NS3 影响</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>max_iters</td><td>10～15 封顶</td><td>限制 worst-case 步数</td></tr>
+          <tr><td>模型路由</td><td>turbo 做分类/摘要</td><td>Token 单价下降 60%+</td></tr>
+          <tr><td>Memory 裁剪</td><td>见 basics-04</td><td>输入 Token 线性下降</td></tr>
+          <tr><td>缓存</td><td>相同 tool 结果短期缓存</td><td>减少重复 LLM 调用</td></tr>
+        </tbody>
+      </table>
+
+      <h4>usage 统计示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">total_tokens = 0
+async for evt in agent.reply_stream(UserMsg("user", "导出周报")):
+    if hasattr(evt, "usage") and evt.usage:
+        total_tokens += evt.usage.total_tokens
+print(f"NS3 指标：本轮 total_tokens={total_tokens}")</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · NS3 评审</span>
+        答辩时需说明：为何 S3 主 Agent 用 plus 而非 max——「90% 任务 8 步内完成，max 仅用于 Planner 子 Agent，月均 Token 降 35%」。
+      </aside>
+
+      <div class="learn-faq">
+        <details>
+          <summary>fallback 链如何配置？</summary>
+          <div class="learn-faq-body">
+            DashScopeChatModel 可在 primary 失败时 fallback 到备用模型或 Provider；CorpAssist 建议 primary=plus，fallback=turbo 并告警，避免 silent 降级到不可用模型。
+          </div>
+        </details>
+      </div>
+
+      <h4>NS3 周报指标模板</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>采集点</th><th>阈值示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>avg_tokens_per_task</td><td>REPLY_END usage</td><td>&lt; 8k</td></tr>
+          <tr><td>avg_iters</td><td>Agent 内部计数</td><td>&lt; 6</td></tr>
+          <tr><td>max_model_tier</td><td>路由 OTel</td><td>90% plus 以下</td></tr>
+        </tbody>
+      </table>
+
+      <p><span class="term" data-term-id="ns3-cost" tabindex="0">NS3</span> 评审时须同时展示质量 eval 与成本曲线，避免单指标优化。当 DashScope 主模型偶发 5xx 时，可配置 <span class="term" data-term-id="model-fallback" tabindex="0">模型降级链</span>：primary 失败自动切换备用模型并上报告警。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.model import DashScopeChatModel
+
+primary = DashScopeChatModel(model="qwen-plus", max_retries=2)
+fallback = DashScopeChatModel(model="qwen-turbo", max_retries=1)
+
+async def chat_with_fallback(messages):
+    try:
+        return await primary.chat(messages=messages)
+    except Exception as e:
+        otel.record("model.fallback", {"from": "qwen-plus", "to": "qwen-turbo", "err": str(e)})
+        return await fallback.chat(messages=messages)</code></pre>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何向 CFO 解释 qwen-plus 默认策略而非全家桶 max？</li>
+              <li>fallback 到 turbo 时如何告警并保证 NS1 质量下限？</li>
+              <li>usage 统计缺失会导致 NS3 的什么盲区？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <h4>环境变量清单</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>变量</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>DASHSCOPE_API_KEY</code></td><td>DashScope 鉴权</td></tr>
+          <tr><td><code>OPENAI_API_KEY</code></td><td>备用 Provider（可选）</td></tr>
+          <tr><td><code>CORPASSIST_MODEL_DEFAULT</code></td><td>覆盖默认 qwen-plus</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>模型无关编程</strong>：ChatModel 抽象隔离 Provider，Agent 逻辑可移植。</li>
+        <li><strong>DashScope 接入</strong>：Credential + Formatter + qwen 系列是 CorpAssist 默认栈。</li>
+        <li><strong>多模型路由</strong>：turbo/plus/max 按任务分层，避免全家桶 max。</li>
+        <li><strong>NS3 成本权衡</strong>：max_iters、路由、Memory 裁剪与 usage 度量组合降本。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：进入实战阶段 <a href="#ch-practice-01-single-agent">单 Agent：CorpAssist 办公助手</a>，整合前五章能力。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://doc.agentscope.io/tutorial/task_model.html" target="_blank" rel="noopener">AgentScope — Model 与 DashScope</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/use-qwen-by-calling-api" target="_blank" rel="noopener">阿里云 — 通义千问 API 参考</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">配置 DashScope 双模型路由（turbo 分类 + plus 执行），并输出一轮 usage 统计（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按「CorpAssist 模型路由」图，为你的实验画 intent → model 映射表。</li>
+      <li>实现「多模型路由」代码块中的 router 字典并跑通两轮不同复杂度问句。</li>
+      <li>打开「NS3 成本权衡」表，任选 2 个杠杆估算 CorpAssist 周任务 Token 节省比例。</li>
+      <li>可选：<code>python main.py</code> 验收 <code>demos/basics-05-model-adaptation-lab/</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）CorpAssist 将全部 Agent 升级为 qwen-max 后准确率 +2%，账单 +180%。是否符合 NS3？应如何调整？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>不符合 NS3「成本可控」。应恢复 plus 为默认，仅 Planner 或 Reflexion 子步骤用 max；摘要用 turbo；并设 max_iters。2% 准确率提升不足以覆盖 180% 成本，需用 eval 集证明 ROI。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：DashScope 路由实验室</h4>
+      <p>目录：<code>demos/basics-05-model-adaptation-lab/</code>。<strong>验收</strong>：<code>python main.py</code> 打印分类模型与执行模型名称及 total_tokens。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-04-memory">记忆：短期与长期控制</a></li>
+      <li><strong>下一阶段</strong>：<a href="#ch-practice-01-single-agent">单 Agent：CorpAssist 办公助手</a></li>
+      <li><a href="../llm-application-fundamentals/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">LLM 应用基础</span><code class="course-ref-slug">llm-application-fundamentals</code></a> — NS 北星能力定义</li>
+    </ul>
+  </div>
+</section>

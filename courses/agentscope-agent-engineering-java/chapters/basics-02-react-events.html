@@ -1,0 +1,417 @@
+<section id="ch-basics-02-react-events" class="chapter" data-chapter="basics-02-react-events">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>ReActAgent 与事件流</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-02-react-events" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>AgentScope Java 核心</strong> · 能力：消费 ReAct 事件流并对接 CorpAssist SSE</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 前端需要实时展示「思考中」「调用工具」「生成回答」——不能只等 <code>call().block()</code> 最终字符串。<span class="term" data-term-id="react-agent-builder" tabindex="0">ReActAgent.builder</span> 内置推理-行动循环，<span class="term" data-term-id="stream-events" tabindex="0">streamEvents</span> 将 text / thinking / tool_call 拆成可订阅 Typed Event。本章让你从 SAA Graph 的节点日志迁移到 AgentScope Java 的事件流范式。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 ReActAgent.builder 配置模型、工具、Middleware 与 maxIterations</li>
+          <li>理解 <span class="term" data-term-id="content-block" tabindex="0">ContentBlock</span> 类型并消费 streamEvents</li>
+          <li>处理 <span class="term" data-term-id="hitl-event" tabindex="0">Human-in-the-loop</span> 审批事件三态</li>
+          <li>对照 Python AgentScope <code>reply_stream</code> 与 EventType 映射</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>builder 模式</strong>：<code>ReActAgent.builder()</code> 链式配置模型、工具、Middleware、预算。</li>
+          <li><strong>事件先于结果</strong>：<code>streamEvents()</code> 逐条发射 Typed Event，UI 应增量渲染。</li>
+          <li><strong>双栈对齐</strong>：Java <code>TextDeltaEvent</code> 与 Python <code>EventType.TEXT_BLOCK_DELTA</code> 语义对应。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>ReActAgent.builder 模式</h3>
+      <p>AgentScope Java 2.0 的 <span class="term" data-term-id="react-agent-builder" tabindex="0">ReActAgent.builder</span> 是创建 Agent 的标准入口：模型生成 → 解析 tool_call → 执行 @Tool → 将观察写回 Session → 再次调用模型，直到输出最终文本或达到 <code>maxIterations</code>。与 SAA Graph 需手写 agent/tools 节点不同，循环对外不可见，通过 streamEvents 暴露中间态。</p>
+
+      <div class="mermaid-wrap">
+        <h5>AgentScope Java ReAct 循环</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as User
+    participant A as ReActAgent
+    participant M as DashScopeChatModel
+    participant T as @Tool
+
+    U->>A: Msg (USER)
+    loop maxIterations
+        A->>M: 推理请求
+        M-->>A: thinking / tool_call / text
+        alt 有 tool_call
+            A->>T: 执行工具
+            T-->>A: ToolResultBlock
+        else 纯文本
+            A-->>U: 最终 Msg
+        end
+    end</pre>
+        <p class="diagram-caption">ReAct 循环在 Agent 内部闭合；外部通过 streamEvents 观察每一步。</p>
+      </div>
+
+      <h4>ReActAgent.builder 完整配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.model.DashScopeChatModel;
+import io.agentscope.core.middleware.LoggingMiddleware;
+
+ReActAgent agent = ReActAgent.builder()
+    .name("S3-Assistant")
+    .systemPrompt("你是 CorpAssist 办公助手，可查询日历。")
+    .model(DashScopeChatModel.builder()
+        .modelName("qwen-plus")
+        .apiKey(System.getenv("DASHSCOPE_API_KEY"))
+        .maxRetries(2)
+        .fallbackModelName("qwen-turbo")
+        .build())
+    .tools(calendarTools)              // @Tool 注册的工具列表
+    .maxIterations(10)                 // 对应 Graph 回环步数上限
+    .middleware(new LoggingMiddleware())
+    .build();</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：maxIterations 与 Graph conditional_edge 回环有何不同？</summary>
+        <p>Graph 通过图的边显式回到 agent 节点；AgentScope Java 在 Agent 内部计数迭代，超限直接终止并返回错误或部分结果，无需在图里画回边。</p>
+      </details>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>builder 参数</th><th>行为</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>模型输出纯文本</td><td>正常结束 ReAct</td><td>展示最终回复</td></tr>
+          <tr><td>达到 maxIterations</td><td>强制停止，可能部分完成</td><td>提示用户缩小问题</td></tr>
+          <tr><td>工具连续失败</td><td>模型可能反复重试</td><td>@Tool 返回结构化错误</td></tr>
+          <tr><td>用户 cancel</td><td>Realtime Steering 中断</td><td>见 practice-03 HITL</td></tr>
+        </tbody>
+      </table>
+
+      <h4>RuntimeContext 与 Session 绑定</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.runtime.RuntimeContext;
+
+RuntimeContext ctx = RuntimeContext.builder()
+    .sessionId("corp-s3-zhangsan-20260610")
+    .userId("zhangsan")
+    .build();
+
+// 同一 sessionId 跨进程可恢复对话（需配置 AgentStateStore）
+Msg reply = agent.call(userMsg, ctx).block();</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>ContentBlock 与 streamEvents</h3>
+      <p><span class="term" data-term-id="content-block" tabindex="0">ContentBlock</span> 是 AgentScope Java 的统一内容单元：text、file、image、model thinking、tool_result 均以 Typed Block 表达。消息不再只是字符串，而是 Block 列表。<span class="term" data-term-id="stream-events" tabindex="0">streamEvents()</span> 将模型输出与工具执行拆成细粒度事件，CorpAssist 前端可据此展示「正在查日历…」进度条。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>ContentBlock / Event 类别</th><th>含义</th><th>UI 映射</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>TextBlock / TextDeltaEvent</td><td>流式可见文本</td><td>打字机效果</td></tr>
+          <tr><td>ThinkingBlock</td><td>模型推理过程（若模型支持）</td><td>可折叠「思考过程」</td></tr>
+          <tr><td>ToolCallStartEvent</td><td>工具名与参数</td><td>工具调用卡片</td></tr>
+          <tr><td>ToolCallEndEvent</td><td>工具结果与耗时</td><td>更新卡片状态</td></tr>
+          <tr><td>ReplyEndEvent</td><td>整轮回复边界</td><td>启用下一轮输入</td></tr>
+        </tbody>
+      </table>
+
+      <h4>消费 streamEvents 事件流</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.event.*;
+
+StringBuilder buffer = new StringBuilder();
+agent.streamEvents(userMsg, ctx).subscribe(event -> {
+    switch (event) {
+        case TextDeltaEvent e -> {
+            buffer.append(e.delta());
+            System.out.print(e.delta());
+        }
+        case ToolCallStartEvent e ->
+            System.out.printf("%n[工具] %s(%s)%n", e.name(), e.args());
+        case ToolCallEndEvent e ->
+            System.out.printf("[完成] %s 耗时 %dms%n", e.name(), e.durationMs());
+        case ReplyEndEvent e ->
+            System.out.println("--- 本轮完成 ---");
+        default -> { /* OTel span 记录 */ }
+    }
+});</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>只用 <code>call().block()</code> 阻塞等待，前端无进度</li>
+            <li>忽略 ToolCallStartEvent，用户不知 Agent 在做什么</li>
+            <li>ThinkingBlock 直接展示给终端用户（可能泄露推理链）</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>SSE / WebSocket 转发 streamEvents 到 CorpAssist UI</li>
+            <li>工具事件显示名称与耗时，隐藏敏感参数</li>
+            <li>thinking 默认折叠，仅 debug 模式开启</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>事件序列完整示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// 典型事件顺序（简化）
+// ReplyStart → ModelCallStart → TextDelta* / ToolCall* → ReplyEnd
+
+Map&lt;String, String&gt; EVENT_UI = Map.of(
+    "ReplyStart", "显示加载动画",
+    "TextDelta", "追加可见文本",
+    "ToolCallStart", "展示工具卡片",
+    "ToolCallEnd", "更新工具耗时",
+    "ReplyEnd", "启用下一轮输入"
+);
+
+// 每个 ToolCall 应配对 Start/End，缺失 End 是排障重点</code></pre>
+      </div>
+
+      <h4>Spring Boot SSE 桥接片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;ServerSentEvent&lt;String&gt;&gt; chatStream(@RequestBody ChatRequest req) {
+    Msg userMsg = Msg.builder().role(MsgRole.USER).textContent(req.question()).build();
+    RuntimeContext ctx = RuntimeContext.builder()
+        .sessionId(req.sessionId()).userId(req.userId()).build();
+    return agent.streamEvents(userMsg, ctx)
+        .map(evt -> ServerSentEvent.builder(evt.getClass().getSimpleName())
+            .data(JsonUtils.toJson(evt)).build());
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Human-in-the-loop 事件</h3>
+      <p>AgentScope Java 2.0 将权限与人工审批提升为一等公民：<span class="term" data-term-id="hitl-event" tabindex="0">Permission 三态</span>（allow / approve / deny）在工具执行前由框架判定，需要人工确认时发射 <code>ApprovalRequiredEvent</code>，外部系统完成审批后恢复任务。这比 Graph 的 interrupt 更结构化，适合 CorpAssist 工单创建、邮件发送等敏感操作。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist HITL 事件流</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant A as ReActAgent
+    participant P as PermissionEngine
+    participant U as 审批人
+    participant T as @Tool
+
+    A->>P: 工具调用请求
+    P-->>A: approve 需要人工
+    A-->>U: ApprovalRequiredEvent
+    U->>A: 审批结果 allow/deny
+    alt allow
+        A->>T: 执行工具
+    else deny
+        A-->>U: 拒绝说明
+    end</pre>
+        <p class="diagram-caption">HITL 通过事件暂停 ReAct 循环，外部执行循环恢复任务。</p>
+      </div>
+
+      <h4>处理 ApprovalRequiredEvent</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">agent.streamEvents(userMsg, ctx).subscribe(event -> {
+    switch (event) {
+        case ApprovalRequiredEvent e -> {
+            // 推送到 CorpAssist 审批队列
+            approvalService.enqueue(e.toolName(), e.args(), e.approvalId());
+            ui.showApprovalCard(e.approvalId(), e.toolName());
+        }
+        case ToolCallStartEvent e -> ui.showTool(e.name());
+        default -> {}
+    }
+});
+
+// 审批完成后恢复（外部执行循环）
+agent.resumeWithApproval(approvalId, ApprovalDecision.ALLOW).block();</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>Permission 三态</th><th>含义</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>allow</td><td>自动放行</td><td>queryCalendar 只读查询</td></tr>
+          <tr><td>approve</td><td>需人工确认</td><td>sendEmail 外发邮件</td></tr>
+          <tr><td>deny</td><td>禁止调用</td><td>deleteTicket 高危操作</td></tr>
+        </tbody>
+      </table>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 邮件外发审批</span>
+        用户说「给张三发会议提醒」后，UI 依次展示：ToolCallStart(sendEmail) → ApprovalRequiredEvent → 审批人点击允许 → ToolCallEnd → TextDelta 确认已发送。详见 <a href="#ch-practice-03-permissions">Events + Permissions 与 HITL</a>。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Python Event System 对照</h3>
+      <p>CorpAssist 双栈部署时，Python 侧 <code>reply_stream</code> 与 Java 侧 <span class="term" data-term-id="stream-events" tabindex="0">streamEvents</span> 应对齐事件名与 payload 结构，便于统一 OTel trace 与前端组件。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>能力</th><th>Python AgentScope 2.0</th><th>Java AgentScope 2.0</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>流式 API</td><td><code>agent.reply_stream(msg)</code></td><td><code>agent.streamEvents(msg, ctx)</code></td></tr>
+          <tr><td>文本增量</td><td><code>EventType.TEXT_BLOCK_DELTA</code></td><td><code>TextDeltaEvent</code></td></tr>
+          <tr><td>工具调用</td><td><code>TOOL_CALL_START</code></td><td><code>ToolCallStartEvent</code></td></tr>
+          <tr><td>结束</td><td><code>REPLY_END</code></td><td><code>ReplyEndEvent</code></td></tr>
+          <tr><td>HITL</td><td>Realtime Steering</td><td><code>ApprovalRequiredEvent</code></td></tr>
+        </tbody>
+      </table>
+
+      <h4>Python reply_stream 对照片段</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Python 平行课写法（对照）
+async for evt in agent.reply_stream(UserMsg("user", question)):
+    match evt.type:
+        case EventType.TEXT_BLOCK_DELTA:
+            ui.append_text(evt.delta)
+        case EventType.TOOL_CALL_START:
+            ui.show_tool(evt.tool_name, evt.args)
+        case EventType.REPLY_END:
+            ui.finish_turn()</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Python 与 Java 事件字段不一致怎么办？</summary>
+          <div class="learn-faq-body">
+            在 A2A 网关维护映射表，统一 trace_id、tool_name、delta 字段；集成测试对比同一条 CorpAssist 问句的双栈事件序列。
+          </div>
+        </details>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>排障信号</th><th>Python 侧</th><th>Java 侧</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>无 TEXT 增量</td><td>检查 stream=True</td><td>检查 subscribe 未阻塞</td></tr>
+          <tr><td>TOOL 无 END</td><td>Toolkit timeout</td><td>ToolCallEndEvent 丢失</td></tr>
+          <tr><td>断连</td><td>SSE heartbeat</td><td>WebClient 超时</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>ReActAgent.builder</strong>：链式配置模型、工具、Middleware 与 maxIterations，内置 ReAct 循环。</li>
+        <li><strong>ContentBlock + streamEvents</strong>：Typed Block 与 Event 支持流式 UI 与审计。</li>
+        <li><strong>HITL 事件</strong>：allow/approve/deny 三态 + ApprovalRequiredEvent 实现人工审批。</li>
+        <li><strong>Python 对照</strong>：reply_stream 与 streamEvents 语义对齐，双栈统一 trace_id。</li>
+      </ul>
+      <p><strong>Python 侧对照</strong>：平行课 <a href="../agentscope-agent-engineering/index.html#ch-basics-02-react-events" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">ReActAgent 与事件流</span><code class="course-ref-slug">agentscope-agent-engineering</code></a> 用 <code>reply_stream</code> + <code>EventType</code>；Java 课用 <code>streamEvents</code> + sealed Event 类。前端组件可共用 SSE 协议，仅在网关层做字段映射，业务 Agent 逻辑不必双写。</p>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>API</th><th>用途</th></tr></thead>
+              <tbody>
+                <tr><td><code>call()</code></td><td>阻塞获取完整 Msg</td></tr>
+                <tr><td><code>streamEvents()</code></td><td>订阅 Typed Event 流</td></tr>
+                <tr><td><code>maxIterations</code></td><td>ReAct 最大步数</td></tr>
+                <tr><td><code>TextDeltaEvent</code></td><td>流式可见文本</td></tr>
+                <tr><td><code>ApprovalRequiredEvent</code></td><td>人工审批暂停点</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+      <p class="chapter-review-next">下一步：下一章 <a href="#ch-basics-03-tools-mcp">Tool 注册与 MCP</a> 扩展 @Tool 与 MCP 客户端。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java.agentscope.io/" target="_blank" rel="noopener">AgentScope Java — Events &amp; Permissions</a></li>
+      <li><a href="https://github.com/agentscope-ai/agentscope-java" target="_blank" rel="noopener">AgentScope Java GitHub — streamEvents 示例</a></li>
+      <li><a href="https://doc.agentscope.io/tutorial/task_event.html" target="_blank" rel="noopener">Python AgentScope — Event 系统（双栈对照）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现 CorpAssist 迷你事件 CLI：消费 <code>streamEvents</code> 并在终端分别打印 text 与 tool_call 事件（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>参照「ReAct 循环」时序图，在纸上标注模型调用与工具调用的先后顺序。</li>
+      <li>复制「消费 streamEvents」代码块，接入 <code>queryCalendar</code> @Tool 并运行一次问句。</li>
+      <li>对照「ContentBlock / Event 类别」表，为每种事件设计一行 CorpAssist UI 展示文案。</li>
+      <li>可选：完成 <code>demos/basics-02-react-events-lab/</code> 运行验收脚本。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（排障）用户反馈 CorpAssist UI 长时间空白，后端日志显示 ToolCallStartEvent 后无 End。最可能的根因与排查顺序是？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>工具执行挂起或超时未配置。排查顺序：① 查 @Tool 侧 API 延迟与错误；② 确认工具是否设置 timeout；③ 检查 streamEvents subscribe 是否阻塞主线程；④ 查看 OTel span 中 TOOL_CALL 段耗时。不应先怀疑模型配额。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：ReAct 事件流实验室</h4>
+      <p>目录：<code>demos/basics-02-react-events-lab/</code>。<strong>验收</strong>：<code>./run.sh</code> 输出至少 1 次 ToolCall 与流式 TEXT 片段。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-01-framework-compare">AgentScope Java 2.0 与 SAA Graph 对照</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-03-tools-mcp">Tool 注册与 MCP</a></li>
+    </ul>
+  </div>
+</section>

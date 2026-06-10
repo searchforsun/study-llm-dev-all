@@ -1,0 +1,342 @@
+<section id="ch-basics-04-session-memory" class="chapter" data-chapter="basics-04-session-memory">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Session 与 Memory 基础</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-session-memory" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>AgentScope Java 核心</strong> · 能力：Session 生命周期、短期上下文与 compaction 入门</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 用户会连续多轮布置任务——「刚才说的报告模板」必须被记住，又不能撑爆 Token 预算。AgentScope Java 2.0 用 <span class="term" data-term-id="agent-state-store" tabindex="0">AgentStateStore</span> + <span class="term" data-term-id="runtime-context" tabindex="0">RuntimeContext</span> 管理会话；对话历史在 <code>AgentState.getContext()</code> 中，与 Spring AI <span class="term" data-term-id="chat-memory" tabindex="0">ChatMemory</span> 理念相近但 API 不同。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <code>RuntimeContext</code> 绑定 <code>userId</code> / <code>sessionId</code> 实现多租户隔离</li>
+          <li>配置 <code>JsonFileAgentStateStore</code> 或 <code>RedisAgentStateStore</code> 持久化短期记忆</li>
+          <li>理解 ReAct 主循环中的上下文压缩与 Harness <span class="term" data-term-id="context-compaction" tabindex="0">Compaction</span> 分层</li>
+          <li>将 AgentScope Session 与 agent-orchestration-java 课的 ChatMemory 对照选型</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Agent 实例无会话态</strong>：同一 <code>ReActAgent</code> 可并发服务多 Session，状态由 Store 按 <code>(userId, sessionId)</code> 加载。</li>
+          <li><strong>短期 = AgentState.context</strong>：每轮 <code>call()</code> 读写完整可见 Msg 链。</li>
+          <li><strong>Compaction 先于硬溢出</strong>：推理前自动压缩；长任务可升级 Harness 完整 compaction 栈。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Session 生命周期</h3>
+      <p><span class="term" data-term-id="runtime-context" tabindex="0">Session 生命周期</span> 由「一次 <code>call()</code> 的 RuntimeContext」与「跨调用的 AgentStateStore」共同定义：调用开始加载状态，调用结束写回；同 Session 并发请求会被框架串行化。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Session 与 AgentStateStore</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant BFF as Spring BFF
+    participant A as ReActAgent
+    participant Store as AgentStateStore
+
+    BFF->>A: call(msgs, RuntimeContext)
+    A->>Store: load(userId, sessionId)
+    Store-->>A: AgentState
+    A->>A: ReAct 推理 + 工具
+    A->>Store: save(AgentState)
+    A-->>BFF: Msg 回复</pre>
+        <p class="diagram-caption">每次 call 结束写回 AgentState；下一请求同 sessionId 自动恢复。</p>
+      </div>
+
+      <h4>多 Session 并发（单 Agent 实例）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.UserMessage;
+import io.agentscope.core.state.JsonFileAgentStateStore;
+import java.nio.file.Paths;
+import java.util.List;
+
+ReActAgent agent = ReActAgent.builder()
+        .name("CorpAssistS3")
+        .sysPrompt("你是 CorpAssist 办公助手。")
+        .model("dashscope:qwen-plus")
+        .stateStore(new JsonFileAgentStateStore(
+                Paths.get(System.getProperty("user.home"), ".agentscope/sessions")))
+        .build();
+
+RuntimeContext alice = RuntimeContext.builder()
+        .userId("alice").sessionId("sess-001").build();
+RuntimeContext bob = RuntimeContext.builder()
+        .userId("bob").sessionId("sess-002").build();
+
+agent.call(List.of(new UserMessage("我是华东区销售张三")), alice).block();
+agent.call(List.of(new UserMessage("查我下周会议")), bob).block();</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不每个 HTTP 请求 new 一个 ReActAgent？</summary>
+        <p>Agent 实例无会话态，创建成本高且浪费连接池。Spring 中单例 Bean + 每请求传入不同 RuntimeContext 是推荐模式；状态由 Store 隔离，与 ChatClient 单例 + sessionId Advisor 类似。</p>
+      </details>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>Store 实现</th><th>适用</th><th>CorpAssist 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>InMemoryAgentStateStore</code></td><td>单元测试</td><td>CI 无 Redis</td></tr>
+          <tr><td><code>JsonFileAgentStateStore</code></td><td>本地 / 单节点</td><td>开发 Demo</td></tr>
+          <tr><td><code>RedisAgentStateStore</code></td><td>K8s 多副本</td><td>S3 生产推荐</td></tr>
+          <tr><td><code>MysqlAgentStateStore</code></td><td>需 SQL 审计</td><td>合规留存</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>短期记忆管理</h3>
+      <p>AgentScope Java 2.0 已弃用 1.x 的 <code>Memory</code> 接口；<span class="term" data-term-id="agent-state-store" tabindex="0">短期记忆</span> 即 <code>AgentState</code> 中的对话上下文（<code>getContext()</code>）。ReAct 每轮推理前读取完整可见历史，工具结果也以 Msg 形式 append。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 多轮追问</span>
+        用户：「帮我查 TKT-001。」Agent 回复处理人张三。用户：「给他发邮件提醒。」——第二轮必须能从 context 读到张三，而非重新查工单。
+      </aside>
+
+      <h4>多轮对话与 stateStore</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">RuntimeContext ctx = RuntimeContext.builder()
+        .userId("tenant-hr")
+        .sessionId("u001-sess-abc")
+        .put("request_id", "req-20260610-001")
+        .build();
+
+agent.call(List.of(new UserMessage("偏好表格报告格式")), ctx).block();
+Msg reply = agent.call(
+        List.of(new UserMessage("刚才说的格式，导出 Q1 销售")), ctx).block();
+System.out.println(reply.getTextContent());</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>工具返回 10MB JSON 原样进 context</li>
+            <li>无 stateStore 却期望跨 Pod 恢复</li>
+            <li>所有租户共用 defaultSessionId</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>大 tool 结果截断或 offload（Harness）</li>
+            <li>生产 Redis + TTL</li>
+            <li><code>tenant:user:uuid</code> 作 sessionId</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>工具观察截断（应用层）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">private static final int MAX_TOOL_CHARS = 2000;
+
+static String truncateToolResult(String raw) {
+    if (raw.length() &lt;= MAX_TOOL_CHARS) return raw;
+    return raw.substring(0, MAX_TOOL_CHARS)
+            + "\n...[truncated " + (raw.length() - MAX_TOOL_CHARS) + " chars]";
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>基础 compaction 概念</h3>
+      <p><span class="term" data-term-id="context-compaction" tabindex="0">Compaction</span> 在 Token 接近模型窗口时触发：ReActAgent 主循环含「Compress context if needed」步骤；升级到 <code>HarnessAgent</code> 后可配置结构化摘要、大 tool 结果 offload 与 overflow 重试。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Compaction 决策流（概念）</h5>
+        <pre class="mermaid">flowchart TD
+    Reason[进入推理] --> Check{上下文超阈值?}
+    Check -->|否| LLM[调用 ChatModel]
+    Check -->|是| Compact[摘要/裁剪旧 Msg]
+    Compact --> LLM
+    LLM --> Tool[工具执行]
+    Tool --> Reason</pre>
+        <p class="diagram-caption">Compaction 在内存中 mutate AgentState；call 结束时 Store 持久化的是压缩后状态。</p>
+      </div>
+
+      <h4>Harness CompactionConfig（长会话预览）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// HarnessAgent 完整 compaction — 详见 agentscope-harness-engineering 课
+import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
+
+CompactionConfig compaction = CompactionConfig.builder()
+        .triggerMessages(30)   // 消息数超 30 触发摘要
+        .keepMessages(10)      // 保留最近 10 条原文
+        .build();</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>组件</th><th>CorpAssist 建议</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ReAct 内置</td><td>推理前自动压缩</td><td>办公助手默认够用</td></tr>
+          <tr><td>Harness 摘要</td><td>CompactionMiddleware</td><td>长线程技术支持</td></tr>
+          <tr><td>Tool 结果</td><td>ToolResultEviction</td><td>大 JSON 查询结果</td></tr>
+          <tr><td>Overflow</td><td>recoverFromOverflow</td><td>极端长对话兜底</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Compaction 与 Session 写回的顺序？</summary>
+          <div class="learn-faq-body">
+            先内存 compaction，再 end-of-call 写 Store。因此 Redis 中持久化的已是压缩后 AgentState，重启 Pod 不会恢复已丢弃的原文——原始 log 在 Harness workspace 的 <code>*.log.jsonl</code> 中可查。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 ChatMemory 对照</h3>
+      <p>若你已完成 <a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排（Java）</span><code class="course-ref-slug">agent-orchestration-java</code></a>，可将 Spring AI <span class="term" data-term-id="chat-memory" tabindex="0">ChatMemory</span> 与 AgentScope Session 一一对照。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>维度</th><th>Spring AI ChatMemory</th><th>AgentScope Java Session</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>存储单元</td><td><code>Message</code> 列表</td><td><code>AgentState</code>（含 context + 权限 + 工具态）</td></tr>
+          <tr><td>Session 键</td><td><code>sessionId</code> 字符串</td><td><code>(userId, sessionId)</code> 二元组</td></tr>
+          <tr><td>Advisor 注入</td><td><code>MessageChatMemoryAdvisor</code></td><td><code>RuntimeContext</code> + <code>stateStore</code></td></tr>
+          <tr><td>分布式</td><td><code>RedisChatMemory</code></td><td><code>RedisAgentStateStore</code></td></tr>
+          <tr><td>裁剪</td><td>Advisor 窗口 / 自定义压缩</td><td>ReAct 内置 + Harness Compaction</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Spring ChatMemory 片段（对照）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// agent-orchestration-java 风格 — ChatClient + RedisChatMemory
+return builder
+    .defaultAdvisors(new MessageChatMemoryAdvisor(
+        chatMemory, sessionId, 10))
+    .build();</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 双栈并存</span>
+        BFF 层 ChatClient 管轻量 FAQ；S3 办公自动化走 AgentScope ReActAgent + RedisAgentStateStore。勿混用同一 Redis key 前缀，避免 ChatMemory Hash 与 AgentState JSON 冲突。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Python AgentScope 对照</h3>
+      <p>Python 栈用 <code>InMemoryMemory</code> / <code>LongTermMemory</code>；Java 2.0 统一为 <code>AgentState</code> + Store。概念映射如下：</p>
+      <table class="outline-table">
+        <thead>
+          <tr><th>Python 2.0</th><th>Java 2.0</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>InMemoryMemory</code></td><td>无 stateStore（单次 call 内 context）</td></tr>
+          <tr><td><code>RedisMemory</code> + session_id</td><td><code>RedisAgentStateStore</code> + RuntimeContext</td></tr>
+          <tr><td><code>max_tokens</code> 裁剪</td><td>ReAct 压缩 + CompactionConfig</td></tr>
+          <tr><td><code>LongTermMemory</code></td><td>Harness MEMORY.md / memory 工具</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Python 平行课 basics-04 — 对照阅读
+memory = InMemoryMemory()
+agent = ReActAgent(..., memory=memory, max_iters=3)
+await agent(Msg("user", "我叫 Alex", "user"))
+await agent(Msg("user", "我叫什么？", "user"))</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Session 生命周期</strong>：RuntimeContext 选槽位，AgentStateStore 跨 call 持久化。</li>
+        <li><strong>短期记忆</strong>：AgentState.context 持有 Msg 链；生产必须外置 Store。</li>
+        <li><strong>Compaction</strong>：ReAct 内置压缩 + Harness 可选完整栈。</li>
+        <li><strong>ChatMemory 对照</strong>：Spring Advisor vs AgentScope Store，按场景分层。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：<a href="#ch-basics-05-chatmodel">ChatModel 与 ModelRegistry</a> 配置 DashScope 与 NS3 成本路由。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java.agentscope.io/v2/en/docs/building-blocks/agent.html" target="_blank" rel="noopener">AgentScope Java — Agent / AgentStateStore</a></li>
+      <li><a href="https://java.agentscope.io/v2/en/docs/harness/compaction.html" target="_blank" rel="noopener">Context Compaction</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">配置 JsonFileAgentStateStore 完成 CorpAssist 两轮对话，验证 Session 恢复与 compaction 概念（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照「Session 与 AgentStateStore」序列图，写出 BFF 传入的 <code>userId</code> / <code>sessionId</code> 命名规范（含租户前缀）。</li>
+      <li>运行「多 Session 并发」代码块思路，在 Demo 中第二轮追问「刚才说的区域」。</li>
+      <li>阅读「Compaction 决策流」图，说明 ReAct 内置压缩与 Harness <code>triggerMessages</code> 的分工。</li>
+      <li>填写「与 ChatMemory 对照」表：CorpAssist 哪些场景仍用 Spring ChatMemory。</li>
+      <li>可选：<code>mvn -q compile exec:java</code> 验收 <code>demos/basics-04-session-memory-lab/</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）下列哪项违反 Session 隔离最佳实践？A) Redis key 含 tenantId B) 每请求 new ReActAgent C) sessionId 含 userId 前缀 D) 工具 JSON 截断后入 context</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>B。Agent 应单例复用，会话隔离靠 RuntimeContext + Store，而非每请求创建 Agent。A/C/D 均为推荐做法。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Session 与 Memory 实验室</h4>
+      <p>目录：<code>demos/basics-04-session-memory-lab/</code>。<strong>验收</strong>：<code>mvn -q compile exec:java</code> 第二轮输出引用「华东」或「张三」，且 <code>~/.agentscope/sessions-demo/</code> 存在状态文件。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>系统课</strong>：<a href="../context-memory-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">上下文与记忆工程</span><code class="course-ref-slug">context-memory-engineering</code></a></li>
+      <li><strong>对照</strong>：<a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排（Java）</span><code class="course-ref-slug">agent-orchestration-java</code></a> — ChatMemory 章</li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-05-chatmodel">ChatModel 与 ModelRegistry</a></li>
+    </ul>
+  </div>
+</section>

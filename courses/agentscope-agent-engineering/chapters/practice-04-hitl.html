@@ -1,0 +1,392 @@
+<section id="ch-practice-04-hitl" class="chapter" data-chapter="practice-04-hitl">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Human-in-the-loop 与 Realtime Steering</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-04-hitl" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>CorpAssist 工作流实战</strong> · 能力：实现 HITL 审批与实时干预</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 涉及发邮件、改权限、提交工单等<strong>敏感操作</strong>，不能全自动执行。AgentScope 2.0 内置 <span class="term" data-term-id="realtime-steering" tabindex="0">Realtime Steering</span> 与权限系统：Agent 在工具调用前可暂停等待用户确认，用户亦可中途 <code>interrupt()</code> 改向。本章对接 <span class="term" data-term-id="audit-log" tabindex="0">审计日志</span>，并与 Spring AI Alibaba 审批节点对照。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>处理 <span class="term" data-term-id="require-user-confirm" tabindex="0">RequireUserConfirmEvent</span> 实现审批与改参</li>
+          <li>用 <code>agent.interrupt()</code> 实现 Realtime Steering</li>
+          <li>记录完整 HITL <span class="term" data-term-id="audit-log" tabindex="0">审计日志</span></li>
+          <li>对照 SAA Graph 审批节点设计双栈方案</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>ASK = 暂停等确认</strong>：权限返回 ASK 时 Agent emit 事件并暂停。</li>
+          <li><strong>改参 = 重新 reply</strong>：用户修改 tool args 后把结果事件传回 Agent。</li>
+          <li><strong>审计不可删</strong>：谁、何时、原参、改参、决裁须落库。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Realtime Steering</h3>
+
+      <p><span class="term" data-term-id="realtime-steering" tabindex="0">Realtime Steering</span> 允许用户在 Agent 执行过程中随时干预：调用 <code>agent.interrupt()</code> 取消当前任务，Agent 运行 <code>handle_interrupt()</code> 做清理，之后可注入新指令继续。适用于用户发现 Agent 偏航、或紧急变更优先级。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 紧急改向</span>
+        用户发起「批量发邮件通知全员」，Agent 正在生成收件人列表时用户点击「停止」并改口「只发项目组」——<code>interrupt()</code> 终止当前 Acting，清理半成品状态，注入新 UserMsg 重新 reply。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>HITL 与 Steering 事件流</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant A as ReActAgent
+    participant T as 工具
+    U->>A: 用户请求
+    A->>A: 推理
+    A-->>U: RequireUserConfirmEvent
+    U->>A: 确认/改参/拒绝
+    A->>T: 执行工具
+    U->>A: interrupt() 可选
+    A-->>U: 最终回复</pre>
+        <p class="diagram-caption">敏感工具先 ASK；用户可在 Acting 前 interrupt 改向。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+from agentscope.agent import ReActAgent
+from agentscope.event import EventType
+
+async def run_with_steering(agent: ReActAgent, user_msg):
+    task = asyncio.create_task(agent.reply(user_msg))
+
+    async def watch_ui():
+        await asyncio.sleep(2)
+        if user_clicked_stop():
+            agent.interrupt()
+            print("[Steering] 用户中断，Agent 清理中…")
+
+    watcher = asyncio.create_task(watch_ui())
+    try:
+        result = await task
+        return result
+    finally:
+        watcher.cancel()
+
+async for evt in agent.reply_stream(user_msg):
+    if evt.type == EventType.REQUIRE_USER_CONFIRM:
+        print(f"待审批工具：{evt.tool_name} args={evt.tool_args}")</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>干预方式</th><th>API</th><th>适用场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>中途改向</td><td><code>interrupt()</code></td><td>用户取消或变更意图</td></tr>
+          <tr><td>工具前审批</td><td>Permission ASK</td><td>敏感写操作</td></tr>
+          <tr><td>改参执行</td><td>confirm.approve(modified_args)</td><td>收件人/金额修正</td></tr>
+          <tr><td>拒绝继续</td><td>confirm.deny()</td><td>合规拦截</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>审批与改参</h3>
+
+      <p>工具权限配置为 <code>ASK</code> 时，Agent 发出 <span class="term" data-term-id="require-user-confirm" tabindex="0">RequireUserConfirmEvent</span> 并暂停。前端展示参数表单；用户可选 ALLOW（原参执行）、MODIFY（改参后执行）或 DENY（拒绝并告知 Agent）。CorpAssist 发邮件给外部域名、批量删数据等须 ASK。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>决裁</th><th>行为</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ALLOW</td><td>按原 args 执行工具</td><td>确认发送会议纪要邮件</td></tr>
+          <tr><td>MODIFY</td><td>替换 args 再执行</td><td>修改收件人列表后发送</td></tr>
+          <tr><td>DENY</td><td>返回错误结果给 LLM</td><td>拒绝向个人邮箱发内部文档</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.tool import Toolkit
+from agentscope.permission import PermissionRule, PermissionDecision
+
+toolkit = Toolkit()
+toolkit.register_tool_function(
+    send_email,
+    permission=PermissionRule(decision=PermissionDecision.ASK),
+)
+
+# 用户确认后恢复 Agent（伪代码）
+async def resume_after_confirm(agent, confirm_event, user_decision, new_args=None):
+    if user_decision == "ALLOW":
+        result_event = confirm_event.approve()
+    elif user_decision == "MODIFY":
+        result_event = confirm_event.approve(modified_args=new_args)
+    else:
+        result_event = confirm_event.deny(reason="用户拒绝")
+    final = await agent.reply(result_event)
+    return final</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">审批反模式</span>
+          <ul>
+            <li>所有工具都 ASK，体验极差</li>
+            <li>前端超时自动 ALLOW</li>
+            <li>改参后不更新 audit modified_args</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">分级 ASK</span>
+          <ul>
+            <li>只读工具 ALLOW 默认</li>
+            <li>外发/删改/权限 ASK</li>
+            <li>超时 DENY 而非自动执行</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>CorpAssist 哪些工具应默认 ASK？</summary>
+          <div class="learn-faq-body">
+            ① 向外部域名发邮件；② 批量操作（&gt;10 收件人）；③ 权限/账号变更类工具。只读查询（查日程、查制度）默认 ALLOW。清单写入 PermissionRule 配置而非 scattered sys_prompt。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>审计日志</h3>
+
+      <p><span class="term" data-term-id="audit-log" tabindex="0">审计日志</span> 须记录：session_id、agent_name、tool_name、original_args、modified_args、decision、operator_id、timestamp。CorpAssist 合规要求保留 180 天，且与 OTel trace_id 关联便于排障。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import json
+from datetime import datetime, timezone
+
+def audit_hitl(record: dict) -> None:
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "session_id": record["session_id"],
+        "tool": record["tool_name"],
+        "original_args": record["original_args"],
+        "modified_args": record.get("modified_args"),
+        "decision": record["decision"],
+        "operator": record["operator_id"],
+        "trace_id": record.get("trace_id"),
+    }
+    # 生产：写入 append-only 存储 / SIEM
+    print(json.dumps(entry, ensure_ascii=False))
+
+# 在 confirm 回调中调用
+audit_hitl({
+    "session_id": "sess-001",
+    "tool_name": "send_email",
+    "original_args": {"to": "partner@external.com"},
+    "modified_args": {"to": "partner@approved-domain.com"},
+    "decision": "MODIFY",
+    "operator_id": "user-zhang",
+})</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>必填</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>session_id</td><td>是</td><td>关联用户会话</td></tr>
+          <tr><td>tool_name</td><td>是</td><td>待审批工具名</td></tr>
+          <tr><td>original_args</td><td>是</td><td>模型提议参数 JSON</td></tr>
+          <tr><td>modified_args</td><td>MODIFY 时</td><td>用户改后参数</td></tr>
+          <tr><td>decision</td><td>是</td><td>ALLOW / MODIFY / DENY</td></tr>
+          <tr><td>trace_id</td><td>推荐</td><td>OTel 关联排障</td></tr>
+        </tbody>
+      </table>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 合规审计</span>
+        安全团队抽查：「上周是否有 Agent 向个人邮箱发内部文档？」审计员查 audit.jsonl 中 decision=DENY 与 MODIFY 记录，按 operator_id 与 tool_name 过滤——DENY 记录不可省略。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>与 SAA 审批节点对照</h3>
+
+      <p>Spring AI Alibaba Graph 的 <code>interrupt_before</code> / 人工节点与 AgentScope HITL 概念对齐：Graph 在节点前持久化 checkpoint；AgentScope 在 tool 权限 ASK 时 emit 事件暂停。双栈 CorpAssist 可约定：Java 侧跑长事务审批流，Python AgentScope 侧跑轻量 ASK，审计格式统一 JSON Schema。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">AgentScope 侧避免</span>
+          <ul>
+            <li>ASK 事件不落库</li>
+            <li>改参后不写 modified_args</li>
+            <li>interrupt 后不 handle_interrupt</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">SAA 侧对齐</span>
+          <ul>
+            <li>Graph interrupt 对应 ASK 暂停点</li>
+            <li>统一 audit schema 跨栈</li>
+            <li>SSE 推送待审批到同一前端</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>外部执行工具（is_external_tool）与 ASK 有何区别？</summary>
+        <p>ASK 是权限确认，工具仍在 Agent 进程内执行；external 工具逻辑完全在外部系统运行，Agent 等外部回传结果事件。CorpAssist 大额转账宜用 external + 后端审批。</p>
+      </details>
+
+      <div class="learn-faq">
+        <details>
+          <summary>AgentScope ASK 与 LangGraph interrupt_before 有何异同？</summary>
+          <div class="learn-faq-body">
+            同：都在敏感步骤前暂停等人输入。异：LangGraph interrupt 绑 checkpoint 节点；AgentScope ASK 绑 tool Permission，粒度更细到单次 tool_call。CorpAssist 双栈可统一前端审批 UX，后端分别 resume。
+          </div>
+        </details>
+        <details>
+          <summary>interrupt 后 Agent 状态如何清理？</summary>
+          <div class="learn-faq-body">
+            Agent 运行 <code>handle_interrupt()</code> 取消进行中的 model/tool 任务；Memory 保留已确认 Msg，未完成的 tool_call 标记 cancelled。用户新指令作为新 UserMsg reply，而非从中间 tool 继续。
+          </div>
+        </details>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>CorpAssist 场景</th><th>Graph interrupt</th><th>AgentScope ASK</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>长事务审批（采购流程）</td><td>interrupt_before 节点</td><td>external tool + 后端</td></tr>
+          <tr><td>单次发邮件确认</td><td>过重</td><td>Permission ASK ✓</td></tr>
+          <tr><td>用户中途改需求</td><td>checkpoint 回滚</td><td>interrupt() ✓</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Realtime Steering</strong>：<code>interrupt()</code> 中途改向，须配合 handle_interrupt。</li>
+        <li><strong>审批改参</strong>：Permission ASK → 事件暂停 → ALLOW/MODIFY/DENY 恢复。</li>
+        <li><strong>审计</strong>：原参/改参/决裁/操作者全量记录。</li>
+        <li><strong>SAA 对照</strong>：Graph interrupt 与 AgentScope ASK 可双栈统一 UX。</li>
+        <li><strong>合规</strong>：敏感工具默认 ASK，而非事后追责。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering_practice04">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="steering" /> 能说明 interrupt 使用场景</label></li>
+          <li><label><input type="checkbox" data-id="ask-flow" /> 能描述 ASK 事件完整流程</label></li>
+          <li><label><input type="checkbox" data-id="modify" /> 能实现改参后 resume</label></li>
+          <li><label><input type="checkbox" data-id="audit" /> 能列出审计日志必填字段</label></li>
+          <li><label><input type="checkbox" data-id="saa" /> 能对照 SAA interrupt 节点</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Realtime Steering</td><td>interrupt 中途干预</td></tr>
+                <tr><td>Permission ASK</td><td>工具前暂停等确认</td></tr>
+                <tr><td>MODIFY</td><td>改参后再执行</td></tr>
+                <tr><td>audit_hitl</td><td>原参/改参/决裁落库</td></tr>
+                <tr><td>external tool</td><td>逻辑在外部系统</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 哪些工具应默认 ASK？列举三类并说明理由。</li>
+              <li>用户改参后 Agent 如何从暂停点精确恢复？</li>
+              <li>AgentScope HITL 与 LangGraph interrupt_before 有何异同？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-05-agentic-rag">Agentic RAG 集成</a> 衔接知识库问答。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.agentscope.io/v2/building-blocks/agent" target="_blank" rel="noopener">Agent — HITL 与权限</a></li>
+      <li><a href="https://java2ai.com/docs/dev/agents/graph/" target="_blank" rel="noopener">Spring AI Alibaba Graph — 人工节点</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 send_email 配置 ASK 权限，实现 CLI 审批流与 audit 落盘（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 Demo 将 <code>send_email</code> 注册为 <code>PermissionDecision.ASK</code>，跑通 <code>reply_stream</code> 捕获确认事件。</li>
+      <li>实现 CLI 提示 ALLOW/MODIFY/DENY；MODIFY 时编辑 to/subject 后再 resume Agent。</li>
+      <li>每次决裁调用 <code>audit_hitl</code> 追加写入 <code>audit.jsonl</code>。</li>
+      <li>对照正文 SAA 对照表，写 3 条 Graph interrupt 与 AgentScope ASK 的映射说明。</li>
+      <li>可选：完成 <code>demos/practice-04-hitl-lab/</code> 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">找错：团队把 DENY 决裁从审计日志中省略以「减少存储」，是否符合 CorpAssist 合规？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>不符合。DENY 同样是安全关键事件，须记录 operator、原参与拒绝原因，否则无法追溯「谁阻止了哪次外发」。合规审计要求决裁全量保留，包括拒绝。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：HITL 审批实验室</h4>
+      <p>目录：<code>demos/practice-04-hitl-lab/</code>。<strong>验收</strong>：<code>python hitl_demo.py</code> 触发 ASK；选 MODIFY 后 <code>audit.jsonl</code> 含 modified_args 字段。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-03-pipeline">Pipeline 工作流编排</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-05-agentic-rag">Agentic RAG 集成</a></li>
+      <li><a href="../spring-ai-alibaba-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI Alibaba 工程化</span><code class="course-ref-slug">spring-ai-alibaba-engineering</code></a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,406 @@
+<section id="ch-practice-05-agentic-rag" class="chapter" data-chapter="practice-05-agentic-rag">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agentic RAG 集成</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-05-agentic-rag" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>CorpAssist 工作流实战</strong> · 能力：将 RAG 检索链接入 AgentScope Agent</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 知识库问答不能仅靠静态 RAG 管线——Agent 需<strong>自主决定何时检索、检索什么、是否多轮</strong>。<span class="term" data-term-id="agentic-rag" tabindex="0">Agentic RAG</span> 把 <a href="../rag-system-py/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">RAG 系统（Python）</span><code class="course-ref-slug">rag-system-py</code></a> 的检索链封装为 Agent 工具，并配合 <span class="term" data-term-id="citation-tracing" tabindex="0">引用溯源</span> 与 <span class="term" data-term-id="hallucination-guard" tabindex="0">幻觉抑制</span> 策略落地生产。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>衔接 rag-system-py 的 LCEL/Chroma 检索链为 AgentScope 工具</li>
+          <li>构建 CorpAssist 知识库问答 ReActAgent</li>
+          <li>在回答中输出可点击的文档引用</li>
+          <li>应用检索置信度与拒答策略抑制幻觉</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>检索是工具不是前置步骤</strong>：Agent 按需调用，避免每次都全库检索。</li>
+          <li><strong>引用必须绑 chunk metadata</strong>：doc_id、page、score 写入回答。</li>
+          <li><strong>低置信度拒答</strong>：score 低于阈值时拒绝编造，建议转人工或换问法。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>衔接 rag-system-py 检索链</h3>
+
+      <p>在 <a href="../rag-system-py/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">rag-system-py</span><code class="course-ref-slug">rag-system-py</code></a> 中你已用 LangChain LCEL 构建 <span class="term" data-term-id="retrieval-chain" tabindex="0">检索链</span>（loader → splitter → embedding → Chroma retriever）。本章将该 retriever 包装为 async 工具函数，注册到 CorpAssist 知识库 Agent 的 Toolkit。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 企业知识库 Agent</span>
+        员工问：「年假最多几天？需要提前多久申请？」Agent 应先调用 <code>search_knowledge_base</code>，基于检索 chunk 回答，并在末尾列出 [1] 员工手册 §3.2 引用。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>Agentic RAG 调用链</h5>
+        <pre class="mermaid">flowchart LR
+    Q[用户问题] --> Agent[ReActAgent]
+    Agent -->|需要事实| Tool[search_knowledge_base]
+    Tool --> Retriever[Chroma Retriever\nfrom rag-system-py]
+    Retriever --> Chunks[Top-K Chunks + metadata]
+    Chunks --> Agent
+    Agent --> Ans[带引用的回答]</pre>
+        <p class="diagram-caption">Agent 自主决定是否检索；多轮对话可多次调用工具 refine query。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.agent import ReActAgent
+from agentscope.tool import Toolkit, ToolResponse
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+# 复用 rag-system-py 课 demo 构建的 vectorstore
+vectorstore = Chroma(persist_directory="./data/chroma", embedding_function=OpenAIEmbeddings())
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+async def search_knowledge_base(query: str) -> ToolResponse:
+    """检索 CorpAssist 企业知识库。输入自然语言问题，返回带 doc_id/page/score 的片段。"""
+    docs = retriever.invoke(query)
+    if not docs:
+        return ToolResponse(content="未找到相关文档，请换关键词或转人工。")
+    blocks = []
+    for i, doc in enumerate(docs, 1):
+        meta = doc.metadata
+        score = meta.get("score", "N/A")
+        blocks.append(
+            f"[{i}] doc={meta.get('source','?')} page={meta.get('page','?')} score={score}\n{doc.page_content[:400]}"
+        )
+    return ToolResponse(content="\n---\n".join(blocks))
+
+toolkit = Toolkit()
+toolkit.register_tool_function(search_knowledge_base)
+
+kb_agent = ReActAgent(
+    name="CorpAssistKB",
+    sys_prompt="你是知识库助手。回答必须基于 search_knowledge_base 结果，并标注 [n] 引用。无依据时拒答。",
+    model=DashScopeChatModel(model_name="qwen-max", api_key="..."),
+    formatter=DashScopeChatFormatter(),
+    toolkit=toolkit,
+    max_iters=6,
+)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为何不把 retriever 固定放在 Agent 前面做「先检索再回答」？</summary>
+        <p>固定链对纯 FAQ 低延迟，但 CorpAssist 统一入口混合闲聊、工具操作与知识问答——Agentic 模式让 Agent 自主决定是否检索，避免无关问题也全库 embedding 浪费 Token。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>知识库问答 Agent</h3>
+
+      <p><span class="term" data-term-id="agentic-rag" tabindex="0">Agentic RAG</span> 与「检索-然后-生成」管线的区别：Agent 可先澄清模糊问题、多次检索、或判断无需检索（闲聊）。CorpAssist KB Agent 的 sys_prompt 应强制：<strong>有事实性问题必须先检索</strong>；<strong>回答格式含引用块</strong>。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>模式</th><th>触发</th><th>适用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>单次检索</td><td>问题明确</td><td>政策条文查询</td></tr>
+          <tr><td>多轮检索</td><td>Agent 改写 query</td><td>跨文档综合</td></tr>
+          <tr><td>跳过检索</td><td>问候/元问题</td><td>「你能做什么」</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">KB_SYS_PROMPT = """你是 CorpAssist 知识库助手。
+规则：
+1. 涉及公司制度/政策/流程的事实性问题，必须先调用 search_knowledge_base
+2. 回答正文用 [1][2] 标注引用；末尾输出 ### 参考文献
+3. 工具无结果或低置信度时拒答，可建议 transfer_to_human
+4. 问候语直接回复，不必检索"""
+
+kb_agent = ReActAgent(
+    name="CorpAssistKB",
+    sys_prompt=KB_SYS_PROMPT,
+    toolkit=toolkit,
+    max_iters=6,
+)</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">KB Agent 反模式</span>
+          <ul>
+            <li>sys_prompt 未强制先检索</li>
+            <li>检索与回答用不同模型</li>
+            <li>无引用也输出具体数字</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>事实问题必须先 tool_call</li>
+            <li>同一 qwen-plus 保证风格一致</li>
+            <li>每条事实对应 citation ref_id</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>引用溯源</h3>
+
+      <p><span class="term" data-term-id="citation-tracing" tabindex="0">引用溯源</span> 要求每条事实对应 chunk metadata。工具返回格式应结构化（JSON 或固定模板），Agent 回答末尾附「参考文献」列表，前端可渲染为可点击链接（doc_id → 原文预览）。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import json
+
+async def search_knowledge_base_structured(query: str) -> ToolResponse:
+    docs = retriever.invoke(query)
+    citations = []
+    for i, doc in enumerate(docs, 1):
+        citations.append({
+            "ref_id": i,
+            "source": doc.metadata.get("source"),
+            "page": doc.metadata.get("page"),
+            "snippet": doc.page_content[:300],
+        })
+    payload = {"query": query, "citations": citations}
+    return ToolResponse(content=json.dumps(payload, ensure_ascii=False))
+
+# sys_prompt 片段：
+# 「正文用 [1][2] 标注；末尾输出 ### 参考文献 列表，含 source 与 page」</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>引用溯源数据流</h5>
+        <pre class="mermaid">flowchart LR
+    Retriever[Chroma Top-K] --> Tool[ToolResponse JSON]
+    Tool --> Agent[ReActAgent 推理]
+    Agent --> UI[回答 + 参考文献块]
+    UI --> Link[doc_id → 原文预览]</pre>
+        <p class="diagram-caption">metadata 从 retriever 经工具到 UI，全程不丢失 source/page。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>metadata 字段</th><th>用途</th><th>前端展示</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>source</td><td>文档路径或 doc_id</td><td>可点击链接</td></tr>
+          <tr><td>page</td><td>PDF 页码</td><td>跳转预览</td></tr>
+          <tr><td>score</td><td>相似度</td><td>低分灰显/拒答</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>幻觉抑制策略</h3>
+
+      <p><span class="term" data-term-id="hallucination-guard" tabindex="0">幻觉抑制</span> 组合拳：① 检索 score 阈值过滤；② sys_prompt 拒答指令；③ 回答后自检（可选第二 pass）；④ 低置信度转 <code>transfer_to_human</code>。与 rag-system-py 评估章节的 faithfulness 指标对齐。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">易幻觉</span>
+          <ul>
+            <li>无检索直接回答政策数字</li>
+            <li>忽略低 score chunk 硬拼答案</li>
+            <li>引用号与正文不对应</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">抑制策略</span>
+          <ul>
+            <li>score &lt; 0.65 拒答并建议换问法</li>
+            <li>工具空结果禁止编造</li>
+            <li>引用数 ≤ 检索 chunk 数</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">MIN_SCORE = 0.65
+
+async def search_with_threshold(query: str) -> ToolResponse:
+    docs = retriever.invoke(query)
+    filtered = [d for d in docs if d.metadata.get("score", 1.0) >= MIN_SCORE]
+    if not filtered:
+        return ToolResponse(
+            content=f"检索置信度均低于 {MIN_SCORE}，无法可靠回答。请转人工或细化问题。"
+        )
+    return format_citations(filtered)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>Agentic RAG 比固定 RAG 链更费 Token，何时仍值得？</summary>
+        <p>当问题类型混合（部分需检索、部分需工具操作）、或需多轮改写 query 时，Agent 按需检索更省平均 Token。纯 FAQ 高 QPS 场景可保留固定链 + 小模型。</p>
+      </details>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Agentic RAG 如何与 rag-system-py 评估指标对齐？</summary>
+          <div class="learn-faq-body">
+            复用 rag-system-py 的 faithfulness / answer_relevance 评测集：Agentic 路径在 golden 中增加 <code>must_call_tools: ["search_knowledge_base"]</code> 断言。引用准确率单独测 citation 与 chunk 对应关系。
+          </div>
+        </details>
+        <details>
+          <summary>多轮检索何时触发？</summary>
+          <div class="learn-faq-body">
+            首次检索 score 偏低或结果不覆盖子问题时，Agent 在 ReAct 第二轮改写 query 再调工具。max_iters=6 限制最多约 2～3 次检索；更多轮应拆分为明确子问题或转人工。
+          </div>
+        </details>
+        <details>
+          <summary>Chroma 与 DashScope Embedding 如何配合？</summary>
+          <div class="learn-faq-body">
+            索引阶段 embedding 模型须与查询阶段一致（见 rag-system-py）。CorpAssist 生产可用 DashScope text-embedding-v3；Agent 工具内只做 retriever.invoke，不在线换 embedding 模型。
+          </div>
+        </details>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 制度问答拒答</span>
+        用户问「火星移民政策」——检索 score 均 &lt;0.65，工具返回拒答文案，Agent 不编造数字并建议联系 HR 或换关键词。审计记录 tool 空结果与拒答原因。
+      </aside>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">静态 RAG 链</span>
+          <ul>
+            <li>所有问题都检索，闲聊也 embedding</li>
+            <li>无法在同一 Agent 内调工单工具</li>
+            <li>query 改写需额外 pipeline 节点</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Agentic RAG</span>
+          <ul>
+            <li>按需检索，混合意图统一入口</li>
+            <li>检索 + 办公工具同一 ReActAgent</li>
+            <li>多轮 query 改写原生支持</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>衔接 rag-system-py</strong>：retriever 包装为 Toolkit 工具。</li>
+        <li><strong>Agentic</strong>：Agent 自主决定检索时机与次数。</li>
+        <li><strong>引用</strong>：chunk metadata → [n] 标注 + 参考文献块。</li>
+        <li><strong>幻觉抑制</strong>：阈值拒答 + 空结果禁编造 + HITL 兜底。</li>
+        <li><strong>practice 阶段收官</strong>：下一进入 advanced Agent Service 章。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering_practice05">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="wrap-retriever" /> 能将 Chroma retriever 封装为工具</label></li>
+          <li><label><input type="checkbox" data-id="citation" /> 能设计引用 JSON 格式</label></li>
+          <li><label><input type="checkbox" data-id="threshold" /> 能配置 score 阈值拒答</label></li>
+          <li><label><input type="checkbox" data-id="agentic-vs-static" /> 能对比 Agentic vs 固定 RAG 链</label></li>
+          <li><label><input type="checkbox" data-id="rag-course-link" /> 能指出 rag-system-py 对应章节</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Agentic RAG</td><td>检索作为 Agent 工具按需调用</td></tr>
+                <tr><td>search_knowledge_base</td><td>封装 retriever 的 async 工具</td></tr>
+                <tr><td>引用溯源</td><td>metadata → [n] 可点击</td></tr>
+                <tr><td>MIN_SCORE</td><td>低置信度拒答</td></tr>
+                <tr><td>rag-system-py</td><td>LCEL/Chroma 检索链前置课</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何将 rag-system-py 的 retriever 无缝接入 AgentScope Toolkit？</li>
+              <li>CorpAssist 知识库 Agent 如何证明回答「有依据」而非幻觉？</li>
+              <li>Agentic RAG 在成本和准确率上与固定链如何权衡？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">practice 阶段完结。下一步：<a href="#ch-advanced-01-agent-service">Agent Service 服务化入门</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.agentscope.io/v2/building-blocks/tool" target="_blank" rel="noopener">AgentScope Tool 注册</a></li>
+      <li><a href="../rag-system-py/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">RAG 系统（Python）— 检索链基础</span><code class="course-ref-slug">rag-system-py</code></a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">将 rag-system-py 风格 retriever 接入 ReActAgent，输出带 [n] 引用且低分拒答（约 45 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>从 <a href="../rag-system-py/index.html#ch-practice-01-langchain-rag" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">rag-system-py · LangChain RAG 实战</span><code class="course-ref-slug">rag-system-py</code></a> 复用 Chroma 索引路径，实现 <code>search_knowledge_base</code> 工具。</li>
+      <li>配置 KB Agent sys_prompt：强制先检索、回答含 [n]、末尾参考文献块。</li>
+      <li>加入 <code>MIN_SCORE=0.65</code> 过滤，测试低相关问题时拒答文案。</li>
+      <li>问「年假政策」与「你好」两类问题，对比是否触发检索（观察 tool_call 事件）。</li>
+      <li>可选：完成 <code>demos/practice-05-agentic-rag-lab/</code> 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">权衡：高 QPS 纯 FAQ 入口应直接固定 RAG 链还是 Agentic RAG？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>高 QPS 纯 FAQ 优先固定 RAG 链 + 小模型，延迟与成本更低。Agentic RAG 适合混合意图（检索+工单+邮件）或需多轮 query 改写的 CorpAssist 统一入口。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Agentic RAG 实验室</h4>
+      <p>目录：<code>demos/practice-05-agentic-rag-lab/</code>。<strong>验收</strong>：<code>python kb_agent_demo.py "年假最多几天"</code> 含 [1] 引用；<code>python kb_agent_demo.py "火星移民政策"</code> 触发拒答或转人工。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>前置</strong>：<a href="../rag-system-py/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">RAG 系统（Python）</span><code class="course-ref-slug">rag-system-py</code></a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-01-agent-service">Agent Service 服务化入门</a></li>
+      <li><a href="../rag-system-py/index.html#ch-practice-04-rag-eval" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">RAG 评估</span><code class="course-ref-slug">rag-system-py</code></a> — faithfulness 指标</li>
+    </ul>
+  </div>
+</section>

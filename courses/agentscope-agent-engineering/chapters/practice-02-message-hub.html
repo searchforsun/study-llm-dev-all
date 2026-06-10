@@ -1,0 +1,421 @@
+<section id="ch-practice-02-message-hub" class="chapter" data-chapter="practice-02-message-hub">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Message Hub 多 Agent 协作</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-02-message-hub" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>CorpAssist 工作流实战</strong> · 能力：用 MsgHub 编排多 Agent 协作</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 复杂任务需要「主管 + 专家工人」分工。<span class="term" data-term-id="msg-hub" tabindex="0">MsgHub</span> 是 AgentScope 的消息广播中枢，让多个 ReActAgent 在同一上下文中互相 observe，无需手写消息转发。本章对比 <span class="term" data-term-id="handoff" tabindex="0">Handoff</span> 与 Java Sub-agent 模式，帮你选对协作范式。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <span class="term" data-term-id="supervisor-worker" tabindex="0">主管-工人模式</span> 分解 CorpAssist 任务</li>
+          <li>在 MsgHub 内实现显式消息传递与动态增删参与者</li>
+          <li>区分 MsgHub 广播协作与 Handoff 任务委派</li>
+          <li>对照 AgentScope Java Sub-agent 的异同</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>MsgHub = 自动广播</strong>：参与者 reply 时，其他人自动 observe。</li>
+          <li><strong>Handoff = 层级委派</strong>：Orchestrator 创建 Worker，上下文隔离更强。</li>
+          <li><strong>显式广播</strong>：<span class="term" data-term-id="explicit-messaging" tabindex="0">hub.broadcast</span> 可分级投递消息。</li>
+          <li><strong>多 Agent 需 MultiAgentFormatter</strong>：否则角色名混淆导致偏航。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>主管-工人模式</h3>
+
+      <p>CorpAssist 项目协调场景：Supervisor 理解用户意图，调度 CalendarWorker、MailWorker、TicketWorker。Supervisor 不直接操作外部系统，而是通过 MsgHub 广播任务描述，专家 Agent 在共享上下文中各自 reply。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 项目启动会</span>
+        用户：「订明天 10 点 A301，发邮件通知项目组，并建 IT 工单申请投影设备。」Supervisor 在 Hub 内依次调度 CalendarWorker → MailWorker → TicketWorker，每个 Worker 只看到自己领域工具，最终 Supervisor 汇总三份汇报给用户。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>MsgHub 主管-工人协作</h5>
+        <pre class="mermaid">flowchart TB
+    User[用户] --> Sup[Supervisor Agent]
+    subgraph Hub[MsgHub 上下文]
+        Sup --> Cal[CalendarWorker]
+        Sup --> Mail[MailWorker]
+        Cal --> Sup
+        Mail --> Sup
+    end
+    Sup --> Reply[汇总回复用户]</pre>
+        <p class="diagram-caption">Supervisor 在 Hub 内依次 invoke 专家；专家 reply 自动被 Supervisor observe。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+import os
+from agentscope.agent import ReActAgent
+from agentscope.formatter import DashScopeMultiAgentFormatter
+from agentscope.message import Msg
+from agentscope.model import DashScopeChatModel
+from agentscope.pipeline import MsgHub
+from agentscope.tool import Toolkit
+
+def make_worker(name: str, role: str, tools: list) -> ReActAgent:
+    tk = Toolkit()
+    for t in tools:
+        tk.register_tool_function(t)
+    return ReActAgent(
+        name=name,
+        sys_prompt=f"你是 {name}，专职{role}。只处理自己领域，完成后简要汇报。",
+        model=DashScopeChatModel(model_name="qwen-max", api_key=os.environ["DASHSCOPE_API_KEY"]),
+        formatter=DashScopeMultiAgentFormatter(),
+        toolkit=tk,
+        max_iters=5,
+    )
+
+async def run_supervisor_flow(user_text: str):
+    supervisor = ReActAgent(
+        name="Supervisor",
+        sys_prompt="协调 Calendar/Mail 专家完成用户请求，最后汇总。",
+        model=DashScopeChatModel(model_name="qwen-max", api_key=os.environ["DASHSCOPE_API_KEY"]),
+        formatter=DashScopeMultiAgentFormatter(),
+        max_iters=6,
+    )
+    calendar = make_worker("CalendarWorker", "日历", [create_calendar_event])
+    mail = make_worker("MailWorker", "邮件", [send_email])
+
+    async with MsgHub(
+        participants=[supervisor, calendar, mail],
+        announcement=Msg("user", user_text, "user"),
+    ) as hub:
+        await supervisor(Msg("system", "请调度专家完成上述请求", "system"))
+        await calendar()
+        await mail()
+        final = await supervisor()
+    return final.get_text_content()</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>角色</th><th>职责</th><th>工具集</th><th>max_iters</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Supervisor</td><td>理解意图、调度、汇总</td><td>无（或只读查询）</td><td>6</td></tr>
+          <tr><td>CalendarWorker</td><td>日历 CRUD</td><td>create_calendar_event</td><td>5</td></tr>
+          <tr><td>MailWorker</td><td>邮件发送</td><td>send_email</td><td>5</td></tr>
+          <tr><td>TicketWorker</td><td>IT 工单</td><td>create_ticket</td><td>5</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Supervisor 为何不应注册全部业务工具？</summary>
+        <p>Supervisor 持有全工具集会导致它绕过专家直接执行，破坏分工与审计边界。正确做法是 Supervisor 只协调，专家各自 Toolkit；必要时 Supervisor 仅保留 <code>transfer_to_human</code>。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>显式消息传递</h3>
+
+      <p><span class="term" data-term-id="explicit-messaging" tabindex="0">显式消息传递</span> 指在 <code>enable_auto_broadcast=False</code> 时，由编排代码通过 <code>hub.broadcast()</code> 精确控制谁能看到什么。适用于部分信息需要对某 Agent 保密（如 HR 薪资）的场景。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>模式</th><th>配置</th><th>适用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>自动广播</td><td><code>enable_auto_broadcast=True</code></td><td>开放式讨论、头脑风暴</td></tr>
+          <tr><td>手动广播</td><td><code>False</code> + <code>hub.broadcast()</code></td><td>分级信息、合规隔离</td></tr>
+          <tr><td>动态参与者</td><td><code>hub.add()</code> / <code>hub.delete()</code></td><td>按需拉入专家</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async with MsgHub(participants=[supervisor], enable_auto_broadcast=False) as hub:
+    hub.add(calendar_worker)
+    await hub.broadcast(Msg("user", "只需 Calendar 处理：订明天 10 点会议室", "user"))
+    await calendar_worker()
+    # MailWorker 未加入，不会看到消息</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">广播误用</span>
+          <ul>
+            <li>薪资信息 auto_broadcast 给所有 Worker</li>
+            <li>忘记 hub.add 就 await Worker</li>
+            <li>手动 broadcast 后仍开 auto_broadcast</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">合规隔离</span>
+          <ul>
+            <li>HR 消息只 broadcast 给 HRWorker</li>
+            <li>enable_auto_broadcast=False 精确控制</li>
+            <li>动态 hub.add 按需拉专家</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>动态增删参与者</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async with MsgHub(participants=[supervisor], enable_auto_broadcast=True) as hub:
+    await supervisor(Msg("user", "先查日程", "user"))
+    await calendar_worker()
+    # 用户追加需求 — 动态拉入 MailWorker
+    hub.add(mail_worker)
+    await hub.broadcast(Msg("user", "再加发邮件通知", "user"))
+    await mail_worker()
+    hub.delete(calendar_worker)  # 日历已完成，移出 Hub
+    final = await supervisor()</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>hub.add 后加入的 Agent 为什么看不到历史？</summary>
+          <div class="learn-faq-body">
+            MsgHub 只向当前参与者广播<strong>之后</strong>的消息；新 Agent 无 retroactive observe。若新专家需要上下文，Supervisor 应 broadcast 一条摘要 Msg 而非依赖自动历史。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>角色分工与 Handoff</h3>
+
+      <p><span class="term" data-term-id="handoff" tabindex="0">Handoff</span> 将子 Agent 包装为工具，Orchestrator 自主决定调用哪个 Worker；Worker 仅收到任务描述，不共享完整对话。MsgHub 则共享完整上下文，适合需要交叉引用的协作。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">MsgHub 不适用</span>
+          <ul>
+            <li>独立子任务可完全并行且无交叉引用</li>
+            <li>Worker 不应看到彼此中间结果</li>
+            <li>需要动态创建/销毁 Worker</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">Handoff 更合适</span>
+          <ul>
+            <li>Orchestrator 用 toolkit 注册 Worker 工具</li>
+            <li>子任务隔离、结果汇总</li>
+            <li>与 Agent-as-Tool 模式一致</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>Handoff 实现示意</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.tool import Toolkit
+
+async def calendar_worker_tool(task: str) -> ToolResponse:
+    """委派日历专家处理任务。输入任务描述，返回执行摘要。"""
+    worker = make_worker("CalendarWorker", "日历", [create_calendar_event])
+    msg = Msg("user", task, "user")
+    result = await worker(msg)
+    return ToolResponse(content=result.get_text_content())
+
+orchestrator = ReActAgent(
+    name="Orchestrator",
+    sys_prompt="用 calendar_worker_tool / mail_worker_tool 委派子任务。",
+    toolkit=Toolkit(tools=[calendar_worker_tool, mail_worker_tool]),
+    max_iters=6,
+)
+# Handoff：子 Agent 上下文隔离，Orchestrator 只见工具返回</code></pre>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>场景</th><th>MsgHub</th><th>Handoff</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>专家需互相引用结论</td><td>✓</td><td>✗</td></tr>
+          <tr><td>子任务完全独立</td><td>可选</td><td>✓</td></tr>
+          <tr><td>信息分级隔离</td><td>手动 broadcast</td><td>✓</td></tr>
+          <tr><td>trace 长度敏感</td><td>较长（共享历史）</td><td>较短</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Java Sub-agent 对照</h3>
+
+      <p>AgentScope Java 2.0 的 Sub-agent 通过 SAA Starter 以嵌套 Agent 或 Tool 形式暴露；Python MsgHub 更偏「会议室广播」，Java 侧常见「Router + SubAgentTool」层级。双栈联调时，Python MsgHub 产出的事件流可映射为 Java <code>streamEvents</code> 的多参与者 trace。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>能力</th><th>Python MsgHub</th><th>Java Sub-agent</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>上下文</td><td>参与者共享 observe</td><td>Sub-agent 通常隔离</td></tr>
+          <tr><td>编排</td><td>显式 await 顺序</td><td>Router 工具调用</td></tr>
+          <tr><td>Formatter</td><td>DashScopeMultiAgentFormatter</td><td>MultiAgentContentFormatter</td></tr>
+          <tr><td>可观测</td><td>reply_stream 事件</td><td>streamEvents SSE</td></tr>
+        </tbody>
+      </table>
+
+      <details class="learn-micro-check">
+        <summary>CorpAssist 跨栈场景：Python 编排 + Java 工具服务，MsgHub 放哪一侧？</summary>
+        <p>编排与 MsgHub 通常在 Python 侧（本课主栈）；Java 侧暴露 REST/MCP 工具供 Worker 调用。避免双端各建 MsgHub 导致消息环。</p>
+      </details>
+
+      <div class="mermaid-wrap">
+        <h5>Python MsgHub + Java 工具服务</h5>
+        <pre class="mermaid">flowchart LR
+    Hub[Python MsgHub] --> CW[CalendarWorker]
+    CW --> MCP[MCP / REST]
+    MCP --> Java[Spring 日历服务]
+    Hub --> MW[MailWorker]
+    MW --> MCP2[邮件 MCP]</pre>
+        <p class="diagram-caption">MsgHub 编排留在 Python；Java 提供工具实现，不重复建 Hub。</p>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>MultiAgentFormatter 选错会怎样？</summary>
+          <div class="learn-faq-body">
+            模型无法区分 Msg 来自哪个 Agent，可能把 CalendarWorker 的回复当成用户输入，或 Supervisor 误以为自己已执行工具。CorpAssist 多 Agent 场景必须使用 <code>DashScopeMultiAgentFormatter</code>。
+          </div>
+        </details>
+        <details>
+          <summary>MsgHub 内 Agent 调用顺序如何定？</summary>
+          <div class="learn-faq-body">
+            MsgHub 不自动调度——编排代码显式 <code>await agent()</code> 顺序。Supervisor 先理解 → 各 Worker 执行 → Supervisor 汇总是常见三段式；顺序错误会导致 Worker 在缺少上下文时行动。
+          </div>
+        </details>
+        <details>
+          <summary>MsgHub 与 Pipeline sequential 如何组合？</summary>
+          <div class="learn-faq-body">
+            Hub 内某一阶段可跑 <code>sequential_pipeline</code>：例如 Supervisor 广播后，三个 Worker 用 Pipeline 串行处理子 SOP。见 practice-03 组合模式。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>MsgHub</strong>：async 上下文管理器，自动广播参与者 reply。</li>
+        <li><strong>主管-工人</strong>：Supervisor 调度专家，MultiAgentFormatter 必备。</li>
+        <li><strong>显式传递</strong>：关闭 auto_broadcast 时用 broadcast 精确路由。</li>
+        <li><strong>Handoff</strong>：任务隔离场景优于 MsgHub 全量共享。</li>
+        <li><strong>Java 对照</strong>：Sub-agent 偏层级，MsgHub 偏对等广播。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering_practice02">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="msghub-basic" /> 能写出 MsgHub 三行最小示例</label></li>
+          <li><label><input type="checkbox" data-id="formatter" /> 能解释为何需要 MultiAgentFormatter</label></li>
+          <li><label><input type="checkbox" data-id="handoff-vs-hub" /> 能对比 MsgHub 与 Handoff 选型</label></li>
+          <li><label><input type="checkbox" data-id="broadcast" /> 能用手动 broadcast 做信息隔离</label></li>
+          <li><label><input type="checkbox" data-id="java-compare" /> 能说明 Java Sub-agent 差异</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>MsgHub</td><td>参与者 reply 自动互 observe</td></tr>
+                <tr><td>announcement</td><td>进入 Hub 时广播的开场消息</td></tr>
+                <tr><td>Handoff</td><td>Agent-as-Tool 任务委派</td></tr>
+                <tr><td>hub.add</td><td>动态加入，不见历史消息</td></tr>
+                <tr><td>Supervisor</td><td>协调专家、汇总结果</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>MsgHub 与 Handoff 各适合 CorpAssist 哪类场景？举两例。</li>
+              <li>新加入 MsgHub 的 Agent 为什么看不到历史消息？</li>
+              <li>多 Agent 协作中 Formatter 选错会导致什么问题？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-03-pipeline">Pipeline 工作流编排</a> 学习串行/并行步骤与失败重试。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.agentscope.io/building-blocks/orchestration" target="_blank" rel="noopener">Orchestration — MsgHub</a></li>
+      <li><a href="https://docs.agentscope.io/tutorial/tutorial_sales_agent" target="_blank" rel="noopener">Multi-Agent Customer Support 教程</a></li>
+      <li><a href="https://java.agentscope.io/" target="_blank" rel="noopener">AgentScope Java 文档</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现 Supervisor + Calendar/Mail 双 Worker 的 MsgHub 协作，并对比 Handoff 变体（约 40 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照正文 Mermaid 图，在 Demo 中创建 Supervisor 与两个 Worker，共用 <code>DashScopeMultiAgentFormatter</code>。</li>
+      <li>用 <code>MsgHub(announcement=...)</code> 传入用户复合请求，按 Supervisor → Calendar → Mail 顺序 await。</li>
+      <li>将 <code>enable_auto_broadcast=False</code>，改用手动 <code>hub.broadcast</code> 仅让 Calendar 处理日程部分。</li>
+      <li>对照「MsgHub vs Handoff」表，用 Agent-as-Tool 实现同等 Handoff 流程并比较 trace 长度。</li>
+      <li>可选：完成 <code>demos/practice-02-message-hub-lab/</code> 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">CorpAssist 需要三个专家互相引用彼此结论做最终决策，应选 MsgHub 还是 Handoff？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>选 MsgHub。专家需要 observe 彼此 reply 才能交叉引用；Handoff 下 Worker 仅见 Orchestrator 分配的任务片段，不适合开放式讨论。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Message Hub 协作实验室</h4>
+      <p>目录：<code>demos/practice-02-message-hub-lab/</code>。<strong>验收</strong>：<code>python message_hub_demo.py</code> 输出 Supervisor 汇总；手动广播模式下 MailWorker 不应收到仅给 Calendar 的消息。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-01-single-agent">单 Agent 办公助手</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-03-pipeline">Pipeline 工作流编排</a></li>
+      <li><a href="../agentscope-agent-engineering-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">AgentScope 多 Agent 工程（Java）</span><code class="course-ref-slug">agentscope-agent-engineering-java</code></a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,403 @@
+<section id="ch-basics-04-memory" class="chapter" data-chapter="basics-04-memory">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>记忆：短期与长期控制</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-04-memory" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>AgentScope 核心抽象</strong> · 能力：控制对话历史、长期记忆与上下文裁剪</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 用户可能连续多轮布置任务——Agent 必须记住「刚才说的报告模板」又不能撑爆 Token 预算。<span class="term" data-term-id="short-term-memory" tabindex="0">短期记忆</span> 管理当前会话 Msg 列表；<span class="term" data-term-id="agentic-memory" tabindex="0">Agentic 长期记忆</span> 让 Agent 主动写入/检索跨会话事实。本章衔接 <a href="../context-memory-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">上下文与记忆工程</span><code class="course-ref-slug">context-memory-engineering</code></a> 的系统化方法。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>配置 AgentScope Memory 管理多轮 UserMsg / AgentMsg</li>
+          <li>使用 Agentic 记忆 API 持久化用户偏好与任务上下文</li>
+          <li>启用<span class="term" data-term-id="context-trimming" tabindex="0">上下文窗口自动裁剪</span> 策略</li>
+          <li>将 AgentScope 记忆层与 context-memory-engineering 课对照</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>短期 = 会话内 Msg 链</strong>：ReAct 每轮都会读取完整可见历史。</li>
+          <li><strong>长期 = Agent 主动存取</strong>：不是简单 append，而是检索后再注入。</li>
+          <li><strong>裁剪先于溢出</strong>：Token 超阈值时 summarization 或 sliding window。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>对话历史管理</h3>
+      <p><span class="term" data-term-id="short-term-memory" tabindex="0">对话历史</span> 在 AgentScope 中由 Memory 组件持有。默认 InMemoryMemory 适合 Demo；生产可换 Redis / 数据库后端，与 LangGraph checkpoint 的 messages 字段类似但 API 不同。</p>
+
+      <div class="mermaid-wrap">
+        <h5>多轮对话与 Memory</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as User
+    participant A as Agent
+    participant Mem as Memory
+
+    U->>A: UserMsg 轮次1
+    A->>Mem: 写入 Msg
+    A-->>U: AgentMsg 回复1
+    U->>A: UserMsg 轮次2
+    A->>Mem: 读取历史 + 新 Msg
+    A-->>U: AgentMsg 回复2</pre>
+        <p class="diagram-caption">每轮 reply 前 Memory 提供完整可见上下文。</p>
+      </div>
+
+      <h4>Memory 初始化与多轮对话</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.agent import Agent
+from agentscope.memory import InMemoryMemory
+from agentscope.message import UserMsg
+
+memory = InMemoryMemory()
+agent = Agent(
+    name="S3-Assistant",
+    model=model,
+    toolkit=toolkit,
+    memory=memory,
+)
+
+async def multi_turn():
+    await agent.reply(UserMsg("user", "我是华东区销售张三"))
+    await agent.reply(UserMsg("user", "刚才说的区域，帮我查 Q1 数据"))  # 依赖短期记忆</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：工具返回的大段 JSON 应进 Memory 吗？</summary>
+        <p>应截断或摘要后再写入。原始 JSON 快速占满上下文，导致后续轮次挤掉用户关键指令——这是 CorpAssist 记忆溢出的常见原因。</p>
+      </details>
+
+      <h4>Redis 持久化 Memory（生产示意）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># 概念：session_id 绑定 Memory 后端
+SESSION_ID = "corp-user-zhangsan-20260610"
+
+memory = RedisMemory(  # 伪代码类名，以实现为准
+    redis_url="redis://localhost:6379/0",
+    session_id=SESSION_ID,
+)
+
+agent = Agent(name="S3", model=model, memory=memory, toolkit=toolkit)</code></pre>
+      </div>
+
+      <ul>
+        <li>多 Worker 部署时，Memory 必须外置，否则请求打到不同 Pod 会丢上下文。</li>
+        <li><span class="term" data-term-id="short-term-memory" tabindex="0">短期记忆</span> 与 LangGraph checkpoint 可并存：前者供 AgentScope reply，后者供子图恢复。</li>
+        <li><span class="term" data-term-id="token-budget" tabindex="0">Token 预算</span> 与 Memory max_tokens 应联动配置，防止长对话撑爆上下文。</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>Agentic 长期记忆</h3>
+      <p><span class="term" data-term-id="agentic-memory" tabindex="0">Agentic 长期记忆</span> 允许 Agent 在对话中调用 memory 工具写入「用户偏好：报告用表格」或检索「上次会议纪要模板」。AgentScope 2.0 提供长期记忆存储抽象，可对接向量库或 KV。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>类型</th><th>生命周期</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>短期 Memory</td><td>单 session</td><td>当前任务的多轮指令</td></tr>
+          <tr><td>长期 Agentic</td><td>跨 session</td><td>用户默认邮件签名、部门代码</td></tr>
+          <tr><td>外部 RAG</td><td>知识库版本</td><td>公司制度 PDF（见 practice-05）</td></tr>
+        </tbody>
+      </table>
+
+      <h4>长期记忆读写工具</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.memory import LongTermMemory
+
+ltm = LongTermMemory(store="redis://localhost:6379/1")
+
+agent = Agent(
+    name="S3-Assistant",
+    model=model,
+    toolkit=toolkit,
+    memory=InMemoryMemory(),
+    long_term_memory=ltm,
+    enable_memory_tools=True,  # Agent 可主动 store/recall
+)
+
+# Agent 在 ReAct 中可调用：
+# memory_store(key="report_format", value="表格+趋势图")
+# memory_recall(query="用户报告格式偏好")</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>把所有历史邮件全文写入长期记忆</li>
+            <li>长期记忆无 TTL，隐私数据永久保留</li>
+            <li>recall 不限制条数，一次注入 50 条</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>只存结构化偏好与任务状态</li>
+            <li>敏感字段加密 + 保留策略</li>
+            <li>recall top_k=3 再注入 prompt</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>上下文窗口自动裁剪</h3>
+      <p><span class="term" data-term-id="context-trimming" tabindex="0">自动裁剪</span> 在 Token 接近模型上限时触发：保留 system + 最近 N 轮 + 可选摘要中间段。AgentScope 2.0 Memory 支持 <code>max_tokens</code> 与 summarization 钩子。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>无上限 append，直到 API 400</li>
+            <li>裁剪时丢掉 system_prompt</li>
+            <li>摘要用同一模型但不缓存，成本翻倍</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>max_tokens=0.8 × 模型窗口</li>
+            <li>优先裁最旧 tool 观察，保留 user 目标句</li>
+            <li>摘要用小模型（NS3 成本）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>裁剪策略配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.memory import InMemoryMemory
+
+memory = InMemoryMemory(
+    max_tokens=120_000,          # qwen-plus 上下文约 128k
+    keep_recent_turns=6,         # 至少保留最近 6 轮
+    summarize_after_tokens=100_000,
+    summarizer_model="qwen-turbo",  # 廉价摘要模型
+)</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>裁剪决策流</h5>
+        <pre class="mermaid">flowchart TD
+    Check[Token 计数] --> Over{超过阈值?}
+    Over -->|否| OK[正常 reply]
+    Over -->|是| Sum[摘要最旧段落]
+    Sum --> Drop[丢弃已摘要 Msg]
+    Drop --> OK</pre>
+        <p class="diagram-caption">摘要与 sliding window 可组合使用。</p>
+      </div>
+
+      <h4>工具观察截断示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">MAX_TOOL_OBS_CHARS = 2000
+
+def truncate_tool_result(raw: str) -> str:
+    if len(raw) <= MAX_TOOL_OBS_CHARS:
+        return raw
+    return raw[:MAX_TOOL_OBS_CHARS] + f"\n...[truncated {len(raw)-MAX_TOOL_OBS_CHARS} chars]"</code></pre>
+      </div>
+
+      <p><span class="term" data-term-id="context-trimming" tabindex="0">自动裁剪</span> 触发时优先删除最旧的 tool 观察，保留最近 user 指令与 system_prompt。生产环境可配合 <span class="term" data-term-id="summarization-hook" tabindex="0">摘要钩子</span> 在裁剪前将最旧段落压缩为一条 system 摘要 Msg，避免完全丢失早期上下文。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>摘要钩子与 keep_recent_turns 如何配合？</summary>
+          <div class="learn-faq-body">
+            当 Token 超过 <code>summarize_after_tokens</code> 时触发钩子：最旧 N 轮 Msg 送入 qwen-turbo 生成一条「历史摘要」Msg，再从 Memory 删除原文。<code>keep_recent_turns</code> 保证最近对话完整保留，摘要 Msg 插入 system 段之后。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 context-memory-engineering 衔接</h3>
+      <p>系统课 <span class="term" data-term-id="memory-engineering" tabindex="0">记忆工程</span> 讲解 Working Memory、Semantic Memory 分层与评估指标。AgentScope 的 Memory / LongTermMemory 是该理论在 Python 栈的落地：短期对应 Working，长期 Agentic 对应 Semantic 写入通道。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>概念（系统课）</th><th>AgentScope 2.0</th><th>实践建议</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Working Memory</td><td>InMemoryMemory 当前 session</td><td>配 max_tokens 裁剪</td></tr>
+          <tr><td>Semantic Memory</td><td>LongTermMemory + 向量检索</td><td>用户偏好与事实</td></tr>
+          <tr><td>Episodic</td><td>会话 log + OTel</td><td>审计不注入 prompt</td></tr>
+          <tr><td>评估</td><td>recall@k、任务成功率</td><td>见 context-memory 课</td></tr>
+        </tbody>
+      </table>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 跨天任务续接</span>
+        用户周一说「用表格模板」，周三回来问「按我的模板导出」——长期记忆 recall 命中 key=report_format；若仅短期 Memory，周三新 session 会丢失偏好。
+      </aside>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Memory 与 RAG 知识库如何分工？</summary>
+          <div class="learn-faq-body">
+            RAG 存公司制度等公共知识；Agentic 长期记忆存用户级偏好与任务状态。CorpAssist 制度问答走 RAG Agent（practice-05），个人模板走 LongTermMemory。
+          </div>
+        </details>
+      </div>
+
+      <h4>与 context-memory-engineering 对照清单</h4>
+      <ul>
+        <li>完成系统课「Working Memory 评估」实验后，在本课用相同 session 脚本对比 AgentScope Memory 行为。</li>
+        <li><span class="term" data-term-id="memory-engineering" tabindex="0">记忆工程</span> 中的 recall@k 指标可用于长期记忆质量验收。</li>
+        <li>Episodic 日志进 OTel，不进入 prompt，避免审计数据污染推理。</li>
+      </ul>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">记忆混用</span>
+          <ul>
+            <li>把 RAG chunk 写入 LongTermMemory</li>
+            <li>短期 Memory 无 session 隔离</li>
+            <li>裁剪后 UI 仍展示「已遗忘」的旧事实</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">分层清晰</span>
+          <ul>
+            <li>公共知识 → RAG 工具按需检索</li>
+            <li>用户偏好 → LongTermMemory store/recall</li>
+            <li>当前任务 → 短期 Memory + 裁剪</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>摘要钩子配置示意</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def summarize_old_turns(msgs: list) -> str:
+    """摘要钩子：将最旧 Msg 压缩为一段文本。"""
+    text = "\n".join(m.content for m in msgs if hasattr(m, "content"))
+    summary_model = DashScopeChatModel(model="qwen-turbo")
+    reply = await summary_model.chat(
+        messages=[{"role": "user", "content": f"用 3 句话摘要：\n{text[:8000]}"}]
+    )
+    return reply.content
+
+memory = InMemoryMemory(
+    max_tokens=120_000,
+    summarize_after_tokens=100_000,
+    on_summarize=summarize_old_turns,
+)</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>问题症状</th><th>可能原因</th><th>修复</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>第二轮忘记实体</td><td>新 Agent 实例未共享 Memory</td><td>同 session_id 注入</td></tr>
+          <tr><td>API 400 context length</td><td>未裁剪 tool 观察</td><td>max_tokens + 截断</td></tr>
+          <tr><td>跨天偏好丢失</td><td>未启用 LongTermMemory</td><td>enable_memory_tools</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 如何决定一条信息进短期 Memory 还是长期 Agentic？</li>
+              <li>记忆溢出与工具 JSON 膨胀的关系？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>对话历史管理</strong>：Memory 持有多轮 Msg，生产需持久化后端。</li>
+        <li><strong>Agentic 长期记忆</strong>：Agent 主动 store/recall，跨 session 保留偏好与事实。</li>
+        <li><strong>上下文裁剪</strong>：max_tokens + 摘要防止溢出，优先保留用户目标与最近轮次。</li>
+        <li><strong>记忆工程衔接</strong>：Working/Semantic 分层与系统课概念一一对应。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：下一章 <a href="#ch-basics-05-model-adaptation">模型适配与 DashScope</a> 配置多模型路由与 NS3 成本。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://doc.agentscope.io/tutorial/task_memory.html" target="_blank" rel="noopener">AgentScope — Memory 与长期记忆</a></li>
+      <li><a href="https://doc.agentscope.io/tutorial/task_context.html" target="_blank" rel="noopener">AgentScope — 上下文管理</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现三轮 CorpAssist 对话：验证短期记忆命中、配置 max_tokens 触发裁剪（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>运行「多轮对话」代码块，第二轮追问「刚才说的区域」验证短期记忆。</li>
+      <li>按「裁剪决策流」图设置 <code>max_tokens</code> 为较小值，观察摘要是否触发。</li>
+      <li>对照「与 context-memory-engineering 衔接」表，写 2 行 CorpAssist 该用 Working 还是 Semantic 的例子。</li>
+      <li>可选：<code>python main.py</code> 验收 <code>demos/basics-04-memory-lab/</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（权衡）CorpAssist 把完整工具 JSON 写入 Memory 以「保留细节」，NS3 成本上升 40%。更合理的做法是？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>工具结果应截断或结构化摘要后再入 Memory；完整 JSON 存 OTel/日志供审计，不进入 prompt。长期事实用 LongTermMemory 存 key-value，而非 append 原始观察。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：记忆控制实验室</h4>
+      <p>目录：<code>demos/basics-04-memory-lab/</code>。<strong>验收</strong>：<code>python main.py</code> 输出第二轮正确引用第一轮实体，且 Token 计数日志显示裁剪生效。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>系统课</strong>：<a href="../context-memory-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">上下文与记忆工程</span><code class="course-ref-slug">context-memory-engineering</code></a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-05-model-adaptation">模型适配与 DashScope</a></li>
+    </ul>
+  </div>
+</section>

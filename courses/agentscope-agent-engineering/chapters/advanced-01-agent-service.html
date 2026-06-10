@@ -1,0 +1,435 @@
+<section id="ch-advanced-01-agent-service" class="chapter" data-chapter="advanced-01-agent-service">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Agent Service 服务化入门</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-01-agent-service" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>服务化与 Capstone</strong> · 能力：将 AgentScope ReActAgent 封装为可部署的 <span class="term" data-term-id="agent-service" tabindex="0">Agent Service</span></p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 办公自动化 Agent 在 Notebook 里跑通后，必须变成 Spring BFF 可调用的 HTTP 服务。AgentScope 2.0 的 <span class="term" data-term-id="react-agent" tabindex="0">ReActAgent</span> 与 Event System 天然适合 <span class="term" data-term-id="sse-streaming" tabindex="0">SSE 流式</span> 暴露——本章教你用 FastAPI 封装 REST+SSE 接口，实现 <span class="term" data-term-id="multi-tenant" tabindex="0">多租户</span> 与 <span class="term" data-term-id="session-isolation" tabindex="0">会话隔离</span>，并定义 Java 侧消费契约。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>设计 Agent Service 的 REST 同步与 SSE 流式双接口</li>
+          <li>用 tenant_id + session_id 隔离 CorpAssist 多部门会话</li>
+          <li>用 FastAPI 封装 AgentScope ReActAgent 与事件流转发</li>
+          <li>编写 Spring WebClient 消费契约与错误码映射</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Agent ≠ LLM Gateway</strong>：Agent Service 管推理循环与工具，网关只管模型 Token。</li>
+          <li><strong>SSE 传 Event，不是传 Token</strong>：每条 SSE 对应 AgentScope 的 text/thinking/tool_call 事件。</li>
+          <li><strong>会话状态外置</strong>：多实例部署时会话存 Redis，不在进程内存。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>REST+SSE 暴露</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 办公助手上线</span>
+        产品要求：Spring <code>dialog-orchestrator</code> 调用 Python <code>agent-service</code>，用户问「帮我订明天下午会议室并通知参会人」——前端需要实时看到 Agent 思考与工具调用进度，最终返回结构化结果。
+      </aside>
+
+      <p>AgentScope 2.0 执行 <span class="term" data-term-id="react-agent" tabindex="0">ReActAgent</span> 时会产生 <span class="term" data-term-id="event-stream" tabindex="0">Event 流</span>：<code>text</code>（模型输出）、<code>thinking</code>（推理过程，若模型支持）、<code>tool_call</code> / <code>tool_result</code>（工具调用与返回）。服务化时需将内部事件映射为对外协议。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Agent Service 请求路径</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant BFF as Spring BFF
+    participant AS as agent-service FastAPI
+    participant Agent as ReActAgent
+    participant Tools as CorpAssist Tools
+    BFF->>AS: POST /v1/chat (sync) 或 /v1/chat/stream (SSE)
+    AS->>Agent: agent(Msg)
+    loop ReAct 循环
+        Agent->>Tools: tool_call
+        Tools-->>Agent: tool_result
+        Agent-->>AS: Event text/thinking/tool_*
+        AS-->>BFF: SSE data: {...}
+    end
+    AS-->>BFF: final Msg + usage</pre>
+        <p class="diagram-caption">同步接口返回最终 Msg；流式接口逐条推送 Event，BFF 可转发给前端 AG-UI。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>接口</th><th>方法</th><th>用途</th><th>响应</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/v1/chat</code></td><td>POST</td><td>批处理、评测脚本</td><td>JSON：final_content + steps + usage</td></tr>
+          <tr><td><code>/v1/chat/stream</code></td><td>POST</td><td>用户对话 UI</td><td>SSE：<code>event: agent_event</code></td></tr>
+          <tr><td><code>/v1/sessions/{id}</code></td><td>DELETE</td><td>用户退出 / 合规擦除</td><td>204</td></tr>
+          <tr><td><code>/health</code></td><td>GET</td><td>K8s 探针</td><td>200 + model 连通性</td></tr>
+        </tbody>
+      </table>
+
+      <h4>SSE 事件 payload 约定</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "event_type": "tool_call",
+  "session_id": "sess-8f3a",
+  "step": 2,
+  "payload": {
+    "tool_name": "book_meeting_room",
+    "arguments": {"room": "A301", "time": "2026-06-11T14:00"}
+  },
+  "trace_id": "tr-abc123"
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>把原始 LLM Token 流直接当 Agent SSE（丢失 tool_call 语义）</li>
+            <li>同步与流式两套 Agent 实例，状态不一致</li>
+            <li>SSE 无 <code>trace_id</code>，排障无法关联</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>统一 Agent 执行内核，仅输出层区分 sync/stream</li>
+            <li>每条 SSE 带 step、trace_id、session_id</li>
+            <li>流结束发送 <code>event: done</code> 含 usage 汇总</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>多租户/多会话基础</h3>
+      <p>CorpAssist 企业部署中，HR 与 IT 部门数据隔离；同一用户可能并行打开「订会议室」与「查制度」两个会话。Agent Service 必须在请求层解析 <span class="term" data-term-id="multi-tenant" tabindex="0">tenant_id</span>，在存储层实现 <span class="term" data-term-id="session-isolation" tabindex="0">session 隔离</span>。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>维度</th><th>请求头 / 字段</th><th>存储键</th><th>隔离策略</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>租户</td><td><code>X-Tenant-Id</code></td><td><code>{tenant}:config</code></td><td>工具白名单、模型路由、Token 预算</td></tr>
+          <tr><td>用户</td><td><code>X-User-Id</code>（BFF 注入）</td><td><code>{tenant}:{user}:sessions</code></td><td>会话列表、并发上限</td></tr>
+          <tr><td>会话</td><td><code>session_id</code> body</td><td><code>{tenant}:{session}:memory</code></td><td>Msg 历史、ReAct 步数计数</td></tr>
+          <tr><td>追踪</td><td><code>X-Trace-Id</code></td><td>日志 / OTLP</td><td>跨 BFF ↔ Agent Service 关联</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># session_store.py — Redis 会话隔离示意
+from dataclasses import dataclass
+import json
+import redis
+
+@dataclass
+class SessionKey:
+    tenant_id: str
+    session_id: str
+
+    @property
+    def redis_key(self) -> str:
+        return f"corpassist:agent:{self.tenant_id}:{self.session_id}:msgs"
+
+class SessionStore:
+    def __init__(self, r: redis.Redis, ttl_seconds: int = 86400):
+        self.r = r
+        self.ttl = ttl_seconds
+
+    def load_messages(self, key: SessionKey) -> list[dict]:
+        raw = self.r.get(key.redis_key)
+        return json.loads(raw) if raw else []
+
+    def append_message(self, key: SessionKey, msg: dict) -> None:
+        msgs = self.load_messages(key)
+        msgs.append(msg)
+        self.r.setex(key.redis_key, self.ttl, json.dumps(msgs, ensure_ascii=False))
+
+    def purge(self, key: SessionKey) -> None:
+        self.r.delete(key.redis_key)</code></pre>
+      </div>
+
+      <p>多租户配置示例：IT 租户启用 <code>restart_server</code> 工具，HR 租户禁用；通过 tenant 级 YAML 热加载，避免硬编码在 Agent 代码中。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>FastAPI 封装</h3>
+      <p>AgentScope 2.0 推荐在 <span class="term" data-term-id="fastapi-wrapper" tabindex="0">FastAPI</span> 中托管 Agent 生命周期：启动时注册工具与模型，请求时从 SessionStore 恢复历史、执行 ReAct、持久化结果。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># main.py — AgentScope Agent Service 最小封装
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import agentscope
+from agentscope.agents import ReActAgent
+from agentscope.message import Msg
+import json
+import asyncio
+
+app = FastAPI(title="CorpAssist Agent Service")
+
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+    max_iters: int = 8
+
+@app.on_event("startup")
+async def init_agentscope():
+    agentscope.init(model_configs=[{
+        "config_name": "qwen",
+        "model_type": "dashscope_chat",
+        "model_name": "qwen-max",
+    }])
+
+def build_agent(tenant_id: str) -> ReActAgent:
+    # 按 tenant 加载工具白名单（示意）
+    tools = load_tools_for_tenant(tenant_id)
+    return ReActAgent(
+        name="corp_assist_s3",
+        model_config_name="qwen",
+        sys_prompt=load_sys_prompt(tenant_id),
+        tools=tools,
+        max_iters=8,
+    )
+
+@app.post("/v1/chat/stream")
+async def chat_stream(
+    req: ChatRequest,
+    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    x_trace_id: str | None = Header(None, alias="X-Trace-Id"),
+):
+    agent = build_agent(x_tenant_id)
+    history = session_store.load_messages(SessionKey(x_tenant_id, req.session_id))
+    user_msg = Msg(name="user", content=req.message, role="user")
+
+    async def event_generator():
+        step = 0
+        async for event in agent.run_stream([*history, user_msg]):
+            step += 1
+            payload = {
+                "event_type": event.type,
+                "session_id": req.session_id,
+                "step": step,
+                "trace_id": x_trace_id,
+                "payload": event.to_dict(),
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>FastAPI 封装检查清单</summary>
+        <div class="learn-faq-body">
+          <ul>
+            <li>启动探针：模型连通 + Redis 连通</li>
+            <li>请求超时：全局 <code>max_iters</code> + 单工具 timeout</li>
+            <li>优雅关闭：drain 进行中 SSE 连接</li>
+            <li>结构化日志：tenant_id、session_id、trace_id 必打</li>
+          </ul>
+        </div>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring 侧消费契约</h3>
+      <p>Java 轨 <code>dialog-orchestrator</code> 通过 WebClient 消费 Agent Service，需对齐 HTTP 头、SSE 解析与错误码。这与 <a href="../spring-ai-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI 工程化开发</span><code class="course-ref-slug">spring-ai-engineering</code></a> 中的 BFF 模式一致：Spring 管 IAM 与审计，Python 管 Agent 推理。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class AgentServiceClient {
+    private final WebClient webClient;
+
+    public Flux&lt;AgentEvent&gt; streamChat(String tenantId, String userId,
+            String sessionId, String message, String traceId) {
+        return webClient.post()
+            .uri("/v1/chat/stream")
+            .header("X-Tenant-Id", tenantId)
+            .header("X-User-Id", userId)
+            .header("X-Trace-Id", traceId)
+            .bodyValue(Map.of("session_id", sessionId, "message", message))
+            .retrieve()
+            .bodyToFlux(String.class)
+            .filter(line -> line.startsWith("data:"))
+            .map(line -> parseAgentEvent(line.substring(5).trim()));
+    }
+}
+
+// 错误码映射
+// 502 AGENT_UPSTREAM — Agent Service 不可达
+// 504 AGENT_TIMEOUT — max_iters 或工具超时
+// 422 AGENT_INVALID_SESSION — session_id 格式非法</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>Agent Service 错误</th><th>HTTP</th><th>Spring 映射</th><th>用户可见</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>max_iters 超限</td><td>200 + done 含 error</td><td>AGENT_STEP_LIMIT</td><td>「任务较复杂，已转人工处理」</td></tr>
+          <tr><td>工具鉴权失败</td><td>403</td><td>AGENT_TOOL_FORBIDDEN</td><td>「暂无权限执行该操作」</td></tr>
+          <tr><td>模型不可用</td><td>503</td><td>LLM_UNAVAILABLE</td><td>「服务繁忙，请稍后重试」</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>Agent Service 和 llm-gateway 应该合并还是分开？</summary>
+          <div class="learn-faq-body"><strong>分开。</strong> Gateway 负责模型路由、Token 计量与密钥；Agent Service 负责 ReAct 循环、工具编排与会话。合并会导致 Gateway 承担有状态逻辑，难以水平扩展。</div>
+        </details>
+        <details>
+          <summary>SSE 连接断开时 Agent 还在跑怎么办？</summary>
+          <div class="learn-faq-body">客户端断开应触发 cancellation token，AgentScope 侧停止后续 tool_call。若业务要求任务继续（如后台订会议室），改用异步 Job 模式：POST 返回 task_id，轮询或 Webhook 通知结果。</div>
+        </details>
+        <details>
+          <summary>多实例部署时 session 粘滞吗？</summary>
+          <div class="learn-faq-body"><strong>不需要。</strong> 会话状态存 Redis，任意 Pod 可处理同一 session_id。仅需保证同一 session 并发请求串行化（分布式锁或队列）。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>双接口</strong>：同步 <code>/v1/chat</code> 供评测；SSE <code>/v1/chat/stream</code> 供 UI。</li>
+        <li><strong>Event 映射</strong>：SSE payload 对齐 AgentScope text/thinking/tool_call。</li>
+        <li><strong>多租户</strong>：tenant 级工具白名单 + Redis session 外置。</li>
+        <li><strong>FastAPI</strong>：统一 Agent 内核，StreamingResponse 转发事件流。</li>
+        <li><strong>Spring 契约</strong>：WebClient + 错误码映射 + trace_id 透传。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering_advanced01">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="rest-sse" /> 能画出 REST 与 SSE 请求序列图</label></li>
+          <li><label><input type="checkbox" data-id="tenant-session" /> 能说明 tenant/session Redis 键设计</label></li>
+          <li><label><input type="checkbox" data-id="fastapi-wrap" /> 能封装 FastAPI 流式 Agent 接口</label></li>
+          <li><label><input type="checkbox" data-id="spring-client" /> 能编写 Spring WebClient 消费代码</label></li>
+          <li><label><input type="checkbox" data-id="error-map" /> 能映射 Agent 错误码到用户提示</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Agent Service</td><td>托管 ReAct 循环的 HTTP 服务</td></tr>
+                <tr><td>SSE</td><td>推送 AgentScope Event，非原始 Token</td></tr>
+                <tr><td>tenant_id</td><td>工具白名单与配置隔离</td></tr>
+                <tr><td>session_id</td><td>Msg 历史 Redis 外置键</td></tr>
+                <tr><td>trace_id</td><td>BFF ↔ Agent 排障关联</td></tr>
+                <tr><td>max_iters</td><td>ReAct 步数硬上限</td></tr>
+                <tr><td>event: done</td><td>SSE 流结束 + usage 汇总</td></tr>
+                <tr><td>WebClient</td><td>Spring 侧 SSE 消费标准方式</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>为什么 Agent Service 要与 llm-gateway 分离部署？</li>
+              <li>设计 CorpAssist Agent Service 的多租户隔离方案，画出存储键结构。</li>
+              <li>SSE 断连时 Agent 任务应继续还是取消？两种模式的适用场景？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-02-framework-compare">框架选型对比</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://doc.agentscope.io/v2/tutorial/agent.html" target="_blank" rel="noopener">AgentScope 2.0 — Agent 与 ReActAgent</a></li>
+      <li><a href="https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse" target="_blank" rel="noopener">FastAPI StreamingResponse</a></li>
+      <li><a href="https://docs.spring.io/spring-framework/reference/web/webflux-webclient.html" target="_blank" rel="noopener">Spring WebClient</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist S3 编写 Agent Service 接口契约：补全 SSE payload 字段、Redis session 键、Spring 错误码映射表，并用 curl 验证流式输出。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在「REST+SSE 暴露」接口表中为 <code>/v1/chat/stream</code> 补充 Request Body 字段（session_id、message、max_iters）。</li>
+      <li>参照「多租户/多会话」Redis 键设计，为 HR 租户 <code>tenant-hr</code> 写出完整 session 键示例。</li>
+      <li>修改 FastAPI 代码块：为 <code>event_generator</code> 增加 <code>event: done</code> 时输出 token usage 字段。</li>
+      <li>在 Spring 错误码映射表中新增一行「Redis 不可用 → 503 → AGENT_STORE_DOWN」。</li>
+      <li>（可选）运行 <code>demos/advanced-01-agent-service-lab/</code>：启动 mock 服务并用 curl 消费 SSE。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">产品要求「前端直接连 Agent Service SSE，跳过 Spring BFF」——生产环境是否可行？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>不可行。</strong> BFF 负责 IAM 注入 <code>X-User-Id</code>、审计日志与速率限制；前端直连会暴露 tenant 配置、绕过企业 SSO，且无法统一错误码与合规擦除。</p></div>
+          </details>
+        </div>
+      </li>
+      <li>
+        <p class="judgment-stem">下列 SSE payload 哪条违反本章约定？A) 含 trace_id；B) event_type 为 raw_token；C) 含 step 序号。</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p><strong>B。</strong> Agent Service 应推送 AgentScope 语义事件（text/thinking/tool_call），不应把 LLM 原始 Token 流当 Agent 事件，否则 BFF 无法展示工具进度。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist Agent Service 最小 FastAPI</h4>
+      <p>目录：<code>demos/advanced-01-agent-service-lab/</code>（<code>main.py</code>、<code>curl-stream.sh</code>、<code>spring-client-snippet.java</code>）。<strong>验收</strong>：执行 <code>curl -N -X POST http://localhost:8080/v1/chat/stream -H "X-Tenant-Id: demo" -d '{"session_id":"s1","message":"你好"}'</code> 可见至少 2 条 <code>data:</code> 行与 <code>event: done</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-04-hitl">Human-in-the-loop 与 Realtime Steering</a>：Agent Service 接入审批节点</li>
+      <li><a href="#ch-basics-02-react-events">ReActAgent 与事件流</a>：Event System 细节</li>
+      <li><a href="../agent-orchestration-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排（Python / LangGraph）</span><code class="course-ref-slug">agent-orchestration-engineering</code></a>：对比 LangGraph 服务化模式</li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-02-framework-compare">框架选型对比</a></li>
+    </ul>
+  </div>
+</section>

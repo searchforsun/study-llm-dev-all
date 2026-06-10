@@ -1,0 +1,447 @@
+<section id="ch-practice-01-single-agent" class="chapter" data-chapter="practice-01-single-agent">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>单 Agent：CorpAssist 办公助手</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-01-single-agent" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>CorpAssist 工作流实战</strong> · 能力：用 AgentScope 构建单 Agent 办公助手</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 自动化场景从「单 Agent + 多工具」起步。AgentScope 2.0 的 <span class="term" data-term-id="react-agent" tabindex="0">ReActAgent</span> 内置推理-行动循环，配合 <span class="term" data-term-id="intent-routing" tabindex="0">意图识别与工具路由</span>，可在一个 Agent 内完成日历、邮件、工单等办公操作。本章是后续 MsgHub 与 Pipeline 的基础。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>为 CorpAssist 办公助手注册日历/邮件/工单三类工具</li>
+          <li>用结构化输出或工具描述实现意图路由</li>
+          <li>配置 <span class="term" data-term-id="token-budget" tabindex="0">步数与 Token 预算</span> 防止失控循环</li>
+          <li>在工具失败或超预算时执行人工转接降级</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>单 Agent 先跑通</strong>：多 Agent 编排之前，务必验证工具链与预算控制。</li>
+          <li><strong>工具描述即路由</strong>：清晰的 docstring 比额外分类器更可靠。</li>
+          <li><strong>降级要显式</strong>：<span class="term" data-term-id="tool-degradation" tabindex="0">人工转接</span> 应是注册工具，而非异常兜底。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>意图识别与工具路由</h3>
+
+      <p>CorpAssist 办公助手需区分「查日程」「发邮件」「建工单」三类意图。AgentScope 推荐两种方式：<strong>结构化输出路由</strong>（主 Agent 先分类再调用子流程）与<strong>工具自路由</strong>（ReActAgent 直接选工具）。对 S3 场景，工具自路由足够且可观测性更好。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 办公自动化</span>
+        员工通过 CorpAssist 说：「帮我把明天 10 点会议室 A 加到日历，并邮件通知项目组。」单 Agent 需依次调用 <code>create_calendar_event</code> 与 <code>send_email</code>，并在参数缺失时追问而非臆造。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>单 Agent 工具路由</h5>
+        <pre class="mermaid">flowchart TD
+    User[用户请求] --> ReAct[ReActAgent 推理]
+    ReAct -->|查日程| Cal[create_calendar_event]
+    ReAct -->|发邮件| Mail[send_email]
+    ReAct -->|建工单| Ticket[create_ticket]
+    ReAct -->|无法处理| Human[transfer_to_human]
+    Cal --> ReAct
+    Mail --> ReAct
+    Ticket --> ReAct
+    Human --> End([结束])</pre>
+        <p class="diagram-caption">ReActAgent 在推理环中根据工具描述选择下一步；转人工是与其他工具同级的显式工具。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+import os
+from agentscope.agent import ReActAgent
+from agentscope.formatter import DashScopeChatFormatter
+from agentscope.memory import InMemoryMemory
+from agentscope.message import Msg
+from agentscope.model import DashScopeChatModel
+from agentscope.tool import Toolkit, ToolResponse
+
+async def create_calendar_event(title: str, start_time: str, attendees: str = "") -> ToolResponse:
+    """创建日历事件。title 为标题，start_time 为 ISO8601 时间，attendees 为逗号分隔邮箱。"""
+    event_id = f"EVT-{hash(title + start_time) % 10000:04d}"
+    return ToolResponse(content=f"已创建日历 {event_id}：{title} @ {start_time}")
+
+async def send_email(to: str, subject: str, body: str) -> ToolResponse:
+    """发送邮件。to 为收件人，subject 为主题，body 为正文。"""
+    return ToolResponse(content=f"邮件已发送至 {to}，主题：{subject}")
+
+async def create_ticket(category: str, description: str) -> ToolResponse:
+    """创建 IT 工单。category 为类别，description 为问题描述。"""
+    ticket_id = f"TK-{hash(description) % 100000:05d}"
+    return ToolResponse(content=f"工单 {ticket_id} 已创建（{category}）")
+
+async def transfer_to_human(reason: str) -> ToolResponse:
+    """转接人工。Agent 无法完成、用户明确要求或预算耗尽时调用。"""
+    return ToolResponse(content=f"已转人工，原因：{reason}。预计 5 分钟内接入。")
+
+def build_office_agent() -> ReActAgent:
+    toolkit = Toolkit()
+    for fn in (create_calendar_event, send_email, create_ticket, transfer_to_human):
+        toolkit.register_tool_function(fn)
+    return ReActAgent(
+        name="CorpAssistOffice",
+        sys_prompt="你是 CorpAssist 办公助手。优先用工具完成请求；缺参数时追问；无法处理时调用 transfer_to_human。",
+        model=DashScopeChatModel(
+            model_name="qwen-max",
+            api_key=os.environ["DASHSCOPE_API_KEY"],
+        ),
+        formatter=DashScopeChatFormatter(),
+        memory=InMemoryMemory(),
+        toolkit=toolkit,
+        max_iters=8,
+    )
+
+async def main():
+    agent = build_office_agent()
+    msg = await agent(Msg("user", "帮我把周五产品评审加到日历并邮件通知 team@corp.com", "user"))
+    print(msg.get_text_content())
+
+asyncio.run(main())</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：为什么不单独写一个「意图分类 LLM」再调 Agent？</summary>
+        <p>多一跳 LLM 增加延迟与成本，且分类错误会级联。ReActAgent 在单循环内完成意图识别与工具调用，事件流可观测每一步，更适合生产排障。</p>
+      </details>
+
+      <div class="learn-faq">
+        <details>
+          <summary>工具 docstring 写多长合适？</summary>
+          <div class="learn-faq-body">
+            一句话说明职责 + 每个参数一行说明 + 一条「不要用于…」反例。CorpAssist 四类工具 docstring 各 3～5 行即可；过长会挤占 tool schema Token。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>日历/邮件/工单工具</h3>
+
+      <p>三类工具应遵循 CorpAssist 统一契约：输入 schema 明确、返回结构化文本、失败时返回可读的 <code>ToolResponse</code> 而非抛异常。工单工具对接内部 ITSM，邮件工具需校验收件人域名。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>工具</th><th>典型场景</th><th>必填参数</th><th>权限</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>create_calendar_event</code></td><td>会议预约、提醒</td><td>title, start_time</td><td>员工日历写</td></tr>
+          <tr><td><code>send_email</code></td><td>通知、摘要</td><td>to, subject, body</td><td>企业邮箱发</td></tr>
+          <tr><td><code>create_ticket</code></td><td>IT 报障、权限申请</td><td>category, description</td><td>工单系统写</td></tr>
+          <tr><td><code>transfer_to_human</code></td><td>复杂审批、情绪投诉</td><td>reason</td><td>无外部副作用</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>工具 docstring 为空或「处理请求」</li>
+            <li>一个 mega-tool 包打天下</li>
+            <li>失败抛异常中断 ReAct 循环</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>每工具单一职责 + 清晰参数说明</li>
+            <li>失败返回 ToolResponse 含错误码</li>
+            <li>敏感操作预留 HITL（见 <a href="#ch-practice-04-hitl">HITL 章</a>）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>工单工具 Mock 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def create_ticket(category: str, description: str) -> ToolResponse:
+    """创建 IT 工单。category 取 hardware/software/access；description 为问题描述。"""
+    if category not in ("hardware", "software", "access"):
+        return ToolResponse(content="错误：category 无效，请从 hardware/software/access 选择")
+    ticket_id = f"TK-{hash(description) % 100000:05d}"
+    return ToolResponse(content=json.dumps({"ticket_id": ticket_id, "status": "open"}))</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 权限申请</span>
+        员工：「帮我申请 VPN 权限。」Agent 应调用 <code>create_ticket(category="access", ...)</code> 而非臆造审批结果；若描述含糊，追问具体系统名后再建单。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>人工转接降级</h3>
+
+      <p><span class="term" data-term-id="tool-degradation" tabindex="0">人工转接降级</span> 是显式工具而非 try/except 兜底。触发条件：用户明确要求、连续工具失败、步数/Token 预算耗尽、或模型主动判断无法完成。降级后 Agent 应停止继续调用业务工具，仅输出转接摘要。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.agent import ReActAgent
+
+def wrap_with_budget_guard(agent: ReActAgent, max_iters: int = 8) -> ReActAgent:
+    """在 sys_prompt 中注入预算与降级策略（生产可用 middleware 替代）。"""
+    agent.sys_prompt += (
+        f"\n\n安全规则：最多 {max_iters} 步推理。"
+        "若即将超限或连续 2 次工具失败，必须调用 transfer_to_human 并说明原因。"
+    )
+    agent.max_iters = max_iters
+    return agent
+
+# 连续失败检测示例（middleware 伪代码）
+async def post_acting_hook(agent, kwargs, output):
+    recent = agent.memory.get_memory()[-6:]
+    tool_errors = sum(1 for m in recent if "失败" in str(m.content))
+    if tool_errors >= 2:
+        agent.sys_prompt += "\n[系统] 已连续失败，请转人工。"
+    return output</code></pre>
+      </div>
+
+      <div class="mermaid-wrap">
+        <h5>降级触发决策</h5>
+        <pre class="mermaid">flowchart TD
+    Start[ReAct 循环] --> Fail{连续工具失败?}
+    Fail -->|是| Human[transfer_to_human]
+    Fail -->|否| Budget{步数将超限?}
+    Budget -->|是| Human
+    Budget -->|否| Continue[继续推理]</pre>
+        <p class="diagram-caption">降级是显式工具调用，事件流可审计触发原因。</p>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>步数与 Token 预算</h3>
+
+      <p><span class="term" data-term-id="token-budget" tabindex="0">Token 预算</span> 与 <code>max_iters</code> 联合约束 ReAct 循环。AgentScope 2.0 的 <code>context_config</code> 可自动压缩历史；<code>react_config.max_iters</code> 限制推理轮次。CorpAssist 办公场景建议 <code>max_iters=8</code>，单次对话 Token 上限 8k（含工具结果）。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>参数</th><th>推荐值</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>max_iters</code></td><td>8–12</td><td>ReAct 最大推理-行动轮次</td></tr>
+          <tr><td><code>context_config.max_tokens</code></td><td>8192</td><td>触发上下文压缩阈值</td></tr>
+          <tr><td><code>model_config.max_retries</code></td><td>2</td><td>模型调用失败重试</td></tr>
+          <tr><td>单次工具超时</td><td>15s</td><td>防止外部 API 拖死循环</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.agent import ReActAgent
+from agentscope.model import DashScopeChatModel
+
+agent = ReActAgent(
+    name="CorpAssistOffice",
+    sys_prompt="...",
+    model=DashScopeChatModel(model_name="qwen-max", api_key="..."),
+    formatter=DashScopeChatFormatter(),
+    memory=InMemoryMemory(),
+    toolkit=toolkit,
+    max_iters=8,  # 步数硬上限
+)
+
+# 观测 Token：通过 reply_stream 的 EventType.MODEL_CALL_END 读取 usage
+async for evt in agent.reply_stream(Msg("user", "查下周会议并发邮件", "user")):
+    if hasattr(evt, "usage"):
+        print(f"tokens: {evt.usage}")</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">预算失控</span>
+          <ul>
+            <li>max_iters=50「保证能跑完」</li>
+            <li>不压缩 tool 结果导致 Token 膨胀</li>
+            <li>超预算后仍继续调业务工具</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">三重约束</span>
+          <ul>
+            <li>max_iters=8 + sys_prompt 约定</li>
+            <li>context_config.max_tokens 压缩</li>
+            <li>超限前 transfer_to_human</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>事件流观测与排障</h3>
+
+      <p>单 Agent 上线前须验证 <code>reply_stream</code> 事件序列：推理 → tool_call → tool_result → 最终回复。CorpAssist 办公场景常见 badcase 是模型跳过工具直接编造日历 ID——通过事件流可立即发现「无 tool_call 却有结论」。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.event import EventType
+
+async def debug_office_agent(agent, user_text: str):
+    tools_called = []
+    async for evt in agent.reply_stream(Msg("user", user_text, "user")):
+        if evt.type == EventType.TOOL_CALL:
+            tools_called.append(evt.tool_name)
+            print(f"[tool_call] {evt.tool_name} args={evt.tool_args}")
+        elif evt.type == EventType.REPLY_END:
+            print(f"[done] tools={tools_called} iters={evt.iter_count}")
+    assert tools_called, "未调用任何工具却给出结论 — 检查 sys_prompt"</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>单 Agent 何时升级到 Message Hub？</summary>
+          <div class="learn-faq-body">
+            当任务需多角色专业分工（日历专员 vs 邮件专员各自独立工具集）、或 Supervisor 需汇总多专家中间结果时，升级到 practice-02 MsgHub。单 Agent 工具数 ≤6 且步骤 ≤8 时不必过早拆分。
+          </div>
+        </details>
+        <details>
+          <summary>Mock 工具与生产 API 如何切换？</summary>
+          <div class="learn-faq-body">
+            工具函数内部读环境变量 <code>CORPASSIST_USE_MOCK=1</code> 分支；Agent / Toolkit 注册不变。golden set 用 Mock 离线跑；staging 接真实 API 做集成测试。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>常见问题（FAQ）</h3>
+      <div class="learn-faq">
+        <details>
+          <summary>ReActAgent 与 LangGraph StateGraph 在本场景如何选型？</summary>
+          <div class="learn-faq-body">单 Agent + 固定工具集优先 ReActAgent；需要可视化图、中断恢复或多分支编排时再上 LangGraph。本课后续 Pipeline/MsgHub 覆盖 AgentScope 原生多 Agent 路径。</div>
+        </details>
+        <details>
+          <summary>工具路由错误如何排查？</summary>
+          <div class="learn-faq-body">打开 <code>reply_stream</code> 观察 <code>tool_call</code> 事件，核对 docstring 与参数 schema；常见原因是工具描述过于相似或缺少反例说明。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>ReActAgent</strong>：CorpAssist 办公助手的默认载体，内置推理-行动循环。</li>
+        <li><strong>工具路由</strong>：清晰 docstring 优于额外分类器；四类工具覆盖日历/邮件/工单/转人工。</li>
+        <li><strong>降级</strong>：<code>transfer_to_human</code> 是显式工具，与预算耗尽联动。</li>
+        <li><strong>预算</strong>：<code>max_iters</code> + 上下文压缩 + 工具超时三重约束。</li>
+        <li><strong>下一步</strong>：单 Agent 稳定后进入 <a href="#ch-practice-02-message-hub">Message Hub 多 Agent 协作</a>。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering_practice01">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="tools-four" /> 能列出四类办公工具及必填参数</label></li>
+          <li><label><input type="checkbox" data-id="routing" /> 能解释工具自路由 vs 结构化路由</label></li>
+          <li><label><input type="checkbox" data-id="degrade" /> 能说明转人工的三类触发条件</label></li>
+          <li><label><input type="checkbox" data-id="budget" /> 能配置 max_iters 与 Token 压缩</label></li>
+          <li><label><input type="checkbox" data-id="demo-run" /> 能跑通 demos 办公助手脚本</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>ReActAgent</td><td>推理-行动循环 + Toolkit</td></tr>
+                <tr><td>工具路由</td><td>docstring 引导模型选工具</td></tr>
+                <tr><td>transfer_to_human</td><td>显式降级工具</td></tr>
+                <tr><td>max_iters</td><td>步数硬上限</td></tr>
+                <tr><td>ToolResponse</td><td>工具统一返回，失败也返回</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 办公助手如何防止 Agent 在工具间死循环？</li>
+              <li>为什么转人工应该是工具而不是异常处理？</li>
+              <li>描述一次「日历 + 邮件」多步工具调用的 ReAct 事件流。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-02-message-hub">Message Hub 多 Agent 协作</a> 学习主管-工人模式与显式消息传递。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.agentscope.io/v2/building-blocks/agent" target="_blank" rel="noopener">AgentScope 2.0 — Agent / ReActAgent</a></li>
+      <li><a href="https://docs.agentscope.io/v2/building-blocks/tool" target="_blank" rel="noopener">Tool / Toolkit 注册</a></li>
+      <li><a href="https://docs.agentscope.io/building-blocks/orchestration" target="_blank" rel="noopener">Orchestration — Master-Worker 路由</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">在 Demo 目录实现 CorpAssist 办公助手 ReActAgent，完成日历+邮件串联并验证预算降级（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>对照正文「日历/邮件/工单工具」表，在 <code>office_assistant.py</code> 补全四个工具的 docstring 与返回格式。</li>
+      <li>将 <code>max_iters</code> 设为 8，用「查日程 + 发邮件」复合请求测试 ReAct 多步调用。</li>
+      <li>模拟连续工具失败（返回含「失败」的 ToolResponse），确认 Agent 调用 <code>transfer_to_human</code>。</li>
+      <li>通过 <code>reply_stream</code> 打印 <code>tool_call</code> 事件，核对路由是否符合意图。</li>
+      <li>可选：完成 <code>demos/practice-01-single-agent-lab/</code> 验收清单。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">下列哪项最符合 CorpAssist 人工转接的最佳实践？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>注册 <code>transfer_to_human</code> 为显式工具，在 sys_prompt 中约定预算耗尽或连续失败时主动调用；而非在 except 块静默吞掉错误。这样事件流可审计，且模型能向用户说明转接原因。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist 办公助手实验室</h4>
+      <p>目录：<code>demos/practice-01-single-agent-lab/</code>。<strong>验收</strong>：运行 <code>python office_assistant.py</code> 完成复合请求；将 <code>max_iters</code> 设为 2 时应触发转人工或提前终止。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>下一章</strong>：<a href="#ch-practice-02-message-hub">Message Hub 多 Agent 协作</a></li>
+      <li><strong>前置</strong>：<a href="../agent-orchestration-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排工程</span><code class="course-ref-slug">agent-orchestration-engineering</code></a></li>
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,399 @@
+<section id="ch-practice-03-permissions" class="chapter" data-chapter="practice-03-permissions">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Events + Permissions 与 HITL</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-permissions" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>CorpAssist 工作流实战</strong> · 能力：实现 NS2 合规 HITL 与权限三态</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 涉及发邮件、改权限、提交工单等<strong>敏感操作</strong>，不能全自动执行。AgentScope Java 2.0 将 Human-in-the-loop 一等地内置：工具权限 <span class="term" data-term-id="permission-tristate" tabindex="0">allow/approve/deny 三态</span>、<code>streamEvents</code> 推送待审批、<span class="term" data-term-id="external-execution-loop" tabindex="0">外部执行循环</span> 暂停等待后端完成。本章对接 <span class="term" data-term-id="hitl-audit-log" tabindex="0">人工审批审计</span>，并与 Spring AI Alibaba Graph 审批节点对照。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>配置工具 Permission 规则实现 allow / approve / deny</li>
+          <li>用 Hook 或 Permission 事件流实现 CorpAssist 审批 UX</li>
+          <li>记录完整 HITL 审计（原参、改参、决裁、操作者）</li>
+          <li>用 ToolSuspendException 实现外部执行循环并与 SAA interrupt 对齐</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>approve = 暂停等确认</strong>：敏感工具触发审批事件后 Agent 暂停。</li>
+          <li><strong>改参 = 新 ToolResult</strong>：用户修改 args 后以 ToolResultBlock 恢复 Agent。</li>
+          <li><strong>审计不可删</strong>：DENY 决裁同样须落库，保留 180 天。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>allow/approve/deny 三态</h3>
+
+      <p>AgentScope Java 权限系统对每次 tool_call 给出三种决策：<strong>allow</strong> 直接执行；<strong>approve</strong> 暂停并 emit 待确认事件；<strong>deny</strong> 拒绝并返回错误 ToolResult 给 LLM。规则来源：静态 PermissionRule、工具 category、输入分析（如外部域名检测）。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 外发邮件审批</span>
+        Agent 提议 <code>send_email(to=partner@external.com)</code>，权限引擎返回 approve；前端展示参数表单，用户选 ALLOW / MODIFY / DENY 后，Spring Controller 调用 <code>agent.call(toolResultMsg)</code> 恢复执行。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>Permission 三态事件流</h5>
+        <pre class="mermaid">sequenceDiagram
+    participant U as 用户/审批员
+    participant C as Spring Controller
+    participant A as ReActAgent
+    participant T as 工具
+    A->>A: 推理 → tool_call send_email
+    A-->>C: PermissionApproveEvent
+    C-->>U: SSE 展示待审批参数
+    U->>C: ALLOW / MODIFY / DENY
+    C->>A: call(toolResultMsg)
+    alt ALLOW
+        A->>T: 执行工具
+    else DENY
+        A->>A: 带拒绝原因继续推理
+    end</pre>
+        <p class="diagram-caption">approve 暂停在 Acting 前；决裁通过 call() 恢复，非轮询。</p>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>决裁</th><th>行为</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ALLOW</td><td>按原 args 执行</td><td>确认发送会议纪要给项目组</td></tr>
+          <tr><td>MODIFY</td><td>替换 args 再执行</td><td>修改收件人列表后发送</td></tr>
+          <tr><td>DENY</td><td>返回错误 ToolResult</td><td>拒绝向个人邮箱发内部文档</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">ReActAgent agent = ReActAgent.builder()
+    .name("CorpAssistOffice")
+    .model(dashScopeModel)
+    .toolkit(Toolkit.builder()
+        .tool(sendEmailTool, ToolOptions.builder()
+            .permission(PermissionRule.builder()
+                .decision(PermissionDecision.APPROVE)  // 敏感：需审批
+                .build())
+            .build())
+        .tool(queryCalendarTool, ToolOptions.builder()
+            .permission(PermissionRule.allow())       // 只读：直接执行
+            .build())
+        .build())
+    .hook(new ToolConfirmationHook(Set.of("send_email", "create_ticket")))
+    .build();
+
+// streamEvents 消费审批事件
+agent.streamEvents(userMsg).subscribe(evt -> {
+    if (evt instanceof PermissionApproveEvent p) {
+        ui.showApprovalForm(p.toolName(), p.toolArgs());
+    }
+});</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">权限反模式</span>
+          <ul>
+            <li>所有工具都 approve，体验极差</li>
+            <li>前端超时自动 ALLOW</li>
+            <li>deny 不写审计记录</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">分级策略</span>
+          <ul>
+            <li>只读查询 allow 默认</li>
+            <li>外发/删改/权限变更 approve</li>
+            <li>超时 DENY 而非自动执行</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>PostReasoningEvent.stopAgent() 与 Permission approve 有何区别？</summary>
+        <p>Hook <code>stopAgent()</code> 是通用暂停点（PostReasoning/PostActing）；Permission approve 绑在 tool 粒度，自动识别敏感工具并 emit 结构化审批事件。CorpAssist 推荐 Permission 规则 + Hook 兜底危险工具白名单。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>人工审批审计</h3>
+
+      <p><span class="term" data-term-id="hitl-audit-log" tabindex="0">人工审批审计</span> 须记录：session_id、agent_name、tool_name、original_args、modified_args、decision、operator_id、timestamp、trace_id。CorpAssist NS2 合规要求保留 180 天，append-only 存储，与 OTel span 关联。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Service
+public class HitlAuditService {
+    private final Path auditFile = Paths.get("audit.jsonl");
+
+    public void record(HitlAuditEntry entry) throws IOException {
+        String line = new ObjectMapper().writeValueAsString(Map.of(
+            "ts", Instant.now().toString(),
+            "session_id", entry.sessionId(),
+            "tool", entry.toolName(),
+            "original_args", entry.originalArgs(),
+            "modified_args", entry.modifiedArgs(),
+            "decision", entry.decision(),      // ALLOW | MODIFY | DENY
+            "operator", entry.operatorId(),
+            "trace_id", entry.traceId()
+        ));
+        Files.writeString(auditFile, line + "\n",
+            StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+}
+
+// Controller 决裁回调
+@PostMapping("/chat/confirm")
+public Flux<ChatEvent> confirmTool(@RequestBody ToolConfirmRequest req) {
+    auditService.record(buildEntry(req));
+    Msg toolResult = req.confirmed()
+        ? buildAllowResult(req)
+        : buildDenyResult(req.reason());
+    return agent.streamEvents(toolResult).map(ChatEvent::from);
+}</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>字段</th><th>必填</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>session_id</td><td>是</td><td>关联用户会话</td></tr>
+          <tr><td>tool_name</td><td>是</td><td>待审批工具名</td></tr>
+          <tr><td>original_args</td><td>是</td><td>模型提议参数 JSON</td></tr>
+          <tr><td>modified_args</td><td>MODIFY 时</td><td>用户改后参数</td></tr>
+          <tr><td>decision</td><td>是</td><td>ALLOW / MODIFY / DENY</td></tr>
+          <tr><td>trace_id</td><td>推荐</td><td>OTel 关联排障</td></tr>
+        </tbody>
+      </table>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 合规抽查</span>
+        安全团队问：「上周是否有 Agent 向个人邮箱发内部文档？」审计员查 audit.jsonl 中 decision=DENY 与 MODIFY 记录——DENY 记录不可省略，否则无法追溯拦截事件。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>外部执行循环</h3>
+
+      <p><span class="term" data-term-id="external-execution-loop" tabindex="0">外部执行循环</span> 适用于工具逻辑完全在外部系统（采购审批、银行转账、人工填表）。工具抛出 <code>ToolSuspendException</code> 或注册为 Schema-only ExternalTool，Agent 返回 <code>GenerateReason.TOOL_SUSPENDED</code>，宿主应用执行外部流程后以 ToolResultBlock 恢复。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">@Tool(name = "submit_purchase_order", description = "提交采购单到 ERP 审批流")
+public ToolResultBlock submitPurchaseOrder(
+        @ToolParam(name = "amount") double amount,
+        @ToolParam(name = "vendor") String vendor) {
+    throw new ToolSuspendException(
+        "Awaiting ERP approval workflow for vendor=" + vendor + " amount=" + amount);
+}
+
+// 宿主恢复
+Msg response = agent.call(userMsg).block();
+if (response.getGenerateReason() == GenerateReason.TOOL_SUSPENDED) {
+    List&lt;ToolUseBlock&gt; pending = response.getContentBlocks(ToolUseBlock.class);
+    // 外部 ERP 完成后：
+    ToolUseBlock toolUse = pending.get(0);
+    Msg toolResult = Msg.builder()
+        .role(MsgRole.TOOL)
+        .content(ToolResultBlock.of(toolUse.getId(), toolUse.getName(),
+            TextBlock.builder().text("ERP approved: PO-2026-001").build()))
+        .build();
+    response = agent.call(toolResult).block();
+}</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>approve 与 TOOL_SUSPENDED 如何选择？</summary>
+          <div class="learn-faq-body">
+            approve 适合「用户在前端点确认/改参」的同步 HITL；TOOL_SUSPENDED 适合「逻辑在外部系统异步跑完再回传」的长事务。CorpAssist 单次发邮件用 approve；大额采购用 external + ERP 工作流。
+          </div>
+        </details>
+      </div>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>CorpAssist 场景</th><th>机制</th><th>恢复方式</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>单次发邮件确认</td><td>Permission approve</td><td>Controller confirm API</td></tr>
+          <tr><td>ERP 采购审批</td><td>ToolSuspendException</td><td>Webhook 回传 ToolResult</td></tr>
+          <tr><td>Schema-only 远程 API</td><td>ExternalTool</td><td>宿主执行后 call(result)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>与 SAA 审批节点对照</h3>
+
+      <p>Spring AI Alibaba Graph 的 <code>interrupt_before</code> / 人工节点与 AgentScope Java HITL 概念对齐：Graph 在节点前持久化 checkpoint；AgentScope 在 tool 权限 approve 时 emit 事件暂停。双栈 CorpAssist 可约定：Java Graph 跑长事务审批流，AgentScope ReActAgent 跑轻量 approve，<strong>审计 JSON Schema 统一</strong>。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">AgentScope 侧避免</span>
+          <ul>
+            <li>approve 事件不落库</li>
+            <li>MODIFY 后不写 modified_args</li>
+            <li>TOOL_SUSPENDED 后丢失 pending tool id</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">SAA 侧对齐</span>
+          <ul>
+            <li>Graph interrupt ↔ Permission approve 暂停点</li>
+            <li>统一 audit schema 跨栈</li>
+            <li>SSE 推送待审批到同一前端组件</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">// SAA Graph interrupt_before 节点（对照概念）
+// graph.addNode("human_approval", humanApprovalNode)
+//      .addEdge("agent_tool", "human_approval")
+//      .addEdge("human_approval", "resume_agent");
+
+// AgentScope 等价：Permission approve 在 tool 调用前暂停
+// 双栈统一：HitlAuditEntry JSON Schema 两边共用
+// 前端 ApprovalPanel 消费同一 SSE event type: PERMISSION_APPROVE</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>AgentScope approve 与 LangGraph interrupt_before 有何异同？</summary>
+          <div class="learn-faq-body">
+            同：都在敏感步骤前暂停等人输入。异：LangGraph interrupt 绑 checkpoint 节点；AgentScope approve 绑 tool Permission，粒度更细到单次 tool_call。CorpAssist 双栈可统一前端审批 UX，后端分别 resume。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>三态权限</strong>：allow 直执行、approve 暂停、deny 拒绝。</li>
+        <li><strong>审计</strong>：原参/改参/决裁/操作者全量记录，含 DENY。</li>
+        <li><strong>外部循环</strong>：ToolSuspendException + call(toolResult) 恢复。</li>
+        <li><strong>SAA 对照</strong>：Graph interrupt 与 approve 可双栈统一 UX。</li>
+        <li><strong>NS2</strong>：敏感工具默认 approve，而非事后追责。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering-java_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="tristate" /> 能说明 allow/approve/deny 差异</label></li>
+          <li><label><input type="checkbox" data-id="audit-fields" /> 能列出审计必填字段</label></li>
+          <li><label><input type="checkbox" data-id="suspend" /> 能描述 TOOL_SUSPENDED 恢复流程</label></li>
+          <li><label><input type="checkbox" data-id="modify-resume" /> 能实现 MODIFY 后 call 恢复</label></li>
+          <li><label><input type="checkbox" data-id="saa-map" /> 能映射 SAA interrupt 节点</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>Permission approve</td><td>工具前暂停等确认</td></tr>
+                <tr><td>MODIFY</td><td>改参后以 ToolResult 恢复</td></tr>
+                <tr><td>TOOL_SUSPENDED</td><td>外部系统异步完成</td></tr>
+                <tr><td>stopAgent()</td><td>Hook 通用暂停点</td></tr>
+                <tr><td>audit.jsonl</td><td>append-only 决裁记录</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 哪些工具应默认 approve？列举三类并说明理由。</li>
+              <li>用户 MODIFY 参数后 Agent 如何从暂停点精确恢复？</li>
+              <li>approve 与 ToolSuspendException 各适合什么场景？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-04-agentic-rag">Agentic RAG 集成</a> 衔接知识库问答。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java.agentscope.io/" target="_blank" rel="noopener">AgentScope Java — Events &amp; Permissions</a></li>
+      <li><a href="https://github.com/agentscope-ai/agentscope-java/blob/master/docs/en/task/hitl.md" target="_blank" rel="noopener">Human-in-the-Loop with Hooks</a></li>
+      <li><a href="https://java2ai.com/docs/dev/agents/graph/" target="_blank" rel="noopener">Spring AI Alibaba Graph — 人工节点</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 send_email 配置 approve 权限，实现 CLI 审批流与 audit.jsonl 落盘（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 Demo 将 <code>send_email</code> 注册为 <code>PermissionDecision.APPROVE</code>，跑通 <code>streamEvents</code> 捕获 PermissionApproveEvent。</li>
+      <li>实现 CLI 提示 ALLOW/MODIFY/DENY；MODIFY 时编辑 to/subject 后再 <code>agent.call(toolResultMsg)</code>。</li>
+      <li>每次决裁调用 <code>HitlAuditService.record</code> 追加写入 <code>audit.jsonl</code>。</li>
+      <li>对照正文 SAA 对照表，写 3 条 Graph interrupt 与 AgentScope approve 的映射说明。</li>
+      <li>可选：完成 <code>demos/practice-03-permissions-lab/</code> 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：Agent 返回 TOOL_SUSPENDED 后团队直接 agent.call() 不带 ToolResult，Agent 反复 suspend。正确恢复顺序是？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>先从 response 取出 pending ToolUseBlock（含 tool id），外部执行完成后构造对应 ToolResultBlock（id 必须匹配），再 <code>agent.call(toolResultMsg)</code>。空 call() 无法消掉 suspended 状态，PendingToolRecoveryHook 可能补错误结果导致偏航。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Permissions HITL 实验室</h4>
+      <p>目录：<code>demos/practice-03-permissions-lab/</code>。<strong>验收</strong>：<code>mvn -q exec:java -Dexec.args="--dry-run"</code> 触发 send_email approve；选 MODIFY 后 <code>audit.jsonl</code> 含 modified_args 字段。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-02-sub-agent">Sub-agent 多 Agent 协作</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-agentic-rag">Agentic RAG 集成</a></li>
+      <li><a href="../agentscope-agent-engineering/index.html#ch-practice-04-hitl" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">HITL 与 Realtime Steering（Python）</span><code class="course-ref-slug">agentscope-agent-engineering</code></a></li>
+      <li><a href="../spring-ai-alibaba-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Spring AI Alibaba 工程化</span><code class="course-ref-slug">spring-ai-alibaba-engineering</code></a></li>
+    </ul>
+  </div>
+</section>

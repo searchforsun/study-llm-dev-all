@@ -1,0 +1,343 @@
+<section id="ch-basics-05-chatmodel" class="chapter" data-chapter="basics-05-chatmodel">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>ChatModel 与 ModelRegistry</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-05-chatmodel" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>35 分钟</strong> · 阶段：<strong>AgentScope Java 核心</strong> · 能力：DashScope 配置、retry/fallback、多模型路由与 NS3 成本</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist 不能绑定单一模型：客服要快、报告要准、摘要要省。<span class="term" data-term-id="model-registry" tabindex="0">ModelRegistry</span> 让 <code>.model("dashscope:qwen-plus")</code> 自动读环境变量；<span class="term" data-term-id="dashscope-chatmodel" tabindex="0">DashScopeChatModel</span> 是 S3 默认栈。多模型路由直接服务北星 <span class="term" data-term-id="ns3-cost-tradeoff" tabindex="0">NS3 成本权衡</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 Builder 或字符串形式配置 DashScope ChatModel</li>
+          <li>设置 <code>maxRetries</code> 与 <code>fallbackModel</code> 容错</li>
+          <li>设计 turbo 分类 + plus 执行的双 Agent 路由</li>
+          <li>在 CorpAssist 场景量化 Token/步数成本杠杆</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>字符串 model id</strong>：<code>dashscope:qwen-plus</code> 由 ModelRegistry 解析，读 <code>DASHSCOPE_API_KEY</code>。</li>
+          <li><strong>Formatter 必须配对</strong>：DashScope 用 <code>DashScopeChatFormatter</code>，否则 tool_call 解析失败。</li>
+          <li><strong>路由降本</strong>：复杂推理 qwen-max，日常 plus，分类/摘要 turbo。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>DashScopeChatModel 配置</h3>
+      <p><span class="term" data-term-id="dashscope-chatmodel" tabindex="0">DashScopeChatModel</span> 位于 <code>io.agentscope.core.model</code>，支持流式、多模态与 reasoning 模式。CorpAssist 办公场景默认 <code>qwen-plus</code> + <code>stream(true)</code> 配合 AG-UI 事件流。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Model 层与 ReActAgent</h5>
+        <pre class="mermaid">flowchart LR
+    Agent[ReActAgent] --> FMT[DashScopeChatFormatter]
+    FMT --> CM[DashScopeChatModel]
+    CM --> API[DashScope API]
+    MR[ModelRegistry] -.->|dashscope:qwen-plus| CM</pre>
+        <p class="diagram-caption">显式 Builder 或 Registry 字符串两种入口，Agent 逻辑不变。</p>
+      </div>
+
+      <h4>显式 Builder（生产精细控制）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.formatter.dashscope.DashScopeChatFormatter;
+import io.agentscope.core.model.DashScopeChatModel;
+import io.agentscope.core.model.GenerateOptions;
+
+DashScopeChatModel model = DashScopeChatModel.builder()
+        .apiKey(System.getenv("DASHSCOPE_API_KEY"))
+        .modelName("qwen-plus")
+        .stream(true)
+        .formatter(new DashScopeChatFormatter())
+        .defaultOptions(GenerateOptions.builder()
+                .parallelToolCalls(false)
+                .maxTokens(8192)
+                .build())
+        .build();
+
+ReActAgent agent = ReActAgent.builder()
+        .name("CorpAssist")
+        .sysPrompt("你是 CorpAssist 办公助手。")
+        .model(model)
+        .build();</code></pre>
+      </div>
+
+      <h4>ModelRegistry 字符串（推荐快速启动）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">ReActAgent agent = ReActAgent.builder()
+        .name("CorpAssist")
+        .sysPrompt("你是 CorpAssist 办公助手。")
+        .model("dashscope:qwen-plus")  // 自动读 DASHSCOPE_API_KEY
+        .build();</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：何时不用字符串而用显式 Builder？</summary>
+        <p>需要自定义 baseUrl（私有化网关）、超时、GenerateOptions（thinkingBudget）、或固定 credential 对象时。CorpAssist staging 走内网 compatible-mode 时常用 Builder。</p>
+      </details>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>模型</th><th>适用</th><th>CorpAssist 场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>qwen-max</td><td>复杂推理、长报告</td><td>季度分析 Planner</td></tr>
+          <tr><td>qwen-plus</td><td>日常办公、工具调用</td><td>S3 默认办公助手</td></tr>
+          <tr><td>qwen-turbo</td><td>分类、摘要、路由</td><td>意图识别 Agent</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>retry + fallback 模型</h3>
+      <p>DashScope 偶发 5xx 或限流时，<span class="term" data-term-id="model-registry" tabindex="0">ReActAgent.Builder</span> 提供 <code>maxRetries</code> 与 <code>fallbackModel</code>，与工具层重试分开计数。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">ReActAgent agent = ReActAgent.builder()
+        .name("CorpAssistResilient")
+        .sysPrompt("你是 CorpAssist 办公助手。")
+        .model("dashscope:qwen-plus")
+        .maxRetries(3)
+        .fallbackModel("dashscope:qwen-turbo")
+        .maxIters(10)
+        .build();</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>fallback 到不可用模型且无告警</li>
+            <li>retry 与 maxIters 混淆（层不同）</li>
+            <li>静默降级到 turbo 却未记录 OTel</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>primary=plus，fallback=turbo + 告警</li>
+            <li>Middleware 记录 model.fallback 事件</li>
+            <li>fallback 后仍满足 NS1 质量下限 eval</li>
+          </ul>
+        </div>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 高峰限流</span>
+        活动日 DashScope 429 激增。maxRetries=3 吸收瞬断；连续失败后 fallback turbo 保证可用性，同时 Prometheus 计数 <code>agentscope_model_fallback_total</code> 供 NS3 评审。
+      </aside>
+    </div>
+
+    <div class="section-block">
+      <h3>多模型路由</h3>
+      <p><span class="term" data-term-id="ns3-cost-tradeoff" tabindex="0">多模型路由</span> 按任务类型选择 ChatModel：意图分类走 turbo，主对话走 plus，规划走 max。Java 栈常见模式是<strong>双 Agent</strong>（分类器 + Worker），而非单 Agent 内硬编码。</p>
+
+      <div class="mermaid-wrap">
+        <h5>CorpAssist 模型路由</h5>
+        <pre class="mermaid">flowchart TD
+    Input[用户输入] --> C[qwen-turbo 分类 Agent]
+    C -->|simple| P[qwen-plus Worker]
+    C -->|complex| M[qwen-max Planner]
+    M --> W[qwen-plus Worker + 工具]
+    P --> Out[回复]
+    W --> Out</pre>
+        <p class="diagram-caption">路由节点用最小模型；主链路按复杂度升级。</p>
+      </div>
+
+      <h4>双 Agent 路由示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">ReActAgent classifier = ReActAgent.builder()
+        .name("intent-router")
+        .sysPrompt("只输出 simple 或 complex。")
+        .model("dashscope:qwen-turbo")
+        .maxIters(1)
+        .build();
+
+ReActAgent worker = ReActAgent.builder()
+        .name("corp-worker")
+        .sysPrompt("你是 CorpAssist 办公助手。")
+        .model("dashscope:qwen-plus")
+        .toolkit(toolkit)
+        .maxIters(8)
+        .build();
+
+Msg label = classifier.call(List.of(new UserMessage(userText))).block();
+String route = label.getTextContent().toLowerCase().contains("complex")
+        ? "max-planner" : "plus-worker";</code></pre>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>能否在 ModelRegistry 注册 CorpAssist 自定义别名？</summary>
+          <div class="learn-faq-body">
+            可以。<code>ModelRegistry.registerFactory("corp:.*", ...)</code> 将 <code>corp:office-plus</code> 映射到内部 DashScope 配置，便于配置中心统一下发而无需改 Agent 代码。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 NS3 成本权衡</h3>
+      <p>北星 NS3 要求 Agent 成本可度量、可优化。AgentScope Java 的 <code>ChatUsage</code> 经事件流汇总到 OTel，配合 <code>maxIters</code>、模型路由与 Session compaction 降本。</p>
+
+      <table class="outline-table learn-decision-table">
+        <thead>
+          <tr><th>杠杆</th><th>做法</th><th>NS3 影响</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>maxIters</code></td><td>8～12 封顶</td><td>限制 worst-case 步数</td></tr>
+          <tr><td>模型路由</td><td>turbo 做分类/摘要</td><td>Token 单价降 60%+</td></tr>
+          <tr><td>Session compaction</td><td>见 basics-04</td><td>输入 Token 线性下降</td></tr>
+          <tr><td>stream + 早停</td><td>UI 满足即中断</td><td>减少无效生成 Token</td></tr>
+        </tbody>
+      </table>
+
+      <h4>usage 采集（streamEvents）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.event.AgentEventType;
+import io.agentscope.core.event.ReplyEndEvent;
+
+agent.streamEvents(new UserMessage("导出周报"))
+    .doOnNext(evt -> {
+        if (evt.getType() == AgentEventType.REPLY_END) {
+            var usage = ((ReplyEndEvent) evt).getUsage();
+            System.out.println("NS3 tokens=" + usage.getTotalTokens());
+        }
+    })
+    .blockLast();</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · NS3 评审</span>
+        答辩说明：S3 主 Agent 默认 plus——「90% 任务 8 步内完成，max 仅用于 Planner，月均 Token 降 35%」。须同时展示 eval 质量曲线，避免单指标优化。
+      </aside>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>如何向 CFO 解释 qwen-plus 默认策略而非全家桶 max？</li>
+              <li>fallback 到 turbo 时如何告警并保证 NS1 质量下限？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>与 Python AgentScope 对照</h3>
+      <table class="outline-table">
+        <thead>
+          <tr><th>Python</th><th>Java 2.0</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>DashScopeChatModel(model="qwen-plus")</code></td><td><code>.model("dashscope:qwen-plus")</code> 或 Builder</td></tr>
+          <tr><td><code>DashScopeChatFormatter()</code></td><td><code>new DashScopeChatFormatter()</code></td></tr>
+          <tr><td><code>max_retries=2</code> on model</td><td><code>.maxRetries(3)</code> on ReActAgent</td></tr>
+          <tr><td>router 字典多 Agent</td><td>classifier + worker 两个 ReActAgent</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Python 平行课 basics-05 — 对照
+model = DashScopeChatModel(
+    credential=DashScopeCredential(api_key=os.environ["DASHSCOPE_API_KEY"]),
+    model="qwen-plus", stream=True, max_retries=2,
+)</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>DashScope 配置</strong>：Builder 精细控制或 ModelRegistry 字符串快速启动。</li>
+        <li><strong>retry + fallback</strong>：Agent 层容错，与工具重试分层。</li>
+        <li><strong>多模型路由</strong>：turbo/plus/max 按任务分层，双 Agent 模式清晰可观测。</li>
+        <li><strong>NS3 成本</strong>：maxIters、路由、compaction 与 usage 度量组合降本。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：进入实战 <a href="#ch-practice-01-single-agent">单 Agent：CorpAssist 办公助手</a>，整合前五章能力。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java.agentscope.io/v2/en/docs/building-blocks/model.html" target="_blank" rel="noopener">AgentScope Java — Model / ModelRegistry</a></li>
+      <li><a href="https://help.aliyun.com/zh/model-studio/developer-reference/use-qwen-by-calling-api" target="_blank" rel="noopener">阿里云 — 通义千问 API</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">配置 DashScope 双模型路由并输出一轮 classify → worker 日志（约 30 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按「CorpAssist 模型路由」图为实验画 intent → model 映射表。</li>
+      <li>实现「双 Agent 路由示例」并跑通 simple / complex 各一句。</li>
+      <li>在 Builder 上添加 <code>maxRetries(2)</code> 与 <code>fallbackModel</code>，说明与工具 retry 的区别。</li>
+      <li>打开「NS3 成本权衡」表，任选 2 个杠杆估算周任务 Token 节省比例。</li>
+      <li>可选：<code>mvn -q compile exec:java</code> 验收 <code>demos/basics-05-chatmodel-lab/</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（场景）CorpAssist 将全部 Agent 升级为 qwen-max 后准确率 +2%，账单 +180%。是否符合 NS3？应如何调整？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>不符合 NS3「成本可控」。应恢复 plus 为默认，仅 Planner 用 max；摘要用 turbo；设 maxIters。2% 准确率提升不足以覆盖 180% 成本，需 eval 集证明 ROI。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：ChatModel 路由实验室</h4>
+      <p>目录：<code>demos/basics-05-chatmodel-lab/</code>。<strong>验收</strong>：<code>mvn -q compile exec:java</code> 打印 <code>[route]</code> 与 <code>[worker]</code> 两行。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-04-session-memory">Session 与 Memory 基础</a></li>
+      <li><strong>下一阶段</strong>：<a href="#ch-practice-01-single-agent">单 Agent：CorpAssist 办公助手</a></li>
+      <li><a href="../llm-application-fundamentals/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">LLM 应用基础</span><code class="course-ref-slug">llm-application-fundamentals</code></a> — 北星能力定义</li>
+    </ul>
+  </div>
+</section>

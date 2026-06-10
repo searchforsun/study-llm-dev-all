@@ -1,0 +1,401 @@
+<section id="ch-basics-03-tools-mcp" class="chapter" data-chapter="basics-03-tools-mcp">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Tool 注册与 MCP</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-tools-mcp" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>AgentScope Java 核心</strong> · 能力：注册工具、接入 MCP 并配置 allowlist</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 需连接日历、邮件、工单与外部知识库——工具是 Agent 的「手」。AgentScope Java 2.0 通过 <span class="term" data-term-id="tool-annotation" tabindex="0">@Tool 注解</span> 注册本地方法，通过 <span class="term" data-term-id="mcp-server-java" tabindex="0">MCP Client</span> 挂载远程服务；<span class="term" data-term-id="tools-allowlist" tabindex="0">tools.json allowlist</span> 在 Workspace 层统一管控工具可见性。生产环境必须处理并发调度、鉴权与权限边界。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 @Tool 与 @ToolParam 注册 CorpAssist 业务工具</li>
+          <li>配置工具 batch / sequential / concurrent 调度属性</li>
+          <li>接入 MCP Server 并映射到 Agent 工具列表</li>
+          <li>编写 workspace/tools.json allowlist 对齐 Permission 三态</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>注解驱动注册</strong>：@Tool 自动生成 JSON Schema，docstring 即模型选型依据。</li>
+          <li><strong>MCP 解耦集成</strong>：外部系统通过 MCP 协议暴露，Agent 不直连各 API 形态。</li>
+          <li><strong>allowlist 管控</strong>：tools.json 白名单 + Permission 防止 Agent 调用未授权工具。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>注解驱动工具注册</h3>
+      <p><span class="term" data-term-id="tool-annotation" tabindex="0">@Tool 注解</span> 将 Java 方法暴露为 Agent 可调用工具。框架自动提取方法签名与 @ToolParam 描述，生成 OpenAI 兼容的 Function Calling Schema。与 SAA Starter 的 @Tool 类似，但 AgentScope Java 的工具直接注册到 ReActAgent.builder().tools()，无需 Spring ChatClient 中转。</p>
+
+      <div class="mermaid-wrap">
+        <h5>工具注册与调用链</h5>
+        <pre class="mermaid">flowchart TB
+    Agent[ReActAgent] --> Registry[Tool Registry]
+    Registry --> Local[@Tool 本地方法]
+    Registry --> MCP[MCP 远程工具]
+    Allow[tools.json allowlist] --> Registry
+    Perm[Permission Engine] --> Local
+    Perm --> MCP</pre>
+        <p class="diagram-caption">allowlist 在 Workspace 层过滤可见工具；Permission 在执行前判定三态。</p>
+      </div>
+
+      <h4>注册 CorpAssist 工单工具</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.tool.annotation.Tool;
+import io.agentscope.core.tool.annotation.ToolParam;
+
+public class TicketTools {
+
+    @Tool(name = "createTicket",
+          description = "在 CorpAssist 创建工单。title: 标题；priority: low/normal/high")
+    public String createTicket(
+            @ToolParam(description = "工单标题") String title,
+            @ToolParam(description = "优先级，默认 normal") String priority) {
+        String ticketId = String.format("T-%04d", Math.abs(title.hashCode() % 10000));
+        return "工单 " + ticketId + " 已创建，优先级 " + priority;
+    }
+
+    @Tool(name = "queryTicket", description = "根据工单编号查询状态")
+    public String queryTicket(
+            @ToolParam(description = "工单编号，格式 T-XXXX") String ticketId) {
+        return ticketId + " 状态：处理中";
+    }
+}
+
+// 注册到 Agent
+ReActAgent agent = ReActAgent.builder()
+    .tools(new TicketTools())
+    .build();</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：@ToolParam description 为什么必须写业务说明？</summary>
+        <p>DashScope 等模型靠 schema + 描述选择工具与填参；缺失描述会导致错误调用或幻觉参数，是 CorpAssist 工单类 bug 的常见根因。</p>
+      </details>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">工具描述模糊</span>
+          <ul>
+            <li><code>@Tool(description = "查询信息")</code> — LLM 误调用</li>
+            <li>参数无 @ToolParam 说明 — 模型填错 priority 枚举</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">工具描述清晰</span>
+          <ul>
+            <li>description 含场景与示例，20～50 字</li>
+            <li>@ToolParam 标明格式与枚举值</li>
+          </ul>
+        </div>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>@Tool 要素</th><th>说明</th><th>CorpAssist 推荐</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>name</td><td>LLM 调用标识</td><td>动词+名词，如 queryTicket</td></tr>
+          <tr><td>description</td><td>模型判断何时调用</td><td>含场景，如「客服跟进工单」</td></tr>
+          <tr><td>@ToolParam</td><td>参数 schema 描述</td><td>标明格式、枚举、是否必填</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>并发/串行调度</h3>
+      <p>AgentScope Java 2.0 支持通过工具属性声明调度策略：<strong>batch</strong>（批量合并）、<strong>sequential</strong>（严格串行）、<strong>concurrent</strong>（并行执行）。CorpAssist 场景中，只读查询工具可并发以缩短延迟；有副作用的写操作必须串行并配合 Permission approve。</p>
+
+      <h4>调度属性示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.tool.annotation.ToolExecutionMode;
+
+public class CalendarTools {
+
+    @Tool(name = "queryCalendar", description = "查询指定日期会议安排（只读）")
+    @ToolExecutionMode(executionMode = ExecutionMode.CONCURRENT)
+    public String queryCalendar(@ToolParam(description = "ISO 日期") String date) {
+        return date + " 10:00 产品评审会";
+    }
+
+    @Tool(name = "sendEmail", description = "发送邮件（有副作用，需审批）")
+    @ToolExecutionMode(executionMode = ExecutionMode.SEQUENTIAL)
+    public String sendEmail(
+            @ToolParam(description = "收件人邮箱") String to,
+            @ToolParam(description = "邮件主题") String subject) {
+        return "邮件已发送至 " + to;
+    }
+}</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>调度模式</th><th>适用</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>CONCURRENT</td><td>只读、无依赖</td><td>并行查日历 + 查工单</td></tr>
+          <tr><td>SEQUENTIAL</td><td>有副作用、有顺序依赖</td><td>先查工单再发邮件</td></tr>
+          <tr><td>BATCH</td><td>同类调用可合并</td><td>批量查多个 ticketId</td></tr>
+        </tbody>
+      </table>
+
+      <div class="learn-faq">
+        <details>
+          <summary>并发工具会导致 ReAct 循环乱序吗？</summary>
+          <div class="learn-faq-body">
+            不会。框架在 Acting 阶段等待所有并发工具完成后，再将合并的 ToolResultBlock 写回 Session，模型下一轮看到的是完整观察结果。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>MCP Server 接入</h3>
+      <p><span class="term" data-term-id="mcp-server-java" tabindex="0">MCP（Model Context Protocol）</span> 让外部服务以标准方式暴露 tools/resources。AgentScope Java 内置 MCP Client，可将远程 Server 工具挂载到 ReActAgent，避免为每个 SaaS 写适配层。</p>
+
+      <h4>接入 MCP Server</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">import io.agentscope.core.mcp.McpClient;
+import io.agentscope.core.mcp.McpToolAdapter;
+
+McpClient kbMcp = McpClient.builder()
+    .serverUrl(System.getenv("KB_MCP_URL"))
+    .headers(Map.of("Authorization", "Bearer " + System.getenv("CORPASSIST_MCP_TOKEN")))
+    .timeout(Duration.ofSeconds(45))
+    .build();
+
+List&lt;Object&gt; remoteTools = kbMcp.listTools().block()
+    .stream()
+    .map(McpToolAdapter::fromMcpTool)
+    .toList();
+
+ReActAgent agent = ReActAgent.builder()
+    .tools(merge(localTools, remoteTools))
+    .build();</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>集成方式</th><th>适用</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>@Tool 本地</td><td>内部微服务已有 Java SDK</td><td>工单 API</td></tr>
+          <tr><td>MCP</td><td>第三方或跨语言服务</td><td>Confluence 知识库 MCP</td></tr>
+          <tr><td>Graph Tool</td><td>确定性子流程</td><td>审批 Graph 封装为 Tool</td></tr>
+        </tbody>
+      </table>
+
+      <h4>MCP 配置文件（mcp-servers.yaml 示例）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">yaml</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-yaml">servers:
+  corpassist-kb:
+    url: http://localhost:8765/mcp
+    headers:
+      Authorization: "Bearer ${CORPASSIST_MCP_TOKEN}"
+    timeout: 45s
+  corpassist-calendar:
+    url: http://calendar-svc:8080/mcp
+    timeout: 30s</code></pre>
+      </div>
+
+      <ul>
+        <li>MCP <code>list_tools</code> 返回的工具名可能与本地 @Tool 重名，注册前加前缀如 <code>kb_</code>。</li>
+        <li>CorpAssist 知识库 MCP 应只暴露 read/search，不暴露 write（权限最小化）。</li>
+        <li>前置课 MCP 概念见 <a href="../agent-orchestration-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排（Java）</span><code class="course-ref-slug">agent-orchestration-java</code></a>。</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>tools.json allowlist</h3>
+      <p>AgentScope Java Workspace 下的 <span class="term" data-term-id="tools-allowlist" tabindex="0">tools.json</span> 是工具白名单真源：声明 Agent 可见的工具名、MCP Server 来源与 Permission 默认策略。生产环境禁止「注册即可见」——必须先入 allowlist 再绑定 Permission 规则。</p>
+
+      <div class="mermaid-wrap">
+        <h5>allowlist 与 Permission 联动</h5>
+        <pre class="mermaid">flowchart LR
+    Reg[工具注册表] --> Allow[tools.json]
+    Allow --> Perm[Permission Rules]
+    Perm --> Allow2[allow]
+    Perm --> Approve[approve]
+    Perm --> Deny[deny]
+    Approve --> HITL[ApprovalRequiredEvent]</pre>
+        <p class="diagram-caption">未列入 allowlist 的工具对模型不可见，列入后由 Permission 决定执行三态。</p>
+      </div>
+
+      <h4>workspace/tools.json 示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "allowlist": [
+    {
+      "name": "queryCalendar",
+      "source": "local",
+      "permission": "allow"
+    },
+    {
+      "name": "queryTicket",
+      "source": "local",
+      "permission": "allow"
+    },
+    {
+      "name": "kb_search",
+      "source": "mcp:corpassist-kb",
+      "permission": "allow"
+    },
+    {
+      "name": "sendEmail",
+      "source": "local",
+      "permission": "approve"
+    },
+    {
+      "name": "deleteTicket",
+      "source": "local",
+      "permission": "deny"
+    }
+  ]
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>注册所有 @Tool 不设 allowlist</li>
+            <li>MCP Token 写进 Git 仓库</li>
+            <li>高危工具 permission 设为 allow</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>tools.json 版本化管理，CI 校验白名单</li>
+            <li>环境变量 + Secret 注入 MCP headers</li>
+            <li>写操作默认 approve，删除类 deny</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>加载 allowlist 与 Agent 绑定</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-java">Path workspace = Paths.get(".agentscope/workspace");
+ToolAllowlist allowlist = ToolAllowlist.load(workspace.resolve("tools.json"));
+
+ReActAgent agent = ReActAgent.builder()
+    .workspace(workspace)
+    .tools(allowlist.filterRegistered(allTools))
+    .permissionRules(allowlist.toPermissionRules())
+    .build();</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 工具治理</span>
+        运维在 tools.json 新增 <code>kb_search</code> 后 staging 验证，再推广到 prod。若模型尝试调用未列入 allowlist 的 <code>deleteTicket</code>，Permission 直接 deny 并返回结构化错误，审计日志记录拒绝事件。
+      </aside>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 如何设计 tools.json 与 MCP 权限对齐？</li>
+              <li>工具返回 mock 数据如何被 streamEvents 与审计发现？</li>
+              <li>并发只读工具与串行写工具如何共存于同一 Agent？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>注解驱动注册</strong>：@Tool + @ToolParam 生成 Schema，description 决定模型选型质量。</li>
+        <li><strong>并发/串行调度</strong>：只读 concurrent，写操作 sequential + approve。</li>
+        <li><strong>MCP Server</strong>：标准协议接入外部系统，headers 从环境变量注入。</li>
+        <li><strong>tools.json allowlist</strong>：Workspace 白名单 + Permission 三态统一工具治理。</li>
+      </ul>
+      <p><strong>Python 侧对照</strong>：平行课 <a href="../agentscope-agent-engineering/index.html#ch-basics-03-tools-mcp" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Tool / Skill 与 MCP</span><code class="course-ref-slug">agentscope-agent-engineering</code></a> 用 <code>@tool</code> + <code>Toolkit</code> + <code>MCPClient</code>；Java 课用 @Tool 注解 + <code>McpClient</code> + <code>tools.json</code>。双栈联调时保持工具 name 与 allowlist 条目一致，MCP Server URL 可不同但 tool schema 应对齐。</p>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：下一章 <a href="#ch-basics-04-session-memory">Session 与 Memory 基础</a> 管理对话历史与 compaction。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java.agentscope.io/" target="_blank" rel="noopener">AgentScope Java — Tools &amp; MCP</a></li>
+      <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">Model Context Protocol 规范</a></li>
+      <li><a href="https://doc.agentscope.io/tutorial/task_mcp.html" target="_blank" rel="noopener">Python AgentScope — MCP 集成（双栈对照）</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 实现工单 @Tool + 模拟 MCP 工具，并编写 tools.json allowlist（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按「工具注册与调用链」图，列出本实验本地工具与 MCP 工具各 1 个。</li>
+      <li>实现 <code>createTicket</code> / <code>queryTicket</code> 并注册到 ReActAgent.builder。</li>
+      <li>编写 <code>tools.json</code>，为 sendEmail 设 approve、deleteTicket 设 deny。</li>
+      <li>可选：运行 <code>demos/basics-03-tools-mcp-lab/</code> 验收脚本。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）下列 MCP 配置哪项违反本章 allowlist 原则？ A) headers 从环境变量读取 B) timeout=30s C) 所有 @Tool 自动可见不设 allowlist D) sendEmail permission=approve</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>C。生产环境必须通过 tools.json allowlist 显式声明可见工具；「注册即可见」违反最小权限。A、B、D 均符合推荐实践。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Tool / MCP 实验室</h4>
+      <p>目录：<code>demos/basics-03-tools-mcp-lab/</code>。<strong>验收</strong>：<code>./run.sh</code> 成功创建工单并打印 MCP 模拟工具结果。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-02-react-events">ReActAgent 与事件流</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-session-memory">Session 与 Memory 基础</a></li>
+    </ul>
+  </div>
+</section>

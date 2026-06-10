@@ -1,0 +1,358 @@
+<section id="ch-basics-03-tools-mcp" class="chapter" data-chapter="basics-03-tools-mcp">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Tool / Skill 与 MCP</h2>
+    <button type="button" class="btn-mark-done" data-chapter="basics-03-tools-mcp" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>40 分钟</strong> · 阶段：<strong>AgentScope 核心抽象</strong> · 能力：注册工具、接入 MCP 并设计重试策略</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>CorpAssist S3 需连接日历、邮件、工单与外部知识库——工具是 Agent 的「手」。AgentScope 2.0 的 <span class="term" data-term-id="agentscope-toolkit" tabindex="0">Toolkit</span> 统一注册本地函数与 <span class="term" data-term-id="mcp-client" tabindex="0">MCP</span> 远程服务；<span class="term" data-term-id="skill-composition" tabindex="0">Skill</span> 把多工具组合为可复用能力包。生产环境必须处理超时、鉴权与<span class="term" data-term-id="retry-strategy" tabindex="0">错误重试</span>。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 <code>@tool</code> 与 Toolkit 注册 CorpAssist 业务工具</li>
+          <li>接入 MCP Server 并映射到 Agent 工具列表</li>
+          <li>配置工具超时、API Key 鉴权与 Workspace 边界</li>
+          <li>设计工具失败时的重试与降级策略</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>Toolkit 是唯一入口</strong>：本地函数与 MCP 工具都注册进 Toolkit。</li>
+          <li><strong>MCP 解耦集成</strong>：外部系统通过 MCP 协议暴露，Agent 不直连各 API 形态。</li>
+          <li><strong>失败可观测</strong>：工具错误应结构化返回，触发 Event 而非 silent fail。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>工具注册与 Skill 组合</h3>
+      <p><span class="term" data-term-id="agentscope-toolkit" tabindex="0">Toolkit</span> 收集 Agent 可调用的工具。用 <code>@tool</code> 装饰器注册 Python 函数，docstring 自动生成 JSON Schema 供模型选择。Skill 将相关工具与提示词打包，例如 CorpAssist「工单 Skill」含 create_ticket / query_ticket。</p>
+
+      <div class="mermaid-wrap">
+        <h5>Toolkit 与 Skill 层次</h5>
+        <pre class="mermaid">flowchart TB
+    Agent[Agent] --> TK[Toolkit]
+    TK --> T1[@tool 本地函数]
+    TK --> T2[MCP 远程工具]
+    SK[Skill 工单包] --> T1
+    SK --> T2
+    SK --> SP[Skill System Prompt]</pre>
+        <p class="diagram-caption">Skill 是逻辑分组；运行时仍通过 Toolkit 统一调度。</p>
+      </div>
+
+      <h4>注册 CorpAssist 工具</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.tool import Toolkit, tool
+
+@tool
+def create_ticket(title: str, priority: str = "normal") -> str:
+    """在 CorpAssist 创建工单。title: 标题；priority: low/normal/high。"""
+    ticket_id = f"T-{hash(title) % 10000:04d}"
+    return f"工单 {ticket_id} 已创建，优先级 {priority}"
+
+@tool
+def query_ticket(ticket_id: str) -> str:
+    """查询工单状态。"""
+    return f"{ticket_id} 状态：处理中"
+
+toolkit = Toolkit(tools=[create_ticket, query_ticket])</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：工具 docstring 为什么必须写参数说明？</summary>
+        <p>DashScope 等模型靠 schema + 描述选择工具与填参；缺失描述会导致错误调用或幻觉参数，是 CorpAssist 工单类 bug 的常见根因。</p>
+      </details>
+
+      <h4>Skill 组合示例</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python"># Skill 将工具 + 领域提示打包（概念示例）
+TICKET_SKILL_PROMPT = """
+你是 CorpAssist 工单专员。创建前确认 title 与 priority。
+可用工具：create_ticket, query_ticket。
+"""
+
+agent = Agent(
+    name="Ticket-Agent",
+    system_prompt=TICKET_SKILL_PROMPT,
+    toolkit=Toolkit(tools=[create_ticket, query_ticket]),
+)</code></pre>
+      </div>
+
+      <ul>
+        <li><span class="term" data-term-id="skill-composition" tabindex="0">Skill</span> 不改变 Toolkit 调度机制，仅缩小模型可见工具集与提示边界。</li>
+        <li>多 Skill 并存时，按路由 Agent 选择不同 toolkit 实例，避免工具名冲突。</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>MCP 客户端接入</h3>
+      <p><span class="term" data-term-id="mcp-client" tabindex="0">MCP（Model Context Protocol）</span> 让外部服务以标准方式暴露 tools/resources。AgentScope 2.0 内置 MCP 客户端，可将远程 Server 工具挂载到 Toolkit，避免为每个 SaaS 写适配层。</p>
+
+      <h4>接入 MCP Server</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">from agentscope.mcp import MCPClient
+from agentscope.tool import Toolkit
+
+# CorpAssist 知识库 MCP（示例配置）
+mcp = MCPClient(
+    server_url="http://localhost:8765/mcp",
+    headers={"Authorization": "Bearer ${KB_MCP_TOKEN}"},
+)
+
+async def build_toolkit() -> Toolkit:
+    remote_tools = await mcp.list_tools()
+    local = [create_ticket, query_ticket]
+    return Toolkit(tools=local + remote_tools)</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>集成方式</th><th>适用</th><th>CorpAssist 示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>@tool 本地</td><td>内部微服务已有 Python SDK</td><td>工单 API</td></tr>
+          <tr><td>MCP</td><td>第三方或跨语言服务</td><td>Confluence 知识库 MCP</td></tr>
+          <tr><td>Skill 组合</td><td>多工具固定编排</td><td>「会议纪要」Skill</td></tr>
+        </tbody>
+      </table>
+
+      <p>前置课 MCP 概念见 <a href="../agent-orchestration-engineering/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Agent 编排（Python / LangGraph）</span><code class="course-ref-slug">agent-orchestration-engineering</code></a> 高级章节。</p>
+
+      <h4>MCP 配置文件（mcp.json 示例）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-json">{
+  "servers": {
+    "corpassist-kb": {
+      "url": "http://localhost:8765/mcp",
+      "headers": {"Authorization": "Bearer ${KB_MCP_TOKEN}"},
+      "timeout": 45
+    }
+  }
+}</code></pre>
+      </div>
+
+      <ul>
+        <li>MCP <code>list_tools</code> 返回的工具名可能与本地 @tool 重名，注册前加前缀如 <code>kb_</code>。</li>
+        <li>CorpAssist 知识库 MCP 应只暴露 read/search，不暴露 write（权限最小化）。</li>
+      </ul>
+    </div>
+
+    <div class="section-block">
+      <h3>超时与鉴权</h3>
+      <p>生产工具调用必须设 <span class="term" data-term-id="tool-timeout" tabindex="0">timeout</span> 与凭证隔离。AgentScope 2.0 支持 Toolkit 级默认超时、单工具 override，以及 Workspace 权限边界（限制文件系统工具路径）。</p>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">反模式</span>
+          <ul>
+            <li>工具内硬编码 API Key</li>
+            <li>无 timeout，线程永久阻塞</li>
+            <li>MCP Token 写进 Git 仓库</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>环境变量 + DashScopeCredential 同类模式</li>
+            <li>默认 timeout=30s，读操作可 60s</li>
+            <li>MCP headers 从 Secret 注入</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4>超时与凭证配置</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import os
+from agentscope.tool import Toolkit
+
+toolkit = Toolkit(
+    tools=[create_ticket, query_ticket],
+    default_timeout=30.0,
+)
+
+# MCP 鉴权从环境变量读取
+mcp_token = os.environ["CORPASSIST_MCP_TOKEN"]
+mcp = MCPClient(
+    server_url=os.environ["KB_MCP_URL"],
+    headers={"Authorization": f"Bearer {mcp_token}"},
+    timeout=45.0,
+)</code></pre>
+      </div>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>工具类型</th><th>建议 timeout</th><th>鉴权</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>本地内存查询</td><td>5s</td><td>无</td></tr>
+          <tr><td>CorpAssist 内部 API</td><td>30s</td><td>Service Token</td></tr>
+          <tr><td>MCP 知识库</td><td>45s</td><td>Bearer Token</td></tr>
+          <tr><td>批量导出</td><td>120s + 异步</td><td>OAuth</td></tr>
+        </tbody>
+      </table>
+
+      <p><span class="term" data-term-id="tool-timeout" tabindex="0">Workspace 边界</span> 限制文件类工具只能访问指定目录，防止 Agent 被诱导读取 <code>/etc/passwd</code> 等路径。</p>
+    </div>
+
+    <div class="section-block">
+      <h3>错误重试策略</h3>
+      <p><span class="term" data-term-id="retry-strategy" tabindex="0">重试策略</span> 需区分可重试错误（5xx、超时）与不可重试（4xx 参数错误）。Agent 层应限制重试次数，避免 ReAct 循环中对同一坏参数无限重试。</p>
+
+      <div class="mermaid-wrap">
+        <h5>工具失败处理流</h5>
+        <pre class="mermaid">flowchart TD
+    Call[工具调用] --> OK{成功?}
+    OK -->|是| Obs[观察写回上下文]
+    OK -->|否| Type{错误类型}
+    Type -->|超时/5xx| Retry{重试 &lt; 3?}
+    Retry -->|是| Call
+    Retry -->|否| Degrade[结构化错误 + 降级提示]
+    Type -->|4xx/鉴权| Fail[立即失败 + 人工指引]</pre>
+        <p class="diagram-caption">结构化错误信息帮助模型修正参数，而非空异常。</p>
+      </div>
+
+      <h4>带重试的工具包装</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+from functools import wraps
+
+def retry_tool(max_attempts: int = 3, backoff: float = 1.0):
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            last_err = None
+            for attempt in range(max_attempts):
+                try:
+                    return await fn(*args, **kwargs)
+                except (TimeoutError, ConnectionError) as e:
+                    last_err = e
+                    await asyncio.sleep(backoff * (attempt + 1))
+            return f"TOOL_ERROR: {last_err}（已重试 {max_attempts} 次，请换参数或人工处理）"
+        return wrapper
+    return decorator</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · S3 工单创建</span>
+        模型误传非法 priority 值时，工具返回 400——不应重试，应返回清晰错误让 Agent 改用 enum 值。网络抖动导致 MCP 超时时，最多重试 2 次后提示用户稍后再试。
+      </aside>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 如何设计工具白名单与 MCP 权限对齐？</li>
+              <li>工具假执行（返回 mock 数据）如何被 Event 与审计发现？</li>
+              <li>重试 3 次仍失败时，Agent 应对用户说什么？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <h4>结构化错误返回格式</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">def format_tool_error(code: str, message: str, retryable: bool) -> str:
+    return f"TOOL_ERROR code={code} retryable={retryable}: {message}"
+
+# 模型看到 retryable=false 时不应再传相同参数</code></pre>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>工具注册与 Skill</strong>：@tool + Toolkit 统一入口，Skill 打包领域能力。</li>
+        <li><strong>MCP 客户端</strong>：标准协议接入外部系统，减少 CorpAssist 适配代码。</li>
+        <li><strong>超时与鉴权</strong>：默认 timeout + 环境变量凭证，禁止硬编码 Secret。</li>
+        <li><strong>错误重试</strong>：区分可重试与不可重试，结构化错误反馈给 ReAct 循环。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <p class="chapter-review-next">下一步：下一章 <a href="#ch-basics-04-memory">记忆：短期与长期控制</a> 管理对话历史与 Agentic 长期记忆。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://doc.agentscope.io/tutorial/task_tool.html" target="_blank" rel="noopener">AgentScope — Tool 与 Toolkit</a></li>
+      <li><a href="https://doc.agentscope.io/tutorial/task_mcp.html" target="_blank" rel="noopener">AgentScope — MCP 集成</a></li>
+      <li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">Model Context Protocol 规范</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">为 CorpAssist 实现工单 Toolkit + 模拟 MCP 工具，并配置 timeout 与重试（约 35 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按「Toolkit 与 Skill 层次」图，列出本实验本地工具与 MCP 工具各 1 个。</li>
+      <li>实现 <code>create_ticket</code> / <code>query_ticket</code> 并注册到 Toolkit。</li>
+      <li>参照「工具失败处理流」图，为超时场景写 retry 包装并模拟一次失败。</li>
+      <li>可选：<code>python main.py</code> 运行 <code>demos/basics-03-tools-mcp-lab/</code>。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">（找错）下列 MCP 配置哪项违反本章「超时与鉴权」原则？ A) headers 从 os.environ 读取 B) timeout=30 C) api_key 写在 tools.py 第 3 行 D) default_timeout 在 Toolkit 级设置</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p>C。API Key 不得硬编码在源码；应使用环境变量或 Secret 管理。A、B、D 均符合推荐实践。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Tool / MCP 实验室</h4>
+      <p>目录：<code>demos/basics-03-tools-mcp-lab/</code>。<strong>验收</strong>：<code>python main.py</code> 成功创建工单并打印 MCP 模拟工具结果。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-basics-02-react-events">ReActAgent 与事件流</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-basics-04-memory">记忆：短期与长期控制</a></li>
+    </ul>
+  </div>
+</section>

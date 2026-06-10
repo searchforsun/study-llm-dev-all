@@ -1,0 +1,394 @@
+<section id="ch-practice-03-pipeline" class="chapter" data-chapter="practice-03-pipeline">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Pipeline 工作流编排</h2>
+    <button type="button" class="btn-mark-done" data-chapter="practice-03-pipeline" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>45 分钟</strong> · 阶段：<strong>CorpAssist 工作流实战</strong> · 能力：用 Pipeline 编排确定性工作流</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>MsgHub 适合讨论式协作；CorpAssist 许多 SOP（入职流程、审批链）需要<strong>确定性顺序</strong>。<span class="term" data-term-id="sequential-pipeline" tabindex="0">Sequential Pipeline</span> 与 <span class="term" data-term-id="fanout-pipeline" tabindex="0">Fanout Pipeline</span> 提供可复用的串行/并行编排，并内置并发工具执行与失败降级能力。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>用 sequential_pipeline 串联 CorpAssist 多步 Agent</li>
+          <li>用 fanout_pipeline 并行收集多专家意见</li>
+          <li>配置失败重试与 <span class="term" data-term-id="retry-degradation" tabindex="0">降级策略</span></li>
+          <li>实现 <span class="term" data-term-id="loop-detection" tabindex="0">循环检测</span> 防止 Pipeline 死转</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>串行 = 上一步输出是下一步输入</strong>：等价于连续 await agent(msg)。</li>
+          <li><strong>并行 = fanout + enable_gather</strong>：asyncio.gather 并发 I/O。</li>
+          <li><strong>Pipeline 可与 MsgHub 组合</strong>：Hub 内跑 sequential 处理子流程。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>串行/并行步骤</h3>
+
+      <p>CorpAssist 员工入职 SOP：HR 填表 → IT 开账号 → 行政发设备。三步 Agent 顺序固定，用 <code>sequential_pipeline</code>。若需法务、安全、合规三方<strong>并行</strong>审阅同一份政策，用 <code>fanout_pipeline</code>。</p>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 新员工入职</span>
+        HR Agent 收集员工信息并生成 onboarding 包 → IT Agent 依据包开 AD 账号 → Admin Agent 分配笔记本。任一步失败应注入错误 Msg 给 fallback Agent，而非静默跳过。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>串行 vs 并行 Pipeline</h5>
+        <pre class="mermaid">flowchart LR
+    subgraph Seq[Sequential]
+        A1[HR Agent] --> A2[IT Agent] --> A3[Admin Agent]
+    end
+    subgraph Fan[Fanout 并行]
+        Input[同一输入] --> B1[Legal]
+        Input --> B2[Security]
+        Input --> B3[Compliance]
+    end</pre>
+        <p class="diagram-caption">Sequential 传递 Msg；Fanout 深拷贝输入给各 Agent，返回 Msg 列表。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+from agentscope.message import Msg
+from agentscope.pipeline import sequential_pipeline, fanout_pipeline, SequentialPipeline
+
+async def onboarding_flow(hr, it, admin, employee_name: str):
+    initial = Msg("user", f"为新员工 {employee_name} 办理入职", "user")
+    # 串行：HR → IT → Admin
+    result = await sequential_pipeline(agents=[hr, it, admin], msg=initial)
+    return result.get_text_content()
+
+async def policy_review(legal, security, compliance, policy_text: str):
+    msg = Msg("user", f"审阅政策：{policy_text}", "user")
+    # 并行：三路同时审阅
+    reviews = await fanout_pipeline(
+        agents=[legal, security, compliance],
+        msg=msg,
+        enable_gather=True,
+    )
+    return [r.get_text_content() for r in reviews]
+
+# 可复用 Pipeline 对象
+onboarding_pipe = SequentialPipeline(agents=[hr_agent, it_agent, admin_agent])
+final_msg = await onboarding_pipe(msg=initial_msg)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：入职 SOP 用 MsgHub 讨论式协作合适吗？</summary>
+        <p>不合适。SOP 步骤顺序固定、无交叉引用需求，Sequential Pipeline 更简洁可测。MsgHub 适合步骤间需协商的场景；确定性流程用 Pipeline 降低 trace 复杂度。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>并发工具执行</h3>
+
+      <p>AgentScope 2.0 ReActAgent 在单轮 Acting 阶段可<strong>批量并发</strong>执行多个 tool_call（模型一次返回多个调用）。Pipeline 层的 <code>enable_gather=True</code> 则在<strong>多 Agent</strong> 维度并发。CorpAssist 查「三系统状态」场景：Fanout 三个只读 Agent 各查一系统，总延迟接近最慢单路而非三者之和。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>并发层级</th><th>机制</th><th>典型场景</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>单 Agent 多工具</td><td>ReAct acting batch</td><td>同时查日历+通讯录</td></tr>
+          <tr><td>多 Agent Fanout</td><td><code>asyncio.gather</code></td><td>多专家并行审阅</td></tr>
+          <tr><td>外部 I/O</td><td>工具内 async/await</td><td>HTTP 并行请求</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import asyncio
+
+async def fanout_with_timeout(agents, msg, timeout_sec=30):
+    async def run_one(agent):
+        return await asyncio.wait_for(agent(msg), timeout=timeout_sec)
+    tasks = [run_one(a) for a in agents]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return [r for r in results if not isinstance(r, Exception)]</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">并发陷阱</span>
+          <ul>
+            <li>Fanout 不设超时，一路阻塞全体</li>
+            <li>并行写同一资源无锁</li>
+            <li>gather 异常未捕获导致整体失败</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">生产做法</span>
+          <ul>
+            <li>wait_for 单 Agent 超时</li>
+            <li>只读 Fanout 优先并行</li>
+            <li>return_exceptions=True 部分降级</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>失败重试与降级</h3>
+
+      <p><span class="term" data-term-id="retry-degradation" tabindex="0">失败重试与降级</span> 分三层：模型调用 <code>model_config.max_retries</code>、工具超时重试、Pipeline 步骤失败跳过或转人工。Sequential 中某步失败时，可将错误 Msg 注入下一步由「修复 Agent」处理，或直接 abort 并调用 <code>transfer_to_human</code>。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def resilient_sequential(agents, msg, fallback_agent):
+    current = msg
+    for agent in agents:
+        try:
+            current = await agent(current)
+        except Exception as e:
+            err = Msg("system", f"步骤 {agent.name} 失败：{e}", "system")
+            current = await fallback_agent(err)
+            break
+    return current
+
+# model_config 层重试（ReActAgent 构造参数）
+from agentscope.model import ModelConfig
+model_cfg = ModelConfig(max_retries=2, fallback_model="qwen-turbo")</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">不推荐</span>
+          <ul>
+            <li>Pipeline 内无限重试同一步</li>
+            <li>失败静默跳过不留 audit</li>
+            <li>并行 Fanout 不设单 Agent 超时</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>指数退避 + 最多 2 次重试</li>
+            <li>失败 Msg 写入审计日志</li>
+            <li>Fanout 用 asyncio.wait_for 包单层超时</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Pipeline 步骤失败应重试还是 skip？</summary>
+          <div class="learn-faq-body">
+            CorpAssist SOP 关键步骤（如 IT 开账号）失败应 abort 并转人工；非关键步骤（如发送欢迎邮件）可 skip 并记录 audit。策略写在 Pipeline 编排层，而非 Agent sys_prompt。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>循环检测</h3>
+
+      <p><span class="term" data-term-id="loop-detection" tabindex="0">循环检测</span> 防止 Agent 在 Pipeline 或 ReAct 中反复调用相同工具。策略：记录最近 N 次 (tool_name, args_hash)，相同组合连续 3 次则强制终止并降级。</p>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">import json
+from collections import deque
+
+class LoopGuard:
+    def __init__(self, window: int = 3):
+        self.recent: deque = deque(maxlen=window)
+
+    def check(self, tool_name: str, args: dict) -> bool:
+        sig = (tool_name, json.dumps(args, sort_keys=True))
+        self.recent.append(sig)
+        if len(self.recent) == self.recent.maxlen and len(set(self.recent)) == 1:
+            return True  # 检测到循环
+        return False
+
+# 在 middleware 或 post_acting hook 中调用 loop_guard.check(...)</code></pre>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>Sequential Pipeline 会把上一步的 tool 原始结果传给下一步吗？</summary>
+        <p>传的是上一步 Agent 的最终 Msg（含文本与 metadata），不是未加工的 tool JSON。若下一步需要结构化数据，上一步 Agent 的 sys_prompt 应要求输出固定格式。</p>
+      </details>
+
+      <div class="mermaid-wrap">
+        <h5>MsgHub 内嵌 Pipeline</h5>
+        <pre class="mermaid">flowchart TB
+    Hub[MsgHub Supervisor] --> Seq[sequential_pipeline\nHR→IT→Admin]
+    Seq --> Hub
+    Hub --> Fan[fanout_pipeline\n法务/安全/合规]</pre>
+        <p class="diagram-caption">讨论式协作用 Hub；Hub 内子流程用 Pipeline 固化 SOP。</p>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>LoopGuard 与 max_iters 如何互补？</summary>
+          <div class="learn-faq-body">
+            max_iters 限制总轮次；LoopGuard 检测<strong>相同 tool+args 重复</strong>——模型「卡住」反复查同一日历。两者同时使用：LoopGuard 提前终止无进展循环，max_iters 兜底 worst-case。
+          </div>
+        </details>
+        <details>
+          <summary>enable_gather=False 何时使用？</summary>
+          <div class="learn-faq-body">
+            当 Fanout 各路结果需严格按 agents 列表顺序处理、或需避免并发压垮下游 API 时，设 False 串行 Fanout。牺牲延迟换确定性。
+          </div>
+        </details>
+      </div>
+
+      <h4>CorpAssist 入职 Pipeline 完整编排</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">python</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制</button>
+        </div>
+        <pre><code class="language-python">async def corpassist_onboarding(employee: str):
+    hr = make_agent("HR", "收集信息并生成 onboarding 包")
+    it = make_agent("IT", "依据 onboarding 包开 AD 账号")
+    admin = make_agent("Admin", "分配设备与工位")
+    fallback = make_agent("Fallback", "处理失败并转人工")
+
+    msg = Msg("user", f"为新员工 {employee} 办理入职", "user")
+    try:
+        return await sequential_pipeline(agents=[hr, it, admin], msg=msg)
+    except Exception as e:
+        err = Msg("system", f"Pipeline 失败：{e}", "system")
+        return await fallback(err)</code></pre>
+      </div>
+
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist · 政策并行审阅</span>
+        法务、安全、合规三 Agent 用 fanout_pipeline 同时审阅新版远程办公政策，Supervisor 汇总三路「通过/修改/否决」意见——总耗时 ≈ max(单路) 而非三路之和。
+      </aside>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Pipeline 与 StateGraph 如何选型？</summary>
+          <div class="learn-faq-body">
+            CorpAssist 确定性 SOP（入职、审批链顺序固定）优先 AgentScope Pipeline；需要可视化分支图、复杂 conditional 或已有 LangGraph checkpoint 资产时用 StateGraph。两者可共存：Pipeline 步骤内嵌 LangGraph 子图作 Tool。
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>Sequential</strong>：SOP 顺序流程，Msg 逐步传递。</li>
+        <li><strong>Fanout</strong>：并行审阅/采集，<code>enable_gather=True</code> 提速。</li>
+        <li><strong>重试降级</strong>：模型、工具、Pipeline 三层，失败须可审计。</li>
+        <li><strong>循环检测</strong>：相同 tool+args 连续 N 次即终止。</li>
+        <li><strong>组合</strong>：MsgHub 内嵌 Pipeline 处理复杂子流程。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering_practice03">
+        <p class="learn-checklist-lead">过关清单（勾选会保存在本浏览器）</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="seq" /> 能写出 sequential_pipeline 最小调用</label></li>
+          <li><label><input type="checkbox" data-id="fan" /> 能解释 fanout enable_gather 语义</label></li>
+          <li><label><input type="checkbox" data-id="retry" /> 能列出三层重试/降级</label></li>
+          <li><label><input type="checkbox" data-id="loop" /> 能实现 LoopGuard 签名检测</label></li>
+          <li><label><input type="checkbox" data-id="combo" /> 能说明 Pipeline 与 MsgHub 组合方式</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>sequential_pipeline</td><td>agents 顺序 await</td></tr>
+                <tr><td>fanout_pipeline</td><td>同输入并行，返回列表</td></tr>
+                <tr><td>enable_gather</td><td>True=asyncio 并发</td></tr>
+                <tr><td>SequentialPipeline</td><td>可复用类封装</td></tr>
+                <tr><td>LoopGuard</td><td>tool+args 重复检测</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>CorpAssist 入职 SOP 用 Sequential 还是 MsgHub？为什么？</li>
+              <li>Fanout 并行时一个 Agent 超时如何处理？</li>
+              <li>LoopGuard 与 max_iters 有何互补关系？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-practice-04-hitl">Human-in-the-loop 与 Realtime Steering</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://docs.agentscope.io/building-blocks/orchestration" target="_blank" rel="noopener">Orchestration — Pipeline</a></li>
+      <li><a href="https://docs.agentscope.io/v2/building-blocks/agent" target="_blank" rel="noopener">Agent — 并发工具执行</a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现 CorpAssist 入职 Sequential Pipeline + 政策 Fanout 审阅，并加入 LoopGuard（约 40 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>在 Demo 创建 HR/IT/Admin 三个 Agent，用 <code>sequential_pipeline</code> 跑通模拟入职。</li>
+      <li>创建 Legal/Security/Compliance 三 Agent，<code>fanout_pipeline(enable_gather=True)</code> 并行审阅同一段政策文本。</li>
+      <li>在 IT 步骤注入一次失败，验证 <code>resilient_sequential</code> 降级到 fallback Agent。</li>
+      <li>实现 <code>LoopGuard</code>，对重复 <code>create_ticket</code> 调用强制终止。</li>
+      <li>可选：完成 <code>demos/practice-03-pipeline-lab/</code> 验收。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">排障：Fanout 三路结果顺序每次不同，是 bug 吗？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body"><p>在 <code>enable_gather=True</code> 下不是 bug——asyncio.gather 完成顺序不确定，但返回列表与 agents 列表顺序一致。若业务需要严格完成顺序，设 <code>enable_gather=False</code> 串行 Fanout。</p></div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：Pipeline 编排实验室</h4>
+      <p>目录：<code>demos/practice-03-pipeline-lab/</code>。<strong>验收</strong>：<code>python pipeline_demo.py --mode sequential</code> 与 <code>--mode fanout</code> 均成功；LoopGuard 触发时打印 <code>LOOP_DETECTED</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><strong>上一章</strong>：<a href="#ch-practice-02-message-hub">Message Hub 多 Agent 协作</a></li>
+      <li><strong>下一章</strong>：<a href="#ch-practice-04-hitl">HITL 与 Realtime Steering</a></li>
+    </ul>
+  </div>
+</section>

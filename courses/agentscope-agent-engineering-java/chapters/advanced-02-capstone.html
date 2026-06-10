@@ -1,0 +1,428 @@
+<section id="ch-advanced-02-capstone" class="chapter" data-chapter="advanced-02-capstone">
+  <header class="chapter-header">
+    <h2><span class="chapter-done-badge">已完成</span>Capstone：CorpAssist 短链路 Agent</h2>
+    <button type="button" class="btn-mark-done" data-chapter="advanced-02-capstone" aria-label="标记本章完成">标记完成</button>
+  </header>
+
+  <div class="concept">
+    <div class="chapter-intro content-section">
+      <p class="chapter-meta">约 <strong>50 分钟</strong> · 阶段：<strong>Capstone 与导读</strong> · 能力：交付 CorpAssist S3 <span class="term" data-term-id="capstone-short-chain-java" tabindex="0">短链路 Agent</span> Spring Boot 端到端 Demo</p>
+      <div class="notice notice-why-learn">
+        <strong>为什么要学本章</strong>
+        <p>本课 advanced 阶段的<strong>结业 Capstone</strong>：在 Spring Boot 中实现 CorpAssist「查制度 → 订会议室 → 发确认邮件」短链路，含 3 个 Mock 工具、golden set 评测与 <span class="term" data-term-id="agent-step-budget-java" tabindex="0">步数预算</span>。与 Python 平行课 <a href="../agentscope-agent-engineering/index.html#ch-advanced-03-capstone" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Capstone 短链路 Agent</span><code class="course-ref-slug">agentscope-agent-engineering</code></a> 指标对齐，但栈为 AgentScope Java + Actuator。</p>
+      </div>
+      <div class="notice notice-outcome">
+        <strong>学完你能</strong>
+        <ul>
+          <li>搭建 Spring Boot + ReActAgent 端到端 Capstone Demo</li>
+          <li>配置 Micrometer 采集 <span class="term" data-term-id="token-monitoring" tabindex="0">步数与 Token 监控</span></li>
+          <li>按验收清单跑通 golden set（pass rate ≥90%、avg steps ≤4）</li>
+          <li>撰写 <span class="term" data-term-id="delivery-runbook-java" tabindex="0">交付文档</span> 并判断何时升级 Harness 课</li>
+        </ul>
+      </div>
+      <div class="notice">
+        <strong>本章先记住 3 件事</strong>
+        <ul>
+          <li><strong>短链路定义</strong>：单 ReActAgent、3 工具、≤5 步、&lt;30s，可离线 golden set 评测。</li>
+          <li><strong>指标门禁</strong>：success rate ≥90%、avg steps ≤4、P95 ≤15s，缺一不可。</li>
+          <li><strong>Mock 可接受</strong>：Capstone 工具可 Mock，<span class="term" data-term-id="delivery-runbook-java" tabindex="0">交付文档</span>须注明与生产 API 差异。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>Spring Boot 端到端 Demo</h3>
+      <aside class="learn-scenario" aria-label="业务情境">
+        <span class="learn-scenario-title">CorpAssist S3 · 短链路 Capstone</span>
+        用户：「查年假制度，若允许则订明天 10 点 A301，并给参会人发确认邮件。」Agent 依次调用 <code>searchPolicy</code>、<code>bookMeeting</code>、<code>sendEmail</code>，≤5 步内返回结构化摘要。
+      </aside>
+
+      <div class="mermaid-wrap">
+        <h5>Capstone 架构（Spring Boot + AgentScope Java）</h5>
+        <pre class="mermaid">flowchart LR
+    Client[CorpAssist BFF / curl] -->|POST /agent/chat| SB[Spring Boot]
+    SB --> RA[ReActAgent]
+    RA --> M[DashScopeChatModel]
+    RA --> T1[searchPolicy @Tool]
+    RA --> T2[bookMeeting @Tool]
+    RA --> T3[sendEmail @Tool]
+    RA --> Ev[streamEvents → SSE]
+    SB --> Redis[(Session Redis)]
+    SB --> Act[Actuator /metrics]</pre>
+        <p class="diagram-caption">Capstone 为单 Agent 短链路；Session 可选 Redis；事件经 SSE 或 block 模式返回。</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-java">@RestController
+@RequestMapping("/agent")
+public class CapstoneAgentController {
+
+    private final ReActAgent capstoneAgent;
+
+    public CapstoneAgentController(CapstoneAgentConfig config) {
+        this.capstoneAgent = ReActAgent.builder()
+            .name("CorpAssist-Capstone")
+            .systemPrompt("""
+                你是 CorpAssist 办公助手。先查制度再订会议室，最后发邮件。
+                信息足够则直接回答，不要多余工具调用。""")
+            .model(config.dashScopeModel())
+            .tools(config.capstoneTools())  // searchPolicy, bookMeeting, sendEmail
+            .maxIterations(5)
+            .build();
+    }
+
+    @PostMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux&lt;ServerSentEvent&lt;String&gt;&gt; chat(
+            @RequestBody ChatRequest req,
+            @RequestHeader("X-Session-Id") String sessionId) {
+        Msg userMsg = Msg.builder()
+            .role(MsgRole.USER)
+            .textContent(req.message())
+            .build();
+        RuntimeContext ctx = RuntimeContext.builder()
+            .sessionId(sessionId)
+            .userId(req.userId())
+            .build();
+        return capstoneAgent.streamEvents(userMsg, ctx)
+            .map(ev -&gt; ServerSentEvent.builder(ev.type()).data(ev.payload()).build());
+    }
+}</code></pre>
+      </div>
+
+      <h4>Mock 工具契约（与生产 API 同结构）</h4>
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class CapstoneTools {
+
+    @Tool(description = "查询公司制度，返回 policy_id 与摘要正文")
+    public String searchPolicy(@ToolParam("keyword") String keyword) {
+        return """
+            {"policy_id":"POL-2024-ANNUAL","summary":"年假按工龄计算，需提前3天申请。"}
+            """;
+    }
+
+    @Tool(description = "预订会议室，返回 confirmation_id 与 room")
+    public String bookMeeting(
+            @ToolParam("room") String room,
+            @ToolParam("startTime") String startTime) {
+        return """
+            {"confirmation_id":"BK-88421","room":"%s","status":"confirmed"}
+            """.formatted(room);
+    }
+
+    @Tool(description = "发送确认邮件给参会人")
+    public String sendEmail(@ToolParam("confirmationId") String confirmationId) {
+        return """
+            {"email_id":"EM-99102","status":"sent","ref":"%s"}
+            """.formatted(confirmationId);
+    }
+}</code></pre>
+      </div>
+
+      <div class="learn-compare">
+        <div class="learn-compare-col learn-compare-bad">
+          <span class="learn-compare-heading">Capstone 反模式</span>
+          <ul>
+            <li>Sub-agent 堆 3 层做简单订会议室</li>
+            <li>工具返回纯文本「ok」导致模型重复调用</li>
+            <li>无 sessionId，每轮丢失上下文</li>
+          </ul>
+        </div>
+        <div class="learn-compare-col learn-compare-good">
+          <span class="learn-compare-heading">推荐</span>
+          <ul>
+            <li>单 ReActAgent + maxIterations(5)</li>
+            <li>Mock JSON 含 confirmation_id 等结构化字段</li>
+            <li>golden set 断言 must_call_tools 顺序</li>
+          </ul>
+        </div>
+      </div>
+
+      <details class="learn-micro-check">
+        <summary>先想 10 秒：Capstone 为何限制单 Agent 而非 Sub-agent？</summary>
+        <p>短链路 Capstone 验证 ReAct 闭环、工具契约与指标门禁；Sub-agent 协作已在 practice-02 覆盖。Capstone 聚焦「可评测、可交付、可答辩」的最小生产切片。</p>
+      </details>
+    </div>
+
+    <div class="section-block">
+      <h3>步数/Token 监控</h3>
+      <p><span class="term" data-term-id="agent-step-budget-java" tabindex="0">步数预算</span> 与 <span class="term" data-term-id="token-monitoring" tabindex="0">Token 监控</span> 是 CorpAssist NS3 成本可控的核心。Capstone 通过 Micrometer 暴露 <code>agent.steps</code>、<code>agent.tokens</code>，与 Python 平行课 metrics 语义对齐。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>指标</th><th>采集点</th><th>Capstone 门禁</th><th>Actuator 路径</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ReAct 步数</td><td>每次 tool_call 后 increment</td><td>avg ≤ 4，max ≤ 5</td><td><code>/actuator/metrics/agent.steps</code></td></tr>
+          <tr><td>Token 用量</td><td>DashScope 响应 usage</td><td>单请求 prompt+completion 可记录</td><td><code>/actuator/metrics/agent.tokens</code></td></tr>
+          <tr><td>成功率</td><td>golden set 评测</td><td>≥ 90%</td><td>eval 脚本输出 metrics.json</td></tr>
+          <tr><td>P95 延迟</td><td>Controller 计时</td><td>≤ 15s</td><td><code>/actuator/metrics/http.server.requests</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">java</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-java">@Component
+public class AgentMetricsListener implements AgentEventListener {
+
+    private final Counter stepCounter;
+    private final Counter tokenCounter;
+
+    public AgentMetricsListener(MeterRegistry registry) {
+        this.stepCounter = Counter.builder("agent.steps")
+            .description("ReAct tool invocation count")
+            .register(registry);
+        this.tokenCounter = Counter.builder("agent.tokens")
+            .description("Total tokens from DashScope usage")
+            .register(registry);
+    }
+
+    @Override
+    public void onToolCall(ToolCallEvent event) {
+        stepCounter.increment();
+    }
+
+    @Override
+    public void onModelResponse(ModelResponseEvent event) {
+        if (event.usage() != null) {
+            tokenCounter.increment(event.usage().totalTokens());
+        }
+    }
+}</code></pre>
+      </div>
+
+      <p>配置 <code>management.endpoints.web.exposure.include=health,metrics,prometheus</code> 后，Prometheus 可抓取 <code>agent_steps_total</code> 与 <code>agent_tokens_total</code>，为后续 <a href="../observability-reliability-ops-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">可观测性与可靠性运维</span><code class="course-ref-slug">observability-reliability-ops-java</code></a> 打基础。</p>
+
+      <div class="learn-faq">
+        <details>
+          <summary>avg steps 4.8、success rate 92% 能否通过？</summary>
+          <div class="learn-faq-body"><strong>不能。</strong> 成功率达标但 avg_steps &gt; 4.0。需优化工具 description 或 systemPrompt，减少无效 ReAct 轮次后再答辩。</div>
+        </details>
+        <details>
+          <summary>Token 监控在 Mock 模式下还有意义吗？</summary>
+          <div class="learn-faq-body">有。即使工具 Mock，模型仍消耗 Token；Capstone 应记录真实 DashScope 调用量，为 NS3 成本估算提供样本。无 API Key 时可跳过 token 断言，步数门禁仍必填。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block">
+      <h3>验收清单</h3>
+      <p><span class="term" data-term-id="capstone-short-chain-java" tabindex="0">短链路 Capstone</span> 验收分<strong>功能</strong>、<strong>指标</strong>、<strong>交付</strong>三层。下表与 Demo <code>ACCEPTANCE.md</code> 一致。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>层级</th><th>检查项</th><th>通过标准</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>功能</td><td>3 工具 Mock 可调用</td><td>Trace 含 searchPolicy → bookMeeting → sendEmail</td></tr>
+          <tr><td>功能</td><td>SSE 或 block 模式可跑通</td><td>curl 返回最终摘要含 confirmation_id</td></tr>
+          <tr><td>指标</td><td>golden set 10 条</td><td>pass rate ≥ 90%（8 happy + 2 边界）</td></tr>
+          <tr><td>指标</td><td>步数 / 延迟</td><td>avg steps ≤ 4，P95 ≤ 15s</td></tr>
+          <tr><td>交付</td><td><span class="term" data-term-id="delivery-runbook-java" tabindex="0">交付文档</span></td><td>架构 + 指标 + 运行手册 + 已知限制 ≥ 4 节</td></tr>
+          <tr><td>交付</td><td>Mock 映射表</td><td>注明 Mock 字段与生产 API 对应关系</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-block">
+        <div class="code-toolbar">
+          <span class="lang-tag">json</span>
+          <button type="button" class="btn-copy" aria-label="复制代码">复制代码</button>
+        </div>
+        <pre><code class="language-json">{
+  "evaluated_at": "2026-06-10T10:00:00Z",
+  "golden_set_version": "1.0",
+  "total_cases": 10,
+  "passed": 9,
+  "success_rate": 0.90,
+  "avg_steps": 3.6,
+  "p95_latency_ms": 12400,
+  "gates": {
+    "success_rate_min": 0.90,
+    "avg_steps_max": 4.0,
+    "p95_max_ms": 15000
+  },
+  "status": "PASS"
+}</code></pre>
+      </div>
+
+      <h4>交付文档章节（答辩载体）</h4>
+      <table class="outline-table">
+        <thead>
+          <tr><th>章节</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1. 背景与范围</td><td>S3 短链路定义、非目标（不含 Harness 长任务）</td></tr>
+          <tr><td>2. 架构图</td><td>Spring Boot + ReActAgent + 3 Mock 工具</td></tr>
+          <tr><td>3. 指标报告</td><td>metrics.json 截图 + Actuator 指标名</td></tr>
+          <tr><td>4. 运行手册</td><td><code>AI_DASHSCOPE_API_KEY</code>、<code>mvn spring-boot:run</code>、curl 示例</td></tr>
+          <tr><td>5. 已知限制</td><td>Mock 工具、单租户、未接 HITL</td></tr>
+          <tr><td>6. 演进路线</td><td>长任务 → advanced-04 Harness 导读</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-block">
+      <h3>长任务 → Harness 课</h3>
+      <p>当任务超出 <span class="term" data-term-id="capstone-short-chain-java" tabindex="0">短链路</span> 能力——步数 &gt;10、跨会话恢复、多文件批处理、Sub-agent 并行长时运行——应升级到 <a href="../agentscope-harness-engineering-java/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">AgentScope Harness 长任务工程（Java）</span><code class="course-ref-slug">agentscope-harness-engineering-java</code></a>（或 Python 平行课）。不要在 ReAct 上无限堆叠 <code>maxIterations</code>。</p>
+
+      <table class="outline-table">
+        <thead>
+          <tr><th>信号</th><th>短链路 Capstone</th><th>升级 Harness</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>步数</td><td>≤ 5</td><td>&gt; 10 或动态未知</td></tr>
+          <tr><td>时长</td><td>&lt; 30s</td><td>分钟～小时级</td></tr>
+          <tr><td>状态</td><td>单 session Redis</td><td>检查点 + 断点续跑 + Workspace</td></tr>
+          <tr><td>示例</td><td>订会议室 + 发邮件</td><td>「整理 Q1 全部会议纪要并生成汇总 PPT」</td></tr>
+        </tbody>
+      </table>
+
+      <div class="mermaid-wrap">
+        <h5>学习路径：Capstone → Harness → OPS</h5>
+        <pre class="mermaid">flowchart LR
+    ASJ[agentscope-agent-engineering-java]
+    Cap[advanced-02 Capstone]
+    Har[agentscope-harness-engineering-java]
+    Ops[observability-reliability-ops-java]
+    ASJ --> Cap
+    Cap -->|步数/时长超限| Har
+    Cap -->|上生产| Ops</pre>
+        <p class="diagram-caption">完成本章 Capstone 后按业务目标接 Harness 长任务或 OPS 生产化。</p>
+      </div>
+
+      <div class="learn-faq">
+        <details>
+          <summary>Capstone 必须接真实日历/邮件 API 吗？</summary>
+          <div class="learn-faq-body"><strong>不必须。</strong> Mock 工具 + golden set 可完成验收。交付文档须注明 Mock 与生产的差异及接入计划。</div>
+        </details>
+        <details>
+          <summary>与毕业项目 M3 Agent 的关系？</summary>
+          <div class="learn-faq-body">本章是<strong>本课结业 Capstone</strong>；<a href="../llm-application-fundamentals/index.html#ch-advanced-05-capstone-plan" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">毕业项目路线图</span><code class="course-ref-slug">llm-application-fundamentals</code></a> 的 M3 是全栈里程碑。本章产出可作为 M3 的 AgentScope Java 技术栈证明。</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="section-block chapter-conclusions-block notice">
+      <h3>本章结论</h3>
+      <ul class="chapter-conclusions-list">
+        <li><strong>短链路</strong>：Spring Boot + 单 ReActAgent + 3 Mock 工具、≤5 步。</li>
+        <li><strong>指标</strong>：success rate ≥90%、avg steps ≤4、P95 ≤15s。</li>
+        <li><strong>监控</strong>：Micrometer 暴露 agent.steps / agent.tokens。</li>
+        <li><strong>交付</strong>：metrics.json + 六章 runbook + Mock 映射表。</li>
+        <li><strong>演进</strong>：长任务 → agentscope-harness-engineering-java。</li>
+      </ul>
+    </div>
+
+    <div class="section-block learn-review-block">
+      <h3>复习与自检</h3>
+      <div class="learn-checklist" data-storage-key="agentscope-agent-engineering-java_advanced02">
+        <p class="learn-checklist-lead">过关清单</p>
+        <p class="learn-checklist-progress" aria-live="polite">0 / 5 已勾选</p>
+        <ul>
+          <li><label><input type="checkbox" data-id="e2e-demo" /> 能跑通 Spring Boot Capstone Demo</label></li>
+          <li><label><input type="checkbox" data-id="metrics" /> 能列出四项指标及门禁</label></li>
+          <li><label><input type="checkbox" data-id="golden" /> 能编写 golden set 并跑 eval 脚本</label></li>
+          <li><label><input type="checkbox" data-id="runbook" /> 能撰写交付文档六章节</label></li>
+          <li><label><input type="checkbox" data-id="harness" /> 能说明何时升级 Harness 课</label></li>
+        </ul>
+      </div>
+
+      <div class="learn-cheat-sheet">
+        <details>
+          <summary>本章速查卡</summary>
+          <div class="learn-cheat-body">
+            <table>
+              <thead><tr><th>概念</th><th>记住一句</th></tr></thead>
+              <tbody>
+                <tr><td>短链路</td><td>≤5 步、3 工具、单 ReActAgent</td></tr>
+                <tr><td>Success Rate</td><td>golden pass ≥ 90%</td></tr>
+                <tr><td>Avg Steps</td><td>均值 ≤ 4</td></tr>
+                <tr><td>Token 监控</td><td>agent.tokens + DashScope usage</td></tr>
+                <tr><td>maxIterations</td><td>Capstone 设 5</td></tr>
+                <tr><td>Mock 工具</td><td>JSON 含 confirmation_id</td></tr>
+                <tr><td>Harness 升级</td><td>&gt;10 步或跨会话长任务</td></tr>
+                <tr><td>Python 对照</td><td>agentscope-agent-engineering advanced-03</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="learn-interview">
+        <details>
+          <summary>答辩 / 面试口述题</summary>
+          <div class="learn-interview-body">
+            <ol>
+              <li>描述你的 CorpAssist Java Capstone 架构与三项核心指标。</li>
+              <li>golden set 中一条失败用例你如何排查与修复？</li>
+              <li>什么情况下推荐 Harness 课而非继续堆 ReAct 步数？</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+
+      <p class="chapter-review-next">下一步：<a href="#ch-advanced-03-interview">面试：AgentScope Java 排障</a>。</p>
+    </div>
+  </div>
+
+  <div class="official-links content-section">
+    <h3>官方文档</h3>
+    <ul>
+      <li><a href="https://java.agentscope.io/" target="_blank" rel="noopener">AgentScope Java — ReActAgent</a></li>
+      <li><a href="https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html" target="_blank" rel="noopener">Spring Boot Actuator</a></li>
+      <li><a href="../agentscope-agent-engineering/index.html#ch-advanced-03-capstone" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 平行课 · Capstone</span><code class="course-ref-slug">agentscope-agent-engineering</code></a></li>
+    </ul>
+  </div>
+
+  <div class="chapter-practice">
+    <h3>动手练习</h3>
+    <p class="steps-intro">实现 CorpAssist Java 短链路 Capstone：Spring Boot + 3 Mock 工具、10 条 golden set、eval 指标门禁，并撰写交付文档（约 45 分钟）。</p>
+    <h4 class="practice-section-title">操作步骤</h4>
+    <ol class="steps steps-operate">
+      <li>按「Spring Boot 端到端 Demo」代码块实现 Controller 与 ReActAgent 配置，设置 <code>maxIterations(5)</code>。</li>
+      <li>实现三个 Mock @Tool，返回 JSON 含 <code>confirmation_id</code>；对照「Mock 工具契约」代码块。</li>
+      <li>配置 AgentMetricsListener，启动后访问 <code>/actuator/metrics/agent.steps</code> 确认指标存在。</li>
+      <li>编写 <code>golden_set.json</code> 10 条并运行 <code>eval_capstone.ps1</code>，将结果写入 <code>metrics.json</code>。</li>
+      <li>按「验收清单」表撰写 DELIVERY 文档四节以上；可选跑 Demo 目录验收脚本。</li>
+    </ol>
+    <h4 class="practice-section-title">判断练习</h4>
+    <ol class="steps-judgment-list">
+      <li>
+        <p class="judgment-stem">Capstone 评测结果：success_rate=0.92，avg_steps=4.8，p95=11000ms——是否通过门禁？</p>
+        <div class="learn-practice-answer">
+          <details>
+            <summary>参考答案</summary>
+            <div class="learn-practice-answer-body">
+              <p><strong>不通过。</strong> success_rate 与 P95 达标，但 avg_steps &gt; 4.0。需优化 systemPrompt 或工具 description，减少无效 ReAct 轮次（例如合并 search 与 book 的前置校验）。</p>
+            </div>
+          </details>
+        </div>
+      </li>
+    </ol>
+    <div class="demo-box">
+      <h4 class="demo-box-title">Demo：CorpAssist Java Capstone 短链路</h4>
+      <p>目录：<code>demos/advanced-02-capstone-lab/</code>（<code>golden_set.json</code>、<code>eval_capstone.ps1</code>、<code>ACCEPTANCE.md</code>）。<strong>验收</strong>：执行 <code>.\eval_capstone.ps1</code>，<code>metrics.json</code> 中 <code>success_rate ≥ 0.9</code> 且 <code>avg_steps ≤ 4</code>。</p>
+    </div>
+  </div>
+
+  <div class="resources content-section">
+    <h3>延伸学习</h3>
+    <ul>
+      <li><a href="#ch-practice-01-single-agent">单 Agent：CorpAssist 办公助手</a>：Capstone 前置实战</li>
+      <li><a href="../llm-evaluation-quality/index.html" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">评测、实验与用户反馈闭环</span><code class="course-ref-slug">llm-evaluation-quality</code></a>：golden set 方法论</li>
+      <li><a href="../agentscope-agent-engineering/index.html#ch-advanced-03-capstone" class="course-ref" target="_blank" rel="noopener"><span class="course-ref-zh">Python 平行课 · Capstone</span><code class="course-ref-slug">agentscope-agent-engineering</code></a></li>
+      <li><strong>下一章</strong>：<a href="#ch-advanced-03-interview">面试：AgentScope Java 排障</a></li>
+    </ul>
+  </div>
+</section>
