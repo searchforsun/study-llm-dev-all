@@ -13,7 +13,7 @@
 | practice-02-bert-encoder | [practice-02-bert-encoder-lab](./practice-02-bert-encoder-lab/) |
 | practice-03-llm-arch-compare | [practice-03-llm-arch-compare-lab](./practice-03-llm-arch-compare-lab/) |
 | practice-04-kv-cache-flash | [practice-04-kv-cache-flash-lab](./practice-04-kv-cache-flash-lab/) |
-| practice-05-numpy-attention-lab | [practice-05-numpy-attention-lab-lab](./practice-05-numpy-attention-lab-lab/) |
+| practice-05-numpy-attention-lab | [practice-05-numpy-attention-lab](./practice-05-numpy-attention-lab/) |
 | advanced-01-positional-encoding | [advanced-01-positional-encoding-lab](./advanced-01-positional-encoding-lab/) |
 | advanced-02-moe-sparse | [advanced-02-moe-sparse-lab](./advanced-02-moe-sparse-lab/) |
 | advanced-03-long-context | [advanced-03-long-context-lab](./advanced-03-long-context-lab/) |
