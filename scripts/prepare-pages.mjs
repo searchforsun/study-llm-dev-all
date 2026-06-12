@@ -51,16 +51,17 @@ function copyCoursesFiltered(src, dest) {
   }
 }
 
-/** 保护 script/style，再压缩空白与 HTML 注释 */
+/** 保护 script/style/pre（Mermaid + 代码块），仅压缩标签间空白 */
 function minifyHtml(html) {
   const preserved = [];
-  html = html.replace(/<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/gi, (block) => {
+  function stash(block) {
     preserved.push(block);
     return `\x00P${preserved.length - 1}\x00`;
-  });
+  }
+  html = html.replace(/<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/gi, stash);
+  html = html.replace(/<pre(\s[^>]*)?>[\s\S]*?<\/pre>/gi, stash);
   html = html
     .replace(/<!--(?!\[if)[\s\S]*?-->/g, '')
-    .replace(/\s+/g, ' ')
     .replace(/>\s+</g, '><')
     .trim();
   return html.replace(/\x00P(\d+)\x00/g, (_, index) => preserved[Number(index)]);
