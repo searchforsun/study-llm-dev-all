@@ -111,24 +111,21 @@ function dirBytes(dir) {
 resetDir(outRoot);
 copyCoursesFiltered(coursesSrc, coursesOut);
 
-fs.writeFileSync(path.join(outRoot, '.nojekyll'), '');
-
+const rootIndex = path.join(repoRoot, 'index.html');
+const rootNoJekyll = path.join(repoRoot, '.nojekyll');
+if (!fs.existsSync(rootIndex)) {
+  throw new Error('Missing repo root index.html (portal redirect)');
+}
 fs.writeFileSync(
   path.join(outRoot, 'index.html'),
-  minifyHtml(`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta http-equiv="refresh" content="0; url=courses/index.html" />
-  <title>大模型应用开发 · 课程中心</title>
-  <script>location.replace('courses/index.html');</script>
-</head>
-<body>
-  <p>正在进入课程中心… <a href="courses/index.html">点此前往</a></p>
-</body>
-</html>`),
+  minifyHtml(fs.readFileSync(rootIndex, 'utf8')),
   'utf8'
 );
+if (fs.existsSync(rootNoJekyll)) {
+  fs.copyFileSync(rootNoJekyll, path.join(outRoot, '.nojekyll'));
+} else {
+  fs.writeFileSync(path.join(outRoot, '.nojekyll'), '');
+}
 
 let saved = 0;
 let htmlCount = 0;
